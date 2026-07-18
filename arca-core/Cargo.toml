@@ -1,0 +1,19 @@
+[package]
+name = "arca-core"
+version = "0.0.0"
+description = "凍結されたトレイト代数と sans-IO コア: Transform/Filter/Format/EntryReader/EntryWriter。no_std + alloc。"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[features]
+default = []
+# core は no_std + alloc が既定。std は adaptor(将来)向けの薄い追加のみ。
+std = []
+
+[lints]
+workspace = true

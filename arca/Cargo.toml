@@ -1,0 +1,25 @@
+[package]
+name = "arca"
+version = "0.0.0"
+description = "統一 streaming アーカイブライブラリ（Pure Rust）。std 高レベル API: 自動検出・FS 展開・安全なパス処理。"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[features]
+default = ["gzip", "zstd", "xz", "lz4"]
+gzip = ["arca-filter/gzip"]
+zstd = ["arca-filter/zstd"]
+xz = ["arca-filter/xz"]
+lz4 = ["arca-filter/lz4"]
+
+[dependencies]
+arca-core = { path = "../arca-core" }
+arca-filter = { path = "../arca-filter" }
+
+[lints]
+workspace = true

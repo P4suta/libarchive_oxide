@@ -1,0 +1,28 @@
+[package]
+name = "arca-filter"
+version = "0.0.0"
+description = "圧縮フィルタ実装: 自作 inflate（no_std）と再利用クレートの完全適合アダプタ（std）。出自不可視。"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[features]
+default = ["gzip"]
+# gzip = 自作 inflate（no_std を保つ）。
+gzip = []
+# 重量級コーデックは再利用クレートを包むため std を引く。表に出す唯一の継ぎ目。
+std = []
+zstd = ["std"]  # ruzstd アダプタ（P3）
+xz = ["std"]    # lzma-rs アダプタ（P3, subset）
+lz4 = ["std"]   # lz4_flex アダプタ（P3）
+bzip2 = ["std"] # bzip2-rs アダプタ（後）
+
+[dependencies]
+arca-core = { path = "../arca-core" }
+
+[lints]
+workspace = true

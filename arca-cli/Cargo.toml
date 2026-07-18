@@ -1,0 +1,20 @@
+[package]
+name = "arca-cli"
+version = "0.0.0"
+description = "bsdtar 風デモ CLI。ドッグフーディング兼、ラウンドトリップ統合テストの実観測面。"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "arca"
+path = "src/main.rs"
+
+[dependencies]
+arca = { path = "../arca" }
+
+[lints]
+workspace = true
