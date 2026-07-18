@@ -83,17 +83,19 @@ while let Some(mut entry) = reader.next_entry()? {
 
 ## Status
 
-**Read and write both work.** Reading: tar (`ustar`/`pax`/GNU), cpio
-(`newc`/`odc`), ar (GNU/BSD/SysV), over gzip/zstd/xz/lz4. Writing: the tar writer
-(with GNU longname/longlink) and all four compression encoders — so `arca` both
-extracts and creates `.tar`, `.tar.gz`, `.tar.zst`, `.tar.xz`, and `.tar.lz4`.
-The `read ∘ write = id` round-trip and cross-checks against GNU `tar` and an
-independent gzip decoder are part of the test suite. Verified end-to-end, adversarially reviewed, and
-hardened against malformed-input panics and extraction attacks.
+**Read and write both work, across all three formats.** Reading: tar
+(`ustar`/`pax`/GNU), cpio (`newc`/`odc`), ar (GNU/BSD/SysV), over
+gzip/zstd/xz/lz4. Writing: tar (GNU longname/longlink), cpio (`newc`), and ar
+(BSD long names) writers, plus all four compression encoders — so `arca` both
+extracts and creates `.tar`, `.tar.gz`, `.tar.zst`, `.tar.xz`, `.tar.lz4`, and
+composes them into a `.deb`. The `read ∘ write = id` round-trip and cross-checks
+against GNU `tar` and an independent gzip decoder are part of the test suite.
+Verified end-to-end, adversarially reviewed twice, and hardened against
+malformed-input panics and extraction attacks.
 
-**Planned:** cpio/ar writers, `zip`/`7z`/`iso9660`, an incrementally-fed sans-IO
-source, and fuzzing. Because the trait algebra is frozen, none of these require a
-trait change.
+**Planned:** `zip`/`7z`/`iso9660`, an incrementally-fed sans-IO source, and
+fuzzing. Because the trait algebra is frozen, none of these require a trait
+change.
 
 ## Quality gates
 
