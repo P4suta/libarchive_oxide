@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
 use crate::format::{
-    ArchiveFormat, Detection, Entry, EntryData, EntryReader, EntrySink, EntryWriter,
+    ArchiveFormat, Detection, Entry, EntryReader, EntrySink, EntryWriter, SliceData,
 };
 use crate::meta::{EntryKind, EntryMeta, Timestamp};
 
@@ -71,35 +71,12 @@ struct Overrides<'a> {
     gid: Option<u64>,
 }
 
-/// Cursor pointing at the entry body. `bytes` is the source slice (`&'a [u8]` is Copy, so it can be shared).
-#[derive(Debug, Default)]
-struct TarPayload<'a> {
-    bytes: &'a [u8],
-    start: usize,
-    len: usize,
-    read: usize,
-}
-
-impl EntryData for TarPayload<'_> {
-    fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize> {
-        let remaining = self.len - self.read;
-        if remaining == 0 || out.is_empty() {
-            return Ok(0);
-        }
-        let n = remaining.min(out.len());
-        let from = self.start + self.read;
-        out[..n].copy_from_slice(&self.bytes[from..from + n]);
-        self.read += n;
-        Ok(n)
-    }
-}
-
 /// tar streaming reader (over an in-memory slice).
 #[derive(Debug)]
 pub struct TarReader<'a> {
     data: &'a [u8],
     pos: usize,
-    payload: TarPayload<'a>,
+    payload: SliceData<'a>,
     pending: Overrides<'a>,
     global: Overrides<'a>,
     ended: bool,
@@ -112,7 +89,7 @@ impl<'a> TarReader<'a> {
         Self {
             data,
             pos: 0,
-            payload: TarPayload::default(),
+            payload: SliceData::default(),
             pending: Overrides::default(),
             global: Overrides::default(),
             ended: false,
@@ -256,12 +233,7 @@ impl EntryReader for TarReader<'_> {
                     let len = usize_of(meta.size)?;
                     // Guarantee that the payload is within bounds.
                     let _ = Self::slice(data, data_start, len)?;
-                    self.payload = TarPayload {
-                        bytes: data,
-                        start: data_start,
-                        len,
-                        read: 0,
-                    };
+                    self.payload = SliceData::new(data, data_start, len);
                     self.pos = data_start
                         .checked_add(round_up(meta.size)?)
                         .ok_or(Error::Malformed("size overflow"))?;

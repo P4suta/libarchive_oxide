@@ -15,6 +15,7 @@ use crate::meta::EntryMeta;
 use crate::Result;
 use core::fmt;
 
+pub mod ar;
 pub mod cpio;
 pub mod tar;
 
@@ -47,6 +48,43 @@ pub trait ArchiveFormat {
 pub trait EntryData {
     /// Pull decoded entry bytes into `out`. The return value is the amount produced. 0 means end of entry.
     fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize>;
+}
+
+/// A payload cursor over a byte slice, shared by the slice-based format readers
+/// (`tar`, `cpio`, `ar`). `&'a [u8]` is `Copy`, so a reader can hold its own copy of the
+/// backing slice here without conflicting with borrows of the header bytes.
+#[derive(Debug, Default)]
+pub(crate) struct SliceData<'a> {
+    bytes: &'a [u8],
+    start: usize,
+    len: usize,
+    read: usize,
+}
+
+impl<'a> SliceData<'a> {
+    /// A cursor over `bytes[start..start + len]`.
+    pub(crate) fn new(bytes: &'a [u8], start: usize, len: usize) -> Self {
+        Self {
+            bytes,
+            start,
+            len,
+            read: 0,
+        }
+    }
+}
+
+impl EntryData for SliceData<'_> {
+    fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize> {
+        let remaining = self.len - self.read;
+        if remaining == 0 || out.is_empty() {
+            return Ok(0);
+        }
+        let n = remaining.min(out.len());
+        let from = self.start + self.read;
+        out[..n].copy_from_slice(&self.bytes[from..from + n]);
+        self.read += n;
+        Ok(n)
+    }
 }
 
 /// A streaming reader that pulls one entry at a time from an archive.
