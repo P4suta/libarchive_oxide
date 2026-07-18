@@ -22,8 +22,8 @@ categories = ["command-line-utilities"]
 [package.metadata.docs.rs]
 all-features = true
 
-# Four bsdtar-family tools. Phase 1 is a scaffold: each bin is a thin main over the shared crate
-# library; the full bsdtar-compatible flag interface lands in a later phase.
+# Four bsdtar-family tools. Each bin is a thin main over the shared crate library, whose documented
+# flag surface and exit-code contract are tested in the crate's integration suite.
 [[bin]]
 name = "oxtar"
 path = "src/bin/oxtar.rs"

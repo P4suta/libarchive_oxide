@@ -74,8 +74,8 @@ core floor (1.81).
 
 ## License
 
-Licensed under either of [MIT](../LICENSES/MIT.txt) or
-[Apache-2.0](../LICENSES/Apache-2.0.txt) at your option.
+Licensed under either of [MIT](LICENSES/MIT.txt) or
+[Apache-2.0](LICENSES/Apache-2.0.txt) at your option.
 
 [`decompress`]: https://docs.rs/libarchive_oxide
 [`decompress_capped`]: https://docs.rs/libarchive_oxide

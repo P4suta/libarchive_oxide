@@ -154,6 +154,23 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: fsfe/reuse-action@bb774aa972c2a89ff34781233d275075cbddf542 # v5
 
+  license-sync:
+    name: crate license copies and package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - run: bash scripts/check-license-sync.sh
+      - name: verify license texts are packaged
+        shell: bash
+        run: |
+          set -euo pipefail
+          for crate in libarchive_oxide-core libarchive_oxide libarchive_oxide-cli; do
+            files="$(cargo package -p "$crate" --list)"
+            grep -Fxq "LICENSES/Apache-2.0.txt" <<<"$files"
+            grep -Fxq "LICENSES/MIT.txt" <<<"$files"
+          done
+
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest
@@ -259,6 +276,7 @@ jobs:
       - msrv
       - nodyn
       - reuse
+      - license-sync
       - deny
       - semver-checks
       - fuzz

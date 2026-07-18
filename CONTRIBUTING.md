@@ -10,12 +10,13 @@ behind it are recorded there and in [ROADMAP.md](ROADMAP.md).
 
 ## Setup
 
-The toolchain is pinned via [mise](https://mise.jdx.dev/) (`mise.toml`); the Rust
-toolchain itself is owned by `rust-toolchain.toml`. Declare tools in `mise.toml`
-and install via `mise install`; do not add them ad hoc.
+The development toolchain is managed via [mise](https://mise.jdx.dev/)
+(`mise.toml`); the Rust toolchain itself is owned by `rust-toolchain.toml`.
+Declare tools in `mise.toml` and install via `mise install`; do not add them ad
+hoc. CI action revisions are pinned independently in the workflow files.
 
 ```sh
-mise install        # install pinned tools (cargo-msrv, cargo-deny, cargo-semver-checks, reuse, typos, ...)
+mise install        # install managed tools (cargo-msrv, cargo-deny, cargo-semver-checks, reuse, typos, ...)
 mise run hooks      # once, per clone: install the lefthook pre-commit / commit-msg hooks
 ```
 

@@ -85,5 +85,5 @@ stability policy and the path to 1.0.
 
 ## License
 
-Licensed under either of [MIT](../LICENSES/MIT.txt) or
-[Apache-2.0](../LICENSES/Apache-2.0.txt) at your option.
+Licensed under either of [MIT](LICENSES/MIT.txt) or
+[Apache-2.0](LICENSES/Apache-2.0.txt) at your option.

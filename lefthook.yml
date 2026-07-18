@@ -50,5 +50,10 @@ pre-commit:
 
     reuse:
       tags: license
-      glob: "{**/*.rs,**/*.toml,**/*.md,**/*.yml,**/*.sh,REUSE.toml,LICENSES/*}"
+      glob: "{**/*.rs,**/*.toml,**/*.md,**/*.yml,**/*.sh,REUSE.toml,**/LICENSES/*}"
       run: uvx --with charset-normalizer reuse lint
+
+    license-sync:
+      tags: license
+      glob: "{LICENSES/*,**/LICENSES/*}"
+      run: bash scripts/check-license-sync.sh

@@ -49,5 +49,5 @@ lowest floor in the workspace; zero external dependencies keep it there.
 
 ## License
 
-Licensed under either of [MIT](../LICENSES/MIT.txt) or
-[Apache-2.0](../LICENSES/Apache-2.0.txt) at your option.
+Licensed under either of [MIT](LICENSES/MIT.txt) or
+[Apache-2.0](LICENSES/Apache-2.0.txt) at your option.

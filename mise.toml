@@ -83,3 +83,7 @@ description = "Check REUSE/SPDX license compliance"
 # `--with charset-normalizer` gives reuse a pure-Python encoding detector, so it
 # needs no native libmagic (required on Windows; harmless on Linux).
 run = "uvx --with charset-normalizer reuse lint"
+
+[tasks.license-sync]
+description = "Verify each published crate carries the canonical license texts"
+run = "bash scripts/check-license-sync.sh"

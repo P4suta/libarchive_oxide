@@ -22,9 +22,10 @@
 //!
 //! # Implementation status
 //!
-//! The abstractions (traits and types) are **frozen in their finished form**. Both write and new formats
-//! land without any trait change (the [`format::tar`]/[`format::cpio`] stubs prove at the type level
-//! that they are implementable under the same traits). Implementation breadth grows later, beneath the frozen abstractions.
+//! The abstractions (traits and types) are **frozen in their finished form**. The implemented read
+//! and write paths for [`format::tar`], [`format::cpio`], [`format::ar`], and [`format::iso9660`]
+//! all use the same traits, demonstrating that implementation breadth grows beneath the frozen
+//! abstractions rather than changing them.
 
 #![no_std]
 #![forbid(unsafe_code)]

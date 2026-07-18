@@ -30,6 +30,8 @@
 //! [`extract`]: libarchive_oxide::extract::extract
 //! [`decompress`]: libarchive_oxide::decompress
 
+#![forbid(unsafe_code)]
+
 pub mod cat;
 pub mod cpio;
 pub mod tar;

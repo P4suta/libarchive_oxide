@@ -30,16 +30,17 @@ Enrollment checklist:
 
 ## Big-endian verification
 
-**State: scaffold planned, not yet green-gated.** All parsing uses explicit
-byte-order conversions, so big-endian correctness is expected, but it is not yet
-verified in CI. The plan is a cross-compile + QEMU job (e.g. `s390x`) running the
-workspace tests, added first as an allow-failure scaffold and promoted to a
-required gate once it passes.
+**State: advisory scaffold present, not yet green-gated.** All parsing uses
+explicit byte-order conversions, so big-endian correctness is expected. CI now
+cross-compiles and runs the workspace tests under QEMU on `s390x`, initially as
+an allow-failure scaffold. It will become a required gate after three consecutive
+green runs on `main`.
 
-- [ ] Add a cross + QEMU CI job (`s390x-unknown-linux-gnu`) as
+- [x] Add a cross + QEMU CI job (`s390x-unknown-linux-gnu`) as
       `continue-on-error: true`.
 - [ ] Triage any endianness divergences the job surfaces.
-- [ ] Promote the job to a required gate once green.
+- [ ] Promote the job to a required gate after three consecutive green `main`
+      runs.
 
 ## `no_std` codec support
 
