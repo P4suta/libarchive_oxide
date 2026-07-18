@@ -203,6 +203,11 @@ jobs:
   fuzz:
     name: fuzz (nightly, build + short run)
     runs-on: ubuntu-latest
+    env:
+      # cargo-binstall distributes cargo-fuzz as a musl-linked executable. Explicitly select the
+      # runner's GNU target so cargo-fuzz does not mistake its own build target for the fuzz target;
+      # ASan is incompatible with a statically linked musl libc.
+      FUZZ_TARGET: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -214,7 +219,7 @@ jobs:
       - name: install nightly (libFuzzer)
         run: rustup toolchain install nightly --profile minimal --no-self-update
       # First gate: every target must compile against libFuzzer on Linux/nightly.
-      - run: cargo +nightly fuzz build
+      - run: cargo +nightly fuzz build --target "$FUZZ_TARGET"
       # Second gate: actually *run* libFuzzer as a bug-finder. Each target fuzzes for a bounded wall
       # time, seeded from its committed corpus (fuzz/corpus/<target>), so a panic on malformed input
       # in a reader/round-trip/codec path fails CI here — not just at compile time. Kept short so the
@@ -225,7 +230,7 @@ jobs:
           targets=$(cargo +nightly fuzz list)
           for t in $targets; do
             echo "::group::fuzz $t"
-            cargo +nightly fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
+            cargo +nightly fuzz run "$t" --target "$FUZZ_TARGET" -- -max_total_time=30 -rss_limit_mb=4096
             echo "::endgroup::"
           done
 

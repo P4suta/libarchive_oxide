@@ -39,7 +39,7 @@ fn system_tar_extracts_our_archive() {
             EntryKind::File
         };
         let mut m = EntryMeta::new(kind, Cow::Borrowed(path.as_bytes()));
-        m.mode = 0o644;
+        m.mode = if kind == EntryKind::Dir { 0o755 } else { 0o644 };
         m.size = data.len() as u64;
         let mut sink = w.start_entry(&m).unwrap();
         if !data.is_empty() {
