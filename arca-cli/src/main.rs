@@ -61,7 +61,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             if inputs.is_empty() {
                 return Err("usage: arca c <archive> <path>...".into());
             }
-            let bytes = arca::build_tar(inputs).map_err(|e| e.to_string())?;
+            let bytes = arca::create::build_archive(inputs, archive).map_err(|e| e.to_string())?;
             std::fs::write(archive, &bytes).map_err(|e| format!("cannot write {archive}: {e}"))?;
             eprintln!(
                 "created {archive} ({} bytes) from {} path(s)",

@@ -60,11 +60,13 @@ Base     Transform::{step, finish}   sans-IO, allocation-free, caller-owned
 ```sh
 arca t archive.tar.zst              # list entries
 arca x archive.tar.gz -C ./out      # extract safely into ./out
+arca c out.tar.gz src/ README.md    # create (compression by extension)
 ```
 
-Compression and format are auto-detected. Extraction rejects path traversal
-(`..`, absolute paths, Windows device names) and caps the decompressed size to
-defend against decompression bombs.
+Compression and format are auto-detected on read. On create, the codec is
+chosen from the output extension (`.gz`/`.tgz`, `.zst`, `.xz`, `.lz4`, or plain
+`.tar`). Extraction rejects path traversal (`..`, absolute paths, Windows device
+names) and caps the decompressed size to defend against decompression bombs.
 
 ### Library
 
@@ -81,11 +83,15 @@ while let Some(mut entry) = reader.next_entry()? {
 
 ## Status
 
-**Read path complete** (tar `ustar`/`pax`/GNU, cpio `newc`/`odc`, ar GNU/BSD/SysV;
-gzip/zstd/xz/lz4). Verified end-to-end, adversarially reviewed, and hardened
-against malformed-input panics and extraction attacks.
+**Read and write both work.** Reading: tar (`ustar`/`pax`/GNU), cpio
+(`newc`/`odc`), ar (GNU/BSD/SysV), over gzip/zstd/xz/lz4. Writing: the tar writer
+(with GNU longname/longlink) and all four compression encoders — so `arca` both
+extracts and creates `.tar`, `.tar.gz`, `.tar.zst`, `.tar.xz`, and `.tar.lz4`.
+The `read ∘ write = id` round-trip and cross-checks against GNU `tar` and an
+independent gzip decoder are part of the test suite. Verified end-to-end, adversarially reviewed, and
+hardened against malformed-input panics and extraction attacks.
 
-**Planned:** writers (encode), `zip`/`7z`/`iso9660`, an incrementally-fed sans-IO
+**Planned:** cpio/ar writers, `zip`/`7z`/`iso9660`, an incrementally-fed sans-IO
 source, and fuzzing. Because the trait algebra is frozen, none of these require a
 trait change.
 

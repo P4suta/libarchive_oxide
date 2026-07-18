@@ -15,7 +15,7 @@
 use std::borrow::Cow;
 
 use arca_core::filter::FilterId;
-use arca_core::{decode_to_vec_capped, Error, Result};
+use arca_core::{decode_to_vec, decode_to_vec_capped, Error, Result};
 
 pub mod create;
 pub mod extract;
@@ -50,5 +50,27 @@ pub fn decompress_capped(bytes: &[u8], max_output: usize) -> Result<Cow<'_, [u8]
             Ok(Cow::Owned(plain))
         }
         None => Ok(Cow::Borrowed(bytes)),
+    }
+}
+
+/// Compresses `plain` with the given codec. The dual of [`decompress`].
+pub fn compress(plain: &[u8], id: FilterId) -> Result<Vec<u8>> {
+    let mut encoder = arca_filter::encoder(id).ok_or(Error::Unsupported("filter not built in"))?;
+    decode_to_vec(encoder.as_mut(), plain)
+}
+
+/// Guesses the compression codec from an archive filename's extension (`None` = plain).
+#[must_use]
+pub fn filter_for_name(name: &str) -> Option<FilterId> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("gz" | "tgz") => Some(FilterId::Gzip),
+        Some("zst") => Some(FilterId::Zstd),
+        Some("xz") => Some(FilterId::Xz),
+        Some("lz4") => Some(FilterId::Lz4),
+        _ => None,
     }
 }

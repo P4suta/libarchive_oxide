@@ -20,6 +20,16 @@ pub fn build_tar<S: AsRef<str>>(inputs: &[S]) -> io::Result<Vec<u8>> {
     Ok(writer.into_inner())
 }
 
+/// Builds an archive from `inputs`, compressing according to `dest_name`'s extension
+/// (`.gz`/`.tgz`, `.zst`, `.xz`, `.lz4`); other names produce a plain tar.
+pub fn build_archive<S: AsRef<str>>(inputs: &[S], dest_name: &str) -> io::Result<Vec<u8>> {
+    let tar = build_tar(inputs)?;
+    match crate::filter_for_name(dest_name) {
+        Some(id) => crate::compress(&tar, id).map_err(to_io),
+        None => Ok(tar),
+    }
+}
+
 /// Recursively adds `fs_path` (with archive name `name`) to the writer.
 fn add_path(writer: &mut TarWriter<Vec<u8>>, fs_path: &Path, name: &str) -> io::Result<()> {
     let file_type = fs::symlink_metadata(fs_path)?.file_type();

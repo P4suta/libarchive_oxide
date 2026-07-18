@@ -7,12 +7,16 @@
 //! P2 assumption: the header fits within the input of the first `step` call (the arca std layer
 //! always passes the whole slice, so this always holds). Buffering headers that span across incremental feeds is a later refinement.
 
-use arca_core::filter::{Decoder, Filter, FilterId};
+use alloc::vec::Vec;
+
+use arca_core::filter::{Decoder, Encoder, Filter, FilterId};
 use arca_core::transform::{Status, Step, Transform};
 use arca_core::{Error, Result};
 
 use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+
+use crate::push::PushBridge;
 
 /// Length of the gzip trailer (CRC32 + ISIZE).
 const TRAILER_LEN: usize = 8;
@@ -159,6 +163,71 @@ impl Filter for GzipDecoder {
 }
 
 impl Decoder for GzipDecoder {}
+
+/// gzip compressor — the dual of [`GzipDecoder`]. Buffers plaintext, then emits an RFC 1952 frame
+/// (header + raw DEFLATE via `miniz_oxide` + CRC32/ISIZE trailer). Stays `no_std`.
+pub struct GzipEncoder(PushBridge);
+
+impl core::fmt::Debug for GzipEncoder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GzipEncoder").finish_non_exhaustive()
+    }
+}
+
+impl Default for GzipEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GzipEncoder {
+    /// Creates a new gzip compressor.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(PushBridge::new())
+    }
+}
+
+impl Transform for GzipEncoder {
+    fn step(&mut self, input: &[u8], _output: &mut [u8]) -> Result<Step> {
+        Ok(self.0.push(input))
+    }
+
+    fn finish(&mut self, output: &mut [u8]) -> Result<Step> {
+        self.0.drain(output, |plain| Ok(gzip_frame(plain)))
+    }
+}
+
+impl Filter for GzipEncoder {
+    const ID: FilterId = FilterId::Gzip;
+}
+
+impl Encoder for GzipEncoder {}
+
+/// Wraps `plain` into a complete gzip frame.
+fn gzip_frame(plain: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Header: magic, CM=deflate(8), no flags, mtime=0, XFL=0, OS=unknown(0xff).
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(plain, 6));
+    out.extend_from_slice(&crc32(plain).to_le_bytes());
+    // ISIZE is the input size modulo 2^32 (per spec).
+    let isize_field = u32::try_from(plain.len() & 0xFFFF_FFFF).unwrap_or(0);
+    out.extend_from_slice(&isize_field.to_le_bytes());
+    out
+}
+
+/// Computes the IEEE CRC-32 of `data` (bitwise; no table, `no_std`).
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
 
 /// Returns the full length of the gzip header (RFC 1952). Returns `None` if the whole header is not yet available.
 fn gzip_header_len(b: &[u8]) -> Result<Option<usize>> {

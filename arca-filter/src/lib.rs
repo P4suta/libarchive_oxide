@@ -25,6 +25,8 @@ pub mod gzip;
 
 #[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 mod bridge;
+#[cfg(any(feature = "gzip", feature = "zstd", feature = "xz", feature = "lz4"))]
+mod push;
 #[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 pub mod reused;
 
@@ -44,6 +46,22 @@ pub fn decoder(id: FilterId) -> Option<Box<dyn Transform>> {
         FilterId::Xz => Some(Box::new(reused::XzDecoder::new())),
         #[cfg(feature = "lz4")]
         FilterId::Lz4 => Some(Box::new(reused::Lz4Decoder::new())),
+        _ => None,
+    }
+}
+
+/// Builds the encoder for the given codec (only for features compiled in). The dual of [`decoder`].
+#[must_use]
+pub fn encoder(id: FilterId) -> Option<Box<dyn Transform>> {
+    match id {
+        #[cfg(feature = "gzip")]
+        FilterId::Gzip => Some(Box::new(gzip::GzipEncoder::new())),
+        #[cfg(feature = "zstd")]
+        FilterId::Zstd => Some(Box::new(reused::ZstdEncoder::new())),
+        #[cfg(feature = "xz")]
+        FilterId::Xz => Some(Box::new(reused::XzEncoder::new())),
+        #[cfg(feature = "lz4")]
+        FilterId::Lz4 => Some(Box::new(reused::Lz4Encoder::new())),
         _ => None,
     }
 }
