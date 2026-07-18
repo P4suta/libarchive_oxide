@@ -8,8 +8,8 @@
 #   - release-plz-release: when that PR merges, publishes the newly-versioned crates to crates.io in
 #                          dependency order (core -> flagship -> cli) and cuts the git tag + GitHub
 #                          release. cargo-semver-checks gates breaking API changes (release-plz.toml).
-#   - upload-cli-binaries: on a fresh tag, cross-builds the four bsdtar-family bins and attaches them
-#                          (with SHA-256 checksums) to the GitHub Release.
+# CLI release assets are built by release-assets.yml in response to the single vX.Y.Z GitHub
+# Release published by the flagship package.
 #
 # Auth is environment-scoped (the `release` GitHub Environment), never repo-level secrets:
 #   - A GitHub App mints a short-lived token via actions/create-github-app-token, so the Release PR
@@ -35,6 +35,7 @@ jobs:
   # introduced a new version (release_always = false); merging that PR is the human gate.
   release-plz-release:
     name: release-plz release
+    if: vars.RELEASE_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -42,7 +43,7 @@ jobs:
       id-token: write # crates.io Trusted Publishing (OIDC)
     outputs:
       releases_created: ${{ steps.release-plz.outputs.releases_created }}
-      tag: ${{ steps.release-plz.outputs.tag }}
+      releases: ${{ steps.release-plz.outputs.releases }}
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
@@ -64,6 +65,7 @@ jobs:
   # Open/update the Release PR. Same App token so the PR retriggers CI.
   release-plz-pr:
     name: release-plz pr
+    if: vars.RELEASE_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -89,47 +91,3 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-
-  # Build the CLI bins (oxtar/oxcpio/oxcat/oxunzip) for each release target and attach the archives +
-  # SHA-256 checksums to the GitHub Release release-plz just cut. Gated on `releases_created` so it
-  # only runs on the push that actually published a new version.
-  upload-cli-binaries:
-    name: cli binaries (${{ matrix.target }})
-    needs: release-plz-release
-    if: needs.release-plz-release.outputs.releases_created == 'true'
-    permissions:
-      contents: write # upload assets to the GitHub Release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ needs.release-plz-release.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # `taiki-e/upload-rust-binary-action` builds the named bins for the target and uploads a tarball
-      # (or zip on Windows) plus a `.sha256` alongside it, onto the release for the current tag.
-      - uses: taiki-e/upload-rust-binary-action@3962470d6e7f1993108411bc3f75a135ec67fc8c # v1.27.0
-        with:
-          bin: oxtar,oxcpio,oxcat,oxunzip
-          target: ${{ matrix.target }}
-          archive: libarchive_oxide-cli-$tag-$target
-          checksum: sha256
-          ref: refs/tags/${{ needs.release-plz-release.outputs.tag }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

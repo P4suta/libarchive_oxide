@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Build the four CLI binaries on native GitHub-hosted runners and attach one archive plus SHA-256
+# checksum per target to the workspace's single vX.Y.Z GitHub Release. workflow_dispatch is a
+# no-upload preflight: it builds and smoke-tests the same matrix at a requested ref.
+
+name: release assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build without uploading
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-assets-${{ github.event.release.tag_name || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cli-binaries:
+    name: cli binaries (${{ matrix.target }})
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: build release binaries
+        run: cargo build --locked --release -p libarchive_oxide-cli --target ${{ matrix.target }}
+      - name: smoke-test all binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            suffix=".exe"
+          fi
+          for bin in oxtar oxcpio oxcat oxunzip; do
+            "target/$TARGET/release/$bin$suffix" --version
+          done
+      - name: upload archives and checksums
+        if: github.event_name == 'release'
+        uses: taiki-e/upload-rust-binary-action@3962470d6e7f1993108411bc3f75a135ec67fc8c # v1.27.0
+        with:
+          bin: oxtar,oxcpio,oxcat,oxunzip
+          target: ${{ matrix.target }}
+          archive: libarchive_oxide-cli-$tag-$target
+          checksum: sha256
+          ref: refs/tags/${{ github.event.release.tag_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

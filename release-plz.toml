@@ -4,9 +4,9 @@
 
 # release-plz configuration — https://release-plz.dev/docs/config
 #
-# release-plz reads Conventional Commits, derives the version bump, maintains each
-# crate's CHANGELOG, opens the Release PR, and on merge publishes in dependency
-# order, then tags and cuts the GitHub release. Run by .github/workflows/release.yml.
+# release-plz reads Conventional Commits, derives the workspace version bump, maintains the root
+# CHANGELOG, opens the Release PR, and on merge publishes in dependency order, then tags and cuts
+# the single product-level GitHub release. Run by .github/workflows/release.yml.
 #
 # Publish order (release-plz toposorts from the path deps; a manual `cargo publish`
 # sweep must follow the same order):
@@ -28,8 +28,27 @@ dependencies_update = false
 release_always = false
 # Gate breaking public-API changes: run cargo-semver-checks before every release.
 semver_check = true
-# Maintain the CHANGELOGs from Conventional Commits.
+# The workspace publishes three crates but presents one product release. Package-specific settings
+# below nominate the flagship as the sole owner of the shared vX.Y.Z tag, root changelog, and GitHub
+# release. All three crates are still published in dependency order.
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false
+
+[[package]]
+name = "libarchive_oxide-core"
+version_group = "libarchive_oxide-workspace"
+
+[[package]]
+name = "libarchive_oxide"
+version_group = "libarchive_oxide-workspace"
 changelog_update = true
-# Create a git tag and a GitHub release for each published version.
+changelog_path = "./CHANGELOG.md"
+changelog_include = ["libarchive_oxide-core", "libarchive_oxide-cli"]
 git_tag_enable = true
+git_tag_name = "v{{ version }}"
 git_release_enable = true
+
+[[package]]
+name = "libarchive_oxide-cli"
+version_group = "libarchive_oxide-workspace"
