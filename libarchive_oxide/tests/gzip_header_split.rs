@@ -6,9 +6,9 @@
 #![cfg(feature = "gzip")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use libarchive_oxide_core::transform::{Status, Transform};
 use libarchive_oxide::filter::gzip::GzipDecoder;
 use libarchive_oxide::filter::{crc32, deflate};
+use libarchive_oxide_core::transform::{Status, Transform};
 
 /// A gzip frame carrying an FNAME field, so the header is 19 bytes (10 fixed + "name.txt\0").
 fn gzip_with_fname(plain: &[u8]) -> Vec<u8> {

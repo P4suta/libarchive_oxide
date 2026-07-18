@@ -1,0 +1,35 @@
+# clippy thresholds and the strict-code role that pairs with the workspace lints
+# (`[workspace.lints]`: pedantic + unwrap/expect/panic = warn) and the CI
+# `-D warnings` gate. Nothing here is stricter than the code already satisfies, so
+# it does not turn the existing gate red.
+avoid-breaking-exported-api = false
+cognitive-complexity-threshold = 15
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
+too-many-lines-threshold = 100
+trivial-copy-size-limit = 128
+pass-by-value-size-limit = 256
+
+# Tests legitimately use `unwrap`/`expect`/`panic`/`println`/`dbg` — gate them
+# only outside the test boundary. Library and binary code must not panic; the
+# workspace lints enforce that, these keep the test modules ergonomic.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true
+
+# Fold the strict-code role into clippy config + cargo-deny.
+disallowed-macros = [
+    { path = "lazy_static::lazy_static", reason = "use std::sync::OnceLock or std::sync::LazyLock" },
+]
+disallowed-types = [
+    { path = "once_cell::sync::Lazy", reason = "use std::sync::LazyLock (stable since 1.80)" },
+    { path = "once_cell::sync::OnceCell", reason = "use std::sync::OnceLock (stable since 1.70)" },
+    # Hash-map iteration order is non-deterministic; an archive writer must emit
+    # byte-reproducible output. Use BTreeMap/BTreeSet or a sorted Vec, or add a
+    # local `#[allow(clippy::disallowed_types, reason = ...)]` where iteration
+    # order provably cannot affect the emitted bytes.
+    { path = "std::collections::HashMap", reason = "non-deterministic iteration; use BTreeMap or a sorted Vec" },
+    { path = "std::collections::HashSet", reason = "non-deterministic iteration; use BTreeSet or a sorted Vec" },
+]

@@ -21,7 +21,9 @@
 
 use std::borrow::Cow;
 
-use libarchive_oxide_core::format::{Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, OwnedData};
+use libarchive_oxide_core::format::{
+    Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, OwnedData,
+};
 use libarchive_oxide_core::io::Sink;
 use libarchive_oxide_core::{EntryKind, EntryMeta, Error, Result, Timestamp};
 
@@ -519,7 +521,7 @@ pub struct ZipOptions {
     /// Salt source for AES.
     pub salt_source: SaltSource,
     /// A value `> zip64_threshold` triggers a zip64 sentinel for that size/offset field. Defaults to
-    /// [`U32_SENTINEL`] (real 4 GiB boundary); tests lower it to force zip64 without huge data.
+    /// `U32_SENTINEL` (real 4 GiB boundary); tests lower it to force zip64 without huge data.
     pub zip64_threshold: u64,
 }
 
@@ -656,7 +658,7 @@ impl<W: Sink> ZipWriter<W> {
                     let salt = self.next_salt()?;
                     let blob = encrypt_aes(&body_pre, &password, salt)?;
                     (METHOD_AES, 0x0001u16, 0u32, blob, Some(base_method))
-                }
+                },
                 None => (base_method, 0u16, crc, body_pre, None),
             };
         let comp_size = body.len() as u64;
@@ -887,7 +889,7 @@ impl<W: Sink> EntryDataSink for ZipWriter<W> {
             Some(p) => {
                 p.plain.extend_from_slice(data);
                 Ok(())
-            }
+            },
             None => Err(Error::InvalidState("zip: write without an open entry")),
         }
     }
@@ -1022,9 +1024,9 @@ fn encrypt_aes(_compressed: &[u8], _password: &[u8], _salt: [u8; 16]) -> Result<
 /// `WinZip` AES-256 AE-2 primitives (PBKDF2-HMAC-SHA1, AES-256-CTR little-endian, HMAC-SHA1 auth).
 #[cfg(feature = "aes")]
 mod aes {
-    use libarchive_oxide_core::{Error, Result};
     use ctr::cipher::{KeyIvInit, StreamCipher};
     use hmac::{Hmac, Mac};
+    use libarchive_oxide_core::{Error, Result};
     use sha1::Sha1;
     use subtle::ConstantTimeEq;
 

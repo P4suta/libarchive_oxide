@@ -1,0 +1,61 @@
+# Supply-chain policy, checked by `cargo deny check` (mise run deny, and a CI job).
+# cargo-deny adds no dependency; it is a CLI that reads Cargo.lock. It enforces the
+# permissive-license boundary, denies yanked crates (the cargo-audit role), pins the
+# source registry to crates.io, and keeps OpenSSL out of the graph (this is a
+# pure-Rust project — crypto is RustCrypto, compression is pure-Rust codecs).
+
+[graph]
+all-features = true
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+# Deny yanked crates — the cargo-audit equivalent. A yank is a maintainer's signal
+# to stop using a version; the lockfile must not pin one.
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# Permissive only. Every codec/crypto dependency (RustCrypto aes/ctr/hmac/sha1/
+# pbkdf2/subtle, ruzstd, lzma-rust2, miniz_oxide, lz4_flex, getrandom, ...) resolves
+# to one of these. No copyleft crate may enter the graph.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path-based workspace-internal deps look like wildcards but carry no semver
+# implications inside the same workspace. A version-less path dep is also what makes
+# `cargo publish` strip dev-only members from the tarball.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+# Pure Rust: no OpenSSL, ever. The crypto path is RustCrypto.
+deny = [{ name = "openssl" }, { name = "openssl-sys" }]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

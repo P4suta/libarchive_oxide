@@ -13,7 +13,7 @@
 //! Two source models coexist, both additive over the same frozen traits:
 //! [`TarReader`] over an **in-memory slice** (`&[u8]`) — the std layer typically
 //! mmaps a file and hands over a `&[u8]` — and [`TarSource`], the incremental,
-//! caller-fed sans-IO [`EntrySource`](crate::format::EntrySource) that accepts the
+//! caller-fed sans-IO [`EntrySource`] that accepts the
 //! archive in arbitrarily small pushes and reuses every field/record parser here.
 
 use alloc::borrow::Cow;
@@ -231,18 +231,18 @@ impl<'a> EntryReader for TarReader<'a> {
                     };
                     parse_pax(records, target)?;
                     self.pos = next_pos;
-                }
+                },
                 // GNU longname / longlink: the whole data is the next entry's name / link name.
                 b'L' => {
                     let raw = Self::slice(data, data_start, usize_of(raw_size)?)?;
                     self.pending.path = Some(Cow::Borrowed(cstr(raw)));
                     self.pos = next_pos;
-                }
+                },
                 b'K' => {
                     let raw = Self::slice(data, data_start, usize_of(raw_size)?)?;
                     self.pending.linkpath = Some(Cow::Borrowed(cstr(raw)));
                     self.pos = next_pos;
-                }
+                },
                 // Real entry.
                 _ => {
                     let meta = self.build_meta(hdr, typeflag)?;
@@ -255,7 +255,7 @@ impl<'a> EntryReader for TarReader<'a> {
                         .ok_or(Error::Malformed("size overflow"))?;
                     self.pending = Overrides::default();
                     return Ok(Some(Entry::new(meta, &mut self.payload)));
-                }
+                },
             }
         }
     }
@@ -404,20 +404,20 @@ impl TarSource {
         match kind {
             MetaKind::LongName => {
                 self.pending.path = Some(Cow::Owned(cstr(&self.record).to_vec()));
-            }
+            },
             MetaKind::LongLink => {
                 self.pending.linkpath = Some(Cow::Owned(cstr(&self.record).to_vec()));
-            }
+            },
             MetaKind::PaxNext => {
                 let mut parsed = Overrides::default();
                 parse_pax(&self.record, &mut parsed)?;
                 merge_owned(&mut self.pending, parsed);
-            }
+            },
             MetaKind::PaxGlobal => {
                 let mut parsed = Overrides::default();
                 parse_pax(&self.record, &mut parsed)?;
                 merge_owned(&mut self.global, parsed);
-            }
+            },
         }
         Ok(())
     }
@@ -468,7 +468,7 @@ impl TarSource {
                 self.record.clear();
                 self.state = State::Meta { kind, data, pad };
                 Ok(Poll::Continue)
-            }
+            },
             // Real entry: take `pending`, compute the size (respecting overrides), advance to the
             // payload, and stage what [`pull`](Self::pull) needs to build the borrowed metadata.
             _ => {
@@ -490,7 +490,7 @@ impl TarSource {
                 self.stage_pending = pending;
                 self.stage_size = size;
                 Ok(Poll::Entry)
-            }
+            },
         }
     }
 
@@ -599,7 +599,7 @@ impl EntrySource for TarSource {
                 State::Payload { remaining, pad } => self.poll_payload(remaining, pad)?,
             };
             match poll {
-                Poll::Continue => {}
+                Poll::Continue => {},
                 Poll::NeedInput => return Ok(SourceEvent::NeedInput),
                 Poll::Done => return Ok(SourceEvent::Done),
                 Poll::EndEntry => return Ok(SourceEvent::EndEntry),
@@ -610,12 +610,12 @@ impl EntrySource for TarSource {
                     let meta =
                         build_source_meta(hdr, &self.stage_pending, &self.global, self.stage_size)?;
                     return Ok(SourceEvent::Entry(meta));
-                }
+                },
                 Poll::Data => {
                     // `poll_payload` advanced the cursor to the window's end.
                     let from = self.cursor - self.stage_len;
                     return Ok(SourceEvent::Data(&self.buf[from..self.cursor]));
-                }
+                },
             }
         }
     }
@@ -645,7 +645,7 @@ fn build_source_meta<'s>(
             } else {
                 Cow::Borrowed(name)
             }
-        }
+        },
     };
 
     let link_target = match kind {
@@ -853,7 +853,7 @@ fn parse_numeric(field: &[u8]) -> Result<u64> {
                     .ok_or(Error::Malformed("base-256 numeric overflow"))?;
             }
             Ok(val)
-        }
+        },
         // Octal ASCII. Leading/trailing spaces / NULs are ignored.
         _ => {
             let mut val: u64 = 0;
@@ -864,19 +864,19 @@ fn parse_numeric(field: &[u8]) -> Result<u64> {
                         if seen {
                             break;
                         }
-                    }
+                    },
                     b'0'..=b'7' => {
                         val = val
                             .checked_mul(8)
                             .and_then(|v| v.checked_add(u64::from(b - b'0')))
                             .ok_or(Error::Malformed("octal numeric overflow"))?;
                         seen = true;
-                    }
+                    },
                     _ => return Err(Error::Malformed("invalid octal digit")),
                 }
             }
             Ok(val)
-        }
+        },
     }
 }
 
@@ -957,7 +957,7 @@ fn apply_pax<'a>(key: &[u8], value: &'a [u8], into: &mut Overrides<'a>) -> Resul
         b"uid" => into.uid = Some(ascii_decimal(value)? as u64),
         b"gid" => into.gid = Some(ascii_decimal(value)? as u64),
         b"mtime" => into.mtime = Some(parse_pax_time(value)?),
-        _ => {} // atime/ctime/uname/gname etc. are ignored in P1.
+        _ => {}, // atime/ctime/uname/gname etc. are ignored in P1.
     }
     Ok(())
 }

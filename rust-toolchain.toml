@@ -1,0 +1,9 @@
+# The inner-loop toolchain (mirrors what CI installs). CI jobs that pin a different
+# channel (the msrv job, a beta run) override this with RUSTUP_TOOLCHAIN, which
+# takes precedence over this file. The no_std core is cross-built for
+# `thumbv7em-none-eabi`; add that target with `rustup target add` (CI does).
+
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

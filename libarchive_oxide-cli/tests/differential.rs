@@ -50,7 +50,11 @@ fn tar_interop_with_system_tar() {
     seed(&dir);
 
     // 1) oxtar writes → system tar reads.
-    let out = run_in("oxtar", &["-c", "-f", "ox.tar", "-C", "src", "."], dir.path());
+    let out = run_in(
+        "oxtar",
+        &["-c", "-f", "ox.tar", "-C", "src", "."],
+        dir.path(),
+    );
     assert_eq!(code(&out), 0, "oxtar create: {out:?}");
     let sys = Command::new(&tar)
         .args(["-tf", "ox.tar"])
@@ -84,7 +88,11 @@ fn tar_gzip_read_by_system_tar() {
     };
     let dir = TempDir::new("diff_tgz");
     seed(&dir);
-    let out = run_in("oxtar", &["-c", "-z", "-f", "ox.tgz", "-C", "src", "."], dir.path());
+    let out = run_in(
+        "oxtar",
+        &["-c", "-z", "-f", "ox.tgz", "-C", "src", "."],
+        dir.path(),
+    );
     assert_eq!(code(&out), 0);
     // System tar auto-detects gzip on read.
     let sys = Command::new(&tar)
@@ -92,7 +100,10 @@ fn tar_gzip_read_by_system_tar() {
         .current_dir(dir.path())
         .output()
         .unwrap();
-    assert!(sys.status.success(), "system tar could not read our gzip tar: {sys:?}");
+    assert!(
+        sys.status.success(),
+        "system tar could not read our gzip tar: {sys:?}"
+    );
     assert!(String::from_utf8_lossy(&sys.stdout).contains("a.txt"));
 }
 
@@ -105,7 +116,11 @@ fn cpio_interop_with_system_cpio() {
     eprintln!("cpio differential using: {cpio}");
     let dir = TempDir::new("diff_cpio");
     seed(&dir);
-    let out = run_in("oxtar", &["-c", "--format", "cpio", "-f", "ox.cpio", "-C", "src", "."], dir.path());
+    let out = run_in(
+        "oxtar",
+        &["-c", "--format", "cpio", "-f", "ox.cpio", "-C", "src", "."],
+        dir.path(),
+    );
     assert_eq!(code(&out), 0, "oxtar cpio create: {out:?}");
 
     // System cpio reads our newc archive (copy-in + list).
@@ -118,7 +133,7 @@ fn cpio_interop_with_system_cpio() {
         other => {
             eprintln!("skipping: system cpio -itF unsupported here: {other:?}");
             return;
-        }
+        },
     };
     assert!(
         String::from_utf8_lossy(&list.stdout).contains("a.txt"),
@@ -134,8 +149,16 @@ fn cat_interop_with_system_bsdcat() {
     };
     let dir = TempDir::new("diff_cat");
     seed(&dir);
-    run_in("oxtar", &["-c", "-f", "plain.tar", "-C", "src", "."], dir.path());
-    run_in("oxtar", &["-c", "-z", "-f", "ox.tgz", "-C", "src", "."], dir.path());
+    run_in(
+        "oxtar",
+        &["-c", "-f", "plain.tar", "-C", "src", "."],
+        dir.path(),
+    );
+    run_in(
+        "oxtar",
+        &["-c", "-z", "-f", "ox.tgz", "-C", "src", "."],
+        dir.path(),
+    );
 
     // bsdcat decompresses our gzip; the bytes must equal the plain tar and oxcat's output.
     let sys = Command::new(&cat)
@@ -145,7 +168,10 @@ fn cat_interop_with_system_bsdcat() {
         .unwrap();
     assert!(sys.status.success(), "bsdcat failed: {sys:?}");
     let plain = std::fs::read(dir.join("plain.tar")).unwrap();
-    assert_eq!(sys.stdout, plain, "bsdcat output differs from the plain tar");
+    assert_eq!(
+        sys.stdout, plain,
+        "bsdcat output differs from the plain tar"
+    );
 
     let ours = run_in("oxcat", &["ox.tgz"], dir.path());
     assert_eq!(ours.stdout, sys.stdout, "oxcat and bsdcat disagree");

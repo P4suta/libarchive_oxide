@@ -102,7 +102,7 @@ fn build_n_entries(count: usize) -> Vec<u8> {
 /// Regression: at *exactly* 65535 entries the classic EOCD count16 field is the 0xFFFF sentinel,
 /// so a zip64 EOCD record + locator must be emitted. The off-by-one (`>` instead of `>=`) stamped
 /// the sentinel with no zip64 record, which arca's own strict reader then rejected. Assert the
-/// exact boundary plus its neighbours: 65534 stays classic, 65535 and 65536 go zip64, and all
+/// exact boundary plus its neighbors: 65534 stays classic, 65535 and 65536 go zip64, and all
 /// three round-trip through arca's reader and the external `zip` crate.
 #[test]
 fn count_sentinel_boundary_round_trips() {

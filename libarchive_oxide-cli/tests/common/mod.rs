@@ -34,10 +34,7 @@ impl TempDir {
     pub(crate) fn new(tag: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "oxcli_{tag}_{}_{n}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("oxcli_{tag}_{}_{n}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self { path }
     }
@@ -108,7 +105,7 @@ pub(crate) fn run_stdin(bin_name: &str, args: &[&str], cwd: &Path, stdin_bytes: 
     child.wait_with_output().expect("wait")
 }
 
-/// The process exit code, or `-1` if the process was signalled.
+/// The process exit code, or `-1` if the process was signaled.
 #[must_use]
 pub(crate) fn code(out: &Output) -> i32 {
     out.status.code().unwrap_or(-1)

@@ -8,10 +8,10 @@ mod common;
 
 use std::io::Write;
 
+use common::{drain, trailer, ustar};
 use libarchive_oxide::decompress;
 use libarchive_oxide_core::format::tar::TarReader;
 use libarchive_oxide_core::{EntryKind, EntryReader};
-use common::{drain, trailer, ustar};
 
 /// A small archive with a text file and a directory, plus a compressible payload.
 fn sample_tar() -> Vec<u8> {

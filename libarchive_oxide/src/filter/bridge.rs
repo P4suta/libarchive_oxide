@@ -86,7 +86,7 @@ impl<D: Read> PullBridge<D> {
                         status: Status::MoreOutput,
                     })
                 }
-            }
+            },
             // Only reachable as `Done`; `Buffering` was converted above.
             _ => Ok(Step {
                 consumed: 0,

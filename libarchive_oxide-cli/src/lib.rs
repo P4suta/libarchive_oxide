@@ -193,7 +193,7 @@ fn extract_selected<R: EntryReader>(
         match kind {
             EntryKind::Dir => {
                 std::fs::create_dir_all(&path).map_err(|e| CliError::runtime(e.to_string()))?;
-            }
+            },
             EntryKind::File => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
@@ -216,8 +216,8 @@ fn extract_selected<R: EntryReader>(
                 if verbose {
                     eprintln!("x {}", rel.display());
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
     filter.ensure_all_matched()
@@ -291,9 +291,10 @@ fn trim_trailing_slash(p: &[u8]) -> &[u8] {
 /// mode / owner / size / mtime / name columns (symlinks append ` -> target`).
 fn format_long(meta: &EntryMeta<'_>) -> String {
     let mode = mode_string(meta.kind, meta.mode);
-    let date = meta
-        .mtime
-        .map_or_else(|| "1970-01-01 00:00".to_string(), |t| format_timestamp(t.secs));
+    let date = meta.mtime.map_or_else(
+        || "1970-01-01 00:00".to_string(),
+        |t| format_timestamp(t.secs),
+    );
     let name = String::from_utf8_lossy(&meta.path);
     match &meta.link_target {
         Some(target) if matches!(meta.kind, EntryKind::Symlink) => format!(
@@ -303,7 +304,10 @@ fn format_long(meta: &EntryMeta<'_>) -> String {
             meta.size,
             String::from_utf8_lossy(target),
         ),
-        _ => format!("{mode} {}/{} {:>10} {date} {name}", meta.uid, meta.gid, meta.size),
+        _ => format!(
+            "{mode} {}/{} {:>10} {date} {name}",
+            meta.uid, meta.gid, meta.size
+        ),
     }
 }
 

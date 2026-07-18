@@ -1,9 +1,29 @@
+# CI for libarchive_oxide (Pure Rust unified archive library).
+#
+# Layout under test: three published crates + an excluded fuzz sub-workspace.
+#   - libarchive_oxide-core   no_std + alloc, zero external deps (the frozen trait algebra).
+#   - libarchive_oxide        the std flagship (auto-detection, FS extraction, safe paths, codecs).
+#   - libarchive_oxide-cli    the bsdtar-family bins (oxtar/oxcpio/oxcat/oxunzip).
+#   - fuzz/                   cargo-fuzz targets; outside the workspace, nightly-only.
+#
+# Policy:
+#   - Every third-party action is SHA-pinned (Dependabot bumps them weekly); the comment records
+#     the human-readable version. `dtolnay/rust-toolchain@stable` is likewise pinned by commit.
+#   - `Swatinem/rust-cache` over raw `actions/cache` for the cargo state.
+#   - A single `ci-required` aggregation gate is the one status context branch protection references,
+#     so the ruleset never desyncs as jobs are added or renamed.
+
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 # Cancel superseded runs on the same ref to keep the queue lean.
 concurrency:
@@ -12,19 +32,20 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
   # NOTE: `-D warnings` is applied *per job*, only on the stable toolchain we can reproduce locally
-  # (fmt/clippy/test/no_std). It is deliberately NOT global: the msrv (1.85) and fuzz (nightly) jobs
-  # run toolchains the dev box cannot reproduce, and a version-specific warning from the compiler or
-  # a dependency there would turn CI red for a reason invisible to every local gate. Those jobs still
-  # fail on real errors; they just do not promote warnings to errors on unverifiable toolchains.
+  # (fmt/clippy/test/no_std/doc). It is deliberately NOT global: the msrv (cargo-msrv installs 1.81 /
+  # 1.87), fuzz (nightly), and big-endian (cross/qemu) jobs run toolchains or emulators the dev box
+  # cannot reproduce, and a version-specific warning from the compiler or a dependency there would
+  # turn CI red for a reason invisible to every local gate. Those jobs still fail on real errors.
 
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -35,12 +56,12 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -52,12 +73,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # This also runs libarchive_oxide/tests/fuzz_replay.rs — the portable adversarial gate that mutates every
-      # committed seed through the reader/round-trip/codec invariants (catches reintroduced panics
-      # on malformed input without nightly/libFuzzer), on all three OSes.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # This also runs libarchive_oxide/tests/fuzz_replay.rs — the portable adversarial gate that
+      # mutates every committed seed through the reader/round-trip/codec invariants (catches
+      # reintroduced panics on malformed input without nightly/libFuzzer), on all three OSes.
       - run: cargo test --workspace --all-features
 
   no_std:
@@ -66,60 +87,188 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: thumbv7em-none-eabi
-      - uses: Swatinem/rust-cache@v2
-      # libarchive_oxide-core must stay pure no_std + alloc; building for a bare-metal target
-      # with no std available proves it. Do NOT pass --all-features here (that pulls std).
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # libarchive_oxide-core must stay pure no_std + alloc; building for a bare-metal target with no
+      # std available proves it. Do NOT pass --all-features here (that pulls std).
       - run: cargo build -p libarchive_oxide-core --target thumbv7em-none-eabi
+
+  doc:
+    name: doc (rustdoc, warnings are errors)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Intra-doc links and doctests across the whole public surface. Keep in sync with docs.yml
+      # (which additionally deploys the result to Pages).
+      - env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps
 
   typos:
     name: typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: crate-ci/typos@master
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
 
   msrv:
-    name: msrv (1.85)
+    name: msrv (core 1.81, flagship 1.87)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-features
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-msrv
+      # `cargo-msrv verify` reads each crate's declared `rust-version` and proves it actually builds
+      # on that floor (installing the toolchain via rustup). The two crates have different floors —
+      # core's zero-dep no_std baseline (1.81) and the flagship's codec closure (1.87) — so each is
+      # verified against its own manifest. The CLI inherits the flagship's floor and is covered by it.
+      - name: verify core MSRV (1.81)
+        run: cargo msrv verify --path libarchive_oxide-core
+      - name: verify flagship MSRV (1.87)
+        run: cargo msrv verify --path libarchive_oxide --all-features
 
   nodyn:
     name: no-dyn gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # Mechanically enforce the zero-type-erasure invariant (uses ripgrep, preinstalled on the runner).
       - run: bash scripts/check-no-dyn.sh
+
+  reuse:
+    name: reuse (SPDX/REUSE compliance)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: fsfe/reuse-action@bb774aa972c2a89ff34781233d275075cbddf542 # v5
+
+  deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --all-features check advisories bans licenses sources
+
+  semver-checks:
+    name: semver-checks (PR API compatibility)
+    # PRs only: compares this branch's public API against the crates.io baseline. A push to main has
+    # no "proposed change" to weigh, and the release job re-runs the same gate at publish time.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-semver-checks
+      # Flags an SemVer-breaking change to the two published library crates that is not paired with a
+      # major bump. `release-plz` re-runs the same tool at publish time (release.yml); this is the
+      # early PR-time signal.
+      - run: cargo semver-checks check-release -p libarchive_oxide-core -p libarchive_oxide
 
   fuzz:
     name: fuzz (nightly, build + short run)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-fuzz
+      # libFuzzer needs nightly + the sanitizer runtime; install it via rustup (no unpinnable
+      # nightly action ref). The fuzz crate is outside the workspace, so it carries its own lockfile.
+      - name: install nightly (libFuzzer)
+        run: rustup toolchain install nightly --profile minimal --no-self-update
       # First gate: every target must compile against libFuzzer on Linux/nightly.
-      - run: cargo fuzz build
+      - run: cargo +nightly fuzz build
       # Second gate: actually *run* libFuzzer as a bug-finder. Each target fuzzes for a bounded wall
       # time, seeded from its committed corpus (fuzz/corpus/<target>), so a panic on malformed input
       # in a reader/round-trip/codec path fails CI here — not just at compile time. Kept short so the
       # job stays lean; the coverage-guided mutator explores far past the seeds within the budget.
-      - name: Short coverage-guided fuzz run per target
+      - name: short coverage-guided fuzz run per target
         run: |
           set -euo pipefail
-          targets=$(cargo fuzz list)
+          targets=$(cargo +nightly fuzz list)
           for t in $targets; do
             echo "::group::fuzz $t"
-            cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
+            cargo +nightly fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
             echo "::endgroup::"
           done
+
+  big-endian:
+    name: big-endian (s390x, qemu) [scaffold]
+    # SCAFFOLD, non-gating (continue-on-error). The archive formats carry big fields (zip is
+    # little-endian, tar is ASCII-octal, cpio/7z/iso mix endian): a byte-order bug hides on the
+    # little-endian CI matrix. `cross` runs the suite under qemu on a big-endian target to surface it.
+    # Kept advisory until the target is proven green, so a qemu/cross hiccup cannot block merges.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cross
+      - name: test suite on big-endian s390x under qemu
+        run: cross test --workspace --all-features --target s390x-unknown-linux-gnu
+
+  actionlint:
+    name: actionlint (workflow self-check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar xz -C /tmp actionlint
+          /tmp/actionlint -color
+
+  # Single aggregation gate. `if: always()` so it runs when an upstream job fails; `skipped` counts
+  # as pass, letting PR-only jobs (semver-checks) report green on push / merge_group. `big-endian` is
+  # a continue-on-error scaffold and is intentionally excluded from the gating set.
+  ci-required:
+    name: ci-required
+    if: always()
+    needs:
+      - fmt
+      - clippy
+      - test
+      - no_std
+      - doc
+      - typos
+      - msrv
+      - nodyn
+      - reuse
+      - deny
+      - semver-checks
+      - fuzz
+      - actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify all required jobs passed (skipped counts as pass)
+        run: |-
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "needs results: $results"
+          for r in $results; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::a required job did not pass ($r)"
+              exit 1
+            fi
+          done
+          echo "all required jobs passed"

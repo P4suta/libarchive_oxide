@@ -151,14 +151,14 @@ impl<'a> IsoReader<'a> {
                         return Err(Error::Unsupported("iso: logical block size is not 2048"));
                     }
                     pvd_root = Some(root_from_vd(vd)?);
-                }
+                },
                 VD_SUPPLEMENTARY => {
                     if is_joliet_escape(&vd[88..120]) {
                         joliet_root = Some(root_from_vd(vd)?);
                     }
-                }
+                },
                 VD_TERMINATOR => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -1093,7 +1093,7 @@ fn push_utf16be(name: &[u8], out: &mut Vec<u8>) {
             Ok(s) => {
                 encode_utf16be(s, out);
                 break;
-            }
+            },
             Err(e) => {
                 let valid = e.valid_up_to();
                 if let Ok(s) = core::str::from_utf8(&input[..valid]) {
@@ -1104,7 +1104,7 @@ fn push_utf16be(name: &[u8], out: &mut Vec<u8>) {
                     Some(len) => input = &input[valid + len..],
                     None => break, // Unexpected end of input; stop.
                 }
-            }
+            },
         }
     }
 }

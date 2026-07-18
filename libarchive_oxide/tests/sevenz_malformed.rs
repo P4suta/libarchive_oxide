@@ -124,7 +124,7 @@ fn unsupported_coder_is_error() {
     out[8..12].copy_from_slice(&start_crc.to_le_bytes());
 
     match drive(&out) {
-        Err(libarchive_oxide_core::Error::Unsupported(_)) => {}
+        Err(libarchive_oxide_core::Error::Unsupported(_)) => {},
         other => panic!("expected Unsupported, got {other:?}"),
     }
 }

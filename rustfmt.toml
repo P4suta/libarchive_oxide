@@ -1,0 +1,20 @@
+# rustfmt configuration. Pinned to what the committed tree already follows, so
+# `cargo fmt --check` stays clean and no reformatting churn lands with this file.
+# The workspace is edition 2021 (MSRV is kept as low as the code allows; edition
+# 2024 would force MSRV >= 1.85), so rustfmt runs in the 2021 style.
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+reorder_imports = true
+reorder_modules = true
+use_field_init_shorthand = true
+use_try_shorthand = true
+match_block_trailing_comma = true
+
+# NOTE: nightly-only options (imports_granularity, group_imports, format_strings,
+# wrap_comments, normalize_comments, condense_wildcard_suffixes,
+# format_macro_matchers, normalize_doc_attributes, comment_width) are intentionally
+# omitted to keep `cargo fmt` clean on stable. Re-enable in a `rustfmt.nightly.toml`
+# overlay once stable adopts them.

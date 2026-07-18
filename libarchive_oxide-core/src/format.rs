@@ -195,7 +195,7 @@ impl<'r, D: EntryData> Entry<'r, D> {
 /// `SourceEvent<'s>` borrows **`&'s self`** — the source's growing internal buffer — not the slice
 /// last handed to [`EntrySource::feed`] (that slice is copied into the buffer and need not outlive
 /// the call). The borrow is stable only until the next `feed`/`pull`, exactly like the output slice
-/// of a [`Transform`]: consume the event before driving the source again.
+/// of a [`Transform`](crate::transform::Transform): consume the event before driving the source again.
 ///
 /// [`SourceEvent::Entry`] paths that sit contiguously in the buffer are `Cow::Borrowed(&'s buf)`
 /// (zero-copy); a path reassembled from a PAX record or a GNU long-name header is `Cow::Owned`
@@ -216,7 +216,8 @@ pub enum SourceEvent<'s> {
 }
 
 /// Incremental, sans-IO reading of an archive from a caller-fed byte stream — the **format-axis dual
-/// of [`Transform`]** (byte axis). Where a `Transform` maps `Status{NeedInput, MoreOutput, Done}`,
+/// of [`Transform`](crate::transform::Transform)** (byte axis). Where a `Transform` maps
+/// `Status{NeedInput, MoreOutput, Done}`,
 /// a source enriches that with the structure a container format adds: [`SourceEvent::Entry`] /
 /// [`SourceEvent::Data`] / [`SourceEvent::EndEntry`].
 ///
@@ -401,7 +402,7 @@ impl<'a> EntryReader for AnyReader<'a> {
                     let meta = e.meta().to_static();
                     self.slot = AnyEntryData::Slice(*e.data());
                     meta
-                }
+                },
                 None => return Ok(None),
             },
             AnyReaderKind::Cpio(r) => match r.next_entry()? {
@@ -409,7 +410,7 @@ impl<'a> EntryReader for AnyReader<'a> {
                     let meta = e.meta().to_static();
                     self.slot = AnyEntryData::Slice(*e.data());
                     meta
-                }
+                },
                 None => return Ok(None),
             },
             AnyReaderKind::Ar(r) => match r.next_entry()? {
@@ -417,7 +418,7 @@ impl<'a> EntryReader for AnyReader<'a> {
                     let meta = e.meta().to_static();
                     self.slot = AnyEntryData::Slice(*e.data());
                     meta
-                }
+                },
                 None => return Ok(None),
             },
             AnyReaderKind::Iso(r) => match r.next_entry()? {
@@ -425,7 +426,7 @@ impl<'a> EntryReader for AnyReader<'a> {
                     let meta = e.meta().to_static();
                     self.slot = AnyEntryData::Slice(*e.data());
                     meta
-                }
+                },
                 None => return Ok(None),
             },
         };

@@ -1,3 +1,34 @@
+# Rust build output
 /target
 **/*.rs.bk
 *.pdb
+*.tmp
+# Cargo.lock is committed: the workspace ships bins (libarchive_oxide-cli), and the
+# exact dependency graph is part of the reproducible build.
+
+# cargo-fuzz build output. `fuzz/` is its own workspace (see fuzz/Cargo.toml) and has
+# its own .gitignore; these root-anchored entries keep `reuse lint` (which reads this
+# file) in agreement with git about what is generated. The curated `fuzz/corpus/`
+# seeds are committed on purpose and are NOT ignored.
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# cargo-mutants working output. Root-anchored and trailing-slash-free so ad-hoc sweep
+# dirs (mutants-ll-full/) AND their console logs (mutants-ll-c2.log) are both ignored,
+# without catching tracked workflow files.
+/mutants.out/
+/mutants.out.old/
+/mutants-*
+
+# mise local overrides (per-developer, never committed)
+/mise.local.toml
+/.mise.local.toml
+
+# Editor / OS
+/.idea/
+/.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+.claude/

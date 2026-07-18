@@ -9,12 +9,14 @@
 
 mod common;
 
-use libarchive_oxide_core::filter::FilterId;
-use libarchive_oxide_core::format::tar::{TarReader, TarSource};
-use libarchive_oxide_core::{EntryData, EntryKind, EntryReader, EntrySource, SourceEvent, Status, Transform};
 use common::{trailer, ustar};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use libarchive_oxide_core::filter::FilterId;
+use libarchive_oxide_core::format::tar::{TarReader, TarSource};
+use libarchive_oxide_core::{
+    EntryData, EntryKind, EntryReader, EntrySource, SourceEvent, Status, Transform,
+};
 use std::io::Write;
 
 fn gzip(data: &[u8]) -> Vec<u8> {
@@ -94,17 +96,17 @@ fn pipeline(gz: &[u8], chunk: usize) -> Vec<Ent> {
                     data: Vec::new(),
                 });
                 continue;
-            }
+            },
             Act::Data(d) => {
                 cur.as_mut().unwrap().data.extend_from_slice(&d);
                 continue;
-            }
+            },
             Act::End => {
                 out.push(cur.take().unwrap());
                 continue;
-            }
+            },
             Act::Done => break,
-            Act::Need => {}
+            Act::Need => {},
         }
 
         // The source is starved: produce more plaintext by advancing the decoder one unit.

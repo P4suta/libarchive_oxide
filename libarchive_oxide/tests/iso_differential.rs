@@ -191,7 +191,8 @@ fn arca_reads_system_mastered_image() {
     }
 
     let bytes = std::fs::read(&out).unwrap();
-    let mut reader = libarchive_oxide::extract::reader(&bytes).expect("arca detects the system ISO");
+    let mut reader =
+        libarchive_oxide::extract::reader(&bytes).expect("arca detects the system ISO");
     let mut found_hello = false;
     let mut found_data = false;
     while let Some(mut entry) = reader.next_entry().unwrap() {

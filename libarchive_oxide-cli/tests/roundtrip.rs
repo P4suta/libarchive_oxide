@@ -27,7 +27,11 @@ fn oxtar_plain_roundtrip() {
     let dir = TempDir::new("tar_plain");
     seed(&dir);
 
-    let out = run_in("oxtar", &["-c", "-f", "out.tar", "-C", "src", "."], dir.path());
+    let out = run_in(
+        "oxtar",
+        &["-c", "-f", "out.tar", "-C", "src", "."],
+        dir.path(),
+    );
     assert_eq!(code(&out), 0, "create: {out:?}");
 
     let out = run_in("oxtar", &["-x", "-f", "out.tar", "-C", "ex"], dir.path());
@@ -56,13 +60,20 @@ fn oxtar_gzip_roundtrip_traditional_flags() {
 fn oxtar_list_selects_members() {
     let dir = TempDir::new("tar_list");
     seed(&dir);
-    run_in("oxtar", &["-c", "-f", "out.tar", "-C", "src", "."], dir.path());
+    run_in(
+        "oxtar",
+        &["-c", "-f", "out.tar", "-C", "src", "."],
+        dir.path(),
+    );
 
     let out = run_in("oxtar", &["-t", "-f", "out.tar", "./data"], dir.path());
     assert_eq!(code(&out), 0);
     let listing = String::from_utf8_lossy(&out.stdout);
     assert!(listing.contains("data/b.txt"), "listing: {listing}");
-    assert!(!listing.contains("a.txt"), "member filter leaked: {listing}");
+    assert!(
+        !listing.contains("a.txt"),
+        "member filter leaked: {listing}"
+    );
 }
 
 #[test]
@@ -102,7 +113,10 @@ fn oxcpio_stdin_roundtrip() {
     let out = run_in("oxcpio", &["-it", "-F", "out.cpio"], dir.path());
     assert_eq!(code(&out), 0);
     let listing = String::from_utf8_lossy(&out.stdout);
-    assert!(listing.contains("a.txt") && listing.contains("data/b.txt"), "{listing}");
+    assert!(
+        listing.contains("a.txt") && listing.contains("data/b.txt"),
+        "{listing}"
+    );
 
     // Copy-in extracts into the working directory.
     std::fs::create_dir_all(dir.join("ex2")).unwrap();
@@ -115,13 +129,24 @@ fn oxcpio_stdin_roundtrip() {
 fn oxcat_decompresses_to_stdout() {
     let dir = TempDir::new("cat");
     seed(&dir);
-    run_in("oxtar", &["-c", "-f", "plain.tar", "-C", "src", "."], dir.path());
-    run_in("oxtar", &["-c", "-z", "-f", "gz.tgz", "-C", "src", "."], dir.path());
+    run_in(
+        "oxtar",
+        &["-c", "-f", "plain.tar", "-C", "src", "."],
+        dir.path(),
+    );
+    run_in(
+        "oxtar",
+        &["-c", "-z", "-f", "gz.tgz", "-C", "src", "."],
+        dir.path(),
+    );
 
     let plain = std::fs::read(dir.join("plain.tar")).unwrap();
     let out = run_in("oxcat", &["gz.tgz"], dir.path());
     assert_eq!(code(&out), 0, "{out:?}");
-    assert_eq!(out.stdout, plain, "oxcat output equals the uncompressed tar");
+    assert_eq!(
+        out.stdout, plain,
+        "oxcat output equals the uncompressed tar"
+    );
 }
 
 /// Builds a small zip with the library's writer and returns its bytes (entries `a.txt`, `data/b.txt`).
@@ -147,7 +172,10 @@ fn oxunzip_list_and_extract() {
     let out = run_in("oxunzip", &["-l", "test.zip"], dir.path());
     assert_eq!(code(&out), 0);
     let listing = String::from_utf8_lossy(&out.stdout);
-    assert!(listing.contains("a.txt") && listing.contains("data/b.txt"), "{listing}");
+    assert!(
+        listing.contains("a.txt") && listing.contains("data/b.txt"),
+        "{listing}"
+    );
 
     let out = run_in("oxunzip", &["-o", "-d", "ex", "test.zip"], dir.path());
     assert_eq!(code(&out), 0, "{out:?}");

@@ -91,7 +91,7 @@ fn drive_reader<R: EntryReader>(mut reader: R) {
                     if total > MAX_TOTAL_BYTES {
                         return;
                     }
-                }
+                },
             }
         }
     }
@@ -390,7 +390,7 @@ fn read_capped<R: Read>(mut reader: R, cap: usize) -> Option<Vec<u8>> {
                     return None;
                 }
                 out.extend_from_slice(&buf[..n]);
-            }
+            },
             Err(_) => return None,
         }
     }
@@ -470,7 +470,7 @@ pub fn run_target(name: &str, data: &[u8]) {
         "codec_xz" => codec_xz(data),
         "codec_lz4" => codec_lz4(data),
         "codec_lzma2" => codec_lzma2(data),
-        _ => {}
+        _ => {},
     }
 }
 

@@ -1,0 +1,131 @@
+# Release automation via release-plz (https://release-plz.dev). On push to main:
+#   - release-plz-pr:      opens/updates a Release PR (version bump + CHANGELOG) from the
+#                          Conventional Commits since the last tag.
+#   - release-plz-release: when that PR merges, publishes the newly-versioned crates to crates.io in
+#                          dependency order (core -> flagship -> cli) and cuts the git tag + GitHub
+#                          release. cargo-semver-checks gates breaking API changes (release-plz.toml).
+#   - upload-cli-binaries: on a fresh tag, cross-builds the four bsdtar-family bins and attaches them
+#                          (with SHA-256 checksums) to the GitHub Release.
+#
+# Auth is environment-scoped (the `release` GitHub Environment), never repo-level secrets:
+#   - A GitHub App mints a short-lived token via actions/create-github-app-token, so the Release PR
+#     it opens is authored by the App and retriggers CI (a GITHUB_TOKEN-authored PR does not). Set
+#     RELEASE_PLZ_APP_ID and RELEASE_PLZ_APP_PRIVATE_KEY in the `release` environment; the App needs
+#     Contents: read/write and Pull requests: read/write, installed on this repository.
+#   - crates.io publish uses Trusted Publishing (OIDC) via `id-token: write`, not a stored token.
+#     Register a trusted publisher for each published crate on crates.io (owner P4suta, repo
+#     libarchive_oxide, workflow release.yml, environment release). A brand-new crate's first publish
+#     must be done once with a token; OIDC covers every release after that.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Publish + GitHub release. Runs on every push to main but no-ops unless a Release PR merge
+  # introduced a new version (release_always = false); merging that PR is the human gate.
+  release-plz-release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write # create the git tag + GitHub release
+      id-token: write # crates.io Trusted Publishing (OIDC)
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      tag: ${{ steps.release-plz.outputs.tag }}
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # release-plz reads the full tag history to derive the bump
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        id: release-plz
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  # Open/update the Release PR. Same App token so the PR retriggers CI.
+  release-plz-pr:
+    name: release-plz pr
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      pull-requests: write
+    # Serialize PR updates; a second push must not race the first. cancel-in-progress is false.
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  # Build the CLI bins (oxtar/oxcpio/oxcat/oxunzip) for each release target and attach the archives +
+  # SHA-256 checksums to the GitHub Release release-plz just cut. Gated on `releases_created` so it
+  # only runs on the push that actually published a new version.
+  upload-cli-binaries:
+    name: cli binaries (${{ matrix.target }})
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    permissions:
+      contents: write # upload assets to the GitHub Release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.release-plz-release.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # `taiki-e/upload-rust-binary-action` builds the named bins for the target and uploads a tarball
+      # (or zip on Windows) plus a `.sha256` alongside it, onto the release for the current tag.
+      - uses: taiki-e/upload-rust-binary-action@3962470d6e7f1993108411bc3f75a135ec67fc8c # v1.27.0
+        with:
+          bin: oxtar,oxcpio,oxcat,oxunzip
+          target: ${{ matrix.target }}
+          archive: libarchive_oxide-cli-$tag-$target
+          checksum: sha256
+          ref: refs/tags/${{ needs.release-plz-release.outputs.tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

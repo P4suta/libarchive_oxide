@@ -28,6 +28,7 @@ panic = "warn"
 missing_errors_doc = "allow"     # Redundant since Result<T, Error> is pervasive
 
 [workspace.lints.rust]
+missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 

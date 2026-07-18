@@ -4,12 +4,12 @@
 
 mod common;
 
-use libarchive_oxide::decompress;
-use libarchive_oxide_core::format::tar::TarReader;
-use libarchive_oxide_core::{EntryKind, EntryReader};
 use common::{drain, trailer, ustar};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use libarchive_oxide::decompress;
+use libarchive_oxide_core::format::tar::TarReader;
+use libarchive_oxide_core::{EntryKind, EntryReader};
 use std::io::Write;
 
 fn gzip(data: &[u8]) -> Vec<u8> {

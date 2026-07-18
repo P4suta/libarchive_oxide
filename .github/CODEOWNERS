@@ -1,0 +1,11 @@
+# Default owner for everything.
+* @P4suta
+
+# Architecture-affecting files require extra scrutiny.
+/Cargo.toml @P4suta
+/Cargo.lock @P4suta
+/rust-toolchain.toml @P4suta
+/.cargo/ @P4suta
+/.github/ @P4suta
+# The frozen trait algebra: any change to the core's abstractions is load-bearing.
+/libarchive_oxide-core/Cargo.toml @P4suta

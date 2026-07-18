@@ -1,0 +1,73 @@
+# Roadmap
+
+This document is the staged-hardening record for `libarchive_oxide`. It tracks
+work that is **planned but not yet applied**, so the checklists below are honest
+about state. Shipped functionality lives in [CHANGELOG.md](CHANGELOG.md), not
+here.
+
+## Continuous fuzzing → OSS-Fuzz enrollment
+
+**State: not yet applied.** The `libarchive_oxide-fuzz` crate already carries
+cargo-fuzz targets over the decode/extract paths, and their portable invariant
+bodies (`fuzz/fuzz_lib`) are replayed from the normal test suite. The next step is
+enrolling the project in [OSS-Fuzz](https://github.com/google/oss-fuzz) for
+continuous, at-scale fuzzing.
+
+Enrollment checklist:
+
+- [ ] Keep the fuzz targets OSS-Fuzz compatible (libFuzzer entry points, no
+      network, no clock, deterministic corpus).
+- [ ] Add an OSS-Fuzz `project.yaml` (language `rust`, the maintainer contact, and
+      the `main` branch) in the OSS-Fuzz repo.
+- [ ] Add a `build.sh` that runs `cargo fuzz build` and copies the fuzz binaries
+      to `$OUT`.
+- [ ] Add a `Dockerfile` based on `gcr.io/oss-fuzz-base/base-builder-rust`.
+- [ ] Seed each target with a minimal corpus of valid archives per format.
+- [ ] Open the OSS-Fuzz onboarding PR and confirm the first ClusterFuzz run is
+      green.
+- [ ] Wire advisory triage back to the private reporting flow in
+      [SECURITY.md](SECURITY.md).
+
+## Big-endian verification
+
+**State: scaffold planned, not yet green-gated.** All parsing uses explicit
+byte-order conversions, so big-endian correctness is expected, but it is not yet
+verified in CI. The plan is a cross-compile + QEMU job (e.g. `s390x`) running the
+workspace tests, added first as an allow-failure scaffold and promoted to a
+required gate once it passes.
+
+- [ ] Add a cross + QEMU CI job (`s390x-unknown-linux-gnu`) as
+      `continue-on-error: true`.
+- [ ] Triage any endianness divergences the job surfaces.
+- [ ] Promote the job to a required gate once green.
+
+## `no_std` codec support
+
+**State: exploratory.** Today the `no_std` core (`libarchive_oxide-core`) carries
+only the uncompressed formats; every compression codec lives in the `std`
+flagship. The core/flagship split makes future `no_std` codec support a
+**non-breaking** addition (a re-export on top of the frozen algebra), so this can
+be pursued when there is demand without a SemVer break.
+
+- [ ] Survey `no_std`-capable pure-Rust codec crates (or allocator-generic
+      in-house filters) per algorithm.
+- [ ] Prototype a `no_std` gzip filter behind an off-by-default core feature.
+- [ ] Confirm the addition stays non-breaking and keeps the zero-dependency
+      default build intact.
+
+## Examples expansion
+
+**State: incremental.** Grow `libarchive_oxide/examples/` beyond the quick start
+to cover the common end-to-end recipes.
+
+- [ ] `.tar.gz` extraction to a directory (safe defaults).
+- [ ] Creating a compressed archive by output extension.
+- [ ] Reading a zip with WinZip AES-256 (password-protected).
+- [ ] Streaming a large archive with the incremental source (no full buffering).
+
+---
+
+Release mechanics (versioning, publishing order, tagging) are handled by
+release-plz and documented in [CONTRIBUTING.md](CONTRIBUTING.md); the path to 1.0
+(soak time plus the hardening items above) is described there under the SemVer &
+stability policy.

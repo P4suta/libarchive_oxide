@@ -68,11 +68,11 @@ pub fn run_tar(args: Vec<String>) -> CliResult {
         Parsed::Help => {
             print!("{HELP}");
             Ok(())
-        }
+        },
         Parsed::Version => {
             println!("oxtar {}", env!("CARGO_PKG_VERSION"));
             Ok(())
-        }
+        },
         Parsed::Run(opts) => dispatch(&opts),
     }
 }
@@ -112,7 +112,7 @@ fn parse(args: Vec<String>) -> Result<Parsed, CliError> {
             match parse_long(long, &mut opts, &mut it)? {
                 Some(Parsed::Help) => return Ok(Parsed::Help),
                 Some(Parsed::Version) => return Ok(Parsed::Version),
-                _ => {}
+                _ => {},
             }
             continue;
         }
@@ -170,7 +170,7 @@ fn parse_long(
             return Err(CliError::unsupported(
                 "--bzip2: bzip2 was removed from libarchive_oxide; use --gzip/--xz/--zstd/--lz4",
             ))
-        }
+        },
         "format" => {
             let value = match inline {
                 Some(v) => v,
@@ -179,7 +179,7 @@ fn parse_long(
                     .ok_or_else(|| CliError::usage("--format requires a value"))?,
             };
             opts.format = Some(parse_format(&value)?);
-        }
+        },
         other => return Err(CliError::usage(format!("unknown flag: --{other}"))),
     }
     Ok(None)
@@ -209,17 +209,17 @@ fn apply_bool_flag(c: char, opts: &mut TarOpts) -> Result<(), CliError> {
             return Err(CliError::unsupported(
                 "-j (bzip2): bzip2 was removed from libarchive_oxide; use -z/-J/--zstd/--lz4",
             ))
-        }
+        },
         'r' => {
             return Err(CliError::unsupported(
                 "-r (append): rewriting an existing archive is out of scope; use -c",
             ))
-        }
+        },
         'u' => {
             return Err(CliError::unsupported(
                 "-u (update): rewriting an existing archive is out of scope; use -c",
             ))
-        }
+        },
         other => return Err(CliError::usage(format!("unknown flag: -{other}"))),
     }
     Ok(())
@@ -230,11 +230,11 @@ fn set_mode(opts: &mut TarOpts, mode: Mode) -> Result<(), CliError> {
     match opts.mode {
         Some(existing) if existing != mode => {
             Err(CliError::usage("only one of -c, -x, -t may be given"))
-        }
+        },
         _ => {
             opts.mode = Some(mode);
             Ok(())
-        }
+        },
     }
 }
 
@@ -255,7 +255,9 @@ fn dispatch(opts: &TarOpts) -> CliResult {
 /// `-c`: build an archive from the member paths, apply create-time compression, write it out.
 fn create(opts: &TarOpts) -> CliResult {
     if opts.members.is_empty() {
-        return Err(CliError::usage("create (-c) requires at least one input path"));
+        return Err(CliError::usage(
+            "create (-c) requires at least one input path",
+        ));
     }
     // Resolve the output target before any chdir so a relative `-f` still points at the original cwd.
     let target = match opts.file.as_deref() {
@@ -276,8 +278,9 @@ fn create(opts: &TarOpts) -> CliResult {
     .map_err(|e| CliError::runtime(e.to_string()))?;
 
     let bytes = match opts.filter {
-        Some(id) => libarchive_oxide::compress(&raw, id)
-            .map_err(|e| CliError::runtime(e.to_string()))?,
+        Some(id) => {
+            libarchive_oxide::compress(&raw, id).map_err(|e| CliError::runtime(e.to_string()))?
+        },
         None => raw,
     };
 
@@ -297,7 +300,10 @@ fn create(opts: &TarOpts) -> CliResult {
 /// `-x`: read the archive (auto-detecting compression + format) and extract under `-C` (or `.`).
 fn extract(opts: &TarOpts) -> CliResult {
     let bytes = read_input(opts.file.as_deref())?;
-    let dest = opts.chdir.as_deref().map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let dest = opts
+        .chdir
+        .as_deref()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
     extract_bytes(&bytes, &dest, None, opts.verbose, &opts.members)
 }
 
@@ -323,7 +329,7 @@ fn read_input(file: Option<&str>) -> Result<Vec<u8>, CliError> {
                 .read_to_end(&mut buf)
                 .map_err(|e| CliError::runtime(format!("cannot read stdin: {e}")))?;
             Ok(buf)
-        }
+        },
         Some(path) => read_file(path),
     }
 }

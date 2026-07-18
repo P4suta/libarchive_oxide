@@ -1,0 +1,48 @@
+# Single source of licensing truth for the whole tree (REUSE 3.3, REUSE.toml format).
+#
+# Rather than scatter inline SPDX headers across every source and config file, this
+# project declares each file's license here in one place. Identity is unified across
+# the sibling projects: MIT OR Apache-2.0, dual-licensed to every contributor.
+# See LICENSES/MIT.txt and LICENSES/Apache-2.0.txt.
+#
+# `target/` and `fuzz/target/` are git-ignored, hence outside `reuse lint`. The
+# license texts under `LICENSES/` need no annotation — REUSE treats them as the
+# license definitions themselves.
+
+version = 1
+
+# Every source, config, script, manifest, lockfile, prose doc, extension-less
+# dotfile, and the CODEOWNERS entry. `precedence = "aggregate"` so that a file which
+# later grows an inline header combines with this declaration rather than conflicting.
+[[annotations]]
+path = [
+  "**/*.rs",
+  "**/*.toml",
+  "**/*.sh",
+  "**/*.yml",
+  "**/*.md",
+  "Cargo.toml",
+  "Cargo.lock",
+  "fuzz/Cargo.lock",
+  ".gitignore",
+  ".gitattributes",
+  ".editorconfig",
+  "fuzz/.gitignore",
+  ".github/CODEOWNERS",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 libarchive_oxide contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# Binary payloads that can hold no comment and receive no inline header: the frozen
+# fuzz-corpus seeds (encoded archive/codec bytes — a wire-format fact, not authored
+# prose) and any binary test fixtures. `precedence = "override"` makes this config the
+# sole authority for these paths.
+[[annotations]]
+path = [
+  "fuzz/corpus/**",
+  "**/tests/fixtures/**",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 libarchive_oxide contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"

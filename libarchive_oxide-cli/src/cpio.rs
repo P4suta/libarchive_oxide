@@ -59,11 +59,11 @@ pub fn run_cpio(args: Vec<String>) -> CliResult {
         Parsed::Help => {
             print!("{HELP}");
             Ok(())
-        }
+        },
         Parsed::Version => {
             println!("oxcpio {}", env!("CARGO_PKG_VERSION"));
             Ok(())
-        }
+        },
         Parsed::Run(opts) => dispatch(&opts),
     }
 }
@@ -96,13 +96,13 @@ fn parse(args: Vec<String>) -> Result<Parsed, CliError> {
                 "extract" => opts.extract = true,
                 "list" => opts.list = true,
                 "verbose" => opts.verbose = true,
-                "make-directories" => {}
+                "make-directories" => {},
                 "file" => {
                     opts.file = Some(
                         it.next()
                             .ok_or_else(|| CliError::usage("--file requires a value"))?,
                     );
-                }
+                },
                 other => return Err(CliError::usage(format!("unknown flag: --{other}"))),
             }
             continue;
@@ -139,17 +139,17 @@ fn apply_bool_flag(c: char, opts: &mut CpioOpts) -> Result<(), CliError> {
         'i' => opts.extract = true,
         't' => opts.list = true,
         'v' => opts.verbose = true,
-        'd' => {} // Leading directories are always created on extract; accepted for compatibility.
+        'd' => {}, // Leading directories are always created on extract; accepted for compatibility.
         'p' => {
             return Err(CliError::unsupported(
                 "-p (pass-through copy): out of scope; use -o then -i",
             ))
-        }
+        },
         'C' => {
             return Err(CliError::unsupported(
                 "-C (I/O block size): not configurable",
             ))
-        }
+        },
         other => return Err(CliError::usage(format!("unknown flag: -{other}"))),
     }
     Ok(())
@@ -181,11 +181,11 @@ fn dispatch(opts: &CpioOpts) -> CliResult {
         Mode::Extract => {
             let bytes = read_input(opts.file.as_deref())?;
             extract_bytes(&bytes, Path::new("."), None, opts.verbose, &opts.members)
-        }
+        },
         Mode::List => {
             let bytes = read_input(opts.file.as_deref())?;
             list_bytes(&bytes, None, &opts.members, opts.verbose)
-        }
+        },
     }
 }
 
@@ -206,7 +206,8 @@ fn create(opts: &CpioOpts) -> CliResult {
         ));
     }
 
-    let bytes = libarchive_oxide::build_cpio(&names).map_err(|e| CliError::runtime(e.to_string()))?;
+    let bytes =
+        libarchive_oxide::build_cpio(&names).map_err(|e| CliError::runtime(e.to_string()))?;
 
     if opts.verbose {
         for n in &names {
@@ -220,7 +221,7 @@ fn create(opts: &CpioOpts) -> CliResult {
             let mut out = stdout.lock();
             out.write_all(&bytes)
                 .map_err(|e| CliError::runtime(format!("cannot write stdout: {e}")))
-        }
+        },
         OutTarget::File(path) => std::fs::write(&path, &bytes)
             .map_err(|e| CliError::runtime(format!("cannot write {}: {e}", path.display()))),
     }
@@ -246,7 +247,7 @@ fn read_input(file: Option<&str>) -> Result<Vec<u8>, CliError> {
                 .read_to_end(&mut buf)
                 .map_err(|e| CliError::runtime(format!("cannot read stdin: {e}")))?;
             Ok(buf)
-        }
+        },
         Some(path) => read_file(path),
     }
 }

@@ -160,7 +160,7 @@ fn read_source(archive: &[u8], chunk: usize) -> Vec<Ent> {
                 } else {
                     src.finish_input();
                 }
-            }
+            },
             Act::Entry(path, kind, size, link) => {
                 cur = Some(Ent {
                     path,
@@ -169,7 +169,7 @@ fn read_source(archive: &[u8], chunk: usize) -> Vec<Ent> {
                     link,
                     data: Vec::new(),
                 });
-            }
+            },
             Act::Data(d) => cur.as_mut().unwrap().data.extend_from_slice(&d),
             Act::End => out.push(cur.take().unwrap()),
             Act::Done => break,
@@ -259,7 +259,7 @@ fn pax_header_and_entry_straddling_feed_boundary() {
                 SourceEvent::Entry(m) => path = Some(m.path.to_vec()),
                 SourceEvent::Data(d) => data.extend_from_slice(d),
                 SourceEvent::Done => break,
-                SourceEvent::EndEntry | SourceEvent::NeedInput => {}
+                SourceEvent::EndEntry | SourceEvent::NeedInput => {},
             }
         }
         assert_eq!(path.as_deref(), Some(long.as_bytes()), "split at {split}");
@@ -316,7 +316,7 @@ fn buffer_stays_bounded_for_a_large_entry_fed_in_small_chunks() {
             SourceEvent::Data(d) => {
                 got.extend_from_slice(d);
                 Act::Other
-            }
+            },
             SourceEvent::Done => Act::Done,
             SourceEvent::Entry(_) | SourceEvent::EndEntry => Act::Other,
         };
@@ -333,8 +333,8 @@ fn buffer_stays_bounded_for_a_large_entry_fed_in_small_chunks() {
                 } else {
                     src.finish_input();
                 }
-            }
-            Act::Other => {}
+            },
+            Act::Other => {},
             Act::Done => done = true,
         }
     }

@@ -44,7 +44,10 @@ fn arca_aes(name: &[u8], data: &[u8], method: ZipMethod) -> Vec<u8> {
     w.into_inner()
 }
 
-fn read_first_with_password(bytes: &[u8], password: &[u8]) -> libarchive_oxide_core::Result<Vec<u8>> {
+fn read_first_with_password(
+    bytes: &[u8],
+    password: &[u8],
+) -> libarchive_oxide_core::Result<Vec<u8>> {
     let mut r = reader_with_password(bytes, Some(password)).unwrap();
     let mut e = r.next_entry()?.unwrap();
     let mut out = Vec::new();

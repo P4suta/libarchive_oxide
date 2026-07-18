@@ -30,15 +30,15 @@ pub fn run_cat(args: Vec<String>) -> CliResult {
             "--help" => {
                 print!("{HELP}");
                 return Ok(());
-            }
+            },
             "--version" => {
                 println!("oxcat {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
-            }
+            },
             "-" => files.push(arg),
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(CliError::usage(format!("unknown flag: {other}")));
-            }
+            },
             _ => files.push(arg),
         }
     }
@@ -53,7 +53,8 @@ pub fn run_cat(args: Vec<String>) -> CliResult {
         let bytes = if file == "-" {
             read_stdin()?
         } else {
-            std::fs::read(file).map_err(|e| CliError::runtime(format!("cannot read {file}: {e}")))?
+            std::fs::read(file)
+                .map_err(|e| CliError::runtime(format!("cannot read {file}: {e}")))?
         };
         cat_stream(&bytes, &mut out)?;
     }

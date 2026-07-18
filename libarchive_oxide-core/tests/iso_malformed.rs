@@ -15,11 +15,11 @@ fn drive(image: &[u8]) -> bool {
                 loop {
                     match e.data().read_chunk(&mut buf) {
                         Ok(0) => break,
-                        Ok(_) => {}
+                        Ok(_) => {},
                         Err(_) => return false,
                     }
                 }
-            }
+            },
             Ok(None) => return true,
             Err(_) => return false,
         }

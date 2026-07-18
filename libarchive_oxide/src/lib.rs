@@ -30,9 +30,9 @@ pub mod path;
 pub mod sevenz;
 pub mod zip;
 
-pub use libarchive_oxide_core;
 pub use create::{build_archive, build_archive_with, build_cpio, build_tar, CreateOptions};
 pub use extract::{reader, reader_with_password, Stats};
+pub use libarchive_oxide_core;
 pub use path::sanitize;
 pub use zip::{SaltSource, ZipMethod, ZipOptions};
 
@@ -57,14 +57,15 @@ pub fn decompress_capped(bytes: &[u8], max_output: usize) -> Result<Cow<'_, [u8]
                 crate::filter::decoder(id).ok_or(Error::Unsupported("filter not built in"))?;
             let plain = decode_to_vec_capped(&mut decoder, bytes, max_output)?;
             Ok(Cow::Owned(plain))
-        }
+        },
         None => Ok(Cow::Borrowed(bytes)),
     }
 }
 
 /// Compresses `plain` with the given codec. The dual of [`decompress`].
 pub fn compress(plain: &[u8], id: FilterId) -> Result<Vec<u8>> {
-    let mut encoder = crate::filter::encoder(id).ok_or(Error::Unsupported("filter not built in"))?;
+    let mut encoder =
+        crate::filter::encoder(id).ok_or(Error::Unsupported("filter not built in"))?;
     decode_to_vec(&mut encoder, plain)
 }
 

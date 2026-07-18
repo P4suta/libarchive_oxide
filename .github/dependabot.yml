@@ -1,0 +1,45 @@
+# Dependabot version updates. Weekly PRs for Cargo crates (the root workspace and the excluded
+# `fuzz` sub-workspace, which resolves against its own Cargo.lock) and the GitHub Actions the
+# workflows use. Every commit is prefixed `build(deps)` so the Conventional Commits gate accepts a
+# Dependabot-authored commit. Patch and minor Cargo updates group into one PR; majors land on their
+# own so each breaking change is weighed separately.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      cargo-minor:
+        update-types: ["minor", "patch"]
+
+  # The fuzz sub-workspace is excluded from the root workspace and resolves against its own
+  # Cargo.lock; label its PRs so they name which tree moved.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+    labels:
+      - "dependencies"
+      - "fuzz-deps"
+    groups:
+      fuzz-minor:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      github-actions:
+        patterns: ["*"]

@@ -38,11 +38,11 @@ pub fn run_unzip(args: Vec<String>) -> CliResult {
         Parsed::Help => {
             print!("{HELP}");
             Ok(())
-        }
+        },
         Parsed::Version => {
             println!("oxunzip {}", env!("CARGO_PKG_VERSION"));
             Ok(())
-        }
+        },
         Parsed::Run(opts) => dispatch(&opts),
     }
 }
@@ -81,7 +81,7 @@ fn parse(args: Vec<String>) -> Result<Parsed, CliError> {
                 let c = cluster[idx];
                 match c {
                     'l' => opts.list = true,
-                    'o' => {} // Always overwrite (non-interactive); accepted for compatibility.
+                    'o' => {}, // Always overwrite (non-interactive); accepted for compatibility.
                     'd' | 'P' => {
                         let rest: String = cluster[idx + 1..].iter().collect();
                         let value = if rest.is_empty() {
@@ -96,17 +96,17 @@ fn parse(args: Vec<String>) -> Result<Parsed, CliError> {
                             opts.password = Some(value);
                         }
                         break;
-                    }
+                    },
                     'n' => {
                         return Err(CliError::unsupported(
                             "-n (never overwrite): not supported; extraction always overwrites",
                         ))
-                    }
+                    },
                     'x' => {
                         return Err(CliError::unsupported(
                             "-x (exclude): not supported; select members positionally instead",
                         ))
-                    }
+                    },
                     other => return Err(CliError::usage(format!("unknown flag: -{other}"))),
                 }
                 idx += 1;
@@ -149,7 +149,10 @@ fn dispatch(opts: &UnzipOpts) -> CliResult {
     if opts.list {
         return list_bytes(&bytes, password, &opts.members, false);
     }
-    let dest = opts.dest.as_deref().map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let dest = opts
+        .dest
+        .as_deref()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
     extract_bytes(&bytes, &dest, password, false, &opts.members)
 }
 

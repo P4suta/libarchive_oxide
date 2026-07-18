@@ -1,0 +1,32 @@
+# Force LF in the working tree on every platform. The toolchain expects LF
+# everywhere — rustfmt (`newline_style = "Unix"`), taplo, the `.editorconfig`, the
+# `scripts/*.sh` hooks. Without this, Git's `core.autocrlf=true` (the Windows
+# default) checks files out as CRLF, so `cargo fmt --check` and the lefthook
+# pre-commit hooks fail on a native Windows host even though the repo blobs are LF.
+# `text=auto` still lets Git auto-detect and leave binaries alone.
+#
+# Existing Windows clones: after pulling this file, run once to refresh the working
+# tree to LF:  git add --renormalize . && git checkout .
+* text=auto eol=lf
+
+# Archive and codec binaries — never normalize these.
+*.tar binary
+*.tgz binary
+*.cpio binary
+*.ar binary
+*.a binary
+*.zip binary
+*.7z binary
+*.iso binary
+*.gz binary
+*.zst binary
+*.xz binary
+*.lz4 binary
+*.bin binary
+*.exe binary
+*.pdb binary
+
+# Frozen fuzz-corpus seeds and any test fixtures are compared byte-exact; keep them
+# byte-identical on every platform (never rewrite LF <-> CRLF inside them).
+fuzz/corpus/** -text
+**/tests/fixtures/** -text

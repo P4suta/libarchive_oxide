@@ -19,14 +19,14 @@ pub fn sanitize(raw: &[u8]) -> Option<PathBuf> {
 
     for part in text.split(['/', '\\']) {
         match part {
-            "" | "." => {}
+            "" | "." => {},
             ".." => return None,
             _ if part.contains(':') => return None,
             _ if is_reserved_device_name(part) => return None,
             _ => {
                 out.push(part);
                 pushed = true;
-            }
+            },
         }
     }
 

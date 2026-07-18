@@ -73,7 +73,7 @@ impl<'a> EntryReader for AnyReader<'a> {
                     let meta = e.meta().to_static();
                     self.slot = AnyEntryData::Core(core::mem::take(e.data()));
                     meta
-                }
+                },
                 None => return Ok(None),
             },
             AnyReaderKind::Zip(r) => match r.next_entry()? {
@@ -81,7 +81,7 @@ impl<'a> EntryReader for AnyReader<'a> {
                     let meta = e.meta().to_static();
                     self.slot = AnyEntryData::Owned(core::mem::take(e.data()));
                     meta
-                }
+                },
                 None => return Ok(None),
             },
             #[cfg(feature = "sevenz")]
@@ -90,11 +90,14 @@ impl<'a> EntryReader for AnyReader<'a> {
                     let meta = e.meta().to_static();
                     self.slot = AnyEntryData::Owned(core::mem::take(e.data()));
                     meta
-                }
+                },
                 None => return Ok(None),
             },
         };
-        Ok(Some(libarchive_oxide_core::Entry::new(meta, &mut self.slot)))
+        Ok(Some(libarchive_oxide_core::Entry::new(
+            meta,
+            &mut self.slot,
+        )))
     }
 }
 
@@ -135,7 +138,9 @@ pub fn reader_with_password<'a>(
     } else if matches!(Ar::sniff(plain), Detection::Match) {
         AnyReaderKind::Core(libarchive_oxide_core::AnyReader::ar(ArReader::new(plain)))
     } else if matches!(Cpio::sniff(plain), Detection::Match) {
-        AnyReaderKind::Core(libarchive_oxide_core::AnyReader::cpio(CpioReader::new(plain)))
+        AnyReaderKind::Core(libarchive_oxide_core::AnyReader::cpio(CpioReader::new(
+            plain,
+        )))
     } else if matches!(Iso9660::sniff(plain), Detection::Match) {
         AnyReaderKind::Core(libarchive_oxide_core::AnyReader::iso(IsoReader::new(plain)))
     } else {
@@ -187,7 +192,7 @@ pub fn extract<R: EntryReader>(reader: &mut R, dest: &Path) -> io::Result<Stats>
             EntryKind::Dir => {
                 fs::create_dir_all(&path)?;
                 stats.dirs += 1;
-            }
+            },
             EntryKind::File => {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
@@ -202,7 +207,7 @@ pub fn extract<R: EntryReader>(reader: &mut R, dest: &Path) -> io::Result<Stats>
                     file.write_all(&buf[..n])?;
                 }
                 stats.files += 1;
-            }
+            },
             _ => stats.skipped += 1,
         }
     }

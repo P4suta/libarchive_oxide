@@ -25,7 +25,9 @@ use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
 
 use libarchive_oxide_core::format::{ArchiveFormat, Detection};
-use libarchive_oxide_core::format::{Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, OwnedData};
+use libarchive_oxide_core::format::{
+    Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, OwnedData,
+};
 use libarchive_oxide_core::io::Sink;
 use libarchive_oxide_core::{EntryKind, EntryMeta, Error, Result, Timestamp};
 
@@ -148,7 +150,7 @@ struct FileRec {
 /// 7z streaming reader over an in-memory archive slice.
 ///
 /// Following the zip `OwnedData` pattern, the whole folder is decompressed once into
-/// [`Self::unpacked`] and each content file is handed a fresh owned window; directories and empty
+/// an internal `unpacked` buffer and each content file is handed a fresh owned window; directories and empty
 /// files get an empty window.
 #[derive(Debug)]
 pub struct SevenZReader<'a> {
@@ -224,7 +226,7 @@ impl<'a> SevenZReader<'a> {
                     ));
                 }
                 self.parse_header(&mut r2)
-            }
+            },
             _ => Err(Error::Malformed("7z: unexpected next-header id")),
         }
     }
@@ -284,12 +286,12 @@ impl<'a> SevenZReader<'a> {
                 K_EMPTY_FILE => {
                     let num_empty = empty_stream.iter().filter(|&&b| b).count();
                     empty_file = br.bit_vector(num_empty)?;
-                }
+                },
                 K_NAME => names = parse_names(&mut br, num_files)?,
                 K_MTIME => mtimes = parse_times(&mut br, num_files)?,
                 K_WIN_ATTRIBUTES => modes = parse_attributes(&mut br, num_files)?,
                 // kCTime/kATime/kAnti/kStartPos/kDummy and any other property: body already skipped.
-                _ => {}
+                _ => {},
             }
         }
 
@@ -367,7 +369,7 @@ impl<'a> SevenZReader<'a> {
                 let dict = lzma2_dict_size(dict_prop)?;
                 let reader = lzma_rust2::Lzma2Reader::new(Cursor::new(packed.to_vec()), dict, None);
                 drain_exact(reader, cap)
-            }
+            },
             FolderCoder::Lzma { props } => {
                 let dict = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
                 let reader = lzma_rust2::LzmaReader::new_with_props(
@@ -379,7 +381,7 @@ impl<'a> SevenZReader<'a> {
                 )
                 .map_err(|_| Error::Malformed("7z: LZMA stream setup failed"))?;
                 drain_exact(reader, cap)
-            }
+            },
         }
     }
 }
@@ -513,7 +515,7 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
                         _ => return Err(Error::Unsupported("7z: unsupported pack-info property")),
                     }
                 }
-            }
+            },
             K_UNPACK_INFO => {
                 if r.u8()? != K_FOLDER {
                     return Err(Error::Malformed("7z: unpack info missing kFolder"));
@@ -535,18 +537,18 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
                         K_CRC => {
                             folder_has_crc = true;
                             read_digests(r, 1)?;
-                        }
+                        },
                         _ => {
                             return Err(Error::Unsupported("7z: unsupported unpack-info property"))
-                        }
+                        },
                     }
                 }
-            }
+            },
             K_SUBSTREAMS_INFO => {
                 let (n, sizes) = parse_substreams_info(r, unpack_size, folder_has_crc)?;
                 num_substreams = n;
                 substream_sizes = Some(sizes);
-            }
+            },
             _ => return Err(Error::Unsupported("7z: unsupported streams-info property")),
         }
     }
@@ -645,13 +647,13 @@ fn parse_substreams_info(
                     .ok_or(Error::Malformed("7z: substream sizes exceed folder"))?;
                 sizes.push(last);
                 have_sizes = true;
-            }
+            },
             K_CRC => {
                 // A digest is present for every substream except the single-substream case whose CRC
                 // is already defined on the folder (then it is not repeated).
                 let unknown = if num == 1 && folder_has_crc { 0 } else { num };
                 read_digests(r, unknown)?;
-            }
+            },
             _ => return Err(Error::Unsupported("7z: unsupported substreams property")),
         }
     }
@@ -1008,7 +1010,7 @@ impl<W: Sink> EntryDataSink for SevenZWriter<W> {
             Some(p) => {
                 p.plain.extend_from_slice(data);
                 Ok(())
-            }
+            },
             None => Err(Error::InvalidState("7z: write without an open entry")),
         }
     }

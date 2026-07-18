@@ -82,7 +82,7 @@ impl PushBridge {
                     produced: n,
                     status: Status::MoreOutput,
                 })
-            }
+            },
             _ => Ok(Step {
                 consumed: 0,
                 produced: 0,

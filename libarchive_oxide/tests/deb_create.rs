@@ -82,7 +82,7 @@ fn assemble_and_read_back_a_deb() {
         match name.as_slice() {
             b"debian-binary" => version = Some(body),
             b"data.tar.gz" => data_member = Some(body),
-            _ => {}
+            _ => {},
         }
     }
     assert_eq!(version.as_deref(), Some(&b"2.0\n"[..]));

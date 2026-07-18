@@ -22,15 +22,15 @@ fn help_and_version_succeed() {
 #[test]
 fn unsupported_flags_exit_2() {
     let cases: &[(&str, &[&str])] = &[
-        ("oxtar", &["-cjf", "x.tar", "src"]),   // -j bzip2 removed
+        ("oxtar", &["-cjf", "x.tar", "src"]),    // -j bzip2 removed
         ("oxtar", &["--bzip2", "-cf", "x.tar"]), // long bzip2
-        ("oxtar", &["-rf", "x.tar", "src"]),    // -r append
-        ("oxtar", &["-uf", "x.tar", "src"]),    // -u update
+        ("oxtar", &["-rf", "x.tar", "src"]),     // -r append
+        ("oxtar", &["-uf", "x.tar", "src"]),     // -u update
         ("oxtar", &["-c", "--format", "zip", "-f", "x.tar", "s"]), // unsupported format
-        ("oxcpio", &["-p"]),                    // pass-through
-        ("oxcpio", &["-iC"]),                   // block size
-        ("oxunzip", &["-n", "a.zip"]),          // never-overwrite
-        ("oxunzip", &["-x", "a.zip"]),          // exclude
+        ("oxcpio", &["-p"]),                     // pass-through
+        ("oxcpio", &["-iC"]),                    // block size
+        ("oxunzip", &["-n", "a.zip"]),           // never-overwrite
+        ("oxunzip", &["-x", "a.zip"]),           // exclude
     ];
     for (tool, args) in cases {
         let out = run(tool, args);

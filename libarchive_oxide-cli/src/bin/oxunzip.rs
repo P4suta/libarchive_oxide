@@ -13,6 +13,6 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("oxunzip: {e}");
             ExitCode::from(e.code)
-        }
+        },
     }
 }

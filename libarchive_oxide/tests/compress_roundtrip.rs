@@ -6,9 +6,9 @@ mod common;
 
 use std::io::Read;
 
+use common::{trailer, ustar};
 use libarchive_oxide::{compress, decompress};
 use libarchive_oxide_core::filter::FilterId;
-use common::{trailer, ustar};
 
 fn sample_tar() -> Vec<u8> {
     let mut tar = Vec::new();

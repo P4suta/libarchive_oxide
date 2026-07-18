@@ -1,0 +1,58 @@
+# Build `cargo doc` for the whole workspace and deploy it to GitHub Pages on push to `main`.
+
+name: docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Pages needs a token to mint the deployment and write the artifact.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer commit waits rather than cancelling a publish in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (cargo doc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        # Keep in sync with the `doc` job in ci.yml (the PR gate that does not deploy).
+        run: cargo doc --workspace --all-features --no-deps
+      - name: write redirect index.html (stable rustdoc has no auto-index)
+        run: |
+          cat > target/doc/index.html <<'HTML'
+          <!doctype html><meta http-equiv="refresh" content="0; url=libarchive_oxide/index.html">
+          HTML
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/doc
+
+  deploy:
+    name: deploy (gh-pages)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

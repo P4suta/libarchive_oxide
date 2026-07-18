@@ -116,7 +116,7 @@ impl Transform for GzipDecoder {
                         status: Status::NeedInput,
                     })
                 }
-            }
+            },
             Phase::Body => {
                 // `miniz_oxide`'s streaming `inflate` errors on a zero-length input under
                 // `MZFlush::None`. With incremental feeding the body phase can be entered before any
@@ -135,14 +135,14 @@ impl Transform for GzipDecoder {
                     Ok(MZStatus::StreamEnd) => {
                         self.phase = Phase::Trailer;
                         Status::MoreOutput
-                    }
+                    },
                     Ok(_) => {
                         if res.bytes_written == output.len() {
                             Status::MoreOutput
                         } else {
                             Status::NeedInput
                         }
-                    }
+                    },
                     Err(_) => return Err(Error::Malformed("gzip: inflate error")),
                 };
                 Ok(Step {
@@ -150,7 +150,7 @@ impl Transform for GzipDecoder {
                     produced: res.bytes_written,
                     status,
                 })
-            }
+            },
             Phase::Trailer => {
                 let take = input.len().min(self.trailer_left);
                 self.trailer_left -= take;
@@ -165,7 +165,7 @@ impl Transform for GzipDecoder {
                     produced: 0,
                     status,
                 })
-            }
+            },
             Phase::Done => Ok(Step {
                 consumed: 0,
                 produced: 0,
@@ -185,7 +185,7 @@ impl Transform for GzipDecoder {
                         produced: res.bytes_written,
                         status: Status::MoreOutput,
                     });
-                }
+                },
                 Ok(_) => {
                     let status = if res.bytes_written > 0 {
                         Status::MoreOutput
@@ -197,7 +197,7 @@ impl Transform for GzipDecoder {
                         produced: res.bytes_written,
                         status,
                     });
-                }
+                },
                 Err(_) => return Err(Error::Malformed("gzip: inflate error")),
             }
         }

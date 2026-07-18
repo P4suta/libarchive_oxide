@@ -9,10 +9,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use libarchive_oxide::{decompress_capped, extract::extract, reader};
 use common::{trailer, ustar};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use libarchive_oxide::{decompress_capped, extract::extract, reader};
 
 /// A unique, empty scratch directory under the system temp dir.
 fn temp_dir(tag: &str) -> PathBuf {
@@ -66,5 +66,8 @@ fn decompression_bomb_is_capped() {
     let gz = gzip(&tar);
 
     let err = decompress_capped(&gz, 64 * 1024).unwrap_err();
-    assert!(matches!(err, libarchive_oxide_core::Error::LimitExceeded(_)));
+    assert!(matches!(
+        err,
+        libarchive_oxide_core::Error::LimitExceeded(_)
+    ));
 }

@@ -10,7 +10,9 @@ use libarchive_oxide_core::format::ar::ArReader;
 use libarchive_oxide_core::format::cpio::{Cpio, CpioReader, CpioWriter};
 use libarchive_oxide_core::format::tar::{Tar, TarReader, TarWriter};
 use libarchive_oxide_core::format::{ArchiveFormat, Detection};
-use libarchive_oxide_core::{AnyReader, EntryData, EntryDataSink, EntryReader, EntryWriter, SliceData};
+use libarchive_oxide_core::{
+    AnyReader, EntryData, EntryDataSink, EntryReader, EntryWriter, SliceData,
+};
 
 /// The read side of the duality, asserted **statically**: any format reader satisfies the
 /// `EntryReader` bound with zero type erasure (no `dyn`). Monomorphizing this over each reader

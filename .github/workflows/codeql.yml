@@ -1,0 +1,56 @@
+# CodeQL security analysis (Advanced Setup). Scans the Rust source and the repository's own GitHub
+# Actions workflows, uploading results to Security > Code scanning. Advanced (not Default) setup keeps
+# the language set, query suite, and SHA-pinned action versions in-repo under the same review as the
+# code — matching this repo's "pin every action" convention.
+#
+# Languages:
+#   - rust    the archive library itself (build-mode: none — the only mode the Rust analysis
+#             supports; it resolves the cargo workspace without a traced build, so the excluded
+#             nightly-only fuzz crate never has to build here).
+#   - actions the workflows under .github/workflows (catches injection / unsafe checkout / token-scope
+#             issues in the CI YAML).
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly re-scan (Mon 03:27 UTC) so newly-published CodeQL queries run against unchanged code,
+    # not only on new commits.
+    - cron: "27 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      security-events: write # upload the SARIF results to code scanning
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: initialize CodeQL
+        uses: github/codeql-action/init@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Broader security rule set than the default suite.
+          queries: security-extended
+      - name: analyze
+        uses: github/codeql-action/analyze@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3
+        with:
+          category: "/language:${{ matrix.language }}"

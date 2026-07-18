@@ -1,0 +1,81 @@
+# Native dev toolchain (mirrors what CI installs). Install with `mise install`, then
+# `mise run hooks`. The Rust toolchain channel is owned by rust-toolchain.toml; the
+# `rust = "stable"` line here just matches it so `mise install` provisions it too.
+
+[tools]
+rust = "stable"
+
+# Git hooks + the commit-message linter (see lefthook.yml, committed.toml).
+lefthook = "latest"
+committed = "latest"
+
+# Format/lint/CI tools the hooks and CI shell out to.
+typos = "latest"
+actionlint = "latest"
+
+# The REUSE license linter has no static binary; it runs through `uvx` (see the
+# `reuse` task below). `uv` provides an isolated, pinned invocation, and on Windows
+# `--with charset-normalizer` gives it a pure-Python encoding detector so it needs no
+# native libmagic.
+uv = "latest"
+
+# Lets the cargo: backend fetch prebuilt binaries instead of compiling.
+cargo-binstall = "latest"
+
+# Cargo subcommands via the cargo: backend (fetched as prebuilt binaries).
+"cargo:cargo-msrv" = "latest"
+"cargo:cargo-deny" = "latest"
+"cargo:cargo-semver-checks" = "latest"
+"cargo:release-plz" = "latest"
+
+[settings.cargo]
+# Use cargo-binstall (prebuilt binaries) for cargo: backend tools, not source builds.
+binstall = true
+
+# --- Tasks: one entry point per gate; each is also a CI job -----------------------
+
+[tasks.hooks]
+description = "Install the git hooks (see lefthook.yml)"
+run = "lefthook install"
+
+[tasks.fmt]
+description = "Format the workspace"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Clippy over the whole workspace, warnings as errors"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run the workspace tests"
+run = "cargo test --workspace --all-features"
+
+[tasks.nodyn]
+description = "Guard the zero-type-erasure invariant (no dyn in library source)"
+run = "bash scripts/check-no-dyn.sh"
+
+[tasks.no-std]
+description = "Cross-build the no_std core for a bare-metal target (zero external deps)"
+run = "cargo build -p libarchive_oxide-core --target thumbv7em-none-eabi"
+
+[tasks.deny]
+description = "Check the dependency graph: advisories, licenses, wildcard pins, sources"
+run = "cargo deny check"
+
+[tasks.msrv]
+description = "Verify each crate still builds on its declared rust-version"
+run = "cargo msrv verify"
+
+[tasks.semver]
+description = "Gate breaking public-API changes"
+run = "cargo semver-checks check-release --workspace"
+
+[tasks.typos]
+description = "Spell-check the repository"
+run = "typos"
+
+[tasks.reuse]
+description = "Check REUSE/SPDX license compliance"
+# `--with charset-normalizer` gives reuse a pure-Python encoding detector, so it
+# needs no native libmagic (required on Windows; harmless on Linux).
+run = "uvx --with charset-normalizer reuse lint"

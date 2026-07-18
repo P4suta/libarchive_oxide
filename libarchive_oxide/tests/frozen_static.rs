@@ -11,9 +11,9 @@
 #![allow(clippy::no_effect_underscore_binding, clippy::match_same_arms)]
 
 use libarchive_oxide::extract::{AnyEntryData, AnyReader};
+use libarchive_oxide::filter::{decoder, encoder, AnyDecoder, AnyEncoder};
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{EntryData, EntryReader, Transform};
-use libarchive_oxide::filter::{decoder, encoder, AnyDecoder, AnyEncoder};
 
 /// The sealed std reader satisfies `EntryReader` — statically, no `dyn`.
 fn assert_is_reader<R: EntryReader>() {}
@@ -52,18 +52,18 @@ fn decoder_is_origin_opaque() {
 /// handling it here breaks the build, mechanically forcing the sealed enum to stay fully handled.
 fn _exhaustive_entry_data(d: &AnyEntryData<'_>) {
     match d {
-        AnyEntryData::Core(_) => {}
-        AnyEntryData::Owned(_) => {}
+        AnyEntryData::Core(_) => {},
+        AnyEntryData::Owned(_) => {},
     }
 }
 
 /// Exhaustiveness guard for the decoder enum (dual, filter axis).
 fn _exhaustive_decoder(d: &AnyDecoder) {
     match d {
-        AnyDecoder::Gzip(_) => {}
-        AnyDecoder::Zstd(_) => {}
-        AnyDecoder::Xz(_) => {}
-        AnyDecoder::Lz4(_) => {}
+        AnyDecoder::Gzip(_) => {},
+        AnyDecoder::Zstd(_) => {},
+        AnyDecoder::Xz(_) => {},
+        AnyDecoder::Lz4(_) => {},
     }
 }
 

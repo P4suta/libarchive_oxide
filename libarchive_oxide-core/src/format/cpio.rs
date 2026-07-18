@@ -131,7 +131,7 @@ impl<'a> CpioReader<'a> {
                     data_start,
                     next_pos,
                 })
-            }
+            },
             Variant::Odc => {
                 let mode = odc_field(data, pos, 18, 6)?;
                 let uid = odc_field(data, pos, 24, 6)?;
@@ -153,7 +153,7 @@ impl<'a> CpioReader<'a> {
                     data_start,
                     next_pos,
                 })
-            }
+            },
         }
     }
 }

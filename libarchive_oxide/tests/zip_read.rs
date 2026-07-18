@@ -26,7 +26,9 @@ fn make_zip(payload: &[u8]) -> Vec<u8> {
     buf.into_inner()
 }
 
-fn drain<D: libarchive_oxide_core::EntryData>(entry: &mut libarchive_oxide_core::Entry<'_, D>) -> Vec<u8> {
+fn drain<D: libarchive_oxide_core::EntryData>(
+    entry: &mut libarchive_oxide_core::Entry<'_, D>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 33];
     loop {

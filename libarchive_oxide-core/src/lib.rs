@@ -11,7 +11,7 @@
 //! - **Orthogonal (format ⊥ filter)**: adding compression does not change a single line of the
 //!   [`format`] layer's code. The converse holds too. format knows nothing of filter, filter nothing of format.
 //! - **Dual (read ⇄ write, decode ⇄ encode)**: [`EntryReader`]/[`EntryWriter`] and
-//!   [`Decoder`](filter::Decoder)/[`Encoder`](filter::Encoder) are symmetric at the type level.
+//!   [`Decoder`]/[`Encoder`] are symmetric at the type level.
 //!   The design of one side forces the other.
 //! - **Purity**: all trait definitions are `no_std`. Only specific impls pull in `std`/`alloc`.
 //! - **Origin-opaque**: whether an impl is hand-written or an adapter over a reused crate never leaks into the caller's types.

@@ -8,13 +8,13 @@ mod common;
 
 use std::io::Write;
 
+use common::{drain, trailer, ustar};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use libarchive_oxide::decompress;
 use libarchive_oxide_core::format::ar::ArReader;
 use libarchive_oxide_core::format::tar::TarReader;
 use libarchive_oxide_core::{EntryReader, Result};
-use common::{drain, trailer, ustar};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
@@ -77,7 +77,7 @@ fn extracts_deb_like_archive() -> Result<()> {
         match name.as_slice() {
             b"debian-binary" => version = Some(body),
             b"data.tar.gz" => data_member = Some(body),
-            _ => {}
+            _ => {},
         }
     }
     assert_eq!(version.as_deref(), Some(&b"2.0\n"[..]));
