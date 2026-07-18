@@ -25,6 +25,7 @@ name = "arca-cli"
 version = "0.0.0"
 dependencies = [
  "arca",
+ "arca-core",
 ]
 
 [[package]]

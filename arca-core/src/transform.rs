@@ -69,14 +69,35 @@ pub trait Transform {
 ///
 /// Usable even in environments without std (`alloc` only). The typical path for the std layer is to pass
 /// a slice mmapped from a file. A truly incremental driver is provided on the std adapter side.
-pub fn decode_to_vec(t: &mut dyn Transform, mut input: &[u8]) -> Result<Vec<u8>> {
+pub fn decode_to_vec(t: &mut dyn Transform, input: &[u8]) -> Result<Vec<u8>> {
+    decode_to_vec_capped(t, input, usize::MAX)
+}
+
+/// Like [`decode_to_vec`], but fails with [`Error::LimitExceeded`](crate::Error::LimitExceeded)
+/// if the produced output would exceed `max_output` bytes.
+///
+/// This is the guard against decompression bombs: a tiny compressed input that expands to an
+/// enormous output. Callers materializing to memory or disk should set a sane cap.
+pub fn decode_to_vec_capped(
+    t: &mut dyn Transform,
+    mut input: &[u8],
+    max_output: usize,
+) -> Result<Vec<u8>> {
     const CHUNK: usize = 16 * 1024;
     let mut out = Vec::new();
     let mut buf = [0u8; CHUNK];
 
+    let push = |out: &mut alloc::vec::Vec<u8>, chunk: &[u8]| -> Result<()> {
+        if out.len().saturating_add(chunk.len()) > max_output {
+            return Err(crate::Error::LimitExceeded("decompressed size exceeds cap"));
+        }
+        out.extend_from_slice(chunk);
+        Ok(())
+    };
+
     loop {
         let step = t.step(input, &mut buf)?;
-        out.extend_from_slice(&buf[..step.produced]);
+        push(&mut out, &buf[..step.produced])?;
         input = &input[step.consumed..];
         if step.status == Status::Done {
             break;
@@ -89,7 +110,7 @@ pub fn decode_to_vec(t: &mut dyn Transform, mut input: &[u8]) -> Result<Vec<u8>>
 
     loop {
         let step = t.finish(&mut buf)?;
-        out.extend_from_slice(&buf[..step.produced]);
+        push(&mut out, &buf[..step.produced])?;
         if step.status == Status::Done || step.produced == 0 {
             break;
         }

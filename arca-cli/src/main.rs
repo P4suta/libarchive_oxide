@@ -1,9 +1,95 @@
-//! `arca` CLI — a bsdtar-style demo and integration-test surface.
+//! `arca` CLI — a bsdtar-style demonstrator over the arca library.
 //!
-//! In P0 this is a skeleton only. `t` (list) / `x` (extract) will be implemented in P5.
+//! Usage:
+//!   arca t <archive>            List entries.
+//!   arca x <archive> [-C <dir>] Extract entries under <dir> (default: current directory).
+//!
+//! The archive may be plain or compressed (gzip/zstd/xz/lz4); compression and format are
+//! auto-detected. Extraction sanitizes paths and caps the decompressed size.
 
-fn main() {
-    // P5: wire up the t/x subcommands, auto-detection, path sanitization, and allocation caps.
-    eprintln!("arca: P0 skeleton. The t/x subcommands are planned for P5.");
-    std::process::exit(2);
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+/// Cap on decompressed size for untrusted input (defends against decompression bombs).
+const MAX_DECOMPRESSED: usize = 4 * 1024 * 1024 * 1024;
+
+fn main() -> ExitCode {
+    match run(std::env::args().skip(1).collect()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("arca: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: Vec<String>) -> Result<(), String> {
+    let mut args = args.into_iter();
+    let cmd = args
+        .next()
+        .ok_or("missing subcommand (expected `t` or `x`)")?;
+
+    let mut file: Option<String> = None;
+    let mut dest = PathBuf::from(".");
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-C" => {
+                dest = PathBuf::from(args.next().ok_or("-C requires a directory")?);
+            }
+            _ => file = Some(arg),
+        }
+    }
+    let file = file.ok_or("missing archive path")?;
+
+    let bytes = std::fs::read(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let plain = arca::decompress_capped(&bytes, MAX_DECOMPRESSED).map_err(|e| e.to_string())?;
+    let mut reader = arca::reader(&plain).map_err(|e| e.to_string())?;
+
+    match cmd.as_str() {
+        "t" => list(reader.as_mut()),
+        "x" => extract(reader.as_mut(), &dest),
+        other => Err(format!(
+            "unknown subcommand `{other}` (expected `t` or `x`)"
+        )),
+    }
+}
+
+fn list(reader: &mut dyn arca_core::EntryReader) -> Result<(), String> {
+    while let Some(entry) = reader.next_entry().map_err(|e| e.to_string())? {
+        let meta = entry.meta();
+        println!(
+            "{:<10} {:>12}  {}",
+            kind_label(meta.kind),
+            meta.size,
+            String::from_utf8_lossy(&meta.path),
+        );
+    }
+    Ok(())
+}
+
+fn extract(reader: &mut dyn arca_core::EntryReader, dest: &Path) -> Result<(), String> {
+    let stats = arca::extract::extract(reader, dest).map_err(|e| e.to_string())?;
+    eprintln!(
+        "extracted {} files, {} dirs ({} skipped) into {}",
+        stats.files,
+        stats.dirs,
+        stats.skipped,
+        dest.display(),
+    );
+    Ok(())
+}
+
+fn kind_label(kind: arca_core::EntryKind) -> &'static str {
+    use arca_core::EntryKind::{Block, Char, Dir, Fifo, File, Hardlink, Socket, Symlink};
+    match kind {
+        File => "file",
+        Dir => "dir",
+        Symlink => "symlink",
+        Hardlink => "hardlink",
+        Char => "char",
+        Block => "block",
+        Fifo => "fifo",
+        Socket => "socket",
+        _ => "other",
+    }
 }

@@ -39,4 +39,4 @@ pub use format::{
     ArchiveFormat, Detection, Entry, EntryData, EntryDataSink, EntryReader, EntrySink, EntryWriter,
 };
 pub use meta::{EntryKind, EntryMeta, PaxMap, Timestamp};
-pub use transform::{decode_to_vec, Status, Step, Transform};
+pub use transform::{decode_to_vec, decode_to_vec_capped, Status, Step, Transform};

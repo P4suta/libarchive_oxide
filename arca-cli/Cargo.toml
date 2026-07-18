@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 arca = { path = "../arca" }
+arca-core = { version = "0.0.0", path = "../arca-core" }
 
 [lints]
 workspace = true

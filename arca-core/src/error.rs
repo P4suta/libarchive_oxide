@@ -9,7 +9,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 ///
 /// I/O-originated failures are not expressed in the base layer (since it is sans-IO, the bytes are carried by the caller).
 /// The std-side adapters are responsible for interconversion with `std::io::Error`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// The input byte sequence violates the format specification (corrupt header, invalid magic, etc.).
