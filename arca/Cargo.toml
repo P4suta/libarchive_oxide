@@ -24,6 +24,9 @@ arca-filter = { path = "../arca-filter" }
 [dev-dependencies]
 # Used only to generate gzip test data (pure Rust: miniz_oxide backend). The main crate does not depend on it.
 flate2 = "1"
+lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
+lzma-rust2 = "0.16.5"
+ruzstd = "0.8.2"
 
 [lints]
 workspace = true

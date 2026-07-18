@@ -23,6 +23,11 @@ use arca_core::Transform;
 #[cfg(feature = "gzip")]
 pub mod gzip;
 
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+mod bridge;
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+pub mod reused;
+
 /// Builds the decoder for the given codec (only for features compiled in).
 ///
 /// The single entry point of the filter layer. The format layer merely obtains a
@@ -33,6 +38,12 @@ pub fn decoder(id: FilterId) -> Option<Box<dyn Transform>> {
     match id {
         #[cfg(feature = "gzip")]
         FilterId::Gzip => Some(Box::new(gzip::GzipDecoder::new())),
+        #[cfg(feature = "zstd")]
+        FilterId::Zstd => Some(Box::new(reused::ZstdDecoder::new())),
+        #[cfg(feature = "xz")]
+        FilterId::Xz => Some(Box::new(reused::XzDecoder::new())),
+        #[cfg(feature = "lz4")]
+        FilterId::Lz4 => Some(Box::new(reused::Lz4Decoder::new())),
         _ => None,
     }
 }

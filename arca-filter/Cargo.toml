@@ -16,14 +16,17 @@ default = ["gzip"]
 gzip = ["dep:miniz_oxide"]
 # Heavyweight codecs pull in std because they wrap reused crates. A seam exposed on the surface.
 std = []
-zstd = ["std"]  # ruzstd adapter (P3)
-xz = ["std"]    # lzma_rust2 adapter (P3)
-lz4 = ["std"]   # lz4_flex adapter (P3)
-bzip2 = ["std"] # bzip2 adapter (later)
+zstd = ["std", "dep:ruzstd"]       # ruzstd adapter
+xz = ["std", "dep:lzma-rust2"]     # lzma-rust2 adapter
+lz4 = ["std", "dep:lz4_flex"]      # lz4_flex adapter
+bzip2 = ["std"]                    # bzip2 adapter (later)
 
 [dependencies]
 arca-core = { path = "../arca-core" }
+lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"], optional = true }
+lzma-rust2 = { version = "0.16.5", optional = true }
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"], optional = true }
+ruzstd = { version = "0.8.2", optional = true }
 
 [lints]
 workspace = true
