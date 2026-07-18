@@ -1,16 +1,19 @@
-//! tar フォーマット（ustar / pax / GNU）。
+//! tar format (ustar / pax / GNU).
 //!
-//! **P1**: スライスベースの読み取りを実装。P0 で凍結した借用検査 `Entry` モデル
-//! （`Entry<'r>` が reader を可変借用し、ペイロードを読み切るまで次へ進めない）と、
-//! `EntryData`（ペイロードの sans-IO pull）をここで確立する。
+//! **P1**: Implements slice-based reading. Establishes here the borrow-checked
+//! `Entry` model frozen in P0 (`Entry<'r>` mutably borrows the reader and cannot
+//! advance until the payload is fully read) together with `EntryData` (sans-IO
+//! pull of the payload).
 //!
-//! 対応: ustar（`prefix`+`name` 結合）、8進 / base-256 数値、チェックサム検証、
-//! PAX 拡張（`x` 次エントリ用 / `g` グローバル）、GNU longname/longlink（`L`/`K`）、
-//! アーカイブ終端（ゼロブロック）。GNU sparse（`S`）は現状 `Unsupported`（P1 の範囲外）。
+//! Supported: ustar (`prefix`+`name` join), octal / base-256 numerics, checksum
+//! verification, PAX extensions (`x` for the next entry / `g` global), GNU
+//! longname/longlink (`L`/`K`), archive end (zero blocks). GNU sparse (`S`) is
+//! currently `Unsupported` (out of scope for P1).
 //!
-//! P1 の source モデルは **メモリ内スライス**（`&[u8]`）。std 層はファイルを mmap して
-//! `&[u8]` を渡すのが一般的経路であり、これで実用の大半を覆う。逐次フィード型の
-//! 完全 sans-IO source は後日の精緻化とする（凍結済みトレイトは変更しない）。
+//! The P1 source model is an **in-memory slice** (`&[u8]`). The std layer's
+//! common path is to mmap a file and hand over a `&[u8]`, which covers the bulk
+//! of practical use. A fully sans-IO, incrementally-fed source is left as later
+//! refinement (the frozen traits are not changed).
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -21,10 +24,10 @@ use crate::format::{
 };
 use crate::meta::{EntryKind, EntryMeta, Timestamp};
 
-/// tar のブロックサイズ。全ヘッダ・全ペイロードはこの倍数境界に整列する。
+/// tar block size. Every header and every payload is aligned to a multiple of this.
 const BLOCK: usize = 512;
 
-// ── ustar ヘッダのフィールド範囲（512B ブロック内オフセット）。
+// ── ustar header field ranges (offsets within the 512B block).
 const F_NAME: (usize, usize) = (0, 100);
 const F_MODE: (usize, usize) = (100, 108);
 const F_UID: (usize, usize) = (108, 116);
@@ -37,7 +40,7 @@ const F_LINKNAME: (usize, usize) = (157, 257);
 const F_MAGIC: (usize, usize) = (257, 263);
 const F_PREFIX: (usize, usize) = (345, 500);
 
-/// tar フォーマットの検出アンカー（零サイズ型）。
+/// Detection anchor for the tar format (zero-sized type).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Tar;
 
@@ -46,7 +49,7 @@ impl ArchiveFormat for Tar {
 
     fn sniff(prefix: &[u8]) -> Detection {
         if prefix.len() < F_MAGIC.1 {
-            // v7 tar はマジックを持たないため、ここでは ustar/pax/GNU のみ確信できる。
+            // v7 tar has no magic, so here we can only be certain about ustar/pax/GNU.
             return Detection::NeedMore;
         }
         if prefix[F_MAGIC.0..F_MAGIC.0 + 5] == *b"ustar" {
@@ -57,7 +60,7 @@ impl ArchiveFormat for Tar {
     }
 }
 
-/// 上位ヘッダ（PAX / GNU longname）が次エントリまたは全エントリへ課す上書き。
+/// Overrides that a preceding header (PAX / GNU longname) imposes on the next entry or on all entries.
 #[derive(Debug, Default, Clone)]
 struct Overrides<'a> {
     path: Option<Cow<'a, [u8]>>,
@@ -68,7 +71,7 @@ struct Overrides<'a> {
     gid: Option<u64>,
 }
 
-/// エントリ本体を指すカーソル。`bytes` は元スライス（`&'a [u8]` は Copy なので共有可）。
+/// Cursor pointing at the entry body. `bytes` is the source slice (`&'a [u8]` is Copy, so it can be shared).
 #[derive(Debug, Default)]
 struct TarPayload<'a> {
     bytes: &'a [u8],
@@ -91,7 +94,7 @@ impl EntryData for TarPayload<'_> {
     }
 }
 
-/// tar のストリーミング reader（メモリ内スライス上）。
+/// tar streaming reader (over an in-memory slice).
 #[derive(Debug)]
 pub struct TarReader<'a> {
     data: &'a [u8],
@@ -103,7 +106,7 @@ pub struct TarReader<'a> {
 }
 
 impl<'a> TarReader<'a> {
-    /// フィルタ適用後のアーカイブバイト列全体から reader を作る。
+    /// Builds a reader from the entire post-filter archive byte slice.
     #[must_use]
     pub fn new(data: &'a [u8]) -> Self {
         Self {
@@ -116,7 +119,7 @@ impl<'a> TarReader<'a> {
         }
     }
 
-    /// `start` から `len` バイトのペイロード/レコードを境界検査つきで切り出す。
+    /// Slices out `len` bytes of payload/record starting at `start`, with bounds checking.
     fn slice(data: &'a [u8], start: usize, len: usize) -> Result<&'a [u8]> {
         let end = start
             .checked_add(len)
@@ -125,7 +128,7 @@ impl<'a> TarReader<'a> {
             .ok_or(Error::Malformed("truncated data"))
     }
 
-    /// 与えられたヘッダから実エントリのメタデータを組み立てる。`pending` は消費する。
+    /// Builds the metadata for a real entry from the given header. Consumes `pending`.
     fn build_meta(&mut self, hdr: &'a [u8], typeflag: u8) -> Result<EntryMeta<'a>> {
         let kind = kind_from_typeflag(typeflag)?;
 
@@ -197,19 +200,19 @@ impl EntryReader for TarReader<'_> {
         if self.ended {
             return Ok(None);
         }
-        // `&'a [u8]` は Copy。self とは独立した 'a のスライスとして扱えるため、
-        // ヘッダ由来の借用（メタデータ）と self.payload の可変借用が競合しない。
+        // `&'a [u8]` is Copy. Because it can be treated as a 'a slice independent of self,
+        // the header-derived borrow (metadata) does not conflict with the mutable borrow of self.payload.
         let data = self.data;
 
         loop {
-            // ヘッダブロックが 1 つ収まらなければ終端とみなす。
+            // If a single header block does not fit, treat it as the end.
             if self.pos + BLOCK > data.len() {
                 self.ended = true;
                 return Ok(None);
             }
             let hdr = &data[self.pos..self.pos + BLOCK];
 
-            // ゼロブロック = アーカイブ終端。
+            // Zero block = archive end.
             if hdr.iter().all(|&b| b == 0) {
                 self.ended = true;
                 return Ok(None);
@@ -225,7 +228,7 @@ impl EntryReader for TarReader<'_> {
                 .ok_or(Error::Malformed("size overflow"))?;
 
             match typeflag {
-                // PAX 拡張ヘッダ（x=次エントリ用 / g=グローバル）。
+                // PAX extended header (x = for the next entry / g = global).
                 b'x' | b'X' | b'g' => {
                     let records = Self::slice(data, data_start, usize_of(raw_size)?)?;
                     let target = if typeflag == b'g' {
@@ -236,7 +239,7 @@ impl EntryReader for TarReader<'_> {
                     parse_pax(records, target)?;
                     self.pos = next_pos;
                 }
-                // GNU longname / longlink: データ全体が次エントリの名前 / リンク名。
+                // GNU longname / longlink: the whole data is the next entry's name / link name.
                 b'L' => {
                     let raw = Self::slice(data, data_start, usize_of(raw_size)?)?;
                     self.pending.path = Some(Cow::Borrowed(cstr(raw)));
@@ -247,11 +250,11 @@ impl EntryReader for TarReader<'_> {
                     self.pending.linkpath = Some(Cow::Borrowed(cstr(raw)));
                     self.pos = next_pos;
                 }
-                // 実エントリ。
+                // Real entry.
                 _ => {
                     let meta = self.build_meta(hdr, typeflag)?;
                     let len = usize_of(meta.size)?;
-                    // ペイロードが範囲内にあることを保証。
+                    // Guarantee that the payload is within bounds.
                     let _ = Self::slice(data, data_start, len)?;
                     self.payload = TarPayload {
                         bytes: data,
@@ -270,15 +273,15 @@ impl EntryReader for TarReader<'_> {
     }
 }
 
-/// tar のストリーミング writer。read の双対として型に載る（実装は writer フェーズ）。
+/// tar streaming writer. Carried in the type system as the dual of read (implementation is the writer phase).
 #[derive(Debug)]
 pub struct TarWriter<W> {
-    #[allow(dead_code)] // writer フェーズで使用。
+    #[allow(dead_code)] // Used in the writer phase.
     sink: W,
 }
 
 impl<W> TarWriter<W> {
-    /// バイトシンクから writer を作る。
+    /// Builds a writer from a byte sink.
     pub fn new(sink: W) -> Self {
         Self { sink }
     }
@@ -294,20 +297,20 @@ impl<W> EntryWriter for TarWriter<W> {
     }
 }
 
-// ── ヘルパ（自由関数。self を借用しないため借用の絡みを避けられる） ─────────────
+// ── Helpers (free functions; they don't borrow self, avoiding borrow entanglement) ─────────────
 
-/// ヘッダから固定フィールドを切り出す。
+/// Slices out a fixed field from the header.
 fn field(hdr: &[u8], (start, end): (usize, usize)) -> &[u8] {
     &hdr[start..end]
 }
 
-/// 最初の NUL までを返す（tar の C 文字列フィールド）。
+/// Returns up to the first NUL (tar's C-string field).
 fn cstr(field: &[u8]) -> &[u8] {
     let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
     &field[..end]
 }
 
-/// `prefix` + "/" + `name` を結合する（ustar の 255B パス）。
+/// Joins `prefix` + "/" + `name` (ustar's 255B path).
 fn join_prefix_name<'a>(prefix: &'a [u8], name: &'a [u8]) -> Cow<'a, [u8]> {
     let mut joined = Vec::with_capacity(prefix.len() + 1 + name.len());
     joined.extend_from_slice(prefix);
@@ -316,7 +319,7 @@ fn join_prefix_name<'a>(prefix: &'a [u8], name: &'a [u8]) -> Cow<'a, [u8]> {
     Cow::Owned(joined)
 }
 
-/// `pending`（take）を優先し、無ければ `global`（clone）を返す。
+/// Prefers `pending` (take); if absent, returns `global` (clone).
 fn take_first<'a>(
     pending: &mut Option<Cow<'a, [u8]>>,
     global: Option<&Cow<'a, [u8]>>,
@@ -324,7 +327,7 @@ fn take_first<'a>(
     pending.take().or_else(|| global.cloned())
 }
 
-/// typeflag を型付き種別へ。`'0'`/`'\0'`/`'7'` および未知は通常ファイル扱い（tar の慣行）。
+/// Maps a typeflag to a typed kind. `'0'`/`'\0'`/`'7'` and unknown values are treated as regular files (tar convention).
 fn kind_from_typeflag(tf: u8) -> Result<EntryKind> {
     Ok(match tf {
         b'5' => EntryKind::Dir,
@@ -338,11 +341,11 @@ fn kind_from_typeflag(tf: u8) -> Result<EntryKind> {
     })
 }
 
-/// tar 数値フィールドを解釈する（8進 ASCII、または高位ビット付き base-256）。
+/// Parses a tar numeric field (octal ASCII, or base-256 with the high bit set).
 fn parse_numeric(field: &[u8]) -> Result<u64> {
     match field.first() {
         None => Ok(0),
-        // base-256（GNU 拡張、大きな値用）。先頭バイトの高位ビットが立つ。
+        // base-256 (GNU extension, for large values). The high bit of the first byte is set.
         Some(&first) if first & 0x80 != 0 => {
             let mut val: u64 = u64::from(first & 0x7f);
             for &b in &field[1..] {
@@ -353,7 +356,7 @@ fn parse_numeric(field: &[u8]) -> Result<u64> {
             }
             Ok(val)
         }
-        // 8進 ASCII。前後の空白 / NUL を無視。
+        // Octal ASCII. Leading/trailing spaces / NULs are ignored.
         _ => {
             let mut val: u64 = 0;
             let mut seen = false;
@@ -379,13 +382,13 @@ fn parse_numeric(field: &[u8]) -> Result<u64> {
     }
 }
 
-/// ヘッダのチェックサムを検証する（符号なし / 符号あり両対応）。
+/// Verifies the header checksum (supports both unsigned and signed).
 fn verify_checksum(hdr: &[u8]) -> Result<()> {
     let stored = parse_numeric(field(hdr, F_CHKSUM))?;
     let mut unsigned: u64 = 0;
     let mut signed: i64 = 0;
     for (i, &b) in hdr.iter().enumerate() {
-        // チェックサムフィールド自身は空白（0x20）として計算する。
+        // The checksum field itself is computed as spaces (0x20).
         let byte = if (F_CHKSUM.0..F_CHKSUM.1).contains(&i) {
             b' '
         } else {
@@ -401,12 +404,12 @@ fn verify_checksum(hdr: &[u8]) -> Result<()> {
     }
 }
 
-/// u64 を usize へ（32bit 環境での過大値を弾く）。
+/// Converts u64 to usize (rejects oversized values on 32-bit platforms).
 fn usize_of(v: u64) -> Result<usize> {
     usize::try_from(v).map_err(|_| Error::LimitExceeded("size exceeds usize"))
 }
 
-/// バイト長を次のブロック境界へ切り上げる。
+/// Rounds a byte length up to the next block boundary.
 fn round_up(size: u64) -> Result<usize> {
     let size = usize_of(size)?;
     let blocks = size
@@ -418,10 +421,10 @@ fn round_up(size: u64) -> Result<usize> {
         .ok_or(Error::Malformed("size overflow"))
 }
 
-/// PAX 拡張レコード群 `"LEN KEY=VALUE\n"...` を解釈し、`into` へ反映する。
+/// Parses a set of PAX extended records `"LEN KEY=VALUE\n"...` and applies them to `into`.
 fn parse_pax<'a>(mut records: &'a [u8], into: &mut Overrides<'a>) -> Result<()> {
     while !records.is_empty() {
-        // 先頭は 10進のレコード全長（自身の桁 + 空白 + KEY=VALUE + 改行を含む）。
+        // The head is the decimal total record length (including its own digits + space + KEY=VALUE + newline).
         let sp = records
             .iter()
             .position(|&b| b == b' ')
@@ -431,7 +434,7 @@ fn parse_pax<'a>(mut records: &'a [u8], into: &mut Overrides<'a>) -> Result<()> 
             return Err(Error::Malformed("pax: bad record length"));
         }
         let record = &records[..len];
-        // "LEN KEY=VALUE\n" の KEY=VALUE 部分（末尾改行を除く）。
+        // The KEY=VALUE part of "LEN KEY=VALUE\n" (excluding the trailing newline).
         let body = &record[sp + 1..record.len() - 1];
         let eq = body
             .iter()
@@ -445,7 +448,7 @@ fn parse_pax<'a>(mut records: &'a [u8], into: &mut Overrides<'a>) -> Result<()> 
     Ok(())
 }
 
-/// 単一の PAX キーバリューを上書きへ反映する（未知キーは無視）。
+/// Applies a single PAX key-value to the overrides (unknown keys are ignored).
 fn apply_pax<'a>(key: &[u8], value: &'a [u8], into: &mut Overrides<'a>) -> Result<()> {
     match key {
         b"path" => into.path = Some(Cow::Borrowed(value)),
@@ -454,12 +457,12 @@ fn apply_pax<'a>(key: &[u8], value: &'a [u8], into: &mut Overrides<'a>) -> Resul
         b"uid" => into.uid = Some(ascii_decimal(value)? as u64),
         b"gid" => into.gid = Some(ascii_decimal(value)? as u64),
         b"mtime" => into.mtime = Some(parse_pax_time(value)?),
-        _ => {} // atime/ctime/uname/gname 等は P1 では無視。
+        _ => {} // atime/ctime/uname/gname etc. are ignored in P1.
     }
     Ok(())
 }
 
-/// ASCII 10進を usize へ。
+/// Converts ASCII decimal to usize.
 fn ascii_decimal(bytes: &[u8]) -> Result<usize> {
     if bytes.is_empty() {
         return Err(Error::Malformed("empty decimal"));
@@ -477,14 +480,14 @@ fn ascii_decimal(bytes: &[u8]) -> Result<usize> {
     Ok(val)
 }
 
-/// PAX の mtime（`"secs"` または `"secs.nanos"`）を解釈する。
+/// Parses a PAX mtime (`"secs"` or `"secs.nanos"`).
 fn parse_pax_time(value: &[u8]) -> Result<Timestamp> {
     let (secs_part, frac_part) = match value.iter().position(|&b| b == b'.') {
         Some(dot) => (&value[..dot], &value[dot + 1..]),
         None => (value, &b""[..]),
     };
     let secs = i64::try_from(ascii_decimal(secs_part)?).unwrap_or(i64::MAX);
-    // 小数部を最大 9 桁までナノ秒へ（不足は 0 埋め、超過は切り捨て）。
+    // Convert up to 9 fractional digits into nanoseconds (pad with 0 if short, truncate if longer).
     let mut nanos: u32 = 0;
     for i in 0..9 {
         nanos *= 10;
@@ -507,7 +510,7 @@ mod tests {
         assert_eq!(parse_numeric(b"0000644\0").unwrap(), 0o644);
         assert_eq!(parse_numeric(b"        ").unwrap(), 0);
         assert_eq!(parse_numeric(b"00000000144\0").unwrap(), 0o144);
-        // base-256: 0x80 マーカ + 大端 0x00000100 = 256。
+        // base-256: 0x80 marker + big-endian 0x00000100 = 256.
         assert_eq!(parse_numeric(&[0x80, 0, 0, 1, 0]).unwrap(), 256);
     }
 

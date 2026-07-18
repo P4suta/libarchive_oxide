@@ -1,31 +1,33 @@
-//! 基層: sans-IO バイト変換 [`Transform`]。
+//! Base layer: the sans-IO byte transform [`Transform`].
 //!
-//! これがすべての土台。圧縮フィルタも（将来的には）フォーマットのシリアライズも、
-//! この 1 つの割当なし・caller-owned なプリミティブの上に乗る。
+//! This is the foundation for everything. Compression filters, and (eventually) format
+//! serialization too, all sit on top of this single allocation-free, caller-owned primitive.
 //!
-//! # なぜ push/pull ではなく step か
+//! # Why step instead of push/pull
 //!
-//! 当初のスケッチは `push`/`pull` の 2 メソッドだったが、それは変換器に内部出力バッファの
-//! 保持（＝割当）を強制する。より美しい（＝割当なし・完全 caller-driven な）プリミティブは
-//! zlib 系の「1 ステップ = 入力スライスを消費し出力スライスへ生成」である。
-//! push（バイトが届く源）と pull（`Read` 的な消費）は、この `step` の上に構築する **アダプタ**
-//! として std 側で導出する。したがって基層は最小・純粋・割当なしに保たれる。
+//! The original sketch had two methods, `push`/`pull`, but that forces the transformer to hold
+//! an internal output buffer (i.e. an allocation). The more elegant primitive (allocation-free,
+//! fully caller-driven) is the zlib-style "one step = consume an input slice and produce into an
+//! output slice." push (a source where bytes arrive) and pull (`Read`-like consumption) are derived
+//! on the std side as **adapters** built on top of this `step`. The base layer is therefore kept
+//! minimal, pure, and allocation-free.
 
 use crate::Result;
+use alloc::vec::Vec;
 
-/// 1 ステップの結果。消費した入力量・生成した出力量・次に何をすべきか。
+/// The result of one step: how much input was consumed, how much output was produced, and what to do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step {
-    /// `input` から消費したバイト数。
+    /// Number of bytes consumed from `input`.
     pub consumed: usize,
-    /// `output` へ生成したバイト数。
+    /// Number of bytes produced into `output`.
     pub produced: usize,
-    /// この変換器が次に必要とするもの。
+    /// What this transformer needs next.
     pub status: Status,
 }
 
 impl Step {
-    /// 進捗なし（消費 0・生成 0）で、更なる入力を要求する状態。
+    /// A state making no progress (0 consumed, 0 produced) that requests more input.
     pub const STALLED: Self = Self {
         consumed: 0,
         produced: 0,
@@ -33,32 +35,65 @@ impl Step {
     };
 }
 
-/// [`Transform::step`] 後に呼び出し側が取るべき行動。
+/// The action the caller should take after [`Transform::step`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// 更なる入力バイトを与えれば前進できる。
+    /// Giving it more input bytes will let it make progress.
     NeedInput,
-    /// 入力はまだ残っているが出力が満杯。より大きな（または空にした）出力で再度呼ぶ。
+    /// Input still remains but the output is full. Call again with a larger (or emptied) output.
     MoreOutput,
-    /// 論理ストリーム終端に到達した。以降 `step` は生成 0 を返す。
+    /// The logical end of stream has been reached. Subsequent `step` calls produce 0.
     Done,
 }
 
-/// sans-IO なバイト→バイト変換器。
+/// A sans-IO byte-to-byte transformer.
 ///
-/// # 契約
+/// # Contract
 ///
-/// - `step` は `input` から任意量を消費し `output` へ任意量を生成し、[`Step`] を返す。
-/// - 割当は強制されない。すべてのバッファは呼び出し側が所有する。
-/// - 入力が尽きたら `finish` を呼び、内部に滞留した末尾出力を排出させる。
-/// - 実装は `no_std`（自作フィルタ）でも `std`（再利用クレートのアダプタ）でもよい。
-///   その差は呼び出し側の型に漏れない（出自不可視）。
+/// - `step` consumes an arbitrary amount from `input`, produces an arbitrary amount into `output`, and returns a [`Step`].
+/// - No allocation is forced. All buffers are owned by the caller.
+/// - Once input is exhausted, call `finish` to drain any trailing output held internally.
+/// - Implementations may be `no_std` (hand-written filters) or `std` (adapters over reused crates).
+///   That difference does not leak into the caller's types (origin-opaque).
 pub trait Transform {
-    /// `input` を消費し `output` へ生成する 1 ステップを進める。
+    /// Advance one step, consuming `input` and producing into `output`.
     fn step(&mut self, input: &[u8], output: &mut [u8]) -> Result<Step>;
 
-    /// 入力終端を通知し、滞留出力を `output` へ排出する。
+    /// Signal end of input and drain the held-back output into `output`.
     ///
-    /// [`Status::Done`] を返すまで、より大きな `output` で繰り返し呼んでよい。
+    /// May be called repeatedly with a larger `output` until it returns [`Status::Done`].
     fn finish(&mut self, output: &mut [u8]) -> Result<Step>;
+}
+
+/// A convenience function that runs all in-memory input through a [`Transform`] and collects the output into a [`Vec`].
+///
+/// Usable even in environments without std (`alloc` only). The typical path for the std layer is to pass
+/// a slice mmapped from a file. A truly incremental driver is provided on the std adapter side.
+pub fn decode_to_vec(t: &mut dyn Transform, mut input: &[u8]) -> Result<Vec<u8>> {
+    const CHUNK: usize = 16 * 1024;
+    let mut out = Vec::new();
+    let mut buf = [0u8; CHUNK];
+
+    loop {
+        let step = t.step(input, &mut buf)?;
+        out.extend_from_slice(&buf[..step.produced]);
+        input = &input[step.consumed..];
+        if step.status == Status::Done {
+            break;
+        }
+        // Once step stops making progress, drain the tail via finish.
+        if step.consumed == 0 && step.produced == 0 {
+            break;
+        }
+    }
+
+    loop {
+        let step = t.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..step.produced]);
+        if step.status == Status::Done || step.produced == 0 {
+            break;
+        }
+    }
+
+    Ok(out)
 }

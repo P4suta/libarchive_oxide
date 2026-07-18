@@ -1,17 +1,17 @@
-//! tar reader の統合テスト。外部ツールに依存せず、メモリ内で ustar アーカイブを
-//! 組み立てて読み取り、パス・種別・サイズ・内容・PAX/GNU 上書きを検証する。
+//! Integration tests for the tar reader. Without depending on external tools, it assembles a
+//! ustar archive in memory and reads it back, verifying path, kind, size, contents, and PAX/GNU overrides.
 
 use arca_core::format::tar::TarReader;
 use arca_core::{Entry, EntryKind, EntryReader};
 
-/// 8進数値フィールドを width-1 桁ゼロ詰め + NUL で書く。
+/// Write an octal numeric field as width-1 zero-padded digits + NUL.
 fn put_octal(hdr: &mut [u8; 512], start: usize, width: usize, val: u64) {
     let digits = format!("{val:0w$o}", w = width - 1);
     hdr[start..start + width - 1].copy_from_slice(digits.as_bytes());
     hdr[start + width - 1] = 0;
 }
 
-/// 1 つの ustar エントリ（ヘッダ + データ + ブロックパディング）を組み立てる。
+/// Assemble a single ustar entry (header + data + block padding).
 fn ustar(name: &str, typeflag: u8, data: &[u8]) -> Vec<u8> {
     let mut h = [0u8; 512];
     let nb = name.as_bytes();
@@ -23,11 +23,11 @@ fn ustar(name: &str, typeflag: u8, data: &[u8]) -> Vec<u8> {
     put_octal(&mut h, 136, 12, 0); // mtime
     h[156] = typeflag;
     h[257..262].copy_from_slice(b"ustar");
-    // magic の NUL(262) はゼロ初期化済み。version:
+    // The magic NUL (262) is already zero-initialized. version:
     h[263] = b'0';
     h[264] = b'0';
 
-    // チェックサム: フィールドを空白にして符号なし総和を取り、6桁8進+NUL+空白で書く。
+    // Checksum: blank out the field with spaces, take the unsigned sum, and write it as 6 octal digits + NUL + space.
     for b in &mut h[148..156] {
         *b = b' ';
     }
@@ -44,7 +44,7 @@ fn ustar(name: &str, typeflag: u8, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// PAX レコード `"LEN KEY=VALUE\n"`（LEN は自身を含む全長）を組み立てる。
+/// Assemble a PAX record `"LEN KEY=VALUE\n"` (LEN is the total length including itself).
 fn pax_record(keyval: &str) -> Vec<u8> {
     let tail = format!(" {keyval}\n");
     let mut n = tail.len() + 1;
@@ -57,12 +57,12 @@ fn pax_record(keyval: &str) -> Vec<u8> {
     }
 }
 
-/// 2 つのゼロブロック（アーカイブ終端）。
+/// Two zero blocks (the archive terminator).
 fn trailer() -> Vec<u8> {
     vec![0u8; 1024]
 }
 
-/// エントリ本体を小さなバッファで少しずつ読み切る（チャンク分割を検証）。
+/// Read an entry's body to completion in small buffers, a little at a time (verifies chunk splitting).
 fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 7];
@@ -100,13 +100,13 @@ fn reads_plain_ustar_file_and_dir() {
         assert_eq!(e.meta().size, 0);
     }
     assert!(r.next_entry().unwrap().is_none());
-    // 終端到達後は None を返し続ける。
+    // After reaching the terminator, it keeps returning None.
     assert!(r.next_entry().unwrap().is_none());
 }
 
 #[test]
 fn skips_unread_payload_between_entries() {
-    // 1 つ目の本体を読まずに 2 つ目へ進んでも、位置がずれないこと。
+    // Advancing to the second entry without reading the first body must not misalign the position.
     let mut ar = Vec::new();
     ar.extend(ustar("a", b'0', &vec![b'x'; 1000]));
     ar.extend(ustar("b", b'0', b"bee"));
@@ -142,10 +142,10 @@ fn pax_path_override() {
 
 #[test]
 fn pax_size_override_controls_payload() {
-    // PAX size は本体長を上書きする（大ファイル表現の要）。
+    // PAX size overrides the body length (essential for representing large files).
     let mut ar = Vec::new();
     ar.extend(ustar("big", b'x', &pax_record("size=5")));
-    // ヘッダ size は 5、実データも 5 バイトに合わせる。
+    // The header size is 5, and the actual data is matched to 5 bytes.
     ar.extend(ustar("big", b'0', b"12345"));
     ar.extend(trailer());
 
@@ -159,7 +159,7 @@ fn pax_size_override_controls_payload() {
 fn gnu_longname() {
     let long = "this/is/a/gnu/longname/entry/exceeding/one/hundred/bytes/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/file";
     let mut name_block = long.as_bytes().to_vec();
-    name_block.push(0); // NUL 終端
+    name_block.push(0); // NUL terminator
     let mut ar = Vec::new();
     ar.extend(ustar("././@LongLink", b'L', &name_block));
     ar.extend(ustar("truncated", b'0', b"data"));
@@ -174,10 +174,10 @@ fn gnu_longname() {
 #[test]
 fn symlink_target() {
     let mut h = ustar("link", b'2', b"");
-    // linkname フィールド(157..257) に対象を書く。
+    // Write the target into the linkname field (157..257).
     let target = b"/etc/target";
     h[157..157 + target.len()].copy_from_slice(target);
-    // チェックサムを取り直す。
+    // Recompute the checksum.
     for b in &mut h[148..156] {
         *b = b' ';
     }
@@ -199,7 +199,7 @@ fn symlink_target() {
 #[test]
 fn rejects_bad_checksum() {
     let mut ar = ustar("x", b'0', b"y");
-    ar[149] ^= 0xff; // チェックサム桁を破壊。
+    ar[149] ^= 0xff; // Corrupt a checksum digit.
     ar.extend(trailer());
     let mut r = TarReader::new(&ar);
     assert!(r.next_entry().is_err());

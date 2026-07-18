@@ -1,7 +1,7 @@
 [package]
 name = "arca"
 version = "0.0.0"
-description = "統一 streaming アーカイブライブラリ（Pure Rust）。std 高レベル API: 自動検出・FS 展開・安全なパス処理。"
+description = "Unified streaming archive library (Pure Rust). std high-level API: auto-detection, FS extraction, safe path handling."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -20,6 +20,10 @@ lz4 = ["arca-filter/lz4"]
 [dependencies]
 arca-core = { path = "../arca-core" }
 arca-filter = { path = "../arca-filter" }
+
+[dev-dependencies]
+# Used only to generate gzip test data (pure Rust: miniz_oxide backend). The main crate does not depend on it.
+flate2 = "1"
 
 [lints]
 workspace = true

@@ -1,7 +1,8 @@
-//! 凍結された抽象の受入基準を機械的に固定するテスト。
+//! Tests that mechanically pin down the acceptance criteria of the frozen abstraction.
 //!
-//! ここが最上位の検証: 「write も新フォーマットも、トレイト変更なしに同一トレイトへ載る」
-//! ことと、filter/format の直交性・双対性を型と挙動で担保する。
+//! This is the top-level verification: that "both writing and new formats fit onto the
+//! same trait with no trait changes," and that the orthogonality and duality of
+//! filter/format are guaranteed by the types and the behavior.
 
 use arca_core::filter::FilterId;
 use arca_core::format::cpio::{Cpio, CpioReader};
@@ -9,36 +10,36 @@ use arca_core::format::tar::{Tar, TarReader, TarWriter};
 use arca_core::format::{ArchiveFormat, Detection};
 use arca_core::{EntryReader, EntryWriter};
 
-/// 双対の read 側: 任意のフォーマット reader が単一トレイトオブジェクトに載る。
+/// The read side of the duality: any format reader fits onto a single trait object.
 fn assert_is_reader(_r: &mut dyn EntryReader) {}
 
-/// 双対の write 側: 任意のフォーマット writer が単一トレイトオブジェクトに載る。
+/// The write side of the duality: any format writer fits onto a single trait object.
 fn assert_is_writer(_w: &mut dyn EntryWriter) {}
 
 #[test]
 fn read_write_dual_and_orthogonal_formats_load_on_same_traits() {
-    // tar は read/write 双方が同一トレイトに載る（双対を型で凍結）。
+    // For tar, both the read and write sides fit onto the same trait (the duality is frozen by the types).
     let mut tar_r = TarReader::new(&b""[..]);
     let mut tar_w = TarWriter::new(alloc_sink());
     assert_is_reader(&mut tar_r);
     assert_is_writer(&mut tar_w);
 
-    // cpio（別フォーマット）は tar と同じ EntryReader に、トレイト変更なしで載る（直交性）。
+    // cpio (a different format) fits onto the same EntryReader as tar, with no trait changes (orthogonality).
     let mut cpio_r = CpioReader::new(&b""[..]);
     assert_is_reader(&mut cpio_r);
 }
 
-/// writer 構築のためのダミーバイトシンク。P2 まで中身は不要。
+/// A dummy byte sink for constructing the writer. Its contents are not needed until P2.
 fn alloc_sink() -> alloc::vec::Vec<u8> {
     alloc::vec::Vec::new()
 }
 
-// 統合テストは std バイナリだが、no_std クレートの alloc を明示的に使うため参照を張る。
+// The integration test is a std binary, but we pull in a reference to explicitly use the no_std crate's alloc.
 extern crate alloc;
 
 #[test]
 fn tar_detection() {
-    // ustar マジックは 257 バイト目。十分な長さが無ければ NeedMore。
+    // The ustar magic is at byte 257. Without sufficient length, it's NeedMore.
     assert_eq!(Tar::sniff(b"short"), Detection::NeedMore);
 
     let mut block = [0u8; 512];
@@ -54,7 +55,7 @@ fn tar_detection() {
 fn cpio_detection() {
     assert_eq!(Cpio::sniff(b"070701rest"), Detection::Match); // newc
     assert_eq!(Cpio::sniff(b"070707rest"), Detection::Match); // odc
-    assert_eq!(Cpio::sniff(&[0xc7, 0x71]), Detection::Match); // 旧バイナリ LE
+    assert_eq!(Cpio::sniff(&[0xc7, 0x71]), Detection::Match); // old binary LE
     assert_eq!(Cpio::sniff(b""), Detection::NeedMore);
     assert_eq!(Cpio::sniff(b"NOTCPIO"), Detection::NoMatch);
 }

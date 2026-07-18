@@ -1,62 +1,62 @@
-//! エントリのメタデータ。read/write 双対をデータ層で担保する共有型。
+//! Entry metadata. A shared type that upholds the read/write duality at the data layer.
 //!
-//! 同一の [`EntryMeta`] を、[`EntryReader`](crate::EntryReader) は **産出** し、
-//! [`EntryWriter`](crate::EntryWriter) は **消費** する。これにより read/write 対称は
-//! トレイトだけでなくデータの形でも保証される。
+//! The same [`EntryMeta`] is **produced** by [`EntryReader`](crate::EntryReader) and
+//! **consumed** by [`EntryWriter`](crate::EntryWriter). This way, read/write symmetry is
+//! guaranteed not only by the traits but also in the shape of the data.
 //!
-//! `no_std` を保つため、パスは `std::path` ではなく生バイト列で持つ（アーカイブ内の
-//! 名前はそもそも OS ネイティブなエンコーディングとは限らない）。可能な限り入力バッファから
-//! 借用し（[`Cow`]）、エントリごとの割当を避ける（ゼロコピー）。
+//! To stay `no_std`, paths are held as raw byte sequences rather than `std::path` (names
+//! inside an archive are not necessarily in the OS-native encoding to begin with). Wherever
+//! possible we borrow from the input buffer ([`Cow`]) to avoid per-entry allocation (zero-copy).
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 
-/// エントリ種別。C の `mode & S_IFMT` を型付き列挙に置き換える。
+/// Entry kind. Replaces C's `mode & S_IFMT` with a typed enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EntryKind {
-    /// 通常ファイル。
+    /// Regular file.
     File,
-    /// ディレクトリ。
+    /// Directory.
     Dir,
-    /// シンボリックリンク（`link_target` を持つ）。
+    /// Symbolic link (carries `link_target`).
     Symlink,
-    /// ハードリンク（`link_target` が対象を指す）。
+    /// Hard link (`link_target` points at the target).
     Hardlink,
-    /// キャラクタデバイス。
+    /// Character device.
     Char,
-    /// ブロックデバイス。
+    /// Block device.
     Block,
-    /// 名前付きパイプ（FIFO）。
+    /// Named pipe (FIFO).
     Fifo,
-    /// UNIX ドメインソケット。
+    /// UNIX domain socket.
     Socket,
 }
 
-/// 秒とナノ秒によるタイムスタンプ。`no_std` のため `SystemTime` は使わない。
+/// A timestamp in seconds and nanoseconds. `SystemTime` is not used, for `no_std`.
 ///
-/// エポックからのオフセット。負値（1970 以前）を許すため `i64`。
+/// An offset from the epoch. `i64` to allow negative values (before 1970).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp {
-    /// UNIX エポックからの秒。
+    /// Seconds since the UNIX epoch.
     pub secs: i64,
-    /// 秒内のナノ秒（`0..1_000_000_000`）。
+    /// Nanoseconds within the second (`0..1_000_000_000`).
     pub nanos: u32,
 }
 
-/// PAX の 1 レコード（キー・値）。いずれも可能なら入力から借用する。
+/// A single PAX record (key, value). Both borrow from the input when possible.
 type PaxRecord<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 
-/// PAX 拡張ヘッダ等の追加キーバリュー。可能な限り入力から借用する。
+/// Additional key-values such as PAX extended headers. Borrows from the input where possible.
 ///
-/// P0 では素朴な連想リスト。走査順を保ちつつ小規模を前提とする。
+/// In P0 this is a naive association list. It preserves iteration order and assumes a small size.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PaxMap<'a> {
     entries: Vec<PaxRecord<'a>>,
 }
 
 impl<'a> PaxMap<'a> {
-    /// 空のマップ。
+    /// An empty map.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -64,7 +64,7 @@ impl<'a> PaxMap<'a> {
         }
     }
 
-    /// キーに対応する値を線形探索で返す。
+    /// Returns the value for a key via linear search.
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
         self.entries
@@ -73,52 +73,52 @@ impl<'a> PaxMap<'a> {
             .map(|(_, v)| v.as_ref())
     }
 
-    /// キーバリューを追加する。
+    /// Appends a key-value pair.
     pub fn insert(&mut self, key: Cow<'a, [u8]>, value: Cow<'a, [u8]>) {
         self.entries.push((key, value));
     }
 
-    /// 保持している組の数。
+    /// The number of pairs held.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// 空か。
+    /// Whether it is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
 
-/// エントリのメタデータ。reader が産出し writer が消費する双対の中核。
+/// Entry metadata. The core of the duality produced by the reader and consumed by the writer.
 ///
-/// ライフタイム `'a` は入力バッファ（read 時）または呼び出し側の借用（write 時）を指し、
-/// ゼロコピーを型で表現する。
+/// The lifetime `'a` refers to the input buffer (on read) or the caller's borrow (on write),
+/// expressing zero-copy in the type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryMeta<'a> {
-    /// エントリ種別。
+    /// Entry kind.
     pub kind: EntryKind,
-    /// アーカイブ内パス（生バイト、可能なら借用）。
+    /// Path within the archive (raw bytes, borrowed if possible).
     pub path: Cow<'a, [u8]>,
-    /// UNIX パーミッションビット（`mode & 0o7777`）。
+    /// UNIX permission bits (`mode & 0o7777`).
     pub mode: u32,
-    /// 所有ユーザ ID。
+    /// Owning user ID.
     pub uid: u64,
-    /// 所有グループ ID。
+    /// Owning group ID.
     pub gid: u64,
-    /// 更新時刻。フォーマットに無ければ `None`。
+    /// Modification time. `None` if absent from the format.
     pub mtime: Option<Timestamp>,
-    /// ファイル内容のバイト長（非ファイルでは 0）。
+    /// Byte length of the file content (0 for non-files).
     pub size: u64,
-    /// シンボリック/ハードリンクの対象。それ以外は `None`。
+    /// The target of a symbolic/hard link. `None` otherwise.
     pub link_target: Option<Cow<'a, [u8]>>,
-    /// PAX 等の拡張属性。
+    /// Extended attributes such as PAX.
     pub pax: PaxMap<'a>,
 }
 
 impl<'a> EntryMeta<'a> {
-    /// 指定種別・パスの最小メタデータ（他は既定値）を作る。
+    /// Builds the minimal metadata for a given kind and path (other fields at their defaults).
     #[must_use]
     pub fn new(kind: EntryKind, path: Cow<'a, [u8]>) -> Self {
         Self {

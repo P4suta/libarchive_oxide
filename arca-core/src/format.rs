@@ -1,14 +1,15 @@
-//! Format 軸: フィルタ後のバイト列 ⇄ 構造化エントリ。
+//! Format axis: filtered byte stream ⇄ structured entries.
 //!
-//! format 層は filter 層と **直交** し、圧縮を一切知らない。読み書きの多相は
-//! [`EntryReader`]/[`EntryWriter`] トレイトオブジェクトで表現され、これらは
-//! 圏論的な双対をなす。
+//! The format layer is **orthogonal** to the filter layer and knows nothing about
+//! compression. Read/write polymorphism is expressed via the
+//! [`EntryReader`]/[`EntryWriter`] trait objects, which form a
+//! category-theoretic dual.
 //!
-//! # 借用検査された no-seek モデル
+//! # Borrow-checked no-seek model
 //!
-//! [`EntryReader::next_entry`] は `&mut self` を借用する [`Entry`] を返す。したがって
-//! **エントリのデータを読み切って `Entry` を落とすまで、次のエントリへ進めない** ことが
-//! コンパイル時に保証される。C の `void*` + 手続き規約に対する型レベルの勝ち。seek 不要。
+//! [`EntryReader::next_entry`] returns an [`Entry`] that borrows `&mut self`. Therefore
+//! **you cannot advance to the next entry until you have read the entry's data to completion and dropped the `Entry`**,
+//! which is guaranteed at compile time. A type-level win over C's `void*` + procedural convention. No seek required.
 
 use crate::meta::EntryMeta;
 use crate::Result;
@@ -17,48 +18,48 @@ use core::fmt;
 pub mod cpio;
 pub mod tar;
 
-/// アーカイブフォーマットの検出結果。
+/// Result of archive-format detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detection {
-    /// このフォーマットだと確信できる。
+    /// We are confident this is the format.
     Match,
-    /// このフォーマットではない。
+    /// This is not the format.
     NoMatch,
-    /// 判定に更なるプレフィックスが必要。
+    /// More prefix bytes are needed to decide.
     NeedMore,
 }
 
-/// アーカイブフォーマットの検出アンカー（レジストリ／自動判定の起点）。
+/// Detection anchor for an archive format (the entry point for the registry / auto-detection).
 ///
-/// 具体的な読み書きは [`EntryReader`]/[`EntryWriter`] を実装する型が担う。この分離により、
-/// 新フォーマット追加は「同じトレイトを実装する型を足す」だけになり、既存トレイトは不変。
+/// The concrete reading and writing is handled by types that implement [`EntryReader`]/[`EntryWriter`]. Thanks to this separation,
+/// adding a new format is just "add a type that implements the same traits", leaving the existing traits unchanged.
 pub trait ArchiveFormat {
-    /// 人間可読なフォーマット名（診断用）。
+    /// Human-readable format name (for diagnostics).
     const NAME: &'static str;
 
-    /// バイト列先頭からこのフォーマットかを判定する。
+    /// Determine from the head of the byte stream whether this is the format.
     fn sniff(prefix: &[u8]) -> Detection;
 }
 
-/// エントリ本体（ペイロード）の sans-IO 読み出し。
+/// sans-IO reading of an entry's body (payload).
 ///
-/// `no_std` のため `std::io::Read` ではなくチャンク pull を採る。std 側で `Read` へ橋渡しする。
+/// Because it is `no_std`, it uses chunk pull rather than `std::io::Read`. On the std side we bridge it to `Read`.
 pub trait EntryData {
-    /// デコード済みエントリバイトを `out` へ取り出す。返り値は生成量。0 はエントリ終端。
+    /// Pull decoded entry bytes into `out`. The return value is the amount produced. 0 means end of entry.
     fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize>;
 }
 
-/// アーカイブから 1 エントリを取り出すストリーミング reader。
+/// A streaming reader that pulls one entry at a time from an archive.
 pub trait EntryReader {
-    /// 次のエントリを返す。末尾に達したら `None`。
+    /// Return the next entry, or `None` when the end has been reached.
     ///
-    /// 返る [`Entry`] は `self` を可変借用するため、そのデータを読み切るまで次へ進めない。
+    /// The returned [`Entry`] mutably borrows `self`, so you cannot advance until you have read its data to completion.
     fn next_entry(&mut self) -> Result<Option<Entry<'_>>>;
 }
 
-/// reader が貸し出す 1 エントリ。メタデータとペイロードストリームを保持する。
+/// A single entry lent out by the reader. Holds the metadata and the payload stream.
 ///
-/// ライフタイム `'r` が親 reader を可変借用しており、no-seek 不変条件を型で担保する。
+/// The lifetime `'r` mutably borrows the parent reader, upholding the no-seek invariant at the type level.
 pub struct Entry<'r> {
     meta: EntryMeta<'r>,
     data: &'r mut dyn EntryData,
@@ -66,7 +67,7 @@ pub struct Entry<'r> {
 
 impl fmt::Debug for Entry<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // ペイロードストリームは不透明なので meta のみ表示する。
+        // The payload stream is opaque, so we show only the meta.
         f.debug_struct("Entry")
             .field("meta", &self.meta)
             .finish_non_exhaustive()
@@ -74,44 +75,44 @@ impl fmt::Debug for Entry<'_> {
 }
 
 impl<'r> Entry<'r> {
-    /// メタデータとペイロードストリームからエントリを組み立てる（フォーマット実装が使う）。
+    /// Assemble an entry from metadata and a payload stream (used by format implementations).
     pub fn new(meta: EntryMeta<'r>, data: &'r mut dyn EntryData) -> Self {
         Self { meta, data }
     }
 
-    /// エントリのメタデータ。
+    /// The entry's metadata.
     #[must_use]
     pub fn meta(&self) -> &EntryMeta<'r> {
         &self.meta
     }
 
-    /// エントリ本体の sans-IO ストリーム。
+    /// The sans-IO stream of the entry's body.
     pub fn data(&mut self) -> &mut dyn EntryData {
         self.data
     }
 }
 
-/// エントリ本体（ペイロード）の sans-IO 書き込み。[`EntryData`] の双対。
+/// sans-IO writing of an entry's body (payload). The dual of [`EntryData`].
 pub trait EntryDataSink {
-    /// エントリバイトを書き込む。
+    /// Write entry bytes.
     fn write_chunk(&mut self, data: &[u8]) -> Result<()>;
 
-    /// このエントリの書き込みを確定する。
+    /// Finalize the writing of this entry.
     fn close(&mut self) -> Result<()>;
 }
 
-/// アーカイブへ 1 エントリを書き出すストリーミング writer。[`EntryReader`] の双対。
+/// A streaming writer that writes one entry at a time into an archive. The dual of [`EntryReader`].
 pub trait EntryWriter {
-    /// メタデータを与えてエントリの書き込みを開始し、本体シンクを貸し出す。
+    /// Begin writing an entry given its metadata, and lend out the body sink.
     ///
-    /// 返る [`EntrySink`] は `self` を可変借用するため、確定するまで次エントリを開始できない。
+    /// The returned [`EntrySink`] mutably borrows `self`, so you cannot begin the next entry until it is finalized.
     fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_>>;
 
-    /// アーカイブ全体を確定する（末尾ブロック等を書く）。
+    /// Finalize the whole archive (write the trailing blocks, etc.).
     fn finish(&mut self) -> Result<()>;
 }
 
-/// writer が貸し出す 1 エントリの本体シンク。[`Entry`] の双対。
+/// The body sink of a single entry lent out by the writer. The dual of [`Entry`].
 pub struct EntrySink<'w> {
     inner: &'w mut dyn EntryDataSink,
 }
@@ -123,17 +124,17 @@ impl fmt::Debug for EntrySink<'_> {
 }
 
 impl<'w> EntrySink<'w> {
-    /// 本体シンクからエントリシンクを組み立てる（フォーマット実装が使う）。
+    /// Assemble an entry sink from a body sink (used by format implementations).
     pub fn new(inner: &'w mut dyn EntryDataSink) -> Self {
         Self { inner }
     }
 
-    /// 本体バイトを書き込む。
+    /// Write body bytes.
     pub fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
         self.inner.write_chunk(data)
     }
 
-    /// このエントリを確定する。
+    /// Finalize this entry.
     pub fn close(&mut self) -> Result<()> {
         self.inner.close()
     }

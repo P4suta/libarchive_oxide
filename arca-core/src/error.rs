@@ -1,26 +1,26 @@
-//! `no_std` フレンドリなエラー型。`std::io::Error` に依存しない。
+//! `no_std`-friendly error type. Does not depend on `std::io::Error`.
 
 use core::fmt;
 
-/// クレート全体の結果型。
+/// Crate-wide result type.
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// `arca` のエラー。sans-IO 層で発生しうる意味論的失敗を型で表す。
+/// `arca`'s error. Represents, in the type system, the semantic failures that can occur in the sans-IO layer.
 ///
-/// I/O 由来の失敗は基層では表現しない（sans-IO のためバイトは呼び出し側が運ぶ）。
-/// std 側のアダプタが `std::io::Error` との相互変換を担う。
+/// I/O-originated failures are not expressed in the base layer (since it is sans-IO, the bytes are carried by the caller).
+/// The std-side adapters are responsible for interconversion with `std::io::Error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// 入力バイト列がフォーマット仕様に反する（壊れたヘッダ、不正なマジック等）。
+    /// The input byte sequence violates the format specification (corrupt header, invalid magic, etc.).
     Malformed(&'static str),
-    /// 仕様上は妥当だが、この実装がまだ扱わない機能。
+    /// Valid per the specification, but a feature this implementation does not yet handle.
     Unsupported(&'static str),
-    /// ヘッダ宣言サイズ等が設定した安全上限を超えた（解凍爆弾・巨大長対策）。
+    /// A header-declared size or similar exceeded the configured safety limit (guards against decompression bombs and huge lengths).
     LimitExceeded(&'static str),
-    /// 呼び出し側の出力バッファが 1 要素も進められないほど小さい。
+    /// The caller's output buffer is too small to advance even a single element.
     OutputTooSmall,
-    /// エントリのデータを読み切る前に次の操作へ進もうとした等、プロトコル違反。
+    /// A protocol violation, such as attempting to proceed to the next operation before fully reading an entry's data.
     InvalidState(&'static str),
 }
 

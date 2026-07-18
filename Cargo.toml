@@ -13,8 +13,8 @@ keywords = ["archive", "tar", "cpio", "streaming"]
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-# 美の受入基準を lint でも守る: unwrap/panic 系は最後の手段。
-missing_errors_doc = "allow"     # Result<T, Error> が全面なので冗長
+# Enforce the acceptance criteria for elegance via lints too: unwrap/panic family is a last resort.
+missing_errors_doc = "allow"     # Redundant since Result<T, Error> is pervasive
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

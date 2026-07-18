@@ -1,25 +1,26 @@
-//! `arca-core` — 凍結されたトレイト代数と sans-IO コア。
+//! `arca-core` — a frozen trait algebra and sans-IO core.
 //!
-//! このクレートの成果物は「動く展開ツール」ではなく **トレイト代数そのもの** である。
-//! 設計の最上位基準は、抽象の対称性・直交性・純度であり、実装の網羅はその下位に置く。
+//! What this crate delivers is not a "working extraction tool" but **the trait algebra itself**.
+//! The top-level design criterion is the symmetry, orthogonality, and purity of the abstractions;
+//! implementation coverage is subordinate to that.
 //!
-//! # 美の不変条件（このクレートの受入基準）
+//! # Invariants of beauty (this crate's acceptance criteria)
 //!
-//! - **単一の sans-IO 基層**: すべての変換は [`Transform`] の上に乗る。I/O を持たず、
-//!   呼び出し側がバイトを駆動する（caller-owned buffers、割当を強制しない）。
-//! - **直交（format ⊥ filter）**: 圧縮を足しても [`format`] 層のコードは 1 行も変わらない。
-//!   その逆も同様。format は filter を、filter は format を一切知らない。
-//! - **双対（read ⇄ write, decode ⇄ encode）**: [`EntryReader`]/[`EntryWriter`] と
-//!   [`Decoder`](filter::Decoder)/[`Encoder`](filter::Encoder) は型レベルで対称。
-//!   片方の設計がもう片方を強制する。
-//! - **純度**: トレイト定義はすべて `no_std`。`std`/`alloc` を引くのは特定 impl のみ。
-//! - **出自不可視**: 自作実装か再利用クレートのアダプタかが、呼び出し側の型に漏れない。
+//! - **A single sans-IO substrate**: every transformation rides on [`Transform`]. It holds no I/O,
+//!   and the caller drives the bytes (caller-owned buffers, never forcing an allocation).
+//! - **Orthogonal (format ⊥ filter)**: adding compression does not change a single line of the
+//!   [`format`] layer's code. The converse holds too. format knows nothing of filter, filter nothing of format.
+//! - **Dual (read ⇄ write, decode ⇄ encode)**: [`EntryReader`]/[`EntryWriter`] and
+//!   [`Decoder`](filter::Decoder)/[`Encoder`](filter::Encoder) are symmetric at the type level.
+//!   The design of one side forces the other.
+//! - **Purity**: all trait definitions are `no_std`. Only specific impls pull in `std`/`alloc`.
+//! - **Origin-opaque**: whether an impl is hand-written or an adapter over a reused crate never leaks into the caller's types.
 //!
-//! # 実装状況
+//! # Implementation status
 //!
-//! 抽象（トレイト・型）は **完成形で凍結** されている。write も新フォーマットも
-//! トレイト変更なしに載る（[`format::tar`]/[`format::cpio`] のスタブが同一トレイトで
-//! 実装可能であることを型として証明する）。実装幅は凍結された抽象の下で後から伸ばす。
+//! The abstractions (traits and types) are **frozen in their finished form**. Both write and new formats
+//! land without any trait change (the [`format::tar`]/[`format::cpio`] stubs prove at the type level
+//! that they are implementable under the same traits). Implementation breadth grows later, beneath the frozen abstractions.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -38,4 +39,4 @@ pub use format::{
     ArchiveFormat, Detection, Entry, EntryData, EntryDataSink, EntryReader, EntrySink, EntryWriter,
 };
 pub use meta::{EntryKind, EntryMeta, PaxMap, Timestamp};
-pub use transform::{Status, Step, Transform};
+pub use transform::{decode_to_vec, Status, Step, Transform};

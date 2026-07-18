@@ -1,9 +1,9 @@
-//! `arca` CLI — bsdtar 風のデモ兼統合テスト面。
+//! `arca` CLI — a bsdtar-style demo and integration-test surface.
 //!
-//! P0 ではスケルトンのみ。`t`（一覧）/`x`（展開）は P5 で実装する。
+//! In P0 this is a skeleton only. `t` (list) / `x` (extract) will be implemented in P5.
 
 fn main() {
-    // P5: サブコマンド t/x、自動検出、パス無害化・割当上限を配線する。
-    eprintln!("arca: P0 スケルトン。t/x サブコマンドは P5 で実装予定。");
+    // P5: wire up the t/x subcommands, auto-detection, path sanitization, and allocation caps.
+    eprintln!("arca: P0 skeleton. The t/x subcommands are planned for P5.");
     std::process::exit(2);
 }

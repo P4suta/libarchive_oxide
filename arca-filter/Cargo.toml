@@ -1,7 +1,7 @@
 [package]
 name = "arca-filter"
 version = "0.0.0"
-description = "圧縮フィルタ実装: 自作 inflate（no_std）と再利用クレートの完全適合アダプタ（std）。出自不可視。"
+description = "Compression filter implementations: an in-house inflate (no_std) and fully conforming adapters over reused crates (std). Origin-opaque."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,17 +12,18 @@ keywords.workspace = true
 
 [features]
 default = ["gzip"]
-# gzip = 自作 inflate（no_std を保つ）。
-gzip = []
-# 重量級コーデックは再利用クレートを包むため std を引く。表に出す唯一の継ぎ目。
+# gzip = adapt miniz_oxide (with-alloc) into a Filter. Stays no_std.
+gzip = ["dep:miniz_oxide"]
+# Heavyweight codecs pull in std because they wrap reused crates. A seam exposed on the surface.
 std = []
-zstd = ["std"]  # ruzstd アダプタ（P3）
-xz = ["std"]    # lzma-rs アダプタ（P3, subset）
-lz4 = ["std"]   # lz4_flex アダプタ（P3）
-bzip2 = ["std"] # bzip2-rs アダプタ（後）
+zstd = ["std"]  # ruzstd adapter (P3)
+xz = ["std"]    # lzma_rust2 adapter (P3)
+lz4 = ["std"]   # lz4_flex adapter (P3)
+bzip2 = ["std"] # bzip2 adapter (later)
 
 [dependencies]
 arca-core = { path = "../arca-core" }
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"], optional = true }
 
 [lints]
 workspace = true

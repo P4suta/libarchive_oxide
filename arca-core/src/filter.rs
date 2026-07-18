@@ -1,42 +1,42 @@
-//! Filter 軸: 圧縮コーデックを表す [`Transform`] の細分。
+//! Filter axis: a subdivision of [`Transform`] that represents compression codecs.
 //!
-//! filter 軸は format 軸と **直交** する。format 層は `Box<dyn Decoder>` の連鎖から
-//! バイトを読むだけで、圧縮の有無・種類を一切知らない。
+//! The filter axis is **orthogonal** to the format axis. The format layer merely reads
+//! bytes from a chain of `Box<dyn Decoder>`, knowing nothing about whether or how they are compressed.
 //!
-//! # 双対性（decode ⇄ encode）
+//! # Duality (decode ⇄ encode)
 //!
-//! [`Decoder`] と [`Encoder`] は型レベルの双対である。任意のコーデックについて、
-//! `Encoder` を通してから `Decoder` を通すと恒等（`Decoder ∘ Encoder = id`）になる。
-//! この不変条件は、エンコーダ実装後に property テストで機械的に守る。
+//! [`Decoder`] and [`Encoder`] are type-level duals. For any codec, passing bytes
+//! through the `Encoder` and then through the `Decoder` yields the identity (`Decoder ∘ Encoder = id`).
+//! This invariant is enforced mechanically by property tests once the encoders are implemented.
 //!
-//! # 出自不可視
+//! # Origin-opaque
 //!
-//! 自作 `Inflate`（sans-IO, `no_std`）も、`ruzstd`/`lzma-rs`/`lz4_flex` を包んだアダプタも、
-//! すべて同一の [`Filter`] として同形に乗る。継ぎ目はアダプタ内部に封じられ、
-//! 表に出る唯一の妥協は「zstd/xz アダプタが `std` feature である」点のみ。
+//! Our own `Inflate` (sans-IO, `no_std`), as well as the adapters wrapping `ruzstd`/`lzma-rs`/`lz4_flex`,
+//! all ride on the same [`Filter`] isomorphically. The seams are sealed inside each adapter,
+//! and the only compromise that surfaces is that "the zstd/xz adapters are `std` feature-gated".
 
 use crate::transform::Transform;
 
-/// 圧縮フィルタの識別子。検出・診断・自動レイヤリングに使う。
+/// Identifier for a compression filter. Used for detection, diagnostics, and automatic layering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FilterId {
-    /// DEFLATE + gzip フレーミング（自作 inflate、`no_std`）。
+    /// DEFLATE + gzip framing (our own inflate, `no_std`).
     Gzip,
-    /// Zstandard（`ruzstd` アダプタ、std）。
+    /// Zstandard (`ruzstd` adapter, std).
     Zstd,
-    /// XZ / LZMA2（`lzma-rs` アダプタ、std、subset）。
+    /// XZ / LZMA2 (`lzma-rs` adapter, std, subset).
     Xz,
-    /// LZ4 フレーム（`lz4_flex` アダプタ、std）。
+    /// LZ4 frame (`lz4_flex` adapter, std).
     Lz4,
-    /// bzip2（`bzip2-rs` アダプタ、std）。
+    /// bzip2 (`bzip2-rs` adapter, std).
     Bzip2,
 }
 
 impl FilterId {
-    /// バイト列先頭のマジックからフィルタを推定する（自動検出用）。
+    /// Infers the filter from the magic bytes at the start of a byte stream (for auto-detection).
     ///
-    /// 判定に十分なプレフィックスが無い場合や該当なしの場合は `None`。
+    /// Returns `None` when there is not enough prefix to decide, or when nothing matches.
     #[must_use]
     pub fn sniff(prefix: &[u8]) -> Option<Self> {
         match prefix {
@@ -50,14 +50,14 @@ impl FilterId {
     }
 }
 
-/// 圧縮フィルタであることを表すマーカ。[`Decoder`]/[`Encoder`] の共通上位。
+/// Marker indicating that a type is a compression filter. The common supertrait of [`Decoder`]/[`Encoder`].
 pub trait Filter: Transform {
-    /// このフィルタが属するコーデック。
+    /// The codec this filter belongs to.
     const ID: FilterId;
 }
 
-/// 展開器: 圧縮バイト列 → 平文バイト列。[`Encoder`] の双対。
+/// Decompressor: compressed byte stream → plaintext byte stream. The dual of [`Encoder`].
 pub trait Decoder: Filter {}
 
-/// 圧縮器: 平文バイト列 → 圧縮バイト列。[`Decoder`] の双対。
+/// Compressor: plaintext byte stream → compressed byte stream. The dual of [`Decoder`].
 pub trait Encoder: Filter {}

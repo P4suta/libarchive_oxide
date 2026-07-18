@@ -1,19 +1,19 @@
-//! cpio フォーマット（SVR4 "newc" / POSIX "odc" / 旧バイナリ）。
+//! cpio format (SVR4 "newc" / POSIX "odc" / old binary).
 //!
-//! **直交性の証明**: 新しいフォーマットの追加は「同じ [`EntryReader`] を実装する型を足す」
-//! だけで済み、既存トレイトも tar 実装も 1 行も変わらない。P0 ではその型付けを凍結する。
+//! **Proof of orthogonality**: adding a new format only requires "adding a type that implements
+//! the same [`EntryReader`]"; neither the existing traits nor the tar implementation change by a single line. In P0 we freeze that typing.
 
 use crate::format::{ArchiveFormat, Detection, Entry, EntryReader};
 use crate::Result;
 
-/// cpio フォーマットの検出アンカー（零サイズ型）。
+/// Detection anchor for the cpio format (zero-sized type).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Cpio;
 
 const NEWC_MAGIC: &[u8] = b"070701";
 const NEWC_CRC_MAGIC: &[u8] = b"070702";
 const ODC_MAGIC: &[u8] = b"070707";
-/// 旧バイナリ形式のマジック（ホストバイトオーダ両対応）。
+/// Magic for the old binary format (supports both host byte orders).
 const BIN_MAGIC_LE: [u8; 2] = [0xc7, 0x71];
 const BIN_MAGIC_BE: [u8; 2] = [0x71, 0xc7];
 
@@ -40,15 +40,15 @@ impl ArchiveFormat for Cpio {
     }
 }
 
-/// cpio のストリーミング reader。
+/// Streaming reader for cpio.
 #[derive(Debug)]
 pub struct CpioReader<S> {
-    #[allow(dead_code)] // P4 で使用。
+    #[allow(dead_code)] // Used in P4.
     source: S,
 }
 
 impl<S> CpioReader<S> {
-    /// バイト源から reader を作る。
+    /// Creates a reader from a byte source.
     pub fn new(source: S) -> Self {
         Self { source }
     }
@@ -56,7 +56,7 @@ impl<S> CpioReader<S> {
 
 impl<S> EntryReader for CpioReader<S> {
     fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
-        // P4: newc(16進) / odc(8進) / 旧バイナリ のヘッダ分岐、TRAILER!!! 終端検出。
+        // P4: header dispatch for newc (hex) / odc (octal) / old binary, and TRAILER!!! end-of-stream detection.
         todo!("P4: cpio header parsing")
     }
 }
