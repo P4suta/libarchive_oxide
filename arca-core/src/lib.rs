@@ -30,6 +30,7 @@ extern crate alloc;
 pub mod error;
 pub mod filter;
 pub mod format;
+pub mod io;
 pub mod meta;
 pub mod transform;
 
@@ -38,5 +39,6 @@ pub use filter::{Decoder, Encoder, Filter};
 pub use format::{
     ArchiveFormat, Detection, Entry, EntryData, EntryDataSink, EntryReader, EntrySink, EntryWriter,
 };
+pub use io::Sink;
 pub use meta::{EntryKind, EntryMeta, PaxMap, Timestamp};
 pub use transform::{decode_to_vec, decode_to_vec_capped, Status, Step, Transform};

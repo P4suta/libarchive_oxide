@@ -30,30 +30,48 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut args = args.into_iter();
     let cmd = args
         .next()
-        .ok_or("missing subcommand (expected `t` or `x`)")?;
+        .ok_or("missing subcommand (expected `t`, `x`, or `c`)")?;
 
-    let mut file: Option<String> = None;
-    let mut dest = PathBuf::from(".");
+    let mut positional: Vec<String> = Vec::new();
+    let mut dest_dir = PathBuf::from(".");
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-C" => {
-                dest = PathBuf::from(args.next().ok_or("-C requires a directory")?);
-            }
-            _ => file = Some(arg),
+            "-C" => dest_dir = PathBuf::from(args.next().ok_or("-C requires a directory")?),
+            _ => positional.push(arg),
         }
     }
-    let file = file.ok_or("missing archive path")?;
-
-    let bytes = std::fs::read(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
-    let cap = usize::try_from(MAX_DECOMPRESSED).unwrap_or(usize::MAX);
-    let plain = arca::decompress_capped(&bytes, cap).map_err(|e| e.to_string())?;
-    let mut reader = arca::reader(&plain).map_err(|e| e.to_string())?;
 
     match cmd.as_str() {
-        "t" => list(reader.as_mut()),
-        "x" => extract(reader.as_mut(), &dest),
+        "t" | "x" => {
+            let file = positional.first().ok_or("missing archive path")?;
+            let bytes = std::fs::read(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+            let cap = usize::try_from(MAX_DECOMPRESSED).unwrap_or(usize::MAX);
+            let plain = arca::decompress_capped(&bytes, cap).map_err(|e| e.to_string())?;
+            let mut reader = arca::reader(&plain).map_err(|e| e.to_string())?;
+            if cmd == "t" {
+                list(reader.as_mut())
+            } else {
+                extract(reader.as_mut(), &dest_dir)
+            }
+        }
+        "c" => {
+            let (archive, inputs) = positional
+                .split_first()
+                .ok_or("usage: arca c <archive> <path>...")?;
+            if inputs.is_empty() {
+                return Err("usage: arca c <archive> <path>...".into());
+            }
+            let bytes = arca::build_tar(inputs).map_err(|e| e.to_string())?;
+            std::fs::write(archive, &bytes).map_err(|e| format!("cannot write {archive}: {e}"))?;
+            eprintln!(
+                "created {archive} ({} bytes) from {} path(s)",
+                bytes.len(),
+                inputs.len()
+            );
+            Ok(())
+        }
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `t` or `x`)"
+            "unknown subcommand `{other}` (expected `t`, `x`, or `c`)"
         )),
     }
 }

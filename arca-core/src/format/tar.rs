@@ -20,8 +20,9 @@ use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
 use crate::format::{
-    ArchiveFormat, Detection, Entry, EntryReader, EntrySink, EntryWriter, SliceData,
+    ArchiveFormat, Detection, Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, SliceData,
 };
+use crate::io::Sink;
 use crate::meta::{EntryKind, EntryMeta, Timestamp};
 
 /// tar block size. Every header and every payload is aligned to a multiple of this.
@@ -245,27 +246,79 @@ impl EntryReader for TarReader<'_> {
     }
 }
 
-/// tar streaming writer. Carried in the type system as the dual of read (implementation is the writer phase).
+/// tar streaming writer — the dual of [`TarReader`]. Emits ustar headers (with GNU longname/
+/// longlink for names over 100 bytes) into a [`Sink`], padding each entry and the trailer.
+///
+/// The declared `size` comes from `EntryMeta`, so the header is written up front at `start_entry`;
+/// the payload is then streamed via the lent [`EntrySink`], and `close` pads to the block boundary.
 #[derive(Debug)]
-pub struct TarWriter<W> {
-    #[allow(dead_code)] // Used in the writer phase.
+pub struct TarWriter<W: Sink> {
     sink: W,
+    /// Bytes still expected for the currently open entry.
+    remaining: u64,
+    /// Zero padding owed after the current entry's payload.
+    pad: usize,
+    /// Whether an entry is open (its `EntrySink` not yet closed).
+    open: bool,
 }
 
-impl<W> TarWriter<W> {
-    /// Builds a writer from a byte sink.
+impl<W: Sink> TarWriter<W> {
+    /// Builds a writer over a byte sink.
     pub fn new(sink: W) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            remaining: 0,
+            pad: 0,
+            open: false,
+        }
+    }
+
+    /// Consumes the writer and returns the underlying sink.
+    pub fn into_inner(self) -> W {
+        self.sink
     }
 }
 
-impl<W> EntryWriter for TarWriter<W> {
-    fn start_entry(&mut self, _meta: &EntryMeta<'_>) -> Result<EntrySink<'_>> {
-        todo!("writer phase: tar header emission")
+impl<W: Sink> EntryWriter for TarWriter<W> {
+    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_>> {
+        if self.open {
+            return Err(Error::InvalidState("tar: previous entry not closed"));
+        }
+        write_header(&mut self.sink, meta)?;
+        self.remaining = meta.size;
+        self.pad = round_up(meta.size)? - usize_of(meta.size)?;
+        self.open = true;
+        Ok(EntrySink::new(self))
     }
 
     fn finish(&mut self) -> Result<()> {
-        todo!("writer phase: tar trailer (two zero blocks)")
+        if self.open {
+            return Err(Error::InvalidState("tar: entry open at finish"));
+        }
+        write_zeros(&mut self.sink, 2 * BLOCK)
+    }
+}
+
+impl<W: Sink> EntryDataSink for TarWriter<W> {
+    fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() as u64 > self.remaining {
+            return Err(Error::InvalidState("tar: payload exceeds declared size"));
+        }
+        self.sink.write_all(data)?;
+        self.remaining -= data.len() as u64;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if self.remaining != 0 {
+            return Err(Error::InvalidState(
+                "tar: payload shorter than declared size",
+            ));
+        }
+        write_zeros(&mut self.sink, self.pad)?;
+        self.pad = 0;
+        self.open = false;
+        Ok(())
     }
 }
 
@@ -475,6 +528,121 @@ fn parse_pax_time(value: &[u8]) -> Result<Timestamp> {
         }
     }
     Ok(Timestamp { secs, nanos })
+}
+
+// ── Writer helpers (dual of the reader's field parsing) ────────────────────────────────────────
+
+/// Writes a full ustar header for `meta`, emitting GNU longname/longlink extension entries first
+/// when the path or link target exceeds the 100-byte fields.
+fn write_header<W: Sink>(sink: &mut W, meta: &EntryMeta<'_>) -> Result<()> {
+    let typeflag = typeflag_for(meta.kind)?;
+
+    if meta.path.len() > 100 {
+        write_gnu_ext(sink, b'L', &meta.path)?;
+    }
+    if let Some(link) = &meta.link_target {
+        if link.len() > 100 {
+            write_gnu_ext(sink, b'K', link)?;
+        }
+    }
+
+    let mut h = [0u8; BLOCK];
+    let name = &meta.path[..meta.path.len().min(100)];
+    h[..name.len()].copy_from_slice(name);
+    put_octal(&mut h[F_MODE.0..F_MODE.1], u64::from(meta.mode & 0o7777))?;
+    put_octal(&mut h[F_UID.0..F_UID.1], meta.uid)?;
+    put_octal(&mut h[F_GID.0..F_GID.1], meta.gid)?;
+    put_octal(&mut h[F_SIZE.0..F_SIZE.1], meta.size)?;
+    let mtime = meta
+        .mtime
+        .map_or(0, |t| u64::try_from(t.secs.max(0)).unwrap_or(0));
+    put_octal(&mut h[F_MTIME.0..F_MTIME.1], mtime)?;
+    h[O_TYPEFLAG] = typeflag;
+    if let Some(link) = &meta.link_target {
+        let l = &link[..link.len().min(100)];
+        h[F_LINKNAME.0..F_LINKNAME.0 + l.len()].copy_from_slice(l);
+    }
+    h[F_MAGIC.0..F_MAGIC.0 + 5].copy_from_slice(b"ustar");
+    h[263] = b'0';
+    h[264] = b'0';
+    write_checksum(&mut h)?;
+    sink.write_all(&h)
+}
+
+/// Writes a GNU extension entry (`'L'` longname / `'K'` longlink) carrying `data` as its payload.
+fn write_gnu_ext<W: Sink>(sink: &mut W, flag: u8, data: &[u8]) -> Result<()> {
+    let mut h = [0u8; BLOCK];
+    let magic_name = b"././@LongLink";
+    h[..magic_name.len()].copy_from_slice(magic_name);
+    put_octal(&mut h[F_MODE.0..F_MODE.1], 0)?;
+    put_octal(&mut h[F_UID.0..F_UID.1], 0)?;
+    put_octal(&mut h[F_GID.0..F_GID.1], 0)?;
+    let size = data.len() as u64 + 1; // include the trailing NUL
+    put_octal(&mut h[F_SIZE.0..F_SIZE.1], size)?;
+    put_octal(&mut h[F_MTIME.0..F_MTIME.1], 0)?;
+    h[O_TYPEFLAG] = flag;
+    h[F_MAGIC.0..F_MAGIC.0 + 5].copy_from_slice(b"ustar");
+    h[263] = b'0';
+    h[264] = b'0';
+    write_checksum(&mut h)?;
+    sink.write_all(&h)?;
+
+    sink.write_all(data)?;
+    sink.write_all(&[0u8])?; // NUL terminator
+    let total = data.len() + 1;
+    write_zeros(sink, round_up(size)? - total)
+}
+
+/// Computes and writes the ustar header checksum (6 octal digits + NUL + space).
+fn write_checksum(h: &mut [u8; BLOCK]) -> Result<()> {
+    for b in &mut h[F_CHKSUM.0..F_CHKSUM.1] {
+        *b = b' ';
+    }
+    let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+    put_octal(&mut h[F_CHKSUM.0..F_CHKSUM.1 - 1], sum)?;
+    h[F_CHKSUM.1 - 1] = b' ';
+    Ok(())
+}
+
+/// Writes `val` as zero-padded octal into `field`, followed by a NUL. Errors if it does not fit.
+fn put_octal(field: &mut [u8], val: u64) -> Result<()> {
+    let n = field.len();
+    field[n - 1] = 0;
+    let mut v = val;
+    for slot in field[..n - 1].iter_mut().rev() {
+        *slot = b'0' + u8::try_from(v & 7).unwrap_or(0);
+        v >>= 3;
+    }
+    if v != 0 {
+        return Err(Error::Unsupported("tar: value too large for octal field"));
+    }
+    Ok(())
+}
+
+/// Maps a typed [`EntryKind`] to a ustar typeflag byte.
+fn typeflag_for(kind: EntryKind) -> Result<u8> {
+    Ok(match kind {
+        EntryKind::File => b'0',
+        EntryKind::Dir => b'5',
+        EntryKind::Symlink => b'2',
+        EntryKind::Hardlink => b'1',
+        EntryKind::Char => b'3',
+        EntryKind::Block => b'4',
+        EntryKind::Fifo => b'6',
+        _ => return Err(Error::Unsupported("tar: unsupported entry kind for write")),
+    })
+}
+
+/// Writes `count` zero bytes to the sink, a block at a time.
+fn write_zeros<W: Sink>(sink: &mut W, count: usize) -> Result<()> {
+    const ZEROS: [u8; BLOCK] = [0; BLOCK];
+    let mut left = count;
+    while left > 0 {
+        let n = left.min(BLOCK);
+        sink.write_all(&ZEROS[..n])?;
+        left -= n;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

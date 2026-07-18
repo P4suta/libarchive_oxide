@@ -17,11 +17,13 @@ use std::borrow::Cow;
 use arca_core::filter::FilterId;
 use arca_core::{decode_to_vec_capped, Error, Result};
 
+pub mod create;
 pub mod extract;
 pub mod path;
 
 pub use arca_core;
 pub use arca_filter;
+pub use create::build_tar;
 pub use extract::{reader, Stats};
 pub use path::sanitize;
 
