@@ -49,7 +49,7 @@ lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"],
 # LZMA2 codec shared by the `xz` filter and the 7z path (features `xz`/`sevenz`). Pure Rust.
 lzma-rust2 = { version = "0.16.5", optional = true }
 # AES layer (feature `aes`). SHA-1 is a WinZip AE-2 interoperability requirement, not a strength choice.
-aes = { version = "0.8", optional = true }
+aes = { version = "0.9", optional = true }
 ctr = { version = "0.9", optional = true }
 hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", optional = true }
