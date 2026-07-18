@@ -321,8 +321,10 @@ fn parse_numeric(field: &[u8]) -> Result<u64> {
         Some(&first) if first & 0x80 != 0 => {
             let mut val: u64 = u64::from(first & 0x7f);
             for &b in &field[1..] {
+                // `checked_mul(256)` (not `checked_shl(8)`) is what actually detects value
+                // overflow: shl only errors when the shift count reaches the bit width.
                 val = val
-                    .checked_shl(8)
+                    .checked_mul(256)
                     .and_then(|v| v.checked_add(u64::from(b)))
                     .ok_or(Error::Malformed("base-256 numeric overflow"))?;
             }
@@ -402,7 +404,9 @@ fn parse_pax<'a>(mut records: &'a [u8], into: &mut Overrides<'a>) -> Result<()> 
             .position(|&b| b == b' ')
             .ok_or(Error::Malformed("pax: missing length separator"))?;
         let len = ascii_decimal(&records[..sp])?;
-        if len < sp + 1 || len > records.len() {
+        // Need room for "LEN" + space + at least an empty body + newline, i.e. len >= sp + 2,
+        // otherwise `record[sp + 1..len - 1]` below would have start > end and panic.
+        if len < sp + 2 || len > records.len() {
             return Err(Error::Malformed("pax: bad record length"));
         }
         let record = &records[..len];
@@ -499,5 +503,23 @@ mod tests {
         let t = parse_pax_time(b"1700000000.5").unwrap();
         assert_eq!(t.secs, 1_700_000_000);
         assert_eq!(t.nanos, 500_000_000);
+    }
+
+    #[test]
+    fn base256_overflow_is_rejected() {
+        // 0x80 marker, then 0x01 followed by zeros = 1 << (8*n), which overflows u64.
+        let field = [0x80, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(parse_numeric(&field).is_err());
+    }
+
+    #[test]
+    fn pax_malformed_record_does_not_panic() {
+        let mut o = Overrides::default();
+        // len == sp + 1: the off-by-one that used to panic in `record[sp + 1..len - 1]`.
+        assert!(parse_pax(b"2 ", &mut o).is_err());
+        assert!(parse_pax(b"1 ", &mut o).is_err());
+        // A well-formed record still parses.
+        assert!(parse_pax(b"11 path=ab\n", &mut o).is_ok());
+        assert_eq!(o.path.as_deref(), Some(&b"ab"[..]));
     }
 }

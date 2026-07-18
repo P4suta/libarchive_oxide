@@ -138,6 +138,23 @@ fn ar_plain_members() {
 }
 
 #[test]
+fn ar_skips_symbol_tables() {
+    // GNU 32-bit ("/") and 64-bit ("/SYM64/") symbol tables must not surface as file entries.
+    let mut a = b"!<arch>\n".to_vec();
+    a.extend(ar_member("/", b"\x00\x00\x00\x00"));
+    a.extend(ar_member("/SYM64/", b"\x00\x00\x00\x00"));
+    a.extend(ar_member("real.o/", b"OBJ"));
+
+    let mut r = ArReader::new(&a);
+    let mut names = Vec::new();
+    while let Some(mut e) = r.next_entry().unwrap() {
+        names.push(String::from_utf8(e.meta().path.to_vec()).unwrap());
+        let _ = drain(&mut e);
+    }
+    assert_eq!(names, ["real.o"]);
+}
+
+#[test]
 fn ar_gnu_long_name() {
     let long = "a_very_long_member_name_exceeding_sixteen_bytes.bin";
     let table = format!("{long}/\n"); // GNU string table entry

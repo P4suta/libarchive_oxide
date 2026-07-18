@@ -3,7 +3,8 @@
 //! Handles the three name conventions: plain `SysV` names (trailing `/` terminator), the GNU
 //! extended-name string table (`//` member plus `/N` offset references), and BSD long names
 //! (`#1/LEN` with the real name stored at the start of the member data). The special GNU symbol
-//! table (`/`) is skipped. Every member is a regular file (`ar` carries no type info).
+//! tables (`/` and 64-bit `/SYM64/`) are skipped. Every member is a regular file (`ar` carries no
+//! type info).
 
 use alloc::borrow::Cow;
 
@@ -148,8 +149,8 @@ impl EntryReader for ArReader<'_> {
                 self.strtab = Some(member);
                 continue;
             }
-            // The GNU symbol table: skip.
-            if trimmed == b"/" {
+            // The GNU 32-bit ("/") and 64-bit ("/SYM64/") symbol tables: skip.
+            if trimmed == b"/" || trimmed == b"/SYM64/" {
                 continue;
             }
 

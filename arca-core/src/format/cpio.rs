@@ -115,10 +115,8 @@ impl<'a> CpioReader<'a> {
                 let filesize = usize_of(f(6)?)?;
                 let name_len = usize_of(f(11)?)?;
                 let name_start = pos + NEWC_HEADER;
-                let data_start = round4(name_start + name_len);
-                let next_pos = data_start
-                    .checked_add(round4(filesize))
-                    .ok_or(Error::Malformed("cpio: size overflow"))?;
+                let data_start = round4(add(name_start, name_len)?)?;
+                let next_pos = add(data_start, round4(filesize)?)?;
                 Ok(Header {
                     mode,
                     uid,
@@ -139,10 +137,8 @@ impl<'a> CpioReader<'a> {
                 let name_len = usize_of(odc_field(data, pos, 59, 6)?)?;
                 let filesize = usize_of(odc_field(data, pos, 65, 11)?)?;
                 let name_start = pos + ODC_HEADER;
-                let data_start = name_start + name_len;
-                let next_pos = data_start
-                    .checked_add(filesize)
-                    .ok_or(Error::Malformed("cpio: size overflow"))?;
+                let data_start = add(name_start, name_len)?;
+                let next_pos = add(data_start, filesize)?;
                 Ok(Header {
                     mode,
                     uid,
@@ -168,7 +164,8 @@ impl EntryReader for CpioReader<'_> {
 
         let header = Self::parse_header(data, self.pos)?;
         let name = data
-            .get(header.name_start..header.name_start + header.name_len)
+            .get(header.name_start..)
+            .and_then(|s| s.get(..header.name_len))
             .ok_or(Error::Malformed("cpio: truncated name"))?;
 
         if name == TRAILER {
@@ -178,7 +175,8 @@ impl EntryReader for CpioReader<'_> {
 
         let kind = kind_from_mode(header.mode);
         let body = data
-            .get(header.data_start..header.data_start + header.filesize)
+            .get(header.data_start..)
+            .and_then(|s| s.get(..header.filesize))
             .ok_or(Error::Malformed("cpio: truncated data"))?;
         let link_target = matches!(kind, EntryKind::Symlink).then(|| Cow::Borrowed(body));
 
@@ -263,9 +261,15 @@ fn kind_from_mode(mode: u64) -> EntryKind {
     }
 }
 
-/// Rounds up to the next 4-byte boundary (newc alignment).
-fn round4(n: usize) -> usize {
-    (n + 3) & !3
+/// Rounds up to the next 4-byte boundary (newc alignment). Errors on overflow (32-bit targets).
+fn round4(n: usize) -> Result<usize> {
+    Ok(add(n, 3)? & !3)
+}
+
+/// Checked `usize` addition, mapped to a malformed-archive error on overflow.
+fn add(a: usize, b: usize) -> Result<usize> {
+    a.checked_add(b)
+        .ok_or(Error::Malformed("cpio: size overflow"))
 }
 
 /// `u64` to `usize`, rejecting oversized values on 32-bit targets.
@@ -285,8 +289,9 @@ mod tests {
 
     #[test]
     fn round4_alignment() {
-        assert_eq!(round4(0), 0);
-        assert_eq!(round4(1), 4);
-        assert_eq!(round4(110), 112);
+        assert_eq!(round4(0).unwrap(), 0);
+        assert_eq!(round4(1).unwrap(), 4);
+        assert_eq!(round4(110).unwrap(), 112);
+        assert!(round4(usize::MAX).is_err());
     }
 }

@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Cap on decompressed size for untrusted input (defends against decompression bombs).
-const MAX_DECOMPRESSED: usize = 4 * 1024 * 1024 * 1024;
+///
+/// Declared as `u64` so the 4 GiB literal does not overflow `usize` on 32-bit targets; it is
+/// clamped to `usize::MAX` at the call site.
+const MAX_DECOMPRESSED: u64 = 4 * 1024 * 1024 * 1024;
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -42,7 +45,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let file = file.ok_or("missing archive path")?;
 
     let bytes = std::fs::read(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
-    let plain = arca::decompress_capped(&bytes, MAX_DECOMPRESSED).map_err(|e| e.to_string())?;
+    let cap = usize::try_from(MAX_DECOMPRESSED).unwrap_or(usize::MAX);
+    let plain = arca::decompress_capped(&bytes, cap).map_err(|e| e.to_string())?;
     let mut reader = arca::reader(&plain).map_err(|e| e.to_string())?;
 
     match cmd.as_str() {
