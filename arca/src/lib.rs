@@ -20,13 +20,16 @@ use arca_core::{decode_to_vec, decode_to_vec_capped, Error, Result};
 pub mod create;
 pub mod extract;
 pub mod path;
+#[cfg(feature = "sevenz")]
+pub mod sevenz;
 pub mod zip;
 
 pub use arca_core;
 pub use arca_filter;
-pub use create::build_tar;
-pub use extract::{reader, Stats};
+pub use create::{build_archive, build_archive_with, build_tar, CreateOptions};
+pub use extract::{reader, reader_with_password, Stats};
 pub use path::sanitize;
+pub use zip::{SaltSource, ZipMethod, ZipOptions};
 
 /// Auto-detects compression from the leading magic bytes and returns the decompressed archive byte stream.
 ///
@@ -47,7 +50,7 @@ pub fn decompress_capped(bytes: &[u8], max_output: usize) -> Result<Cow<'_, [u8]
         Some(id) => {
             let mut decoder =
                 arca_filter::decoder(id).ok_or(Error::Unsupported("filter not built in"))?;
-            let plain = decode_to_vec_capped(decoder.as_mut(), bytes, max_output)?;
+            let plain = decode_to_vec_capped(&mut decoder, bytes, max_output)?;
             Ok(Cow::Owned(plain))
         }
         None => Ok(Cow::Borrowed(bytes)),
@@ -57,7 +60,7 @@ pub fn decompress_capped(bytes: &[u8], max_output: usize) -> Result<Cow<'_, [u8]
 /// Compresses `plain` with the given codec. The dual of [`decompress`].
 pub fn compress(plain: &[u8], id: FilterId) -> Result<Vec<u8>> {
     let mut encoder = arca_filter::encoder(id).ok_or(Error::Unsupported("filter not built in"))?;
-    decode_to_vec(encoder.as_mut(), plain)
+    decode_to_vec(&mut encoder, plain)
 }
 
 /// Guesses the compression codec from an archive filename's extension (`None` = plain).

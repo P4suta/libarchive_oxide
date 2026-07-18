@@ -2,6 +2,7 @@
 //!
 //! Each codec's own pure-Rust encoder (dev-dependency) compresses a hand-built tar; arca then
 //! auto-detects the codec and decompresses it, and the entries are verified via `TarReader`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 

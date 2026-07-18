@@ -1,5 +1,6 @@
 //! Filesystem extraction tests: real files/dirs on disk, path-traversal rejection, and the
 //! decompression-bomb cap.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
@@ -39,7 +40,7 @@ fn extracts_files_and_rejects_traversal() {
 
     let dir = temp_dir("extract");
     let mut r = reader(&tar).unwrap();
-    let stats = extract(r.as_mut(), &dir).unwrap();
+    let stats = extract(&mut r, &dir).unwrap();
 
     assert_eq!(fs::read(dir.join("top.txt")).unwrap(), b"hello\n");
     assert_eq!(

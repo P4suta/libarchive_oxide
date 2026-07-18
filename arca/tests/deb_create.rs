@@ -1,5 +1,6 @@
 //! Full-stack write capstone: assemble a `.deb` with arca's own ar writer, tar writer, and gzip
 //! encoder, then read it back down through ar -> gzip -> tar. The write-direction dual of `deb.rs`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::borrow::Cow;
 
@@ -7,9 +8,9 @@ use arca::{compress, decompress};
 use arca_core::filter::FilterId;
 use arca_core::format::ar::{ArReader, ArWriter};
 use arca_core::format::tar::{TarReader, TarWriter};
-use arca_core::{Entry, EntryKind, EntryMeta, EntryReader, EntryWriter};
+use arca_core::{Entry, EntryData, EntryKind, EntryMeta, EntryReader, EntryWriter};
 
-fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
+fn drain<D: EntryData>(entry: &mut Entry<'_, D>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 32];
     loop {

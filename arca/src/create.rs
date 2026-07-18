@@ -9,6 +9,16 @@ use std::path::Path;
 use arca_core::format::tar::TarWriter;
 use arca_core::{EntryKind, EntryMeta, EntryWriter};
 
+use crate::zip::{ZipOptions, ZipWriter};
+
+/// Options for [`build_archive`], threaded from the CLI. Currently carries zip-specific options
+/// (method, password, salt); other formats ignore it.
+#[derive(Debug, Clone, Default)]
+pub struct CreateOptions {
+    /// Options applied when the destination is a `.zip`.
+    pub zip: ZipOptions,
+}
+
 /// Builds a plain (uncompressed) tar in memory from the given input paths, recursing into
 /// directories. Each input's archive name is the path as given (normalized to a safe relative
 /// `/`-separated name). Regular files, directories, and symlinks are archived; other special
@@ -23,9 +33,29 @@ pub fn build_tar<S: AsRef<str>>(inputs: &[S]) -> io::Result<Vec<u8>> {
     Ok(writer.into_inner())
 }
 
-/// Builds an archive from `inputs`, compressing according to `dest_name`'s extension
-/// (`.gz`/`.tgz`, `.zst`, `.xz`, `.lz4`); other names produce a plain tar.
+/// Builds an archive from `inputs` with default options; see [`build_archive_with`].
 pub fn build_archive<S: AsRef<str>>(inputs: &[S], dest_name: &str) -> io::Result<Vec<u8>> {
+    build_archive_with(inputs, dest_name, &CreateOptions::default())
+}
+
+/// Builds an archive from `inputs`, dispatching on `dest_name`'s extension: `.zip` routes to the
+/// zip writer (bypassing the tar+filter pipeline); `.gz`/`.tgz`/`.zst`/`.xz`/`.lz4` produce a
+/// compressed tar; any other name produces a plain tar.
+pub fn build_archive_with<S: AsRef<str>>(
+    inputs: &[S],
+    dest_name: &str,
+    options: &CreateOptions,
+) -> io::Result<Vec<u8>> {
+    if is_zip_name(dest_name) {
+        return build_zip(inputs, &options.zip);
+    }
+    if has_extension(dest_name, "iso") {
+        return build_iso(inputs);
+    }
+    #[cfg(feature = "sevenz")]
+    if has_extension(dest_name, "7z") {
+        return build_sevenz(inputs);
+    }
     let tar = build_tar(inputs)?;
     match crate::filter_for_name(dest_name) {
         Some(id) => crate::compress(&tar, id).map_err(to_io),
@@ -33,8 +63,57 @@ pub fn build_archive<S: AsRef<str>>(inputs: &[S], dest_name: &str) -> io::Result
     }
 }
 
+/// Whether `name` has a `.zip` extension (case-insensitive).
+fn is_zip_name(name: &str) -> bool {
+    has_extension(name, "zip")
+}
+
+/// Whether `name`'s extension equals `ext` (case-insensitive).
+fn has_extension(name: &str, ext: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
+/// Builds a 7z archive in memory from `inputs`, using the shared filesystem walk.
+#[cfg(feature = "sevenz")]
+fn build_sevenz<S: AsRef<str>>(inputs: &[S]) -> io::Result<Vec<u8>> {
+    use crate::sevenz::SevenZWriter;
+    let mut writer = SevenZWriter::new(Vec::new());
+    for input in inputs {
+        let name = normalize_name(input.as_ref());
+        add_path(&mut writer, Path::new(input.as_ref()), &name)?;
+    }
+    writer.finish().map_err(to_io)?;
+    Ok(writer.into_inner())
+}
+
+/// Builds an ISO 9660 + Joliet image in memory from `inputs`, using the shared filesystem walk.
+fn build_iso<S: AsRef<str>>(inputs: &[S]) -> io::Result<Vec<u8>> {
+    use arca_core::format::iso9660::IsoWriter;
+    let mut writer = IsoWriter::new(Vec::new());
+    for input in inputs {
+        let name = normalize_name(input.as_ref());
+        add_path(&mut writer, Path::new(input.as_ref()), &name)?;
+    }
+    writer.finish().map_err(to_io)?;
+    Ok(writer.into_inner())
+}
+
+/// Builds a zip archive in memory from `inputs`, using the shared filesystem walk.
+fn build_zip<S: AsRef<str>>(inputs: &[S], zip: &ZipOptions) -> io::Result<Vec<u8>> {
+    let mut writer = ZipWriter::with_options(Vec::new(), zip.clone());
+    for input in inputs {
+        let name = normalize_name(input.as_ref());
+        add_path(&mut writer, Path::new(input.as_ref()), &name)?;
+    }
+    writer.finish().map_err(to_io)?;
+    Ok(writer.into_inner())
+}
+
 /// Recursively adds `fs_path` (with archive name `name`, raw bytes) to the writer.
-fn add_path(writer: &mut TarWriter<Vec<u8>>, fs_path: &Path, name: &[u8]) -> io::Result<()> {
+fn add_path<W: EntryWriter>(writer: &mut W, fs_path: &Path, name: &[u8]) -> io::Result<()> {
     let file_type = fs::symlink_metadata(fs_path)?.file_type();
 
     if file_type.is_symlink() {
@@ -70,8 +149,8 @@ fn add_path(writer: &mut TarWriter<Vec<u8>>, fs_path: &Path, name: &[u8]) -> io:
 }
 
 /// Writes a single entry (header + payload) to the writer.
-fn write_entry(
-    writer: &mut TarWriter<Vec<u8>>,
+fn write_entry<W: EntryWriter>(
+    writer: &mut W,
     kind: EntryKind,
     name: &[u8],
     mode: u32,
@@ -129,6 +208,7 @@ fn to_io(e: arca_core::Error) -> io::Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::normalize_name;
 

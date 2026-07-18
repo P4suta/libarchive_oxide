@@ -1,7 +1,8 @@
 //! Filter axis: a subdivision of [`Transform`] that represents compression codecs.
 //!
-//! The filter axis is **orthogonal** to the format axis. The format layer merely reads
-//! bytes from a chain of `Box<dyn Decoder>`, knowing nothing about whether or how they are compressed.
+//! The filter axis is **orthogonal** to the format axis. The std layer decompresses through the
+//! sealed `AnyDecoder` enum (fully monomorphized, no type erasure), and the format layer reads the
+//! resulting plaintext bytes, knowing nothing about whether or how they were compressed.
 //!
 //! # Duality (decode ⇄ encode)
 //!
@@ -29,8 +30,6 @@ pub enum FilterId {
     Xz,
     /// LZ4 frame (`lz4_flex` adapter, std).
     Lz4,
-    /// bzip2 (`bzip2-rs` adapter, std).
-    Bzip2,
 }
 
 impl FilterId {
@@ -44,7 +43,6 @@ impl FilterId {
             [0x28, 0xb5, 0x2f, 0xfd, ..] => Some(Self::Zstd),
             [0xfd, b'7', b'z', b'X', b'Z', 0x00, ..] => Some(Self::Xz),
             [0x04, 0x22, 0x4d, 0x18, ..] => Some(Self::Lz4),
-            [b'B', b'Z', b'h', ..] => Some(Self::Bzip2),
             _ => None,
         }
     }

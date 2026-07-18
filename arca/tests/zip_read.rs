@@ -1,10 +1,11 @@
 //! zip reader test: generate a zip with the `zip` crate (store + deflate + a directory), then read
 //! it back through arca's format auto-detection and `ZipReader`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{Cursor, Write};
 
 use arca::reader;
-use arca_core::EntryKind;
+use arca_core::{EntryKind, EntryReader};
 use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::CompressionMethod;
 
@@ -25,7 +26,7 @@ fn make_zip(payload: &[u8]) -> Vec<u8> {
     buf.into_inner()
 }
 
-fn drain(entry: &mut arca_core::Entry<'_>) -> Vec<u8> {
+fn drain<D: arca_core::EntryData>(entry: &mut arca_core::Entry<'_, D>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 33];
     loop {

@@ -14,7 +14,8 @@ name = "arca"
 path = "src/main.rs"
 
 [dependencies]
-arca = { path = "../arca" }
+# The CLI enables AES (zip `--encrypt`/`--password`) and 7z read+write end-to-end.
+arca = { path = "../arca", features = ["aes", "sevenz"] }
 arca-core = { version = "0.0.0", path = "../arca-core" }
 
 [lints]

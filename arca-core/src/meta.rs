@@ -89,6 +89,24 @@ impl<'a> PaxMap<'a> {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// A deep, lifetime-independent (`'static`) copy: every borrowed key/value is cloned into an
+    /// owned one. Used when a value must outlive the input buffer it was parsed from.
+    #[must_use]
+    pub fn to_static(&self) -> PaxMap<'static> {
+        PaxMap {
+            entries: self
+                .entries
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        Cow::Owned(k.clone().into_owned()),
+                        Cow::Owned(v.clone().into_owned()),
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Entry metadata. The core of the duality produced by the reader and consumed by the writer.
@@ -131,6 +149,29 @@ impl<'a> EntryMeta<'a> {
             size: 0,
             link_target: None,
             pax: PaxMap::new(),
+        }
+    }
+
+    /// A deep, lifetime-independent (`'static`) copy of this metadata: every borrowed byte string
+    /// is cloned into an owned one, so the result no longer borrows the input buffer.
+    ///
+    /// [`AnyReader`](crate::format::AnyReader) uses this to lift an inner entry's metadata out from
+    /// under the transient `&mut self` borrow of the wrapped reader when re-homing.
+    #[must_use]
+    pub fn to_static(&self) -> EntryMeta<'static> {
+        EntryMeta {
+            kind: self.kind,
+            path: Cow::Owned(self.path.clone().into_owned()),
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            mtime: self.mtime,
+            size: self.size,
+            link_target: self
+                .link_target
+                .as_ref()
+                .map(|t| Cow::Owned(t.clone().into_owned())),
+            pax: self.pax.to_static(),
         }
     }
 }

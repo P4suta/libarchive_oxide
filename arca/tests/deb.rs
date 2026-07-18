@@ -2,6 +2,7 @@
 //!
 //! This exercises all three layers composing at once: ar (outer format) -> gzip (filter) ->
 //! tar (inner format), which is exactly how a Debian package is structured.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 

@@ -19,7 +19,6 @@ std = []
 zstd = ["std", "dep:ruzstd"]       # ruzstd adapter
 xz = ["std", "dep:lzma-rust2"]     # lzma-rust2 adapter
 lz4 = ["std", "dep:lz4_flex"]      # lz4_flex adapter
-bzip2 = ["std"]                    # bzip2 adapter (later)
 
 [dependencies]
 arca-core = { path = "../arca-core" }

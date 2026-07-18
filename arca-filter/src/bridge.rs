@@ -10,6 +10,7 @@
 //! Matching the whole-slice source model of P1/P2, the compressed input is buffered in full
 //! before decoding. A truly incremental Read-to-sans-IO pump is a later refinement.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use std::io::{Cursor, Read};
 
@@ -17,11 +18,16 @@ use arca_core::transform::{Status, Step};
 use arca_core::{Error, Result};
 
 /// Accumulates compressed input, then drives a `Read`-based decoder `D` to produce output.
+///
+/// The concrete decoder `D` can be large (e.g. an LZMA reader carries several KB of window/state),
+/// so the running decoder is held behind a `Box<D>` — an owning pointer to a fully monomorphized
+/// type, **not** a trait object. This keeps every adapter (and the sealed `AnyDecoder` enum that
+/// wraps them) one word wide regardless of which codec `D` is.
 pub(crate) enum PullBridge<D> {
     /// Still receiving compressed input.
     Buffering(Vec<u8>),
     /// Input complete; the decoder is running.
-    Decoding(D),
+    Decoding(Box<D>),
     /// The decoder reached end of stream.
     Done,
 }
@@ -59,7 +65,7 @@ impl<D: Read> PullBridge<D> {
     ) -> Result<Step> {
         if let Self::Buffering(buf) = self {
             let data = core::mem::take(buf);
-            *self = Self::Decoding(make(Cursor::new(data))?);
+            *self = Self::Decoding(Box::new(make(Cursor::new(data))?));
         }
         match self {
             Self::Decoding(decoder) => {

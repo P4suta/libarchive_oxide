@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["arca-core", "arca-filter", "arca", "arca-cli"]
+# The cargo-fuzz crate needs nightly + the sanitizer runtime, unavailable on the Windows/MSVC dev
+# box, so it is kept out of the main workspace. `cargo test --workspace` never builds it. Its
+# portable invariant bodies (fuzz/fuzz_lib) are still exercised via arca/tests/fuzz_replay.rs.
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2021"
@@ -14,6 +18,10 @@ keywords = ["archive", "tar", "cpio", "streaming"]
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # Enforce the acceptance criteria for elegance via lints too: unwrap/panic family is a last resort.
+# Library and binary code must not panic; test modules opt out with a local `#[allow]`.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
 missing_errors_doc = "allow"     # Redundant since Result<T, Error> is pervasive
 
 [workspace.lints.rust]

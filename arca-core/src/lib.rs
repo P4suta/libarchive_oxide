@@ -37,7 +37,8 @@ pub mod transform;
 pub use error::{Error, Result};
 pub use filter::{Decoder, Encoder, Filter};
 pub use format::{
-    ArchiveFormat, Detection, Entry, EntryData, EntryDataSink, EntryReader, EntrySink, EntryWriter,
+    AnyEntryData, AnyReader, ArchiveFormat, Detection, Entry, EntryData, EntryDataSink,
+    EntryReader, EntrySink, EntrySource, EntryWriter, OwnedData, SliceData, SourceEvent,
 };
 pub use io::Sink;
 pub use meta::{EntryKind, EntryMeta, PaxMap, Timestamp};

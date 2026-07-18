@@ -3,8 +3,9 @@
 //! Each test binary that declares `mod common;` compiles this independently and may use only a
 //! subset of the helpers, so unused-code warnings are expected and allowed here.
 #![allow(dead_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use arca_core::Entry;
+use arca_core::{Entry, EntryData};
 
 /// Writes a numeric field as `width - 1` zero-padded octal digits followed by a NUL.
 pub(crate) fn put_octal(hdr: &mut [u8; 512], start: usize, width: usize, val: u64) {
@@ -47,7 +48,7 @@ pub(crate) fn trailer() -> Vec<u8> {
 }
 
 /// Reads an entry body to completion using a small buffer (exercises chunked reads).
-pub(crate) fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
+pub(crate) fn drain<D: EntryData>(entry: &mut Entry<'_, D>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 9];
     loop {

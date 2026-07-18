@@ -10,17 +10,20 @@
 //! longname/longlink (`L`/`K`), archive end (zero blocks). GNU sparse (`S`) is
 //! currently `Unsupported` (out of scope for P1).
 //!
-//! The P1 source model is an **in-memory slice** (`&[u8]`). The std layer's
-//! common path is to mmap a file and hand over a `&[u8]`, which covers the bulk
-//! of practical use. A fully sans-IO, incrementally-fed source is left as later
-//! refinement (the frozen traits are not changed).
+//! Two source models coexist, both additive over the same frozen traits:
+//! [`TarReader`] over an **in-memory slice** (`&[u8]`) — the std layer typically
+//! mmaps a file and hands over a `&[u8]` — and [`TarSource`], the incremental,
+//! caller-fed sans-IO [`EntrySource`](crate::format::EntrySource) that accepts the
+//! archive in arbitrarily small pushes and reuses every field/record parser here.
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
+use core::mem;
 
 use crate::error::{Error, Result};
 use crate::format::{
-    ArchiveFormat, Detection, Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, SliceData,
+    ArchiveFormat, Detection, Entry, EntryDataSink, EntryReader, EntrySink, EntrySource,
+    EntryWriter, SliceData, SourceEvent,
 };
 use crate::io::Sink;
 use crate::meta::{EntryKind, EntryMeta, Timestamp};
@@ -71,6 +74,16 @@ struct Overrides<'a> {
     uid: Option<u64>,
     gid: Option<u64>,
 }
+
+/// Owned overrides for the incremental [`TarSource`]: the same struct instantiated at `'static`.
+///
+/// `Overrides` is already generic over the `Cow` lifetime, so pinning it to `'static` yields an
+/// owned-only variant with **zero duplicated code** — the cleaner of the two options in the plan
+/// (a hand-written twin struct would just re-list the same six fields). The slice [`TarReader`]
+/// borrows PAX/long-name bytes straight from the archive slice (`Overrides<'a>`); the source cannot,
+/// because its accumulation buffer is compacted between entries, so it merges each parsed record's
+/// values into `OwnedOverrides` via an explicit `into_owned` clone (see [`merge_owned`]).
+type OwnedOverrides = Overrides<'static>;
 
 /// tar streaming reader (over an in-memory slice).
 #[derive(Debug)]
@@ -173,8 +186,10 @@ impl<'a> TarReader<'a> {
     }
 }
 
-impl EntryReader for TarReader<'_> {
-    fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+impl<'a> EntryReader for TarReader<'a> {
+    type Data = SliceData<'a>;
+
+    fn next_entry(&mut self) -> Result<Option<Entry<'_, SliceData<'a>>>> {
         if self.ended {
             return Ok(None);
         }
@@ -246,6 +261,460 @@ impl EntryReader for TarReader<'_> {
     }
 }
 
+// ── Incremental sans-IO source (Phase 4) ────────────────────────────────────────────────────────
+
+/// Which kind of extended / long header the [`TarSource`] is currently accumulating.
+#[derive(Debug, Clone, Copy)]
+enum MetaKind {
+    /// PAX `x`/`X`: extended records applying to the next entry.
+    PaxNext,
+    /// PAX `g`: global extended records applying to all subsequent entries.
+    PaxGlobal,
+    /// GNU `L`: the next entry's long name.
+    LongName,
+    /// GNU `K`: the next entry's long link target.
+    LongLink,
+}
+
+/// The [`TarSource`] driver state. `Copy` so `pull` can read it out of `self`, mutate the other
+/// fields, and write the successor back without borrow entanglement.
+#[derive(Debug, Clone, Copy)]
+enum State {
+    /// Awaiting a full 512-byte header block.
+    Header,
+    /// Streaming a real entry's payload: `remaining` data bytes, then `pad` zero bytes.
+    Payload { remaining: u64, pad: usize },
+    /// Accumulating an extended / long header record: `data` record bytes, then `pad` zero bytes.
+    Meta {
+        kind: MetaKind,
+        data: usize,
+        pad: usize,
+    },
+    /// The archive has ended.
+    Done,
+}
+
+/// The outcome of driving one state, before the (possibly buffer-borrowing) event is materialized.
+/// `Entry` and `Data` carry no data here — their borrowed payload is built in [`TarSource::pull`]
+/// from staged fields, keeping each state method free of a self-borrow it would have to return.
+enum Poll {
+    /// The state advanced; loop and drive again.
+    Continue,
+    /// Starved: waiting for more fed bytes.
+    NeedInput,
+    /// Archive terminated.
+    Done,
+    /// The current entry's payload is complete.
+    EndEntry,
+    /// A real entry header was parsed; its metadata is staged.
+    Entry,
+    /// A payload window is staged.
+    Data,
+}
+
+/// Incremental, sans-IO tar reader — the [`EntrySource`] reference implementation.
+///
+/// It reuses **every** field / record parser the slice [`TarReader`] uses (`field`, `cstr`,
+/// `parse_numeric`, `verify_checksum`, `kind_from_typeflag`, `join_prefix_name`, `round_up`,
+/// `parse_pax`, `apply_pax`, `parse_pax_time`); only the driver — a state machine over a growing
+/// `Vec<u8>` with a read cursor — is new. Bytes arrive via [`feed`](EntrySource::feed) in any
+/// chunking (down to a single byte); [`pull`](EntrySource::pull) emits events borrowing the internal
+/// buffer, which is compacted (`drain(..cursor)`) at the top of every [`pull`](EntrySource::pull) —
+/// reclaiming the bytes the previous event consumed, including each payload window mid-entry — so the
+/// resident size stays bounded (about one in-flight window plus not-yet-consumed fed bytes),
+/// independent of total entry size.
+///
+/// A future `enum AnySource { Tar, Cpio, Ar }` (the shape of [`AnyReader`](crate::format::AnyReader))
+/// could wrap this and forward the three methods by exhaustive `match`, with no type erasure — this
+/// type is deliberately a plain concrete implementor to make that wrapping trivial.
+#[derive(Debug)]
+pub struct TarSource {
+    /// Growing accumulation buffer of fed archive bytes.
+    buf: Vec<u8>,
+    /// Read position within `buf`; bytes before it are consumed and reclaimed on compaction.
+    cursor: usize,
+    /// Driver state.
+    state: State,
+    /// Whether `finish_input` has been called (no more bytes will arrive).
+    finished: bool,
+    /// Overrides captured for the *next* real entry (PAX `x`, GNU `L`/`K`).
+    pending: OwnedOverrides,
+    /// Global overrides (PAX `g`) applying to all subsequent entries.
+    global: OwnedOverrides,
+    /// Accumulator for the current extended / long header record (may span feeds).
+    record: Vec<u8>,
+    /// Overrides taken for the entry whose header was just parsed, staged for [`Poll::Entry`].
+    stage_pending: OwnedOverrides,
+    /// Payload size of the entry staged for [`Poll::Entry`].
+    stage_size: u64,
+    /// Length of the payload window staged for [`Poll::Data`] (it ends at `cursor`).
+    stage_len: usize,
+}
+
+impl Default for TarSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TarSource {
+    /// A fresh source with an empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            cursor: 0,
+            state: State::Header,
+            finished: false,
+            pending: Overrides::default(),
+            global: Overrides::default(),
+            record: Vec::new(),
+            stage_pending: Overrides::default(),
+            stage_size: 0,
+            stage_len: 0,
+        }
+    }
+
+    /// Bytes available past the cursor.
+    fn available(&self) -> usize {
+        self.buf.len() - self.cursor
+    }
+
+    /// Bytes currently held in the internal accumulation buffer (consumed-but-not-yet-reclaimed plus
+    /// unconsumed). Compaction at the top of each [`pull`](EntrySource::pull) keeps this bounded to
+    /// roughly one in-flight window plus not-yet-consumed fed bytes, independent of entry size — a
+    /// hook for callers that want to apply their own feed backpressure, and for asserting the bound.
+    #[must_use]
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Drop consumed bytes and reset the cursor. Sound only when no event borrow is outstanding,
+    /// which holds at the top of every [`pull`](EntrySource::pull) — the sole call site — because
+    /// the previous event's borrow has ended by then.
+    fn compact(&mut self) {
+        if self.cursor > 0 {
+            self.buf.drain(..self.cursor);
+            self.cursor = 0;
+        }
+    }
+
+    /// Apply a completed extended / long header record to the pending / global overrides.
+    fn apply_record(&mut self, kind: MetaKind) -> Result<()> {
+        match kind {
+            MetaKind::LongName => {
+                self.pending.path = Some(Cow::Owned(cstr(&self.record).to_vec()));
+            }
+            MetaKind::LongLink => {
+                self.pending.linkpath = Some(Cow::Owned(cstr(&self.record).to_vec()));
+            }
+            MetaKind::PaxNext => {
+                let mut parsed = Overrides::default();
+                parse_pax(&self.record, &mut parsed)?;
+                merge_owned(&mut self.pending, parsed);
+            }
+            MetaKind::PaxGlobal => {
+                let mut parsed = Overrides::default();
+                parse_pax(&self.record, &mut parsed)?;
+                merge_owned(&mut self.global, parsed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Map a starvation point to [`Poll::NeedInput`] (more bytes may still arrive) or a truncation
+    /// error (input was already declared finished).
+    fn starved(&self, what: &'static str) -> Result<Poll> {
+        if self.finished {
+            Err(Error::Malformed(what))
+        } else {
+            Ok(Poll::NeedInput)
+        }
+    }
+
+    /// Parse the next header block. Meta/long headers set up the [`State::Meta`] accumulation; a real
+    /// entry stages its overrides/size and advances to [`State::Payload`]; a zero/short block ends.
+    fn poll_header(&mut self) -> Result<Poll> {
+        if self.available() < BLOCK {
+            // A short/absent final block is a clean end of archive (mirrors the slice reader
+            // returning `None` when a whole header no longer fits).
+            if self.finished {
+                self.state = State::Done;
+                return Ok(Poll::Done);
+            }
+            return Ok(Poll::NeedInput);
+        }
+        let hdr = &self.buf[self.cursor..self.cursor + BLOCK];
+        if hdr.iter().all(|&b| b == 0) {
+            self.state = State::Done;
+            return Ok(Poll::Done);
+        }
+        verify_checksum(hdr)?;
+        let typeflag = hdr[O_TYPEFLAG];
+        let raw_size = parse_numeric(field(hdr, F_SIZE))?;
+
+        match typeflag {
+            // PAX / GNU long headers: their whole payload is a record, not entry data.
+            b'x' | b'X' | b'g' | b'L' | b'K' => {
+                let data = usize_of(raw_size)?;
+                let pad = round_up(raw_size)? - data;
+                let kind = match typeflag {
+                    b'g' => MetaKind::PaxGlobal,
+                    b'L' => MetaKind::LongName,
+                    b'K' => MetaKind::LongLink,
+                    _ => MetaKind::PaxNext,
+                };
+                self.cursor += BLOCK;
+                self.record.clear();
+                self.state = State::Meta { kind, data, pad };
+                Ok(Poll::Continue)
+            }
+            // Real entry: take `pending`, compute the size (respecting overrides), advance to the
+            // payload, and stage what [`pull`](Self::pull) needs to build the borrowed metadata.
+            _ => {
+                let pending = mem::take(&mut self.pending);
+                let hdr_start = self.cursor;
+                let size = {
+                    let hdr = &self.buf[hdr_start..hdr_start + BLOCK];
+                    pending
+                        .size
+                        .or(self.global.size)
+                        .map_or_else(|| parse_numeric(field(hdr, F_SIZE)), Ok)?
+                };
+                let pad = round_up(size)? - usize_of(size)?;
+                self.cursor = hdr_start + BLOCK;
+                self.state = State::Payload {
+                    remaining: size,
+                    pad,
+                };
+                self.stage_pending = pending;
+                self.stage_size = size;
+                Ok(Poll::Entry)
+            }
+        }
+    }
+
+    /// Accumulate an extended / long header record (data bytes then padding). On completion it is
+    /// applied to the pending / global overrides and the driver returns to reading headers.
+    fn poll_meta(&mut self, kind: MetaKind, data: usize, pad: usize) -> Result<Poll> {
+        if data > 0 {
+            let avail = self.available();
+            if avail == 0 {
+                return self.starved("tar: truncated extended header");
+            }
+            let n = data.min(avail);
+            let from = self.cursor;
+            self.record.extend_from_slice(&self.buf[from..from + n]);
+            self.cursor += n;
+            self.state = State::Meta {
+                kind,
+                data: data - n,
+                pad,
+            };
+            return Ok(Poll::Continue);
+        }
+        if pad > 0 {
+            let avail = self.available();
+            if avail == 0 {
+                return self.starved("tar: truncated extended header");
+            }
+            let n = pad.min(avail);
+            self.cursor += n;
+            self.state = State::Meta {
+                kind,
+                data,
+                pad: pad - n,
+            };
+            return Ok(Poll::Continue);
+        }
+        self.apply_record(kind)?;
+        self.record = Vec::new();
+        self.state = State::Header;
+        Ok(Poll::Continue)
+    }
+
+    /// Stream a real entry's payload (data window then padding). Data windows are staged for
+    /// [`Poll::Data`]; once payload and padding are consumed the entry ends and the buffer compacts.
+    fn poll_payload(&mut self, remaining: u64, pad: usize) -> Result<Poll> {
+        if remaining > 0 {
+            let avail = self.available();
+            if avail == 0 {
+                return self.starved("tar: truncated payload");
+            }
+            let want = usize_of(remaining)?.min(avail);
+            self.cursor += want;
+            self.state = State::Payload {
+                remaining: remaining - want as u64,
+                pad,
+            };
+            self.stage_len = want;
+            return Ok(Poll::Data);
+        }
+        if pad > 0 {
+            let avail = self.available();
+            if avail == 0 {
+                return self.starved("tar: truncated payload padding");
+            }
+            let n = pad.min(avail);
+            self.cursor += n;
+            self.state = State::Payload {
+                remaining,
+                pad: pad - n,
+            };
+            return Ok(Poll::Continue);
+        }
+        // Payload and padding consumed: end the entry. The consumed bytes are reclaimed at the
+        // top of the next `pull` (a single compaction point), keeping residency bounded.
+        self.state = State::Header;
+        Ok(Poll::EndEntry)
+    }
+}
+
+impl EntrySource for TarSource {
+    fn feed(&mut self, input: &[u8]) -> Result<usize> {
+        // We accept the whole slice: the buffer is compacted between entries, so it never holds more
+        // than the in-flight entry window plus the current header/record — no backpressure needed.
+        self.buf.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn finish_input(&mut self) {
+        self.finished = true;
+    }
+
+    fn pull(&mut self) -> Result<SourceEvent<'_>> {
+        // Reclaim every byte consumed by the previous event before producing the next one. The
+        // event returned by the prior `pull` borrowed `buf`; that borrow has ended (this method
+        // takes `&mut self`), so draining `..cursor` here is sound and keeps residency bounded to
+        // one in-flight window plus not-yet-consumed fed bytes, no matter how large the entry is.
+        self.compact();
+        loop {
+            // Drive the current state. `Continue` loops; the terminal outcomes return an event.
+            // `Entry`/`Data` events borrow the buffer, so they are materialized here from the
+            // fields the state method staged, once all mutation is done.
+            let poll = match self.state {
+                State::Done => return Ok(SourceEvent::Done),
+                State::Header => self.poll_header()?,
+                State::Meta { kind, data, pad } => self.poll_meta(kind, data, pad)?,
+                State::Payload { remaining, pad } => self.poll_payload(remaining, pad)?,
+            };
+            match poll {
+                Poll::Continue => {}
+                Poll::NeedInput => return Ok(SourceEvent::NeedInput),
+                Poll::Done => return Ok(SourceEvent::Done),
+                Poll::EndEntry => return Ok(SourceEvent::EndEntry),
+                Poll::Entry => {
+                    // `poll_header` advanced the cursor to just past this header block.
+                    let start = self.cursor - BLOCK;
+                    let hdr = &self.buf[start..start + BLOCK];
+                    let meta =
+                        build_source_meta(hdr, &self.stage_pending, &self.global, self.stage_size)?;
+                    return Ok(SourceEvent::Entry(meta));
+                }
+                Poll::Data => {
+                    // `poll_payload` advanced the cursor to the window's end.
+                    let from = self.cursor - self.stage_len;
+                    return Ok(SourceEvent::Data(&self.buf[from..self.cursor]));
+                }
+            }
+        }
+    }
+}
+
+/// Builds an [`EntryMeta`] for a real entry from its header block (`hdr`, borrowed from the source's
+/// buffer) and the owned overrides. Non-overridden path / link fields borrow `hdr` (zero-copy);
+/// overridden ones are cloned to owned, so the result borrows only `hdr`, never the overrides (which
+/// are locals or fields the caller keeps mutating). Mirrors [`TarReader::build_meta`] field-for-field.
+fn build_source_meta<'s>(
+    hdr: &'s [u8],
+    pending: &OwnedOverrides,
+    global: &OwnedOverrides,
+    size: u64,
+) -> Result<EntryMeta<'s>> {
+    let kind = kind_from_typeflag(hdr[O_TYPEFLAG])?;
+
+    let name = cstr(field(hdr, F_NAME));
+    let prefix = cstr(field(hdr, F_PREFIX));
+    let is_ustar = field(hdr, F_MAGIC).starts_with(b"ustar");
+
+    let path = match pending.path.as_ref().or(global.path.as_ref()) {
+        Some(p) => Cow::Owned(p.clone().into_owned()),
+        None => {
+            if is_ustar && !prefix.is_empty() {
+                join_prefix_name(prefix, name)
+            } else {
+                Cow::Borrowed(name)
+            }
+        }
+    };
+
+    let link_target = match kind {
+        EntryKind::Symlink | EntryKind::Hardlink => Some(
+            match pending.linkpath.as_ref().or(global.linkpath.as_ref()) {
+                Some(l) => Cow::Owned(l.clone().into_owned()),
+                None => Cow::Borrowed(cstr(field(hdr, F_LINKNAME))),
+            },
+        ),
+        _ => None,
+    };
+
+    let mtime = pending.mtime.or(global.mtime).or_else(|| {
+        parse_numeric(field(hdr, F_MTIME))
+            .ok()
+            .map(|secs| Timestamp {
+                secs: i64::try_from(secs).unwrap_or(i64::MAX),
+                nanos: 0,
+            })
+    });
+
+    let uid = pending
+        .uid
+        .or(global.uid)
+        .map_or_else(|| parse_numeric(field(hdr, F_UID)), Ok)?;
+    let gid = pending
+        .gid
+        .or(global.gid)
+        .map_or_else(|| parse_numeric(field(hdr, F_GID)), Ok)?;
+    let mode = u32::try_from(parse_numeric(field(hdr, F_MODE))? & 0o7777).unwrap_or(0);
+
+    Ok(EntryMeta {
+        kind,
+        path,
+        mode,
+        uid,
+        gid,
+        mtime,
+        size,
+        link_target,
+        pax: crate::meta::PaxMap::new(),
+    })
+}
+
+/// Merges the set fields of a freshly parsed (buffer-borrowing) `Overrides` into an
+/// [`OwnedOverrides`], cloning each present byte string so it survives buffer compaction. Only set
+/// fields overwrite, so a GNU `L`/`K` header and a PAX `x` header can both contribute to the same
+/// next entry.
+fn merge_owned(dst: &mut OwnedOverrides, src: Overrides<'_>) {
+    if let Some(v) = src.path {
+        dst.path = Some(Cow::Owned(v.into_owned()));
+    }
+    if let Some(v) = src.linkpath {
+        dst.linkpath = Some(Cow::Owned(v.into_owned()));
+    }
+    if let Some(v) = src.size {
+        dst.size = Some(v);
+    }
+    if let Some(v) = src.mtime {
+        dst.mtime = Some(v);
+    }
+    if let Some(v) = src.uid {
+        dst.uid = Some(v);
+    }
+    if let Some(v) = src.gid {
+        dst.gid = Some(v);
+    }
+}
+
 /// tar streaming writer — the dual of [`TarReader`]. Emits ustar headers (with GNU longname/
 /// longlink for names over 100 bytes) into a [`Sink`], padding each entry and the trailer.
 ///
@@ -280,7 +749,9 @@ impl<W: Sink> TarWriter<W> {
 }
 
 impl<W: Sink> EntryWriter for TarWriter<W> {
-    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_>> {
+    type Sink = Self;
+
+    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_, Self>> {
         if self.open {
             return Err(Error::InvalidState("tar: previous entry not closed"));
         }
@@ -671,6 +1142,7 @@ fn write_zeros<W: Sink>(sink: &mut W, count: usize) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

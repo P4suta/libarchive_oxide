@@ -1,10 +1,12 @@
 //! Round-trip test for `build_tar`: create a tar from a real directory tree, then read it back.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use arca::{build_tar, reader};
+use arca_core::{EntryData, EntryReader};
 
 fn temp_dir(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);

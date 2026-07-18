@@ -158,8 +158,10 @@ impl<'a> CpioReader<'a> {
     }
 }
 
-impl EntryReader for CpioReader<'_> {
-    fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+impl<'a> EntryReader for CpioReader<'a> {
+    type Data = SliceData<'a>;
+
+    fn next_entry(&mut self) -> Result<Option<Entry<'_, SliceData<'a>>>> {
         if self.ended {
             return Ok(None);
         }
@@ -270,7 +272,9 @@ impl<W: Sink> CpioWriter<W> {
 }
 
 impl<W: Sink> EntryWriter for CpioWriter<W> {
-    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_>> {
+    type Sink = Self;
+
+    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_, Self>> {
         if self.open {
             return Err(Error::InvalidState("cpio: previous entry not closed"));
         }
@@ -470,6 +474,7 @@ fn usize_of(v: u64) -> Result<usize> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

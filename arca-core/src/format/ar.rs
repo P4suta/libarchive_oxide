@@ -112,8 +112,10 @@ impl<'a> ArReader<'a> {
     }
 }
 
-impl EntryReader for ArReader<'_> {
-    fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+impl<'a> EntryReader for ArReader<'a> {
+    type Data = SliceData<'a>;
+
+    fn next_entry(&mut self) -> Result<Option<Entry<'_, SliceData<'a>>>> {
         if self.ended {
             return Ok(None);
         }
@@ -256,7 +258,9 @@ impl<W: Sink> ArWriter<W> {
 }
 
 impl<W: Sink> EntryWriter for ArWriter<W> {
-    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_>> {
+    type Sink = Self;
+
+    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_, Self>> {
         if self.open {
             return Err(Error::InvalidState("ar: previous entry not closed"));
         }

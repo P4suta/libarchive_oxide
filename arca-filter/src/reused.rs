@@ -10,9 +10,8 @@
 //! its own `Read` trait, so two thin shims (`xz_shim`) bridge std `Read` in and lzma `Read` out;
 //! that seam stays sealed inside this module.
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 
 use arca_core::filter::{Decoder, Encoder, Filter, FilterId};
 use arca_core::transform::{Step, Transform};
@@ -21,12 +20,13 @@ use arca_core::{Error, Result};
 use crate::bridge::PullBridge;
 use crate::push::PushBridge;
 
-/// Generates a decoder adapter that stores a [`PullBridge`] and constructs its `Read` decoder
-/// with `$make` on `finish`. `$make: FnOnce(Cursor<Vec<u8>>) -> Result<Box<dyn Read>>`.
+/// Generates a decoder adapter that stores a [`PullBridge`] over the **concrete** `Read` decoder
+/// type `$read` (a boxed `Read` trait object is never used — the decoder type is fully monomorphized), constructing it
+/// with `$make` on `finish`. `$make: FnOnce(Cursor<Vec<u8>>) -> Result<$read>`.
 macro_rules! read_adapter {
-    ($(#[$meta:meta])* $name:ident, $id:expr, $make:expr) => {
+    ($(#[$meta:meta])* $name:ident, $id:expr, $read:ty, $make:expr) => {
         $(#[$meta])*
-        pub struct $name(PullBridge<Box<dyn Read>>);
+        pub struct $name(PullBridge<$read>);
 
         $(#[$meta])*
         impl $name {
@@ -76,9 +76,9 @@ read_adapter!(
     #[cfg(feature = "zstd")]
     ZstdDecoder,
     FilterId::Zstd,
+    ruzstd::decoding::StreamingDecoder<Cursor<Vec<u8>>, ruzstd::decoding::FrameDecoder>,
     |cur: Cursor<Vec<u8>>| {
         ruzstd::decoding::StreamingDecoder::new(cur)
-            .map(|d| Box::new(d) as Box<dyn Read>)
             .map_err(|_| Error::Malformed("zstd: init failed"))
     }
 );
@@ -87,16 +87,18 @@ read_adapter!(
     #[cfg(feature = "lz4")]
     Lz4Decoder,
     FilterId::Lz4,
-    |cur: Cursor<Vec<u8>>| Ok(Box::new(lz4_flex::frame::FrameDecoder::new(cur)) as Box<dyn Read>)
+    lz4_flex::frame::FrameDecoder<Cursor<Vec<u8>>>,
+    |cur: Cursor<Vec<u8>>| Ok(lz4_flex::frame::FrameDecoder::new(cur))
 );
 
 read_adapter!(
     #[cfg(feature = "xz")]
     XzDecoder,
     FilterId::Xz,
+    lzma_rust2::XzReader<Cursor<Vec<u8>>>,
     // Under the `std` feature, lzma-rust2's `Read` is `std::io::Read`, so the cursor and the
     // resulting reader both speak std `Read` — no shim needed. `true` allows multiple streams.
-    |cur: Cursor<Vec<u8>>| Ok(Box::new(lzma_rust2::XzReader::new(cur, true)) as Box<dyn Read>)
+    |cur: Cursor<Vec<u8>>| Ok(lzma_rust2::XzReader::new(cur, true))
 );
 
 /// Generates a compressor adapter that buffers plaintext in a [`PushBridge`] and compresses it

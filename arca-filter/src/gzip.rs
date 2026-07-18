@@ -4,9 +4,18 @@
 //! interpreted here, and the body is delegated to `miniz_oxide::inflate::stream` (which manages the 32KB window internally).
 //! This makes it behave, from the caller's viewpoint, as a [`Transform`] with the same shape as our hand-written filters.
 //!
-//! P2 assumption: the header fits within the input of the first `step` call (the arca std layer
-//! always passes the whole slice, so this always holds). Buffering headers that span across incremental feeds is a later refinement.
+//! # Header that spans multiple feeds
+//!
+//! The gzip header is variable-length (optional FEXTRA / FNAME / FCOMMENT / FHCRC) and may be split
+//! across several `step` calls when the caller feeds bytes incrementally (the sans-IO source
+//! pipeline drives exactly this). [`GzipDecoder`] therefore accumulates the header prefix internally
+//! until it is complete: each `step` in the header phase consumes only the header bytes present in
+//! that chunk and reports [`Status::NeedInput`] while it is still short. The whole-slice caller
+//! (arca's std layer) hits the fast path — the header is complete on the first call and nothing is
+//! buffered. This is the genuine streaming path that lets a hand-written filter compose end-to-end
+//! with the incremental format source.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use arca_core::filter::{Decoder, Encoder, Filter, FilterId};
@@ -30,10 +39,18 @@ enum Phase {
 }
 
 /// gzip decompressor. Plugs into the format layer with the same shape as a `Filter`.
+///
+/// `InflateState` is large (~10 KB of Huffman/window state), so it is boxed here at its source:
+/// `GzipDecoder` stays one word wide, which keeps the sealed `AnyDecoder` enum small and balanced
+/// with the reused adapters. The box is a plain owning pointer, not a trait object.
 pub struct GzipDecoder {
     phase: Phase,
-    inflate: InflateState,
+    inflate: Box<InflateState>,
     trailer_left: usize,
+    /// Accumulated header prefix when the RFC 1952 header spans multiple `step` chunks. Empty on the
+    /// fast path (a caller that hands over the whole header at once) and freed once the header is
+    /// parsed; it only ever grows while the header itself is still incomplete.
+    header_buf: Vec<u8>,
 }
 
 impl core::fmt::Debug for GzipDecoder {
@@ -54,8 +71,9 @@ impl GzipDecoder {
     pub fn new() -> Self {
         Self {
             phase: Phase::Header,
-            inflate: InflateState::new(DataFormat::Raw),
+            inflate: Box::new(InflateState::new(DataFormat::Raw)),
             trailer_left: TRAILER_LEN,
+            header_buf: Vec::new(),
         }
     }
 }
@@ -63,22 +81,55 @@ impl GzipDecoder {
 impl Transform for GzipDecoder {
     fn step(&mut self, input: &[u8], output: &mut [u8]) -> Result<Step> {
         match self.phase {
-            Phase::Header => match gzip_header_len(input)? {
-                None => Ok(Step {
-                    consumed: 0,
-                    produced: 0,
-                    status: Status::NeedInput,
-                }),
-                Some(hlen) => {
+            Phase::Header => {
+                // `prev` is how many header bytes were already accumulated from earlier chunks. The
+                // fast path (`prev == 0`, the whole-slice caller) parses `input` directly and never
+                // touches the buffer; a continuation appends this chunk and re-parses the prefix.
+                let prev = self.header_buf.len();
+                let complete = if prev == 0 {
+                    gzip_header_len(input)?
+                } else {
+                    self.header_buf.extend_from_slice(input);
+                    gzip_header_len(&self.header_buf)?
+                };
+                if let Some(hlen) = complete {
+                    // `hlen` indexes the accumulated header; the bytes it covers from *this* chunk are
+                    // `hlen - prev`. Body bytes appended past the header stay in the caller's input
+                    // (we do not consume them), so freeing the accumulator loses nothing.
+                    self.header_buf = Vec::new();
                     self.phase = Phase::Body;
                     Ok(Step {
-                        consumed: hlen,
+                        consumed: hlen - prev,
                         produced: 0,
                         status: Status::MoreOutput,
                     })
+                } else {
+                    // Header still incomplete: on the fast path this chunk had not yet been buffered,
+                    // so buffer it now. Consuming the whole chunk keeps the driver's input cursor and
+                    // our accumulation in lockstep.
+                    if prev == 0 {
+                        self.header_buf.extend_from_slice(input);
+                    }
+                    Ok(Step {
+                        consumed: input.len(),
+                        produced: 0,
+                        status: Status::NeedInput,
+                    })
                 }
-            },
+            }
             Phase::Body => {
+                // `miniz_oxide`'s streaming `inflate` errors on a zero-length input under
+                // `MZFlush::None`. With incremental feeding the body phase can be entered before any
+                // body byte has arrived (the header was consumed on the previous chunk), so ask for
+                // more input rather than calling `inflate` with nothing. The whole-slice driver never
+                // hits this (its body input is non-empty until consumed); trailing flush is `finish`.
+                if input.is_empty() {
+                    return Ok(Step {
+                        consumed: 0,
+                        produced: 0,
+                        status: Status::NeedInput,
+                    });
+                }
                 let res = inflate(&mut self.inflate, input, output, MZFlush::None);
                 let status = match res.status {
                     Ok(MZStatus::StreamEnd) => {
@@ -218,15 +269,57 @@ fn gzip_frame(plain: &[u8]) -> Vec<u8> {
 }
 
 /// Computes the IEEE CRC-32 of `data` (bitwise; no table, `no_std`).
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
-        }
+///
+/// Shared primitive: gzip framing, the zip writer, and 7z all use the same polynomial
+/// (`0xEDB88320`). One-shot convenience over [`Crc32`]; identical result to feeding `data` in
+/// a single [`Crc32::update`].
+#[must_use]
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = Crc32::new();
+    crc.update(data);
+    crc.finalize()
+}
+
+/// Incremental IEEE CRC-32 (bitwise; no table, `no_std`), polynomial `0xEDB88320`.
+///
+/// The streaming dual of [`crc32`]: the zip writer's `write_chunk` folds each plaintext chunk in
+/// as it arrives, without buffering the whole entry just to checksum it. Feeding all bytes through
+/// one or many `update` calls yields the same value as the one-shot [`crc32`].
+#[derive(Clone, Copy, Debug)]
+pub struct Crc32 {
+    state: u32,
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
     }
-    !crc
+}
+
+impl Crc32 {
+    /// Starts a fresh CRC-32 accumulator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { state: 0xFFFF_FFFF }
+    }
+
+    /// Folds `data` into the running checksum.
+    pub fn update(&mut self, data: &[u8]) {
+        let mut crc = self.state;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        self.state = crc;
+    }
+
+    /// Consumes the accumulator and returns the final CRC-32 value.
+    #[must_use]
+    pub fn finalize(self) -> u32 {
+        !self.state
+    }
 }
 
 /// Returns the full length of the gzip header (RFC 1952). Returns `None` if the whole header is not yet available.

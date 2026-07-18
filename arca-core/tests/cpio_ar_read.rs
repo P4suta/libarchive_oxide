@@ -1,13 +1,14 @@
 //! Integration tests for the cpio (newc/odc) and ar readers, using hand-built archives.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use arca_core::format::ar::ArReader;
 use arca_core::format::cpio::CpioReader;
-use arca_core::{Entry, EntryKind, EntryReader};
+use arca_core::{Entry, EntryData, EntryKind, EntryReader};
 
 const S_IFREG: u32 = 0o100_000;
 const S_IFDIR: u32 = 0o040_000;
 
-fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
+fn drain<D: EntryData>(entry: &mut Entry<'_, D>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 8];
     loop {

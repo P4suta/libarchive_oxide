@@ -1,5 +1,6 @@
 //! Encode/decode duality: for every codec, `decompress ∘ compress = id`, plus a cross-check that
 //! our gzip output is readable by an independent decoder (flate2).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 

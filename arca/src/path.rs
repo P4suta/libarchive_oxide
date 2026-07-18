@@ -62,6 +62,7 @@ fn is_reserved_device_name(part: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::sanitize;
     use std::path::Path;

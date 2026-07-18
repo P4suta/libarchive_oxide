@@ -69,7 +69,7 @@ pub trait Transform {
 ///
 /// Usable even in environments without std (`alloc` only). The typical path for the std layer is to pass
 /// a slice mmapped from a file. A truly incremental driver is provided on the std adapter side.
-pub fn decode_to_vec(t: &mut dyn Transform, input: &[u8]) -> Result<Vec<u8>> {
+pub fn decode_to_vec<T: Transform + ?Sized>(t: &mut T, input: &[u8]) -> Result<Vec<u8>> {
     decode_to_vec_capped(t, input, usize::MAX)
 }
 
@@ -78,8 +78,8 @@ pub fn decode_to_vec(t: &mut dyn Transform, input: &[u8]) -> Result<Vec<u8>> {
 ///
 /// This is the guard against decompression bombs: a tiny compressed input that expands to an
 /// enormous output. Callers materializing to memory or disk should set a sane cap.
-pub fn decode_to_vec_capped(
-    t: &mut dyn Transform,
+pub fn decode_to_vec_capped<T: Transform + ?Sized>(
+    t: &mut T,
     mut input: &[u8],
     max_output: usize,
 ) -> Result<Vec<u8>> {

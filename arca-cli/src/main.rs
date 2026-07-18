@@ -34,9 +34,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
     let mut positional: Vec<String> = Vec::new();
     let mut dest_dir = PathBuf::from(".");
+    let mut password: Option<String> = None;
+    let mut method: Option<String> = None;
+    let mut encrypt: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-C" => dest_dir = PathBuf::from(args.next().ok_or("-C requires a directory")?),
+            "--password" => {
+                password = Some(args.next().ok_or("--password requires a value")?);
+            }
+            "--method" => method = Some(args.next().ok_or("--method requires a value")?),
+            "--encrypt" => encrypt = Some(args.next().ok_or("--encrypt requires a value")?),
             _ => positional.push(arg),
         }
     }
@@ -47,11 +55,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let bytes = std::fs::read(file).map_err(|e| format!("cannot read {file}: {e}"))?;
             let cap = usize::try_from(MAX_DECOMPRESSED).unwrap_or(usize::MAX);
             let plain = arca::decompress_capped(&bytes, cap).map_err(|e| e.to_string())?;
-            let mut reader = arca::reader(&plain).map_err(|e| e.to_string())?;
+            let mut reader =
+                arca::reader_with_password(&plain, password.as_deref().map(str::as_bytes))
+                    .map_err(|e| e.to_string())?;
             if cmd == "t" {
-                list(reader.as_mut())
+                list(&mut reader)
             } else {
-                extract(reader.as_mut(), &dest_dir)
+                extract(&mut reader, &dest_dir)
             }
         }
         "c" => {
@@ -61,7 +71,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             if inputs.is_empty() {
                 return Err("usage: arca c <archive> <path>...".into());
             }
-            let bytes = arca::create::build_archive(inputs, archive).map_err(|e| e.to_string())?;
+            let options = create_options(method.as_deref(), encrypt.as_deref(), password)?;
+            let bytes =
+                arca::build_archive_with(inputs, archive, &options).map_err(|e| e.to_string())?;
             std::fs::write(archive, &bytes).map_err(|e| format!("cannot write {archive}: {e}"))?;
             eprintln!(
                 "created {archive} ({} bytes) from {} path(s)",
@@ -76,7 +88,34 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
 }
 
-fn list(reader: &mut dyn arca_core::EntryReader) -> Result<(), String> {
+/// Builds [`arca::CreateOptions`] from the CLI flags (relevant only for `.zip` destinations).
+fn create_options(
+    method: Option<&str>,
+    encrypt: Option<&str>,
+    password: Option<String>,
+) -> Result<arca::CreateOptions, String> {
+    let mut zip = arca::ZipOptions::default();
+    match method {
+        None => {}
+        Some("store") => zip.method = arca::ZipMethod::Store,
+        Some("deflate") => zip.method = arca::ZipMethod::Deflate,
+        Some(other) => return Err(format!("--method must be store|deflate (got `{other}`)")),
+    }
+    match encrypt {
+        None => {}
+        Some("aes256") => {
+            let pw = password.ok_or("--encrypt aes256 requires --password")?;
+            if pw.is_empty() {
+                return Err("--password must not be empty".into());
+            }
+            zip.password = Some(pw.into_bytes());
+        }
+        Some(other) => return Err(format!("--encrypt must be aes256 (got `{other}`)")),
+    }
+    Ok(arca::CreateOptions { zip })
+}
+
+fn list<R: arca_core::EntryReader>(reader: &mut R) -> Result<(), String> {
     while let Some(entry) = reader.next_entry().map_err(|e| e.to_string())? {
         let meta = entry.meta();
         println!(
@@ -89,7 +128,7 @@ fn list(reader: &mut dyn arca_core::EntryReader) -> Result<(), String> {
     Ok(())
 }
 
-fn extract(reader: &mut dyn arca_core::EntryReader, dest: &Path) -> Result<(), String> {
+fn extract<R: arca_core::EntryReader>(reader: &mut R, dest: &Path) -> Result<(), String> {
     let stats = arca::extract::extract(reader, dest).map_err(|e| e.to_string())?;
     eprintln!(
         "extracted {} files, {} dirs ({} skipped) into {}",

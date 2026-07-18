@@ -1,12 +1,13 @@
 //! Writer tests: the round-trip invariant `read ∘ write = id` for the tar format, plus GNU
 //! longname/longlink extension emission for over-100-byte names.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::borrow::Cow;
 
 use arca_core::format::tar::{TarReader, TarWriter};
-use arca_core::{Entry, EntryKind, EntryMeta, EntryReader, EntryWriter};
+use arca_core::{Entry, EntryData, EntryKind, EntryMeta, EntryReader, EntryWriter};
 
-fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
+fn drain<D: EntryData>(entry: &mut Entry<'_, D>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 100];
     loop {
@@ -19,8 +20,8 @@ fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
     out
 }
 
-fn write_entry(
-    w: &mut TarWriter<Vec<u8>>,
+fn write_entry<W: EntryWriter>(
+    w: &mut W,
     kind: EntryKind,
     path: &[u8],
     data: &[u8],

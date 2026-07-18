@@ -1,5 +1,6 @@
 //! Differential test: a tar produced by `TarWriter` must be extractable by the real GNU/BSD
 //! `tar`. Skips gracefully if no `tar` binary is on PATH.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::borrow::Cow;
 use std::fs;

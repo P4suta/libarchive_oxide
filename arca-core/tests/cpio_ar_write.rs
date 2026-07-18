@@ -1,12 +1,13 @@
 //! Writer round-trip tests for cpio (newc) and ar: `read ∘ write = id` via our own readers.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::borrow::Cow;
 
 use arca_core::format::ar::{ArReader, ArWriter};
 use arca_core::format::cpio::{CpioReader, CpioWriter};
-use arca_core::{Entry, EntryKind, EntryMeta, EntryReader, EntryWriter};
+use arca_core::{Entry, EntryData, EntryKind, EntryMeta, EntryReader, EntryWriter};
 
-fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
+fn drain<D: EntryData>(entry: &mut Entry<'_, D>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 16];
     loop {
@@ -19,7 +20,7 @@ fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
     out
 }
 
-fn write_entry(w: &mut dyn EntryWriter, kind: EntryKind, path: &[u8], mode: u32, data: &[u8]) {
+fn write_entry<W: EntryWriter>(w: &mut W, kind: EntryKind, path: &[u8], mode: u32, data: &[u8]) {
     let mut m = EntryMeta::new(kind, Cow::Borrowed(path));
     m.mode = mode;
     m.size = data.len() as u64;

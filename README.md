@@ -3,10 +3,12 @@
 A pure-Rust, unified, streaming archive library — one trait algebra for archive
 **formats**, compression **filters**, and **I/O**, with a `no_std` core.
 
-`arca` reads `tar`, `cpio`, and `ar` archives, transparently layered over `gzip`,
-`zstd`, `xz`, and `lz4` compression — so `.tar.gz`, `.tar.zst`, `.tar.xz`, and
-`.deb` all extract through a single entry point. The read path is complete;
-writing is planned (the abstraction already accounts for it).
+`arca` reads and writes `tar`, `cpio`, and `ar` archives, transparently layered
+over `gzip`, `zstd`, `xz`, and `lz4` compression — so `.tar.gz`, `.tar.zst`,
+`.tar.xz`, and `.deb` all extract *and* compose through a single entry point.
+`zip` archives can additionally be read. Runtime format/codec choice is dispatched
+over sealed enums with **zero type erasure** — there is no `dyn` anywhere in the
+library (a CI grep gate enforces it).
 
 ## Why
 
@@ -38,9 +40,12 @@ Base     Transform::{step, finish}   sans-IO, allocation-free, caller-owned
   writers.
 - **Origin-opaque.** A hand-written filter (gzip) and an adapter over a reused
   crate (zstd/xz/lz4) are indistinguishable to callers.
-- **Borrow-checked, no-seek.** `next_entry()` lends an `Entry<'_>` that mutably
+- **Borrow-checked, no-seek.** `next_entry()` lends an `Entry<'_, D>` that mutably
   borrows the reader, so you cannot advance until its payload is consumed — the
   streaming contract is enforced by the compiler, not by convention.
+- **No type erasure.** `EntryReader::Data`/`EntryWriter::Sink` are associated
+  types and runtime dispatch uses sealed enums (`AnyReader`, `AnyDecoder`); the
+  library contains no `Box<dyn>`, `&dyn`, or `&mut dyn`, enforced mechanically.
 - **Pure core.** `arca-core` builds on bare metal (`thumbv7em-none-eabi`); only
   the heavyweight-codec adapters and the filesystem layer require `std`.
 
@@ -106,8 +111,10 @@ frozen, none of these require a trait change.
 
 ## Quality gates
 
-`clippy` (pedantic), `rustfmt`, `typos`, tests, and a bare-metal `no_std` build.
-The crate forbids `unsafe`.
+`clippy` (pedantic, plus `unwrap`/`expect`/`panic` denied in library code),
+`rustfmt`, `typos`, tests, a bare-metal `no_std` build, and a `check-no-dyn`
+grep gate that fails on any trait object in library source. The crate forbids
+`unsafe`.
 
 ## License
 

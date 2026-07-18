@@ -1,8 +1,9 @@
 //! Integration tests for the tar reader. Without depending on external tools, it assembles a
 //! ustar archive in memory and reads it back, verifying path, kind, size, contents, and PAX/GNU overrides.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use arca_core::format::tar::TarReader;
-use arca_core::{Entry, EntryKind, EntryReader};
+use arca_core::{Entry, EntryData, EntryKind, EntryReader};
 
 /// Write an octal numeric field as width-1 zero-padded digits + NUL.
 fn put_octal(hdr: &mut [u8; 512], start: usize, width: usize, val: u64) {
@@ -63,7 +64,7 @@ fn trailer() -> Vec<u8> {
 }
 
 /// Read an entry's body to completion in small buffers, a little at a time (verifies chunk splitting).
-fn drain(entry: &mut Entry<'_>) -> Vec<u8> {
+fn drain<D: EntryData>(entry: &mut Entry<'_, D>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut tmp = [0u8; 7];
     loop {

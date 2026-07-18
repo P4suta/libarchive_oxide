@@ -3,30 +3,55 @@
 //! This is the top-level verification: that "both writing and new formats fit onto the
 //! same trait with no trait changes," and that the orthogonality and duality of
 //! filter/format are guaranteed by the types and the behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use arca_core::filter::FilterId;
-use arca_core::format::cpio::{Cpio, CpioReader};
+use arca_core::format::ar::ArReader;
+use arca_core::format::cpio::{Cpio, CpioReader, CpioWriter};
 use arca_core::format::tar::{Tar, TarReader, TarWriter};
 use arca_core::format::{ArchiveFormat, Detection};
-use arca_core::{EntryReader, EntryWriter};
+use arca_core::{AnyReader, EntryData, EntryDataSink, EntryReader, EntryWriter, SliceData};
 
-/// The read side of the duality: any format reader fits onto a single trait object.
-fn assert_is_reader(_r: &mut dyn EntryReader) {}
+/// The read side of the duality, asserted **statically**: any format reader satisfies the
+/// `EntryReader` bound with zero type erasure (no `dyn`). Monomorphizing this over each reader
+/// type is the compile-time proof.
+fn assert_is_reader<R: EntryReader>(_r: &R) {}
 
-/// The write side of the duality: any format writer fits onto a single trait object.
-fn assert_is_writer(_w: &mut dyn EntryWriter) {}
+/// The write side of the duality: any format writer satisfies `EntryWriter`, statically.
+fn assert_is_writer<W: EntryWriter>(_w: &W) {}
+
+/// Type-level check that the associated payload/sink wiring is exactly as frozen: the slice readers
+/// expose `Data = SliceData`, and that type is an `EntryData`; a writer is its own `EntryDataSink`.
+fn assert_wiring<'a, R, W>()
+where
+    R: EntryReader<Data = SliceData<'a>>,
+    W: EntryWriter<Sink = W>,
+    W: EntryDataSink,
+    SliceData<'a>: EntryData,
+{
+}
 
 #[test]
 fn read_write_dual_and_orthogonal_formats_load_on_same_traits() {
-    // For tar, both the read and write sides fit onto the same trait (the duality is frozen by the types).
-    let mut tar_r = TarReader::new(&b""[..]);
-    let mut tar_w = TarWriter::new(alloc_sink());
-    assert_is_reader(&mut tar_r);
-    assert_is_writer(&mut tar_w);
+    // For tar, both the read and write sides satisfy the same frozen traits (duality by types).
+    let tar_r = TarReader::new(&b""[..]);
+    let tar_w = TarWriter::new(alloc_sink());
+    assert_is_reader(&tar_r);
+    assert_is_writer(&tar_w);
 
-    // cpio (a different format) fits onto the same EntryReader as tar, with no trait changes (orthogonality).
-    let mut cpio_r = CpioReader::new(&b""[..]);
-    assert_is_reader(&mut cpio_r);
+    // cpio/ar (different formats) satisfy the same EntryReader, with no trait changes (orthogonality).
+    let cpio_r = CpioReader::new(&b""[..]);
+    let ar_r = ArReader::new(&b""[..]);
+    assert_is_reader(&cpio_r);
+    assert_is_reader(&ar_r);
+
+    // The sealed AnyReader is itself an EntryReader — runtime dispatch with no type erasure.
+    let any = AnyReader::tar(TarReader::new(&b""[..]));
+    assert_is_reader(&any);
+
+    // The associated-type wiring (Data = SliceData, Sink = Self) is frozen, checked at compile time.
+    assert_wiring::<TarReader<'_>, TarWriter<alloc::vec::Vec<u8>>>();
+    assert_wiring::<CpioReader<'_>, CpioWriter<alloc::vec::Vec<u8>>>();
 }
 
 /// A dummy byte sink for constructing the writer. Its contents are not needed until P2.
@@ -75,6 +100,5 @@ fn filter_magic_sniffing() {
         FilterId::sniff(&[0x04, 0x22, 0x4d, 0x18]),
         Some(FilterId::Lz4)
     );
-    assert_eq!(FilterId::sniff(b"BZh"), Some(FilterId::Bzip2));
     assert_eq!(FilterId::sniff(b"\x00\x00"), None);
 }
