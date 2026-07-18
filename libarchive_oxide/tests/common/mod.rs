@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared helpers for integration tests: build in-memory ustar archives and drain entries.
 //!
 //! Each test binary that declares `mod common;` compiles this independently and may use only a

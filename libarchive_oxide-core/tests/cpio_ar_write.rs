@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Writer round-trip tests for cpio (newc) and ar: `read ∘ write = id` via our own readers.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

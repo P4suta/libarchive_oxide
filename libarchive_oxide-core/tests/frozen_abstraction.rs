@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Tests that mechanically pin down the acceptance criteria of the frozen abstraction.
 //!
 //! This is the top-level verification: that "both writing and new formats fit onto the

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for the tar reader. Without depending on external tools, it assembles a
 //! ustar archive in memory and reads it back, verifying path, kind, size, contents, and PAX/GNU overrides.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

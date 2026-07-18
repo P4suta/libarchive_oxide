@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared helpers for the `ox*` CLI integration tests: locating the built binaries, running them,
 //! and managing throwaway working directories. No external test crates are used (keeping the
 //! dependency footprint minimal); the bins are invoked through the `CARGO_BIN_EXE_*` paths Cargo

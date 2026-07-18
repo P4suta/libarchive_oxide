@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! zip64 tests: a test-only low threshold forces zip64 emission without multi-gigabyte data. We
 //! assert the on-disk sentinels / 0x0001 extra / EOCD64 record, then round-trip through both arca's
 //! own reader and the external `zip` crate.

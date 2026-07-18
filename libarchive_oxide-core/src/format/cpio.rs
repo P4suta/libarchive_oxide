@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! cpio format (SVR4 "newc"/"crc" and POSIX "odc").
 //!
 //! **Orthogonality proof, realized**: adding a new format is just adding a type that implements

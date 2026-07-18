@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Tests for the incremental sans-IO tar source ([`TarSource`]).
 //!
 //! The invariant under test: feeding a tar archive through [`EntrySource`] in *any* chunking — one

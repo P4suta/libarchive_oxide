@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Filesystem extraction tests: real files/dirs on disk, path-traversal rejection, and the
 //! decompression-bomb cap.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The encode-side dual of [`PullBridge`](super::bridge::PullBridge): buffer plaintext, then
 //! compress it and dole the result out into the caller's output.
 //!

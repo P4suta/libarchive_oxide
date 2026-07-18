@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `filter` — concrete implementations of compression filters.
 //!
 //! They all sit isomorphically as [`libarchive_oxide_core::Filter`]. Whether it is a hand-written

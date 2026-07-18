@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for the cpio (newc/odc) and ar readers, using hand-built archives.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

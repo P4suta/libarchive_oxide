@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-tool round-trip integration tests, exercising the real built binaries.
 //!
 //! Each test drives an actual `ox*` process (create → extract / list) and asserts on the

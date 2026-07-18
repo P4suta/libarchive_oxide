@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # The inner-loop toolchain (mirrors what CI installs). CI jobs that pin a different
 # channel (the msrv job, a beta run) override this with RUSTUP_TOOLCHAIN, which
 # takes precedence over this file. The no_std core is cross-built for

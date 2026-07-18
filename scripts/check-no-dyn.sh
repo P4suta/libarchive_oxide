@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Mechanical guard for the "zero type erasure" invariant: no `dyn` (Box<dyn>, &mut dyn, &dyn,
 # or bare dyn) may appear in library/binary source. Comment lines are ignored. A hit fails.
 set -euo pipefail

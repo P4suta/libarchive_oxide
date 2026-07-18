@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Malformed-input tests for the ISO reader: every corrupt image must yield an `Error`, never a
 //! panic (no index-out-of-bounds, no infinite loop, no unbounded allocation).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

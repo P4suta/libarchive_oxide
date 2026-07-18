@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Minimal byte-sink abstraction for the write path (sans-IO, `no_std`).
 //!
 //! The read path borrows an input `&[u8]`; its dual, the write path, pushes bytes into a [`Sink`].

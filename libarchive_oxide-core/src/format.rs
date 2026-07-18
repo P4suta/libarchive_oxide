@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Format axis: filtered byte stream ⇄ structured entries.
 //!
 //! The format layer is **orthogonal** to the filter layer and knows nothing about

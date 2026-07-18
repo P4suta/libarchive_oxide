@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! CLI-contract regression: the supported-flag surface and the unified exit-code contract
 //! (0 success / 1 runtime failure / 2 usage-or-unsupported-flag). This is the machine-checkable
 //! form of the `SemVer` interface promise in the README, and the guard that unsupported classic flags

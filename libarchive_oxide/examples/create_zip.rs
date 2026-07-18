@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Create a `.zip` in memory with the streaming [`ZipWriter`], then write it to disk.
 //!
 //! Run it with `cargo run --example create_zip` (writes to a temp file), or pass a destination path:

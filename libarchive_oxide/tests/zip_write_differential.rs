@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Differential test: a zip produced by arca's `ZipWriter` must be readable by the external `zip`
 //! crate (an independent implementation), covering store, deflate, directories, and Unix mode.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

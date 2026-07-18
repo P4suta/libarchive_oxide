@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ISO 9660 (ECMA-119) with the Joliet extension — reader and writer.
 //!
 //! Unlike the container formats that keep compressed payloads (zip/7z), an ISO image stores every

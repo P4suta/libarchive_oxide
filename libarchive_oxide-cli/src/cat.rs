@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `oxcat` — the bsdcat-compatible transparent decompressor.
 //!
 //! For each file operand (or stdin, when none are given or the operand is `-`), the leading magic

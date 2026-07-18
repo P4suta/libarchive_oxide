@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `libarchive_oxide-core` — a frozen trait algebra and sans-IO core.
 //!
 //! What this crate delivers is not a "working extraction tool" but **the trait algebra itself**.

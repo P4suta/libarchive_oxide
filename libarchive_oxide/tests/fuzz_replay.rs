@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Portable fuzz replay — the Windows/MSVC dev-box gate that needs neither nightly nor libFuzzer.
 //!
 //! It drives the **same** invariant functions the cargo-fuzz targets use (`libarchive_oxide_fuzz_cases`) over

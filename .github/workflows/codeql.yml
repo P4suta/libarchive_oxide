@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # CodeQL security analysis (Advanced Setup). Scans the Rust source and the repository's own GitHub
 # Actions workflows, uploading results to Security > Code scanning. Advanced (not Default) setup keeps
 # the language set, query suite, and SHA-pinned action versions in-repo under the same review as the

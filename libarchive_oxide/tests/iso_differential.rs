@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Differential / independent-validation test for the ISO 9660 + Joliet writer.
 //!
 //! No usable independent *pure-Rust* ISO reader exists on every target this suite runs on: the

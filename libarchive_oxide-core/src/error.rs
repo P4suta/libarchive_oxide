@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `no_std`-friendly error type. Does not depend on `std::io::Error`.
 
 use core::fmt;

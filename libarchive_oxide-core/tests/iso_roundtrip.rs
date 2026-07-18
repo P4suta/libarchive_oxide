@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Round-trip invariant for ISO 9660 + Joliet: `read ∘ write = id` over path, kind, size, and data.
 //!
 //! Exercises a nested directory, a Unicode/long name that only survives via the Joliet tree, and a

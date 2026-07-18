@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # typos — strict spell check across the repo, run by the CI `typos` job
 # (crate-ci/typos) and the pre-commit hook. Fix typos rather than suppress them;
 # keep the allowlist below to the minimum the archive/codec vocabulary needs. Every

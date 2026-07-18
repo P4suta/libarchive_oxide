@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Full-stack write capstone: assemble a `.deb` with arca's own ar writer, tar writer, and gzip
 //! encoder, then read it back down through ar -> gzip -> tar. The write-direction dual of `deb.rs`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

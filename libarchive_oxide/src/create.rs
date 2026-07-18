@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Building a plain tar archive from filesystem paths (the std convenience over `TarWriter`).
 
 use std::borrow::Cow;

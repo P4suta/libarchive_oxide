@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! zip reader test: generate a zip with the `zip` crate (store + deflate + a directory), then read
 //! it back through arca's format auto-detection and `ZipReader`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

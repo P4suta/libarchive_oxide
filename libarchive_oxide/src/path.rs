@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Safe conversion of archive entry paths into relative filesystem paths.
 //!
 //! Extracting untrusted archives is a classic path-traversal vector (`../../etc/passwd`,

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `oxtar` — the bsdtar-compatible tar interface over the flagship library.
 //!
 //! Supported (each flag is fully functional — no partial behavior):

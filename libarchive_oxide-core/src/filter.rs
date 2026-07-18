@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Filter axis: a subdivision of [`Transform`] that represents compression codecs.
 //!
 //! The filter axis is **orthogonal** to the format axis. The std layer decompresses through the

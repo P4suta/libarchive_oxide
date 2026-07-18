@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Writer tests: the round-trip invariant `read ∘ write = id` for the tar format, plus GNU
 //! longname/longlink extension emission for over-100-byte names.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

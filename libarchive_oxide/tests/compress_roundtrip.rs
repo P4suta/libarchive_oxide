@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Encode/decode duality: for every codec, `decompress ∘ compress = id`, plus a cross-check that
 //! our gzip output is readable by an independent decoder (flate2).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

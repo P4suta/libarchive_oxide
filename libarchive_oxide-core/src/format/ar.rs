@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Unix `ar` archive format (used by `.deb`, static libraries).
 //!
 //! Handles the three name conventions: plain `SysV` names (trailing `/` terminator), the GNU

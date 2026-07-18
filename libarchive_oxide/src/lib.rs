@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `libarchive_oxide` — the std high-level API of the unified streaming archive library.
 //!
 //! On top of [`libarchive_oxide_core`]'s frozen trait algebra, this layers a practical std layer:

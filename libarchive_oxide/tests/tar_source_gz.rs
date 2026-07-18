@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end incremental pipeline: the byte-axis filter [`libarchive_oxide::filter::AnyDecoder`] (gzip) feeding
 //! the format-axis [`TarSource`], both caller-driven and free of any type erasure.
 //!

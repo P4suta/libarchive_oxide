@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared library for the `ox*` CLI tools (`oxtar`/`oxcpio`/`oxcat`/`oxunzip`).
 //!
 //! Each `[[bin]]` is a thin `main` that forwards to a `run_*` entry point here and maps the

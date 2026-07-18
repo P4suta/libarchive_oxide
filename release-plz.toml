@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # release-plz configuration — https://release-plz.dev/docs/config
 #
 # release-plz reads Conventional Commits, derives the version bump, maintains each

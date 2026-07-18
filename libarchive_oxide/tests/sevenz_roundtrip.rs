@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Round-trip: an archive written by `SevenZWriter` must read back identically through
 //! `SevenZReader` (`read ∘ write = id`) — nested directories, an empty file, a multi-file solid
 //! folder, and modification times.

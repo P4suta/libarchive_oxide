@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Round-trip test for `build_tar`: create a tar from a real directory tree, then read it back.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

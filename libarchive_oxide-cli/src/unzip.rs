@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `oxunzip` — the bsdunzip-compatible zip extractor over the flagship library.
 //!
 //! Supported (each flag fully functional):

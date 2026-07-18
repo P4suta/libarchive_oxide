@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Regression test for a gzip header that spans multiple `step` feeds.
 //!
 //! The whole-slice caller always hands the header over at once, but the incremental source pipeline

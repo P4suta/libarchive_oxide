@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # rustfmt configuration. Pinned to what the committed tree already follows, so
 # `cargo fmt --check` stays clean and no reformatting churn lands with this file.
 # The workspace is edition 2021 (MSRV is kept as low as the code allows; edition

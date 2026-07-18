@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Release automation via release-plz (https://release-plz.dev). On push to main:
 #   - release-plz-pr:      opens/updates a Release PR (version bump + CHANGELOG) from the
 #                          Conventional Commits since the last tag.

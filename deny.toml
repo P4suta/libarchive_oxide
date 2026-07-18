@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Supply-chain policy, checked by `cargo deny check` (mise run deny, and a CI job).
 # cargo-deny adds no dependency; it is a CLI that reads Cargo.lock. It enforces the
 # permissive-license boundary, denies yanked crates (the cargo-audit role), pins the

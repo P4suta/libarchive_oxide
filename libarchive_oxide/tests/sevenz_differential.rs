@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Differential test against the independent pure-Rust `sevenz-rust2` crate, mirroring how the zip
 //! tests lean on the `zip` crate. Two directions run:
 //!

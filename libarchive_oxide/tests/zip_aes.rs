@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `WinZip` AES-256 (AE-2) tests. Requires the `aes` feature.
 //!
 //! Coverage:

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! 7z reader and writer — a deliberately narrow, fully interoperable subset.
 //!
 //! 7z, like zip, keeps its authoritative metadata in a header (here at the *end* of the file,

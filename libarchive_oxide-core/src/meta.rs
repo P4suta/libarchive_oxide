@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Entry metadata. A shared type that upholds the read/write duality at the data layer.
 //!
 //! The same [`EntryMeta`] is **produced** by [`EntryReader`](crate::EntryReader) and

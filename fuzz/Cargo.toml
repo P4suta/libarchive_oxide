@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # cargo-fuzz workspace for libarchive_oxide. This is **deliberately outside** the main workspace (the root
 # Cargo.toml lists `exclude = ["fuzz"]`), so `cargo test --workspace` never tries to build the
 # libFuzzer targets — which need a nightly toolchain and the sanitizer runtime that is not available

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # clippy thresholds and the strict-code role that pairs with the workspace lints
 # (`[workspace.lints]`: pedantic + unwrap/expect/panic = warn) and the CI
 # `-D warnings` gate. Nothing here is stricter than the code already satisfies, so

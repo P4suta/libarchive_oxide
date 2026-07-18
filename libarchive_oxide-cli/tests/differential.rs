@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Differential tests: cross-validate the `ox*` tools against the real system
 //! `bsdtar`/`bsdcpio`/`bsdcat`/`unzip` when they are on `PATH`, and gracefully skip when absent
 //! (the same idiom as the library's `*_differential.rs` suites). These prove genuine interop:

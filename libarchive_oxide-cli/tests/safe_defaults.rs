@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The safe defaults must survive through the CLI: path-traversal entries are refused on extract,
 //! and transparent decompression is capped (bomb defense). These are the documented, intentional
 //! divergences from historical tar's unsafe behavior.

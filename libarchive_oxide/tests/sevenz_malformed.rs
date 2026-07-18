@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Malformed / adversarial 7z inputs must produce an `Error`, never a panic. Covers a truncated
 //! signature header, corrupt CRCs, a lying next-header size, a truncated header body, an unsupported
 //! coder (non-LZMA2), and a lying folder unpack size.

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Adapters over reused pure-Rust decoder crates, all conformed to the sans-IO `Transform`
 //! via the shared `PullBridge`.
 //!

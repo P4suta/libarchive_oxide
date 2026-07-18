@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Dependabot version updates. Weekly PRs for Cargo crates (the root workspace and the excluded
 # `fuzz` sub-workspace, which resolves against its own Cargo.lock) and the GitHub Actions the
 # workflows use. Every commit is prefixed `build(deps)` so the Conventional Commits gate accepts a

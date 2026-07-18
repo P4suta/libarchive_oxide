@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Build `cargo doc` for the whole workspace and deploy it to GitHub Pages on push to `main`.
 
 name: docs

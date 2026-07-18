@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end round-trip tests for the zstd / xz / lz4 decode adapters.
 //!
 //! Each codec's own pure-Rust encoder (dev-dependency) compresses a hand-built tar; arca then

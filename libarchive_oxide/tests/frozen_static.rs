@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Static (compile-time) proofs of the frozen abstraction on the std side.
 //!
 //! There is **no runtime type erasure** anywhere in the pipeline: the sealed [`AnyReader`] is an

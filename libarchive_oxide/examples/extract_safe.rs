@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Extract an archive with the traversal-safe path API.
 //!
 //! Run it with `cargo run --example extract_safe`. It synthesizes a tar that includes a *hostile*

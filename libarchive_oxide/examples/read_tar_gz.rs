@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Read a `.tar.gz`: auto-detect the gzip filter, then stream the tar entries.
 //!
 //! Run it with `cargo run --example read_tar_gz`. To keep the example self-contained it first

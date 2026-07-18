@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end test for `.tar.gz`. Produces gzip via flate2 (a pure-Rust backend),
 //! and verifies the full path of arca auto-detection + gzip decompression -> `TarReader`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

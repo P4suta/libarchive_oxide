@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # committed checks the one thing release-plz needs from a commit: a Conventional
 # Commits type prefix. It is a Rust tool (no Node), run by the commit-msg hook and a
 # CI job. Length and capitalization rules are off: subjects here are prose, can run

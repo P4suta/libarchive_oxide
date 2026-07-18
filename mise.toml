@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Native dev toolchain (mirrors what CI installs). Install with `mise install`, then
 # `mise run hooks`. The Rust toolchain channel is owned by rust-toolchain.toml; the
 # `rust = "stable"` line here just matches it so `mise install` provisions it too.

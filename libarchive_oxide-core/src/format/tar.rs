@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! tar format (ustar / pax / GNU).
 //!
 //! **P1**: Implements slice-based reading. Establishes here the borrow-checked

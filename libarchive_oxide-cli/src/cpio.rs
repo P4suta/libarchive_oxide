@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `oxcpio` — the bsdcpio-compatible cpio interface over the flagship library.
 //!
 //! Supported (each flag fully functional):

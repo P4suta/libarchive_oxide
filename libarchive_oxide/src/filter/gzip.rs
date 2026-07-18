@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! gzip decode filter (bridges `miniz_oxide`'s streaming inflate to the sans-IO `Transform`).
 //!
 //! gzip framing (RFC 1952: header + raw deflate body + CRC32/ISIZE trailer) is

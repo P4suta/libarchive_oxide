@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `.deb`-style end-to-end test: an `ar` archive whose members are gzip-compressed tarballs.
 //!
 //! This exercises all three layers composing at once: ar (outer format) -> gzip (filter) ->

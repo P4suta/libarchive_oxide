@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Differential test: a tar produced by `TarWriter` must be extractable by the real GNU/BSD
 //! `tar`. Skips gracefully if no `tar` binary is on PATH.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

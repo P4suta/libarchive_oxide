@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! zip writer tests: store/deflate/dir/symlink/empty/incompressible-fallback/mode preservation,
 //! all read back through arca's own zip reader (arca-internal round-trip).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

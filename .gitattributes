@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Force LF in the working tree on every platform. The toolchain expects LF
 # everywhere — rustfmt (`newline_style = "Unix"`), taplo, the `.editorconfig`, the
 # `scripts/*.sh` hooks. Without this, Git's `core.autocrlf=true` (the Windows

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bridge from a pull-based (`std::io::Read`) decoder to the sans-IO `Transform`.
 //!
 //! Reused decoder crates (`ruzstd`, `lzma-rust2`, `lz4_flex`) expose a `Read`-based API.

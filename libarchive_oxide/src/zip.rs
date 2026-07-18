@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! zip reader and writer (central-directory based, store + deflate, zip64, AES-256 AE-2).
 //!
 //! zip differs in shape from tar/cpio/ar: its authoritative metadata lives in a *central

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Malformed-input tests: truncated archives, damaged zip64/EOCD64, and (with the `aes` feature)
 //! corrupted AES fields and password mismatches must all return an error, never panic.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

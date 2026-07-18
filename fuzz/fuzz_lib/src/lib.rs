@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `libarchive_oxide-fuzz-cases` — the invariant bodies of libarchive_oxide's fuzzing, factored out as plain functions.
 //!
 //! This crate holds **no** libFuzzer machinery, so it builds and runs anywhere (including the
