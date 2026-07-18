@@ -59,8 +59,7 @@ jobs:
         shell: bash
         run: |
           for attempt in {1..40}; do
-            if curl --fail --silent --show-error \
-              "https://crates.io/api/v1/crates/libarchive_oxide-core/$VERSION" >/dev/null; then
+            if cargo info "libarchive_oxide-core@$VERSION" >/dev/null 2>&1; then
               exit 0
             fi
             echo "core is not visible yet (attempt $attempt/40)"
@@ -80,8 +79,7 @@ jobs:
         shell: bash
         run: |
           for attempt in {1..40}; do
-            if curl --fail --silent --show-error \
-              "https://crates.io/api/v1/crates/libarchive_oxide/$VERSION" >/dev/null; then
+            if cargo info "libarchive_oxide@$VERSION" >/dev/null 2>&1; then
               exit 0
             fi
             echo "flagship is not visible yet (attempt $attempt/40)"
@@ -101,7 +99,6 @@ jobs:
         shell: bash
         run: |
           for crate in libarchive_oxide-core libarchive_oxide libarchive_oxide-cli; do
-            curl --fail --silent --show-error \
-              "https://crates.io/api/v1/crates/$crate/$VERSION" >/dev/null
+            cargo info "$crate@$VERSION" >/dev/null
             echo "$crate $VERSION is visible on crates.io"
           done
