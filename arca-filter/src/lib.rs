@@ -16,9 +16,20 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use arca_core::filter::FilterId;
 use arca_core::Transform;
+
+/// One-shot raw DEFLATE decompression with an output-size cap.
+///
+/// Used by per-entry container formats (e.g. zip) whose uncompressed size is known up front; the
+/// cap defends against a lying size field (decompression bomb).
+#[cfg(feature = "gzip")]
+pub fn inflate(compressed: &[u8], max_size: usize) -> arca_core::Result<Vec<u8>> {
+    miniz_oxide::inflate::decompress_to_vec_with_limit(compressed, max_size)
+        .map_err(|_| arca_core::Error::Malformed("deflate: decode failed"))
+}
 
 #[cfg(feature = "gzip")]
 pub mod gzip;

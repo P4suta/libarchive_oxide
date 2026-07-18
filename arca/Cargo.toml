@@ -27,6 +27,7 @@ flate2 = "1"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
 lzma-rust2 = "0.16.5"
 ruzstd = "0.8.2"
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

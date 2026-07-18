@@ -14,9 +14,11 @@ use crate::path::sanitize;
 
 /// Detects the archive format from `plain` (already decompressed) and builds a reader.
 ///
-/// Recognizes tar, ar, and cpio. Errors if the bytes match none of them.
+/// Recognizes zip, tar, ar, and cpio. Errors if the bytes match none of them.
 pub fn reader(plain: &[u8]) -> io::Result<Box<dyn EntryReader + '_>> {
-    if matches!(Tar::sniff(plain), Detection::Match) {
+    if crate::zip::is_zip(plain) {
+        Ok(Box::new(crate::zip::ZipReader::new(plain)))
+    } else if matches!(Tar::sniff(plain), Detection::Match) {
         Ok(Box::new(TarReader::new(plain)))
     } else if matches!(Ar::sniff(plain), Detection::Match) {
         Ok(Box::new(ArReader::new(plain)))

@@ -93,9 +93,16 @@ against GNU `tar` and an independent gzip decoder are part of the test suite.
 Verified end-to-end, adversarially reviewed twice, and hardened against
 malformed-input panics and extraction attacks.
 
-**Planned:** `zip`/`7z`/`iso9660`, an incrementally-fed sans-IO source, and
-fuzzing. Because the trait algebra is frozen, none of these require a trait
-change.
+`zip` archives can also be **read** (store + deflate, central-directory based) —
+its reader lives in the std crate because it needs a per-entry DEFLATE codec,
+yet it implements the very same `EntryReader` trait, so it plugs straight into
+detection and extraction. This shows the frozen abstraction reaching across
+crate boundaries even for a format whose shape (per-entry compression, metadata
+at the end) differs from the tar family.
+
+**Planned:** a `zip` writer, `7z`/`iso9660`, zip64/encryption, an
+incrementally-fed sans-IO source, and fuzzing. Because the trait algebra is
+frozen, none of these require a trait change.
 
 ## Quality gates
 

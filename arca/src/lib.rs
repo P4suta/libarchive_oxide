@@ -20,6 +20,7 @@ use arca_core::{decode_to_vec, decode_to_vec_capped, Error, Result};
 pub mod create;
 pub mod extract;
 pub mod path;
+pub mod zip;
 
 pub use arca_core;
 pub use arca_filter;
