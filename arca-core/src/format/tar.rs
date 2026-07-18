@@ -604,18 +604,43 @@ fn write_checksum(h: &mut [u8; BLOCK]) -> Result<()> {
     Ok(())
 }
 
-/// Writes `val` as zero-padded octal into `field`, followed by a NUL. Errors if it does not fit.
+/// Writes `val` as a numeric field: zero-padded octal + NUL when it fits, otherwise the GNU
+/// base-256 encoding (dual of [`parse_numeric`]'s two branches), so any value the reader accepts
+/// can be written back.
 fn put_octal(field: &mut [u8], val: u64) -> Result<()> {
     let n = field.len();
-    field[n - 1] = 0;
-    let mut v = val;
-    for slot in field[..n - 1].iter_mut().rev() {
-        *slot = b'0' + u8::try_from(v & 7).unwrap_or(0);
-        v >>= 3;
+    // `n - 1` octal digits fit if the value needs at most that many.
+    if fits_octal(val, n - 1) {
+        field[n - 1] = 0;
+        let mut v = val;
+        for slot in field[..n - 1].iter_mut().rev() {
+            *slot = b'0' + u8::try_from(v & 7).unwrap_or(0);
+            v >>= 3;
+        }
+        Ok(())
+    } else {
+        put_base256(field, val)
     }
-    if v != 0 {
-        return Err(Error::Unsupported("tar: value too large for octal field"));
+}
+
+/// Whether `val` fits in `digits` octal digits.
+fn fits_octal(val: u64, digits: usize) -> bool {
+    digits >= 22 || val < 1u64 << (3 * digits)
+}
+
+/// Encodes `val` as GNU base-256: the first byte's high bit marks it, the value is stored
+/// big-endian in the remaining bytes.
+fn put_base256(field: &mut [u8], val: u64) -> Result<()> {
+    let n = field.len();
+    let capacity = n - 1; // bytes available after the marker byte
+    let bytes = val.to_be_bytes();
+    if capacity < 8 && bytes[..8 - capacity].iter().any(|&b| b != 0) {
+        return Err(Error::Unsupported("tar: value too large for numeric field"));
     }
+    field.fill(0);
+    field[0] = 0x80;
+    let take = capacity.min(8);
+    field[n - take..].copy_from_slice(&bytes[8 - take..]);
     Ok(())
 }
 
@@ -678,6 +703,26 @@ mod tests {
         // 0x80 marker, then 0x01 followed by zeros = 1 << (8*n), which overflows u64.
         let field = [0x80, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(parse_numeric(&field).is_err());
+    }
+
+    #[test]
+    fn put_octal_falls_back_to_base256() {
+        // 10 GiB does not fit the 12-byte octal size field, so base-256 is used and round-trips.
+        let mut size = [0u8; 12];
+        put_octal(&mut size, 10_737_418_240).unwrap();
+        assert_eq!(size[0] & 0x80, 0x80, "base-256 marker set");
+        assert_eq!(parse_numeric(&size).unwrap(), 10_737_418_240);
+
+        // A small value still uses plain octal.
+        let mut mode = [0u8; 8];
+        put_octal(&mut mode, 0o644).unwrap();
+        assert_eq!(mode[0], b'0');
+        assert_eq!(parse_numeric(&mode).unwrap(), 0o644);
+
+        // A uid beyond 7 octal digits round-trips via base-256.
+        let mut uid = [0u8; 8];
+        put_octal(&mut uid, 3_000_000).unwrap();
+        assert_eq!(parse_numeric(&uid).unwrap(), 3_000_000);
     }
 
     #[test]
