@@ -192,13 +192,40 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: detect published API baselines
+        id: semver-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for crate in libarchive_oxide-core libarchive_oxide; do
+            status=$(curl --silent --show-error --location --retry 3 \
+              --output /dev/null --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/$crate")
+            case "$status" in
+              200) ;;
+              404) missing+=("$crate") ;;
+              *)
+                echo "::error::crates.io returned HTTP $status while checking $crate"
+                exit 1
+                ;;
+            esac
+          done
+          if (( ${#missing[@]} )); then
+            echo "available=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::Skipping semver-checks before the first publish; missing: ${missing[*]}"
+          else
+            echo "available=true" >>"$GITHUB_OUTPUT"
+          fi
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        if: steps.semver-baseline.outputs.available == 'true'
         with:
           tool: cargo-semver-checks
       # Flags an SemVer-breaking change to the two published library crates that is not paired with a
       # major bump. `release-plz` re-runs the same tool at publish time (release.yml); this is the
       # early PR-time signal.
-      - run: cargo semver-checks check-release -p libarchive_oxide-core -p libarchive_oxide
+      - if: steps.semver-baseline.outputs.available == 'true'
+        run: cargo semver-checks check-release -p libarchive_oxide-core -p libarchive_oxide
 
   fuzz:
     name: fuzz (nightly, build + short run)
