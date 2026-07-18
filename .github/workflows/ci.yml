@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to keep the queue lean.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # NOTE: `-D warnings` is applied *per job*, only on the stable toolchain we can reproduce locally
+  # (fmt/clippy/test/no_std). It is deliberately NOT global: the msrv (1.85) and fuzz (nightly) jobs
+  # run toolchains the dev box cannot reproduce, and a version-specific warning from the compiler or
+  # a dependency there would turn CI red for a reason invisible to every local gate. Those jobs still
+  # fail on real errors; they just do not promote warnings to errors on unverifiable toolchains.
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # This also runs arca/tests/fuzz_replay.rs — the portable adversarial gate that mutates every
+      # committed seed through the reader/round-trip/codec invariants (catches reintroduced panics
+      # on malformed input without nightly/libFuzzer), on all three OSes.
+      - run: cargo test --workspace --all-features
+
+  no_std:
+    name: no_std (thumbv7em)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabi
+      - uses: Swatinem/rust-cache@v2
+      # arca-core must stay pure no_std + alloc; building for a bare-metal target
+      # with no std available proves it. Do NOT pass --all-features here (that pulls std).
+      - run: cargo build -p arca-core --target thumbv7em-none-eabi
+
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@master
+
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-features
+
+  nodyn:
+    name: no-dyn gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Mechanically enforce the zero-type-erasure invariant (uses ripgrep, preinstalled on the runner).
+      - run: bash scripts/check-no-dyn.sh
+
+  fuzz:
+    name: fuzz (nightly, build + short run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # First gate: every target must compile against libFuzzer on Linux/nightly.
+      - run: cargo fuzz build
+      # Second gate: actually *run* libFuzzer as a bug-finder. Each target fuzzes for a bounded wall
+      # time, seeded from its committed corpus (fuzz/corpus/<target>), so a panic on malformed input
+      # in a reader/round-trip/codec path fails CI here — not just at compile time. Kept short so the
+      # job stays lean; the coverage-guided mutator explores far past the seeds within the budget.
+      - name: Short coverage-guided fuzz run per target
+        run: |
+          set -euo pipefail
+          targets=$(cargo fuzz list)
+          for t in $targets; do
+            echo "::group::fuzz $t"
+            cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done

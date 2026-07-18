@@ -1,0 +1,147 @@
+# cargo-fuzz workspace for arca. This is **deliberately outside** the main workspace (the root
+# Cargo.toml lists `exclude = ["fuzz"]`), so `cargo test --workspace` never tries to build the
+# libFuzzer targets — which need a nightly toolchain and the sanitizer runtime that is not available
+# on the Windows/MSVC dev box. The portable invariants live in `fuzz_lib` (a plain library) and are
+# exercised on Windows through `arca/tests/fuzz_replay.rs`; only this crate's `fuzz_targets/*` bins
+# require nightly `cargo fuzz`.
+
+[workspace]
+resolver = "2"
+members = ["fuzz_lib"]
+
+[package]
+name = "arca-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+arca-fuzz-cases = { path = "fuzz_lib" }
+
+# Keep the targets fast to link and free of unrelated harness cruft.
+[profile.release]
+debug = 1
+
+# ── Reader targets: arbitrary bytes → detection + drain, no panic. ──
+
+[[bin]]
+name = "read_tar"
+path = "fuzz_targets/read_tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_cpio"
+path = "fuzz_targets/read_cpio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_ar"
+path = "fuzz_targets/read_ar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_zip"
+path = "fuzz_targets/read_zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_7z"
+path = "fuzz_targets/read_7z.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_iso"
+path = "fuzz_targets/read_iso.rs"
+test = false
+doc = false
+bench = false
+
+# ── Round-trip targets: synthesized entry set → write → read back → id. ──
+
+[[bin]]
+name = "roundtrip_tar"
+path = "fuzz_targets/roundtrip_tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_cpio"
+path = "fuzz_targets/roundtrip_cpio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_ar"
+path = "fuzz_targets/roundtrip_ar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_7z"
+path = "fuzz_targets/roundtrip_7z.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_iso"
+path = "fuzz_targets/roundtrip_iso.rs"
+test = false
+doc = false
+bench = false
+
+# ── Codec targets: decode-no-panic + decode∘encode = id. ──
+
+[[bin]]
+name = "codec_gzip"
+path = "fuzz_targets/codec_gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_zstd"
+path = "fuzz_targets/codec_zstd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_xz"
+path = "fuzz_targets/codec_xz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_lz4"
+path = "fuzz_targets/codec_lz4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_lzma2"
+path = "fuzz_targets/codec_lzma2.rs"
+test = false
+doc = false
+bench = false
