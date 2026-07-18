@@ -10,7 +10,10 @@
 use alloc::borrow::Cow;
 
 use crate::error::{Error, Result};
-use crate::format::{ArchiveFormat, Detection, Entry, EntryReader, SliceData};
+use crate::format::{
+    ArchiveFormat, Detection, Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, SliceData,
+};
+use crate::io::Sink;
 use crate::meta::{EntryKind, EntryMeta, Timestamp};
 
 const NEWC_MAGIC: &[u8] = b"070701";
@@ -201,6 +204,194 @@ impl EntryReader for CpioReader<'_> {
     }
 }
 
+/// cpio "newc" streaming writer — the dual of [`CpioReader`]. Emits SVR4 headers with 4-byte
+/// alignment and closes with the `TRAILER!!!` marker.
+#[derive(Debug)]
+pub struct CpioWriter<W: Sink> {
+    sink: W,
+    ino: u32,
+    remaining: u64,
+    data_pad: usize,
+    open: bool,
+}
+
+impl<W: Sink> CpioWriter<W> {
+    /// Builds a writer over a byte sink.
+    pub fn new(sink: W) -> Self {
+        Self {
+            sink,
+            ino: 0,
+            remaining: 0,
+            data_pad: 0,
+            open: false,
+        }
+    }
+
+    /// Consumes the writer and returns the underlying sink.
+    pub fn into_inner(self) -> W {
+        self.sink
+    }
+
+    /// Emits a newc header, the name, and its 4-byte padding.
+    fn emit_header(&mut self, name: &[u8], f: &NewcFields) -> Result<()> {
+        let filesize = u32::try_from(f.filesize)
+            .map_err(|_| Error::Unsupported("cpio: file too large for newc"))?;
+        let namesize = u32::try_from(name.len() + 1)
+            .map_err(|_| Error::Unsupported("cpio: name too long for newc"))?;
+        let fields = [
+            self.ino,
+            lo32(f.mode),
+            lo32(f.uid),
+            lo32(f.gid),
+            f.nlink,
+            lo32(f.mtime),
+            filesize,
+            0,
+            0,
+            0,
+            0,
+            namesize,
+            0,
+        ];
+        let mut h = [0u8; NEWC_HEADER];
+        h[..6].copy_from_slice(NEWC_MAGIC);
+        for (i, &val) in fields.iter().enumerate() {
+            let off = 6 + i * 8;
+            put_hex8(&mut h[off..off + 8], val);
+        }
+        self.sink.write_all(&h)?;
+        self.sink.write_all(name)?;
+        self.sink.write_all(&[0u8])?;
+        let after = NEWC_HEADER + name.len() + 1;
+        write_zeros(&mut self.sink, round4(after)? - after)?;
+        self.ino = self.ino.wrapping_add(1);
+        Ok(())
+    }
+}
+
+impl<W: Sink> EntryWriter for CpioWriter<W> {
+    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_>> {
+        if self.open {
+            return Err(Error::InvalidState("cpio: previous entry not closed"));
+        }
+        let mode = mode_bits(meta.kind) | u64::from(meta.mode & 0o7777);
+        let nlink = if matches!(meta.kind, EntryKind::Dir) {
+            2
+        } else {
+            1
+        };
+        let mtime = meta
+            .mtime
+            .map_or(0, |t| u64::try_from(t.secs.max(0)).unwrap_or(0));
+        self.emit_header(
+            &meta.path,
+            &NewcFields {
+                mode,
+                uid: meta.uid,
+                gid: meta.gid,
+                mtime,
+                filesize: meta.size,
+                nlink,
+            },
+        )?;
+        self.remaining = meta.size;
+        let size = usize_of(meta.size)?;
+        self.data_pad = round4(size)? - size;
+        self.open = true;
+        Ok(EntrySink::new(self))
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.open {
+            return Err(Error::InvalidState("cpio: entry open at finish"));
+        }
+        self.emit_header(
+            TRAILER,
+            &NewcFields {
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                filesize: 0,
+                nlink: 1,
+            },
+        )
+    }
+}
+
+/// The numeric fields of a newc header (grouped to keep `emit_header` small).
+struct NewcFields {
+    mode: u64,
+    uid: u64,
+    gid: u64,
+    mtime: u64,
+    filesize: u64,
+    nlink: u32,
+}
+
+impl<W: Sink> EntryDataSink for CpioWriter<W> {
+    fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() as u64 > self.remaining {
+            return Err(Error::InvalidState("cpio: payload exceeds declared size"));
+        }
+        self.sink.write_all(data)?;
+        self.remaining -= data.len() as u64;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if self.remaining != 0 {
+            return Err(Error::InvalidState(
+                "cpio: payload shorter than declared size",
+            ));
+        }
+        write_zeros(&mut self.sink, self.data_pad)?;
+        self.data_pad = 0;
+        self.open = false;
+        Ok(())
+    }
+}
+
+/// Maps a typed kind to its `S_IFMT` bits for writing.
+fn mode_bits(kind: EntryKind) -> u64 {
+    match kind {
+        EntryKind::Dir => S_IFDIR,
+        EntryKind::Symlink => S_IFLNK,
+        EntryKind::Char => S_IFCHR,
+        EntryKind::Block => S_IFBLK,
+        EntryKind::Fifo => S_IFIFO,
+        EntryKind::Socket => S_IFSOCK,
+        _ => S_IFREG,
+    }
+}
+
+/// The low 32 bits of `v` (newc fields are 32-bit).
+fn lo32(v: u64) -> u32 {
+    u32::try_from(v & 0xFFFF_FFFF).unwrap_or(0)
+}
+
+/// Writes `val` as 8 uppercase hex digits into `field`.
+fn put_hex8(field: &mut [u8], val: u32) {
+    let mut v = val;
+    for slot in field.iter_mut().rev() {
+        let d = u8::try_from(v & 0xf).unwrap_or(0);
+        *slot = if d < 10 { b'0' + d } else { b'A' + (d - 10) };
+        v >>= 4;
+    }
+}
+
+/// Writes `count` zero bytes to the sink.
+fn write_zeros<W: Sink>(sink: &mut W, count: usize) -> Result<()> {
+    const ZEROS: [u8; 512] = [0; 512];
+    let mut left = count;
+    while left > 0 {
+        let n = left.min(512);
+        sink.write_all(&ZEROS[..n])?;
+        left -= n;
+    }
+    Ok(())
+}
+
 /// Reads the `i`-th 8-hex-digit field of a newc header (0-based, after the 6-byte magic).
 fn newc_field(data: &[u8], pos: usize, i: usize) -> Result<u64> {
     let start = pos + 6 + i * 8;
@@ -241,6 +432,7 @@ fn parse_radix(field: &[u8], radix: u32) -> Result<u64> {
 
 // File-type bits (`S_IFMT`) of a UNIX mode.
 const S_IFMT: u64 = 0o170_000;
+const S_IFREG: u64 = 0o100_000;
 const S_IFDIR: u64 = 0o040_000;
 const S_IFCHR: u64 = 0o020_000;
 const S_IFBLK: u64 = 0o060_000;

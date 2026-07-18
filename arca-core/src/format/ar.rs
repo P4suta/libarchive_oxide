@@ -7,9 +7,13 @@
 //! type info).
 
 use alloc::borrow::Cow;
+use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
-use crate::format::{ArchiveFormat, Detection, Entry, EntryReader, SliceData};
+use crate::format::{
+    ArchiveFormat, Detection, Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, SliceData,
+};
+use crate::io::Sink;
 use crate::meta::{EntryKind, EntryMeta, Timestamp};
 
 const MAGIC: &[u8] = b"!<arch>\n";
@@ -177,6 +181,173 @@ impl EntryReader for ArReader<'_> {
             return Ok(Some(Entry::new(meta, &mut self.payload)));
         }
     }
+}
+
+/// `ar` streaming writer — the dual of [`ArReader`]. Writes the global magic once, then a 60-byte
+/// header per member (BSD `#1/LEN` inline names for names longer than 15 bytes) and an even-byte
+/// pad. Every member is a regular file.
+#[derive(Debug)]
+pub struct ArWriter<W: Sink> {
+    sink: W,
+    remaining: u64,
+    pad: bool,
+    open: bool,
+    started: bool,
+}
+
+impl<W: Sink> ArWriter<W> {
+    /// Builds a writer over a byte sink.
+    pub fn new(sink: W) -> Self {
+        Self {
+            sink,
+            remaining: 0,
+            pad: false,
+            open: false,
+            started: false,
+        }
+    }
+
+    /// Consumes the writer and returns the underlying sink.
+    pub fn into_inner(self) -> W {
+        self.sink
+    }
+
+    /// Writes the global `!<arch>\n` magic if it has not been written yet.
+    fn ensure_started(&mut self) -> Result<()> {
+        if !self.started {
+            self.sink.write_all(MAGIC)?;
+            self.started = true;
+        }
+        Ok(())
+    }
+
+    /// Emits a 60-byte member header.
+    fn emit_header(
+        &mut self,
+        name_field: &[u8],
+        mode: u64,
+        meta: &EntryMeta<'_>,
+        size: u64,
+    ) -> Result<()> {
+        let mtime = meta
+            .mtime
+            .map_or(0, |t| u64::try_from(t.secs.max(0)).unwrap_or(0));
+        let mut h = [b' '; HEADER];
+        let mut buf = [0u8; 24];
+        put_field(&mut h[F_NAME.0..F_NAME.1], name_field);
+        put_field(
+            &mut h[F_MTIME.0..F_MTIME.1],
+            radix_bytes(mtime, 10, &mut buf),
+        );
+        put_field(
+            &mut h[F_UID.0..F_UID.1],
+            radix_bytes(meta.uid, 10, &mut buf),
+        );
+        put_field(
+            &mut h[F_GID.0..F_GID.1],
+            radix_bytes(meta.gid, 10, &mut buf),
+        );
+        put_field(&mut h[F_MODE.0..F_MODE.1], radix_bytes(mode, 8, &mut buf));
+        put_field(&mut h[F_SIZE.0..F_SIZE.1], radix_bytes(size, 10, &mut buf));
+        h[F_MAGIC.0] = b'`';
+        h[F_MAGIC.0 + 1] = b'\n';
+        self.sink.write_all(&h)
+    }
+}
+
+impl<W: Sink> EntryWriter for ArWriter<W> {
+    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_>> {
+        if self.open {
+            return Err(Error::InvalidState("ar: previous entry not closed"));
+        }
+        self.ensure_started()?;
+
+        // Names up to 15 bytes fit "name/" in the 16-byte field; longer names use BSD "#1/LEN"
+        // with the name stored inline at the front of the member data.
+        let name = &meta.path;
+        let mut prefix: &[u8] = &[];
+        let name_field: Vec<u8> = if name.len() <= 15 {
+            let mut nf = Vec::with_capacity(name.len() + 1);
+            nf.extend_from_slice(name);
+            nf.push(b'/');
+            nf
+        } else {
+            prefix = name;
+            let mut nf = Vec::new();
+            nf.extend_from_slice(b"#1/");
+            let mut buf = [0u8; 24];
+            nf.extend_from_slice(radix_bytes(name.len() as u64, 10, &mut buf));
+            nf
+        };
+
+        let total = prefix.len() as u64 + meta.size;
+        let mode = 0o100_000 | u64::from(meta.mode & 0o7777);
+        self.emit_header(&name_field, mode, meta, total)?;
+        if !prefix.is_empty() {
+            self.sink.write_all(prefix)?;
+        }
+
+        self.remaining = meta.size;
+        self.pad = total % 2 == 1;
+        self.open = true;
+        Ok(EntrySink::new(self))
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.open {
+            return Err(Error::InvalidState("ar: entry open at finish"));
+        }
+        // An empty archive is still just the magic.
+        self.ensure_started()
+    }
+}
+
+impl<W: Sink> EntryDataSink for ArWriter<W> {
+    fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() as u64 > self.remaining {
+            return Err(Error::InvalidState("ar: payload exceeds declared size"));
+        }
+        self.sink.write_all(data)?;
+        self.remaining -= data.len() as u64;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if self.remaining != 0 {
+            return Err(Error::InvalidState(
+                "ar: payload shorter than declared size",
+            ));
+        }
+        if self.pad {
+            self.sink.write_all(b"\n")?;
+            self.pad = false;
+        }
+        self.open = false;
+        Ok(())
+    }
+}
+
+/// Left-aligns `value` into `field`, space-padding the remainder (ar's ASCII header fields).
+fn put_field(field: &mut [u8], value: &[u8]) {
+    field.fill(b' ');
+    let n = value.len().min(field.len());
+    field[..n].copy_from_slice(&value[..n]);
+}
+
+/// Formats `val` in the given radix (8 or 10) into `buf`, returning the written slice.
+fn radix_bytes(val: u64, radix: u64, buf: &mut [u8; 24]) -> &[u8] {
+    if val == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut i = buf.len();
+    let mut v = val;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + u8::try_from(v % radix).unwrap_or(0);
+        v /= radix;
+    }
+    &buf[i..]
 }
 
 /// Extracts a fixed header field.
