@@ -1,11 +1,11 @@
-//! `arca-fuzz-cases` — the invariant bodies of arca's fuzzing, factored out as plain functions.
+//! `libarchive_oxide-fuzz-cases` — the invariant bodies of libarchive_oxide's fuzzing, factored out as plain functions.
 //!
 //! This crate holds **no** libFuzzer machinery, so it builds and runs anywhere (including the
 //! Windows/MSVC dev box with a stable toolchain). Two callers share it:
 //!
 //! - `fuzz/fuzz_targets/*.rs` — thin `fuzz_target!` shims (built only under the `fuzz` crate on a
 //!   nightly Linux CI box) that delegate straight to these functions.
-//! - `arca/tests/fuzz_replay.rs` — a portable `cargo test` runner that replays committed corpus
+//! - `libarchive_oxide/tests/fuzz_replay.rs` — a portable `cargo test` runner that replays committed corpus
 //!   files and a batch of `arbitrary`-seeded structured inputs through the **same** functions.
 //!
 //! # Invariants
@@ -28,18 +28,18 @@ use std::io::{Read, Write};
 
 use arbitrary::Arbitrary;
 
-use arca_core::filter::FilterId;
-use arca_core::format::ar::{Ar, ArReader, ArWriter};
-use arca_core::format::cpio::{Cpio, CpioReader, CpioWriter};
-use arca_core::format::iso9660::{Iso9660, IsoReader, IsoWriter};
-use arca_core::format::tar::{Tar, TarReader, TarWriter};
-use arca_core::format::ArchiveFormat;
-use arca_core::{
+use libarchive_oxide_core::filter::FilterId;
+use libarchive_oxide_core::format::ar::{Ar, ArReader, ArWriter};
+use libarchive_oxide_core::format::cpio::{Cpio, CpioReader, CpioWriter};
+use libarchive_oxide_core::format::iso9660::{Iso9660, IsoReader, IsoWriter};
+use libarchive_oxide_core::format::tar::{Tar, TarReader, TarWriter};
+use libarchive_oxide_core::format::ArchiveFormat;
+use libarchive_oxide_core::{
     decode_to_vec, decode_to_vec_capped, EntryData, EntryKind, EntryMeta, EntryReader, EntryWriter,
 };
 
-use arca::sevenz::{SevenZReader, SevenZWriter};
-use arca::zip::ZipReader;
+use libarchive_oxide::sevenz::{SevenZReader, SevenZWriter};
+use libarchive_oxide::zip::ZipReader;
 
 // ── Bounds: the guardrails that make "no panic / bounded work" enforceable on adversarial input. ──
 
@@ -123,7 +123,7 @@ pub fn read_iso(data: &[u8]) {
 
 /// zip reader: no panic on any input.
 pub fn read_zip(data: &[u8]) {
-    let _ = arca::zip::is_zip(data);
+    let _ = libarchive_oxide::zip::is_zip(data);
     drive_reader(ZipReader::new(data));
 }
 
@@ -331,21 +331,21 @@ pub fn roundtrip_iso(entries: &[FuzzEntry]) {
 
 /// Feeds arbitrary bytes to a codec's decoder with an output cap; errors are expected, panics are not.
 fn codec_decode_no_panic(id: FilterId, data: &[u8]) {
-    if let Some(mut decoder) = arca_filter::decoder(id) {
+    if let Some(mut decoder) = libarchive_oxide::filter::decoder(id) {
         let _ = decode_to_vec_capped(&mut decoder, data, CODEC_CAP);
     }
 }
 
-/// Asserts `decode ∘ encode = id` for a codec whose encoder is exposed via [`arca_filter::encoder`].
+/// Asserts `decode ∘ encode = id` for a codec whose encoder is exposed via [`libarchive_oxide::filter::encoder`].
 fn codec_roundtrip(id: FilterId, data: &[u8]) {
     let plain: Vec<u8> = data.iter().copied().take(CODEC_ROUNDTRIP_MAX).collect();
-    let Some(mut encoder) = arca_filter::encoder(id) else {
+    let Some(mut encoder) = libarchive_oxide::filter::encoder(id) else {
         return;
     };
     let Ok(compressed) = decode_to_vec(&mut encoder, &plain) else {
         return;
     };
-    let Some(mut decoder) = arca_filter::decoder(id) else {
+    let Some(mut decoder) = libarchive_oxide::filter::decoder(id) else {
         return;
     };
     // Our own encoder's output must decode back to the exact input.

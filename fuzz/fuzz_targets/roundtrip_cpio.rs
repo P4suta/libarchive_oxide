@@ -1,8 +1,8 @@
 #![no_main]
-//! Thin libFuzzer shim → the portable `arca_fuzz_cases::roundtrip_cpio` invariant.
-use arca_fuzz_cases::FuzzEntry;
+//! Thin libFuzzer shim → the portable `libarchive_oxide_fuzz_cases::roundtrip_cpio` invariant.
+use libarchive_oxide_fuzz_cases::FuzzEntry;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|entries: Vec<FuzzEntry>| {
-    arca_fuzz_cases::roundtrip_cpio(&entries);
+    libarchive_oxide_fuzz_cases::roundtrip_cpio(&entries);
 });

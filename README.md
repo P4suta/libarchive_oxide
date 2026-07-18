@@ -1,10 +1,10 @@
-# arca
+# libarchive_oxide
 
 A pure-Rust, unified, streaming archive library — one trait algebra for archive
 **formats**, compression **filters**, and **I/O**, with a `no_std` core.
 
-`arca` reads and writes `tar`, `cpio`, and `ar` archives, transparently layered
-over `gzip`, `zstd`, `xz`, and `lz4` compression — so `.tar.gz`, `.tar.zst`,
+`libarchive_oxide` reads and writes `tar`, `cpio`, and `ar` archives, transparently
+layered over `gzip`, `zstd`, `xz`, and `lz4` compression — so `.tar.gz`, `.tar.zst`,
 `.tar.xz`, and `.deb` all extract *and* compose through a single entry point.
 `zip` archives can additionally be read. Runtime format/codec choice is dispatched
 over sealed enums with **zero type erasure** — there is no `dyn` anywhere in the
@@ -15,13 +15,15 @@ library (a CI grep gate enforces it).
 The Rust ecosystem has excellent single-purpose crates (`tar`, `zip`, `sevenz-rust`)
 and mature codecs (`miniz_oxide`, `ruzstd`, `lzma-rust2`, `lz4_flex`), but no
 *unified streaming* library that composes formats and filters behind one clean,
-`no_std`, sans-IO abstraction the way C's `libarchive` does. `arca` is that
-abstraction — and it reuses those mature codecs rather than reimplementing them.
+`no_std`, sans-IO abstraction the way C's `libarchive` does. `libarchive_oxide` is
+that abstraction — an independent, pure-Rust reimplementation (not a binding), and
+it reuses those mature codecs rather than reimplementing them.
 
 ## Architecture
 
-The value of `arca` is the **trait algebra**, designed as a frozen whole from day
-one so new formats and the write path load without changing any trait:
+The value of `libarchive_oxide` is the **trait algebra**, designed as a frozen
+whole from day one so new formats and the write path load without changing any
+trait:
 
 ```
 Format   tar / cpio / ar            EntryReader  ⇄  EntryWriter     (a dual)
@@ -46,26 +48,29 @@ Base     Transform::{step, finish}   sans-IO, allocation-free, caller-owned
 - **No type erasure.** `EntryReader::Data`/`EntryWriter::Sink` are associated
   types and runtime dispatch uses sealed enums (`AnyReader`, `AnyDecoder`); the
   library contains no `Box<dyn>`, `&dyn`, or `&mut dyn`, enforced mechanically.
-- **Pure core.** `arca-core` builds on bare metal (`thumbv7em-none-eabi`); only
-  the heavyweight-codec adapters and the filesystem layer require `std`.
+- **Pure core.** `libarchive_oxide-core` builds on bare metal
+  (`thumbv7em-none-eabi`) with **zero external dependencies**; only the
+  heavyweight-codec adapters and the filesystem layer require `std`.
 
 ### Crates
 
-| Crate         | `std`? | Role |
-|---------------|--------|------|
-| `arca-core`   | no     | Trait algebra, `EntryMeta`, tar/cpio/ar readers, the sans-IO pipeline |
-| `arca-filter` | mixed  | gzip (native, `no_std`); zstd/xz/lz4 adapters over reused crates (`std`) |
-| `arca`        | yes    | Auto-detection, safe extraction, path sanitization, decompression caps |
-| `arca-cli`    | yes    | `arca t` / `arca x` demonstrator |
+| Crate                     | `std`? | Role |
+|---------------------------|--------|------|
+| `libarchive_oxide-core`   | no     | Trait algebra, `EntryMeta`, tar/cpio/ar/iso readers+writers, the sans-IO pipeline. No external deps. |
+| `libarchive_oxide`        | yes    | Compression filters (gzip native + zstd/xz/lz4 adapters), zip/7z, auto-detection, safe extraction, path sanitization, decompression caps |
+| `libarchive_oxide-cli`    | yes    | `oxtar` / `oxcpio` / `oxcat` / `oxunzip` tools |
 
 ## Usage
 
 ### CLI
 
 ```sh
-arca t archive.tar.zst              # list entries
-arca x archive.tar.gz -C ./out      # extract safely into ./out
-arca c out.tar.gz src/ README.md    # create (compression by extension)
+oxtar t archive.tar.zst              # list entries
+oxtar x archive.tar.gz -C ./out      # extract safely into ./out
+oxtar c out.tar.gz src/ README.md    # create (compression by extension)
+oxcat archive.tar.gz > archive.tar   # decompress to stdout
+oxunzip -l archive.zip               # list a zip
+oxunzip archive.zip -d ./out         # extract a zip
 ```
 
 Compression and format are auto-detected on read. On create, the codec is
@@ -77,8 +82,8 @@ names) and caps the decompressed size to defend against decompression bombs.
 
 ```rust
 // Decompress (auto-detected), then read entries.
-let plain = arca::decompress(&bytes)?;          // Cow: borrowed if uncompressed
-let mut reader = arca::reader(&plain)?;          // detects tar / cpio / ar
+let plain = libarchive_oxide::decompress(&bytes)?;   // Cow: borrowed if uncompressed
+let mut reader = libarchive_oxide::reader(&plain)?;  // detects tar / cpio / ar
 while let Some(mut entry) = reader.next_entry()? {
     println!("{}", String::from_utf8_lossy(&entry.meta().path));
     let mut buf = [0u8; 8192];
@@ -88,26 +93,22 @@ while let Some(mut entry) = reader.next_entry()? {
 
 ## Status
 
-**Read and write both work, across all three formats.** Reading: tar
+**Read and write both work, across all three streaming formats.** Reading: tar
 (`ustar`/`pax`/GNU), cpio (`newc`/`odc`), ar (GNU/BSD/SysV), over
 gzip/zstd/xz/lz4. Writing: tar (GNU longname/longlink), cpio (`newc`), and ar
-(BSD long names) writers, plus all four compression encoders — so `arca` both
-extracts and creates `.tar`, `.tar.gz`, `.tar.zst`, `.tar.xz`, `.tar.lz4`, and
-composes them into a `.deb`. The `read ∘ write = id` round-trip and cross-checks
-against GNU `tar` and an independent gzip decoder are part of the test suite.
-Verified end-to-end, adversarially reviewed twice, and hardened against
-malformed-input panics and extraction attacks.
+(BSD long names) writers, plus all four compression encoders — so
+`libarchive_oxide` both extracts and creates `.tar`, `.tar.gz`, `.tar.zst`,
+`.tar.xz`, `.tar.lz4`, and composes them into a `.deb`. The `read ∘ write = id`
+round-trip and cross-checks against GNU `tar` and an independent gzip decoder are
+part of the test suite. Verified end-to-end, adversarially reviewed, and hardened
+against malformed-input panics and extraction attacks.
 
-`zip` archives can also be **read** (store + deflate, central-directory based) —
-its reader lives in the std crate because it needs a per-entry DEFLATE codec,
-yet it implements the very same `EntryReader` trait, so it plugs straight into
-detection and extraction. This shows the frozen abstraction reaching across
-crate boundaries even for a format whose shape (per-entry compression, metadata
-at the end) differs from the tar family.
-
-**Planned:** a `zip` writer, `7z`/`iso9660`, zip64/encryption, an
-incrementally-fed sans-IO source, and fuzzing. Because the trait algebra is
-frozen, none of these require a trait change.
+`zip` (read+write, including zip64 and WinZip AES-256), `7z` (single-folder
+LZMA2), and `iso9660` are also supported; each implements the very same
+`EntryReader`/`EntryWriter` traits, so they plug straight into detection and
+extraction. This shows the frozen abstraction reaching across crate boundaries
+even for formats whose shape (per-entry compression, metadata at the end)
+differs from the tar family.
 
 ## Quality gates
 

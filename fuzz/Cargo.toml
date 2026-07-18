@@ -1,8 +1,8 @@
-# cargo-fuzz workspace for arca. This is **deliberately outside** the main workspace (the root
+# cargo-fuzz workspace for libarchive_oxide. This is **deliberately outside** the main workspace (the root
 # Cargo.toml lists `exclude = ["fuzz"]`), so `cargo test --workspace` never tries to build the
 # libFuzzer targets — which need a nightly toolchain and the sanitizer runtime that is not available
 # on the Windows/MSVC dev box. The portable invariants live in `fuzz_lib` (a plain library) and are
-# exercised on Windows through `arca/tests/fuzz_replay.rs`; only this crate's `fuzz_targets/*` bins
+# exercised on Windows through `libarchive_oxide/tests/fuzz_replay.rs`; only this crate's `fuzz_targets/*` bins
 # require nightly `cargo fuzz`.
 
 [workspace]
@@ -10,7 +10,7 @@ resolver = "2"
 members = ["fuzz_lib"]
 
 [package]
-name = "arca-fuzz"
+name = "libarchive_oxide-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -22,7 +22,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-arca-fuzz-cases = { path = "fuzz_lib" }
+libarchive_oxide-fuzz-cases = { path = "fuzz_lib" }
 
 # Keep the targets fast to link and free of unrelated harness cruft.
 [profile.release]

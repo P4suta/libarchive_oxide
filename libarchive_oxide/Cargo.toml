@@ -1,0 +1,73 @@
+[package]
+name = "libarchive_oxide"
+version.workspace = true
+description = "Unified streaming archive library (Pure Rust). std high-level API: auto-detection, FS extraction, safe path handling."
+edition.workspace = true
+# Override above the workspace baseline: the codec closure (ruzstd, lzma-rust2, lz4_flex) sets a
+# higher floor than the no_std core. Measured with cargo-msrv over --all-features.
+rust-version = "1.87"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/libarchive_oxide"
+keywords = ["archive", "tar", "zip", "7z", "iso9660"]
+categories = ["compression", "filesystem", "parsing"]
+# Trim the published tarball: integration tests are repo-only, not needed by consumers.
+exclude = ["tests/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--generate-link-to-definition"]
+
+[features]
+default = ["gzip", "zstd", "xz", "lz4"]
+# Compression codecs. `gzip` is a hand-written sans-IO filter over miniz_oxide; the rest are adapters
+# over reused pure-Rust crates. All live in `crate::filter` (merged in from the former arca-filter).
+gzip = ["dep:miniz_oxide"]
+zstd = ["dep:ruzstd"]
+xz = ["dep:lzma-rust2"]
+lz4 = ["dep:lz4_flex"]
+# WinZip AES-256 (AE-2) zip encryption/decryption (pure Rust, RustCrypto).
+aes = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1", "dep:pbkdf2", "dep:subtle", "dep:getrandom"]
+# 7z read+write (single-folder LZMA2 subset). Pulls the pure-Rust lzma-rust2 codec and needs the
+# shared CRC-32 primitives, which live behind `gzip` in `crate::filter`.
+sevenz = ["dep:lzma-rust2", "gzip"]
+
+[dependencies]
+libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.1.0" }
+# Compression codecs (feature-gated), merged in from the former arca-filter crate.
+# gzip = hand-written sans-IO filter adapting miniz_oxide; zstd/xz/lz4 = adapters over reused crates.
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"], optional = true }
+ruzstd = { version = "0.8.2", optional = true }
+lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"], optional = true }
+# LZMA2 codec shared by the `xz` filter and the 7z path (features `xz`/`sevenz`). Pure Rust.
+lzma-rust2 = { version = "0.16.5", optional = true }
+# AES layer (feature `aes`). SHA-1 is a WinZip AE-2 interoperability requirement, not a strength choice.
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+subtle = { version = "2.6", default-features = false, optional = true }
+getrandom = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# Portable fuzz invariants, shared with the cargo-fuzz targets (see fuzz/). Pulling it here as a
+# dev-dependency lets tests/fuzz_replay.rs call the exact same functions the fuzzer runs, and (via
+# feature unification) switches on the crate's `sevenz`/`aes` features for the whole test build so the
+# replay gate covers every format regardless of the flags passed to `cargo test`.
+libarchive_oxide-fuzz-cases = { path = "../fuzz/fuzz_lib" }
+# Structured-input synthesis for the replay batch (deterministic; no rand, no clock).
+arbitrary = { version = "1", features = ["derive"] }
+# Used only to generate gzip test data (pure Rust: miniz_oxide backend). The main crate does not depend on it.
+flate2 = "1"
+lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
+lzma-rust2 = "0.16.5"
+ruzstd = "0.8.2"
+sevenz-rust2 = "0.20.2"
+zip = { version = "7.2.0", default-features = false, features = ["deflate", "aes-crypto"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,45 @@
+[package]
+name = "libarchive_oxide-cli"
+version.workspace = true
+description = "bsdtar-style CLI tools (oxtar/oxcpio/oxcat/oxunzip) over the libarchive_oxide library. Dogfooding + the observation surface for round-trip integration tests."
+edition.workspace = true
+# Override above the workspace baseline: it depends on the flagship with its default codec set
+# enabled (ruzstd et al.), inheriting the same floor as the flagship. Measured with cargo-msrv.
+rust-version = "1.87"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/libarchive_oxide-cli"
+keywords = ["bsdtar", "cpio", "unzip", "archive", "cli"]
+categories = ["command-line-utilities"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+# Four bsdtar-family tools. Phase 1 is a scaffold: each bin is a thin main over the shared crate
+# library; the full bsdtar-compatible flag interface lands in a later phase.
+[[bin]]
+name = "oxtar"
+path = "src/bin/oxtar.rs"
+
+[[bin]]
+name = "oxcpio"
+path = "src/bin/oxcpio.rs"
+
+[[bin]]
+name = "oxcat"
+path = "src/bin/oxcat.rs"
+
+[[bin]]
+name = "oxunzip"
+path = "src/bin/oxunzip.rs"
+
+[dependencies]
+# The CLI enables AES (zip `--encrypt`/`--password`) and 7z read+write end-to-end.
+libarchive_oxide = { path = "../libarchive_oxide", version = "0.1.0", features = ["aes", "sevenz"] }
+libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.1.0" }
+
+[lints]
+workspace = true

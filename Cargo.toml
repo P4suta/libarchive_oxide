@@ -1,19 +1,22 @@
 [workspace]
 resolver = "2"
-members = ["arca-core", "arca-filter", "arca", "arca-cli"]
+members = ["libarchive_oxide-core", "libarchive_oxide", "libarchive_oxide-cli"]
 # The cargo-fuzz crate needs nightly + the sanitizer runtime, unavailable on the Windows/MSVC dev
 # box, so it is kept out of the main workspace. `cargo test --workspace` never builds it. Its
-# portable invariant bodies (fuzz/fuzz_lib) are still exercised via arca/tests/fuzz_replay.rs.
+# portable invariant bodies (fuzz/fuzz_lib) are still exercised via libarchive_oxide/tests/fuzz_replay.rs.
 exclude = ["fuzz"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# Workspace baseline = the no_std core's true floor (zero external deps). Measured with cargo-msrv:
+# 1.81 is required by `core::error::Error` (the `error_in_core` feature, stabilized in Rust 1.81).
+# Higher crates override below (the flagship/CLI pull codec crates with steeper MSRVs).
+rust-version = "1.81"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/livec/arca"
-authors = ["livec"]
-categories = ["compression", "filesystem", "no-std"]
-keywords = ["archive", "tar", "cpio", "streaming"]
+authors = ["Yasunobu Sakashita <crates.tank733@slmails.com>"]
+repository = "https://github.com/P4suta/libarchive_oxide"
+homepage = "https://github.com/P4suta/libarchive_oxide"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

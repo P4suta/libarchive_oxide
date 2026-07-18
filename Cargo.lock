@@ -29,63 +29,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arca"
-version = "0.0.0"
-dependencies = [
- "aes",
- "arbitrary",
- "arca-core",
- "arca-filter",
- "arca-fuzz-cases",
- "ctr",
- "flate2",
- "getrandom 0.2.17",
- "hmac",
- "lz4_flex",
- "lzma-rust2",
- "pbkdf2",
- "ruzstd",
- "sevenz-rust2",
- "sha1",
- "subtle",
- "zip",
-]
-
-[[package]]
-name = "arca-cli"
-version = "0.0.0"
-dependencies = [
- "arca",
- "arca-core",
-]
-
-[[package]]
-name = "arca-core"
-version = "0.0.0"
-
-[[package]]
-name = "arca-filter"
-version = "0.0.0"
-dependencies = [
- "arca-core",
- "lz4_flex",
- "lzma-rust2",
- "miniz_oxide 0.9.1",
- "ruzstd",
-]
-
-[[package]]
-name = "arca-fuzz-cases"
-version = "0.0.0"
-dependencies = [
- "arbitrary",
- "arca",
- "arca-core",
- "arca-filter",
- "lzma-rust2",
-]
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -392,6 +335,51 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "libarchive_oxide"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "arbitrary",
+ "ctr",
+ "flate2",
+ "getrandom 0.2.17",
+ "hmac",
+ "libarchive_oxide-core",
+ "libarchive_oxide-fuzz-cases",
+ "lz4_flex",
+ "lzma-rust2",
+ "miniz_oxide 0.9.1",
+ "pbkdf2",
+ "ruzstd",
+ "sevenz-rust2",
+ "sha1",
+ "subtle",
+ "zip",
+]
+
+[[package]]
+name = "libarchive_oxide-cli"
+version = "0.1.0"
+dependencies = [
+ "libarchive_oxide",
+ "libarchive_oxide-core",
+]
+
+[[package]]
+name = "libarchive_oxide-core"
+version = "0.1.0"
+
+[[package]]
+name = "libarchive_oxide-fuzz-cases"
+version = "0.0.0"
+dependencies = [
+ "arbitrary",
+ "libarchive_oxide",
+ "libarchive_oxide-core",
+ "lzma-rust2",
 ]
 
 [[package]]

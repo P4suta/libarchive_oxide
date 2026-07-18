@@ -3,7 +3,7 @@
 # or bare dyn) may appear in library/binary source. Comment lines are ignored. A hit fails.
 set -euo pipefail
 
-if rg -n '\bdyn\b' arca-core/src arca-filter/src arca/src arca-cli/src | rg -v '^\s*//'; then
+if rg -n '\bdyn\b' libarchive_oxide-core/src libarchive_oxide/src libarchive_oxide-cli/src | rg -v '^\s*//'; then
   echo "check-no-dyn: found 'dyn' in library source (type erasure is forbidden)" >&2
   exit 1
 fi

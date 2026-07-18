@@ -1,4 +1,4 @@
-# arca fuzzing
+# libarchive_oxide fuzzing
 
 This directory is a **cargo-fuzz** workspace, deliberately **excluded** from the main workspace
 (`exclude = ["fuzz"]` in the root `Cargo.toml`) so `cargo test --workspace` never tries to build
@@ -7,7 +7,7 @@ on the Windows/MSVC dev box.
 
 ## Layout
 
-- `fuzz_lib/` (`arca-fuzz-cases`) — the invariant bodies as **plain functions**, no libFuzzer. Builds
+- `fuzz_lib/` (`libarchive_oxide-fuzz-cases`) — the invariant bodies as **plain functions**, no libFuzzer. Builds
   on stable, everywhere. This is the single source of truth for what each target checks.
 - `fuzz_targets/*.rs` — one thin `fuzz_target!` shim per target, each delegating to a `fuzz_lib`
   function. Compiled only under this crate (nightly `cargo fuzz`).
@@ -39,10 +39,10 @@ cargo +nightly fuzz run read_zip -- -max_total_time=30   # bounded run, as CI do
 Portable gate (no nightly, no libFuzzer — the Windows dev box):
 
 ```sh
-cargo test -p arca --test fuzz_replay
+cargo test -p libarchive_oxide --test fuzz_replay
 ```
 
-`arca/tests/fuzz_replay.rs` replays, through the same `arca-fuzz-cases` functions the fuzzer uses:
+`libarchive_oxide/tests/fuzz_replay.rs` replays, through the same `libarchive_oxide-fuzz-cases` functions the fuzzer uses:
 
 1. every committed corpus file,
 2. a batch of deterministic `arbitrary`-seeded inputs, and

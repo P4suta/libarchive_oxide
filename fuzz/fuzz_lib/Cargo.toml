@@ -1,11 +1,11 @@
 [package]
-name = "arca-fuzz-cases"
+name = "libarchive_oxide-fuzz-cases"
 version = "0.0.0"
 publish = false
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Portable fuzz invariant bodies for arca, shared by the cargo-fuzz targets and the arca/tests/fuzz_replay.rs runner. No libFuzzer dependency."
+description = "Portable fuzz invariant bodies for libarchive_oxide, shared by the cargo-fuzz targets and the libarchive_oxide/tests/fuzz_replay.rs runner. No libFuzzer dependency."
 
 [lib]
 # A plain library: no libFuzzer, no proc-macro. Builds on stable Windows/MSVC.
@@ -13,9 +13,9 @@ doctest = false
 
 [dependencies]
 # All formats and codecs are needed, so every relevant feature is switched on unconditionally.
-arca-core = { path = "../../arca-core" }
-arca-filter = { path = "../../arca-filter", default-features = false, features = ["gzip", "zstd", "xz", "lz4", "std"] }
-arca = { path = "../../arca", default-features = false, features = ["gzip", "zstd", "xz", "lz4", "aes", "sevenz"] }
+# The former arca-filter crate is now `libarchive_oxide::filter`, gated by the same codec features.
+libarchive_oxide-core = { path = "../../libarchive_oxide-core" }
+libarchive_oxide = { path = "../../libarchive_oxide", default-features = false, features = ["gzip", "zstd", "xz", "lz4", "aes", "sevenz"] }
 # Structured input synthesis (round-trip entry sets); no rand/no clock.
 arbitrary = { version = "1", features = ["derive"] }
 # The LZMA2 codec that backs the 7z folder — driven directly for the `codec_lzma2` target.
