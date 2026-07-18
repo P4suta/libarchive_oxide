@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# One-shot publisher for the first crates.io release. New crates cannot use Trusted Publishing
+# until they exist, so this workflow accepts a narrowly scoped, temporary token from the `release`
+# Environment. Delete CRATES_IO_BOOTSTRAP_TOKEN after all three Trusted Publishers are registered.
+
+name: bootstrap publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type "publish-0.1.0" to publish all three crates
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: core → flagship → cli
+    if: >-
+      github.repository == 'P4suta/libarchive_oxide' &&
+      inputs.confirmation == 'publish-0.1.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    env:
+      VERSION: 0.1.0
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: require the temporary crates.io token
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        run: |
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "::error::CRATES_IO_BOOTSTRAP_TOKEN is not set in the release Environment"
+            exit 1
+          fi
+
+      - name: verify and publish core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        run: |
+          cargo publish -p libarchive_oxide-core --dry-run --locked
+          cargo publish -p libarchive_oxide-core --locked
+
+      - name: wait for core in the crates.io index
+        shell: bash
+        run: |
+          for attempt in {1..40}; do
+            if curl --fail --silent --show-error \
+              "https://crates.io/api/v1/crates/libarchive_oxide-core/$VERSION" >/dev/null; then
+              exit 0
+            fi
+            echo "core is not visible yet (attempt $attempt/40)"
+            sleep 15
+          done
+          echo "::error::core did not become visible on crates.io within 10 minutes"
+          exit 1
+
+      - name: verify and publish flagship
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        run: |
+          cargo publish -p libarchive_oxide --dry-run --locked
+          cargo publish -p libarchive_oxide --locked
+
+      - name: wait for flagship in the crates.io index
+        shell: bash
+        run: |
+          for attempt in {1..40}; do
+            if curl --fail --silent --show-error \
+              "https://crates.io/api/v1/crates/libarchive_oxide/$VERSION" >/dev/null; then
+              exit 0
+            fi
+            echo "flagship is not visible yet (attempt $attempt/40)"
+            sleep 15
+          done
+          echo "::error::flagship did not become visible on crates.io within 10 minutes"
+          exit 1
+
+      - name: verify and publish CLI
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        run: |
+          cargo publish -p libarchive_oxide-cli --dry-run --locked
+          cargo publish -p libarchive_oxide-cli --locked
+
+      - name: confirm all published versions
+        shell: bash
+        run: |
+          for crate in libarchive_oxide-core libarchive_oxide libarchive_oxide-cli; do
+            curl --fail --silent --show-error \
+              "https://crates.io/api/v1/crates/$crate/$VERSION" >/dev/null
+            echo "$crate $VERSION is visible on crates.io"
+          done
