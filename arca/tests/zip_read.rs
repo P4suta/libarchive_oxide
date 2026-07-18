@@ -66,3 +66,17 @@ fn reads_zip_store_and_deflate() {
     }
     assert!(r.next_entry().unwrap().is_none());
 }
+
+#[test]
+fn malformed_zip_errors_without_panic() {
+    // Truncated and garbage inputs that pass the "PK\x03\x04" sniff must error, not panic.
+    for bad in [
+        &b"PK\x03\x04"[..], // local magic only, no EOCD
+        &b"PK\x03\x04garbage-without-eocd"[..],
+        &b"PK\x05\x06"[..], // EOCD magic but too short
+    ] {
+        let mut r = reader(bad).unwrap();
+        // Either construction-time or first next_entry surfaces the error; neither may panic.
+        let _ = r.next_entry();
+    }
+}

@@ -91,19 +91,22 @@ impl<'a> ZipReader<'a> {
         let mut pos = usize_of(u32le(data, eocd + 16)?)?; // central directory offset
 
         for _ in 0..count {
-            if data.get(pos..pos + 4) != Some(&CD_SIG[..]) {
+            if !data.get(pos..).is_some_and(|s| s.starts_with(&CD_SIG)) {
                 return Err(Error::Malformed("zip: bad central directory signature"));
             }
-            let method = u16le(data, pos + 10)?;
-            let comp_size = usize_of(u32le(data, pos + 20)?)?;
-            let uncomp_size = usize_of(u32le(data, pos + 24)?)?;
-            let name_len = usize::from(u16le(data, pos + 28)?);
-            let extra_len = usize::from(u16le(data, pos + 30)?);
-            let comment_len = usize::from(u16le(data, pos + 32)?);
-            let external_attrs = u32le(data, pos + 38)?;
-            let local_offset = usize_of(u32le(data, pos + 42)?)?;
-            let name_start = pos + 46;
-            if name_start + name_len > data.len() {
+            let method = u16le(data, add(pos, 10)?)?;
+            let comp_size = usize_of(u32le(data, add(pos, 20)?)?)?;
+            let uncomp_size = usize_of(u32le(data, add(pos, 24)?)?)?;
+            let name_len = usize::from(u16le(data, add(pos, 28)?)?);
+            let extra_len = usize::from(u16le(data, add(pos, 30)?)?);
+            let comment_len = usize::from(u16le(data, add(pos, 32)?)?);
+            let external_attrs = u32le(data, add(pos, 38)?)?;
+            let local_offset = usize_of(u32le(data, add(pos, 42)?)?)?;
+            let name_start = add(pos, 46)?;
+            if data
+                .get(name_start..)
+                .is_none_or(|rest| rest.len() < name_len)
+            {
                 return Err(Error::Malformed("zip: truncated central directory name"));
             }
             self.entries.push(CdEntry {
@@ -115,7 +118,7 @@ impl<'a> ZipReader<'a> {
                 local_offset,
                 external_attrs,
             });
-            pos = name_start + name_len + extra_len + comment_len;
+            pos = add(add(add(name_start, name_len)?, extra_len)?, comment_len)?;
         }
         Ok(())
     }
@@ -124,14 +127,15 @@ impl<'a> ZipReader<'a> {
     fn load_content(&mut self, entry: CdEntry) -> Result<()> {
         let data = self.data;
         let lo = entry.local_offset;
-        if data.get(lo..lo + 4) != Some(&LOCAL_SIG[..]) {
+        if !data.get(lo..).is_some_and(|s| s.starts_with(&LOCAL_SIG)) {
             return Err(Error::Malformed("zip: bad local header signature"));
         }
-        let local_name = usize::from(u16le(data, lo + 26)?);
-        let local_extra = usize::from(u16le(data, lo + 28)?);
-        let start = lo + 30 + local_name + local_extra;
+        let local_name = usize::from(u16le(data, add(lo, 26)?)?);
+        let local_extra = usize::from(u16le(data, add(lo, 28)?)?);
+        let start = add(add(add(lo, 30)?, local_name)?, local_extra)?;
         let compressed = data
-            .get(start..start + entry.comp_size)
+            .get(start..)
+            .and_then(|s| s.get(..entry.comp_size))
             .ok_or(Error::Malformed("zip: truncated entry data"))?;
 
         let content = match entry.method {
@@ -213,20 +217,32 @@ fn find_eocd(data: &[u8]) -> Result<usize> {
     Err(Error::Malformed("zip: no EOCD record"))
 }
 
-/// Reads a little-endian `u16` at `off`, bounds-checked.
+/// Reads a little-endian `u16` at `off`, bounds- and overflow-checked.
 fn u16le(data: &[u8], off: usize) -> Result<u16> {
+    let end = off
+        .checked_add(2)
+        .ok_or(Error::Malformed("zip: offset overflow"))?;
     let b = data
-        .get(off..off + 2)
+        .get(off..end)
         .ok_or(Error::Malformed("zip: truncated field"))?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
-/// Reads a little-endian `u32` at `off`, bounds-checked.
+/// Reads a little-endian `u32` at `off`, bounds- and overflow-checked.
 fn u32le(data: &[u8], off: usize) -> Result<u32> {
+    let end = off
+        .checked_add(4)
+        .ok_or(Error::Malformed("zip: offset overflow"))?;
     let b = data
-        .get(off..off + 4)
+        .get(off..end)
         .ok_or(Error::Malformed("zip: truncated field"))?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Checked `usize` addition, mapped to a malformed-archive error on overflow.
+fn add(a: usize, b: usize) -> Result<usize> {
+    a.checked_add(b)
+        .ok_or(Error::Malformed("zip: offset overflow"))
 }
 
 /// `u32` to `usize` (infallible on 32/64-bit, but explicit for clarity).
