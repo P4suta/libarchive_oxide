@@ -34,13 +34,7 @@ bzip2 = [
     "compression-codecs/bzip2",
     "async-compression?/bzip2",
 ]
-zstd = [
-    "dep:ruzstd",
-    "dep:zstd-codec",
-    "dep:compression-codecs",
-    "compression-codecs/zstd",
-    "async-compression?/zstd",
-]
+zstd = ["dep:ruzstd"]
 xz = [
     "dep:lzma-rust2",
     "dep:compression-codecs",
@@ -72,7 +66,6 @@ libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
 # Feature-gated codecs.
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 ruzstd = { version = "0.8.2", optional = true }
-zstd-codec = { package = "zstd", version = "0.13.3", optional = true }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"], optional = true }
 compression-codecs = { version = "0.4.38", default-features = false, optional = true }
 bzip2 = { version = "0.6.1", optional = true }
@@ -108,6 +101,7 @@ flate2 = "1"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
 lzma-rust2 = "0.16.5"
 ruzstd = "0.8.2"
+zstd-codec = { package = "zstd", version = "0.13.3" }
 sevenz-rust2 = "0.21.3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }
 futures-lite = "2.6.1"

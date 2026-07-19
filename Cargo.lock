@@ -190,8 +190,6 @@ dependencies = [
  "liblzma",
  "lz4",
  "memchr",
- "zstd",
- "zstd-safe",
 ]
 
 [[package]]

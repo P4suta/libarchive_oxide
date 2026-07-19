@@ -63,7 +63,7 @@ package-licenses:
 package-smoke:
     cargo run --quiet -p xtask -- package-smoke
 
-# Keep the bzip2 Tier 1 path on its default Rust implementation.
+# Keep the bzip2 and zstd Tier 1 paths on their Rust implementations.
 codec-policy:
     cargo run --quiet -p xtask -- codec-policy
 

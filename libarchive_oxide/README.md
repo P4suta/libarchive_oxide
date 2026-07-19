@@ -68,7 +68,7 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 |---|:---:|---|
 | `gzip` | yes | gzip |
 | `bzip2` | yes | bzip2 through the Rust `libbz2-rs-sys` backend |
-| `zstd` | yes | zstd |
+| `zstd` | yes | zstd through the Pure-Rust `ruzstd` backend |
 | `xz` | yes | xz / LZMA2 |
 | `lz4` | yes | lz4 frame |
 | `aes` | no | WinZip AES-256 AE-2 |
@@ -78,11 +78,11 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 
 `--no-default-features` retains uncompressed formats and zip store mode.
 
-The sync-only and async/Tokio bzip2 dependency graphs are CI-checked to require
-`libbz2-rs-sys` and exclude native `bzip2-sys`. The complete default feature
-graph is not yet guaranteed C/FFI-free: zstd encoding uses a native backend,
-and async all-features builds may enable other native codec backends. A
-dependency-verified portable profile is roadmap work.
+The sync-only and async/Tokio bzip2 and zstd dependency graphs are CI-checked
+to require their Rust backends and exclude native codec packages. The complete
+default feature graph is not yet guaranteed C/FFI-free because xz and LZ4
+caller-driven/async paths still select native backends. A dependency-verified
+portable profile is roadmap work.
 
 Sequential, seek, futures-io, and Tokio adapters all drive the same archive
 state machines. Seek variants are named `SeekArchive*`, `AsyncSeekArchive*`,

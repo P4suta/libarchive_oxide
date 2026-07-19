@@ -169,6 +169,7 @@ fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
         b"12345".to_vec(),
         compress(b"12345", FilterId::Gzip).unwrap(),
         compress(b"12345", FilterId::Bzip2).unwrap(),
+        compress(b"12345", FilterId::Zstd).unwrap(),
     ] {
         let mut reader = FilterReader::with_limits(OneByte::new(bytes), limits).unwrap();
         let mut output = Vec::new();

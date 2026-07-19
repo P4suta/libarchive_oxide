@@ -326,6 +326,60 @@ fn caller_driven_pipeline_rejects_bzip2_crc_failure_and_truncation() {
 }
 
 #[test]
+fn caller_driven_pipeline_rejects_truncated_zstd() {
+    let tar = tar_bytes();
+    let mut truncated = filter_bytes(&tar, FilterId::Zstd);
+    truncated.truncate(truncated.len() - 3);
+    assert_eq!(
+        collect_pipeline(&truncated, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+}
+
+#[test]
+fn pure_rust_zstd_writer_is_deterministic_and_independently_decodable() {
+    let payload: Vec<u8> = (0_u8..=251).cycle().take(200_000).collect();
+    let metadata = EntryMetadata::builder(
+        EntryKind::File,
+        ArchivePath::from_bytes(b"portable-zstd.bin".to_vec()),
+    )
+    .size(Some(payload.len() as u64))
+    .build();
+
+    let build = |filter, chunk: usize| {
+        let mut writer =
+            ArchiveWriter::with_filter(Vec::new(), FormatId::Tar, filter, Limits::default())
+                .unwrap();
+        writer.start_entry(&metadata).unwrap();
+        for bytes in payload.chunks(chunk) {
+            writer.write_data(bytes).unwrap();
+        }
+        writer.end_entry().unwrap();
+        writer.finish().unwrap()
+    };
+
+    let plain = build(None, payload.len());
+    let one_write = build(Some(FilterId::Zstd), payload.len());
+    let one_byte_writes = build(Some(FilterId::Zstd), 1);
+    assert_eq!(one_write, one_byte_writes);
+    assert_eq!(
+        zstd_codec::stream::decode_all(Cursor::new(one_write.as_slice())).unwrap(),
+        plain
+    );
+
+    let mut corrupt = one_write;
+    *corrupt.last_mut().unwrap() ^= 0x80;
+    assert_eq!(
+        collect_pipeline(&corrupt, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+}
+
+#[test]
 fn streaming_writer_round_trips_without_archive_buffering() {
     let mut writer = ArchiveWriter::new(Vec::new());
     let metadata = EntryMetadata::builder(

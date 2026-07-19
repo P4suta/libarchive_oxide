@@ -27,7 +27,7 @@ dependencies use native C backends; see [Codec backends](#codec-backends).
 |---|:---:|:---:|---|
 | gzip/DEFLATE | yes | yes | Rust |
 | bzip2 | yes | yes | Rust `libbz2-rs-sys`; CI rejects native `bzip2-sys` |
-| zstd | yes | yes | decode is Rust; encode currently uses native zstd |
+| zstd | yes | yes | Pure-Rust `ruzstd`; native zstd packages rejected by CI |
 | xz/LZMA2 | yes | yes | Rust in sync paths; async all-features may select a native backend |
 | LZ4 frame | yes | yes | Rust in sync paths; async all-features may select a native backend |
 
@@ -115,7 +115,7 @@ fn list(input: impl Read) -> Result<(), Box<dyn std::error::Error>> {
 |---|:---:|---|
 | `gzip` | yes | gzip |
 | `bzip2` | yes | bzip2 through the Rust backend |
-| `zstd` | yes | zstd |
+| `zstd` | yes | zstd through the Pure-Rust `ruzstd` backend |
 | `xz` | yes | xz |
 | `lz4` | yes | lz4 frame |
 | `aes` | no | WinZip AES-256 AE-2 |
@@ -134,8 +134,9 @@ configured number of gzip, bzip2, zstd, xz, and lz4 layers.
 
 `libarchive_oxide-core` is zero-dependency `no_std + alloc` safe Rust, and all
 project-owned crates use `#![forbid(unsafe_code)]`. The current default codec
-feature set is not yet a C/FFI-free dependency graph: zstd encoding uses
-`zstd-sys`, and some async all-feature codec paths can enable native backends.
+feature set is not yet a C/FFI-free dependency graph: the xz and LZ4
+caller-driven/async codec paths still select native backends. The `zstd`
+feature is C/FFI-free in sync, Pipeline, futures-io, and Tokio configurations.
 The roadmap separates a dependency-verified `portable-codecs` profile from an
 explicit `native-codecs` performance profile. Until that work lands, do not
 interpret “safe Rust” as “no native transitive dependencies.”

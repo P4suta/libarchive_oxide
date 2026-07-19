@@ -76,7 +76,7 @@ enum FilteredOutput<W: Write> {
     #[cfg(feature = "bzip2")]
     Bzip2(Box<bzip2::write::BzEncoder<W>>),
     #[cfg(feature = "zstd")]
-    Zstd(Box<zstd_codec::stream::write::Encoder<'static, W>>),
+    Zstd(Box<crate::filtered_io::ZstdFrameWrite<W>>),
     #[cfg(feature = "xz")]
     Xz(Box<lzma_rust2::XzWriter<W>>),
     #[cfg(feature = "lz4")]
@@ -94,10 +94,9 @@ impl<W: Write> FilteredOutput<W> {
                 bzip2::Compression::default(),
             )))),
             #[cfg(feature = "zstd")]
-            Some(FilterId::Zstd) => zstd_codec::stream::write::Encoder::new(output, 3)
-                .map(Box::new)
-                .map(Self::Zstd)
-                .map_err(CreateStreamError::Io),
+            Some(FilterId::Zstd) => Ok(Self::Zstd(Box::new(
+                crate::filtered_io::ZstdFrameWrite::new(output),
+            ))),
             #[cfg(feature = "xz")]
             Some(FilterId::Xz) => {
                 lzma_rust2::XzWriter::new(output, lzma_rust2::XzOptions::with_preset(6))
