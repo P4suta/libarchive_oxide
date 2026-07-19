@@ -99,8 +99,20 @@ Before 1.0:
 - Do not edit released CHANGELOG sections.
 
 Release mechanics are defined by
-[ADR-0002](docs/adr/0002-workspace-releases.md). Merging a release-plz Release
-PR publishes crates and creates the tag and GitHub Release.
+[ADR-0002](docs/adr/0002-workspace-releases.md).
+
+Releases intentionally require several independent maintainer actions:
+
+1. Dispatch the release workflow with `prepare` and the `PREPARE` confirmation.
+2. Review the generated release PR and manually apply `release-approved`.
+3. After merge, dispatch `publish` with the exact tag and `RELEASE`, then approve
+   the protected `release` Environment deployment.
+4. Dispatch the release-assets workflow with the exact tag and `ASSETS`, approve
+   the Environment deployment, and verify every draft asset.
+5. Publish the completed draft Release manually in the GitHub UI.
+
+Never automate the approval label, the Environment review, or final draft
+publication. A maintainer must make each authorization deliberately.
 
 ## License
 

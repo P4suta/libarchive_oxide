@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# This workflow deliberately runs from the protected base branch. It never checks
+# out or executes pull-request code, so a release PR cannot weaken its own gate.
+name: release approval
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-approved:
+    name: release-approved label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Allow ordinary pull requests
+        if: ${{ !startsWith(github.event.pull_request.head.ref, 'release-plz-') }}
+        run: echo "This is not a release-plz pull request."
+
+      - name: Require explicit maintainer approval for release pull requests
+        if: >-
+          ${{
+            startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+            !contains(github.event.pull_request.labels.*.name, 'release-approved')
+          }}
+        run: |
+          echo "::error::A maintainer must manually apply the release-approved label."
+          exit 1
+
+      - name: Record release approval
+        if: >-
+          ${{
+            startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+            contains(github.event.pull_request.labels.*.name, 'release-approved')
+          }}
+        run: echo "The release-approved label is present."
