@@ -5,6 +5,8 @@
 //! Compression filter implementations and runtime dispatch.
 
 pub mod gzip;
+#[cfg(feature = "lz4")]
+pub(crate) mod lz4;
 #[cfg(feature = "zstd")]
 pub(crate) mod zstd;
 

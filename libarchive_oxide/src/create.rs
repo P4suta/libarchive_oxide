@@ -80,7 +80,7 @@ enum FilteredOutput<W: Write> {
     #[cfg(feature = "xz")]
     Xz(Box<lzma_rust2::XzWriter<W>>),
     #[cfg(feature = "lz4")]
-    Lz4(Box<lz4_flex::frame::FrameEncoder<W>>),
+    Lz4(Box<crate::filtered_io::Lz4FrameWrite<W>>),
 }
 
 impl<W: Write> FilteredOutput<W> {
@@ -105,7 +105,7 @@ impl<W: Write> FilteredOutput<W> {
                     .map_err(CreateStreamError::Io)
             },
             #[cfg(feature = "lz4")]
-            Some(FilterId::Lz4) => Ok(Self::Lz4(Box::new(lz4_flex::frame::FrameEncoder::new(
+            Some(FilterId::Lz4) => Ok(Self::Lz4(Box::new(crate::filtered_io::Lz4FrameWrite::new(
                 output,
             )))),
             Some(_) => Err(CreateStreamError::Contract(
@@ -126,9 +126,7 @@ impl<W: Write> FilteredOutput<W> {
             #[cfg(feature = "xz")]
             Self::Xz(output) => (*output).finish(),
             #[cfg(feature = "lz4")]
-            Self::Lz4(output) => (*output)
-                .finish()
-                .map_err(|error| io::Error::other(error.to_string())),
+            Self::Lz4(output) => (*output).finish(),
         }
     }
 }

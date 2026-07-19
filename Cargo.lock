@@ -188,7 +188,6 @@ dependencies = [
  "compression-core",
  "flate2",
  "liblzma",
- "lz4",
  "memchr",
 ]
 
@@ -509,6 +508,7 @@ dependencies = [
  "hmac",
  "libarchive_oxide-core",
  "libarchive_oxide-fuzz-cases",
+ "lz4",
  "lz4_flex",
  "lzma-rust2",
  "miniz_oxide 0.9.1",
@@ -521,6 +521,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "twox-hash",
  "zeroize",
  "zip",
  "zstd",
@@ -929,9 +930,9 @@ dependencies = [
 
 [[package]]
 name = "twox-hash"
-version = "2.1.2"
+version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 
 [[package]]
 name = "typed-path"
