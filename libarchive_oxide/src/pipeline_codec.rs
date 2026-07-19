@@ -39,9 +39,11 @@ impl PipelineCodec {
             FilterId::Xz => {
                 #[cfg(feature = "xz")]
                 {
-                    let memory = limits.codec_memory().unwrap_or(64 * 1024 * 1024);
+                    let memory = limits
+                        .codec_memory()
+                        .map_or(u64::MAX, |bytes| u64::try_from(bytes).unwrap_or(u64::MAX));
                     Ok(Self::Xz(compression_codecs::XzDecoder::with_memlimit(
-                        memory as u64,
+                        memory,
                     )))
                 }
                 #[cfg(not(feature = "xz"))]

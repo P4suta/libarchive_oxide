@@ -133,3 +133,19 @@ fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
         assert_eq!(output, b"1234");
     }
 }
+
+#[test]
+fn xz_dictionary_limit_prevents_oversized_allocation() {
+    let encoded = [
+        253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70, 0, 208, 208, 208, 208, 1, 32, 208, 208,
+        208, 208, 58, 26, 8, 206, 118, 199, 229, 233, 111, 229, 163, 224, 0, 175, 0, 49, 0, 58, 26,
+        8, 93, 206, 118, 199, 214, 233, 229, 7, 52, 195, 209, 14, 191, 206, 85, 103, 251, 2, 0, 0,
+        0, 0, 4, 89, 90,
+    ];
+    let mut reader = FilterReader::with_limits(Cursor::new(encoded), Limits::default()).unwrap();
+    let mut output = [0_u8; 1];
+    assert_eq!(
+        reader.read(&mut output).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}

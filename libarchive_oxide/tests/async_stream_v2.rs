@@ -267,6 +267,31 @@ fn async_reader_composes_four_nested_filters() {
     });
 }
 
+#[test]
+fn async_xz_dictionary_limit_prevents_oversized_allocation() {
+    block_on(async {
+        let bytes = vec![
+            253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70, 0, 208, 208, 208, 208, 1, 32, 208,
+            208, 208, 208, 58, 26, 8, 206, 118, 199, 229, 233, 111, 229, 163, 224, 0, 175, 0, 49,
+            0, 58, 26, 8, 93, 206, 118, 199, 214, 233, 229, 7, 52, 195, 209, 14, 191, 206, 85, 103,
+            251, 2, 0, 0, 0, 0, 4, 89, 90,
+        ];
+        let mut reader =
+            AsyncArchiveReader::with_limits(AsyncOneByte { bytes, position: 0 }, Limits::default());
+        let error = loop {
+            match reader.next_event().await {
+                Ok(ReaderEvent::Done) => panic!("oversized XZ dictionary was accepted"),
+                Ok(_) => {},
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            error.io_error().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+    });
+}
+
 #[cfg(feature = "tokio")]
 #[tokio::test(flavor = "current_thread")]
 async fn tokio_reader_and_writer_match_sync_contract() {

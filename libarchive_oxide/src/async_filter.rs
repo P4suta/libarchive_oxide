@@ -96,7 +96,12 @@ fn codec_error(error: io::Error) -> io::Error {
         }
         return io::Error::from(kind);
     }
-    io::Error::new(io::ErrorKind::InvalidData, error)
+    let kind = if error.kind() == io::ErrorKind::OutOfMemory {
+        io::ErrorKind::OutOfMemory
+    } else {
+        io::ErrorKind::InvalidData
+    };
+    io::Error::new(kind, error)
 }
 
 fn codec_poll(result: Poll<io::Result<usize>>) -> Poll<io::Result<usize>> {
@@ -203,6 +208,7 @@ pub(crate) struct AsyncFilterReader<R> {
     inner: ReaderInner<R>,
     decoded: u64,
     decoded_limit: Option<u64>,
+    codec_memory: Option<u64>,
 }
 
 impl<R> AsyncFilterReader<R> {
@@ -216,6 +222,9 @@ impl<R> AsyncFilterReader<R> {
             },
             decoded: 0,
             decoded_limit: limits.decoded_total(),
+            codec_memory: limits
+                .codec_memory()
+                .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX)),
         }
     }
 
@@ -301,7 +310,10 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
             #[cfg(feature = "xz")]
             {
                 buffered.input.wrap_source_errors = true;
-                let mut decoder = async_compression::futures::bufread::XzDecoder::new(buffered);
+                let mut decoder = async_compression::futures::bufread::XzDecoder::with_mem_limit(
+                    buffered,
+                    self.codec_memory.unwrap_or(u64::MAX),
+                );
                 decoder.multiple_members(true);
                 self.inner = ReaderInner::Xz(decoder);
             }

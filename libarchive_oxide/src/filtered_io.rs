@@ -13,6 +13,8 @@ use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, EndOfInput, ErrorKind, Limits};
 
 use crate::filter::gzip::{GzipDecoder, GzipEncoder};
+#[cfg(feature = "xz")]
+use crate::pipeline_codec::PipelineCodec;
 
 const BUFFER: usize = 64 * 1024;
 
@@ -94,11 +96,14 @@ impl<R: Read> FilterReader<R> {
         }
         if available.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
             #[cfg(feature = "xz")]
-            return Ok(Self {
-                inner: FilterReaderInner::Xz(Box::new(XzRead::new(input))),
-                decoded: 0,
-                decoded_limit: limits.decoded_total(),
-            });
+            return XzRead::new(input, limits)
+                .map(Box::new)
+                .map(FilterReaderInner::Xz)
+                .map(|inner| Self {
+                    inner,
+                    decoded: 0,
+                    decoded_limit: limits.decoded_total(),
+                });
             #[cfg(not(feature = "xz"))]
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -311,92 +316,185 @@ impl<R: Read> Read for ZstdRead<R> {
 
 #[cfg(feature = "xz")]
 struct XzRead<R: Read> {
-    decoder: Option<lzma_rust2::XzReader<MemberInput<ShortReadFix<R>>>>,
-    input: Option<MemberInput<ShortReadFix<R>>>,
-    failed: bool,
+    input: R,
+    decoder: PipelineCodec,
+    buffer: Vec<u8>,
+    start: usize,
+    end: usize,
+    eof: bool,
+    state: XzReadState,
+    limits: Limits,
 }
 
 #[cfg(feature = "xz")]
-struct ShortReadFix<R>(R);
-
-#[cfg(feature = "xz")]
-impl<R: Read> Read for ShortReadFix<R> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.len() > 8 {
-            return self.0.read(output);
-        }
-        let mut total = 0;
-        while total != output.len() {
-            let read = self.0.read(&mut output[total..])?;
-            if read == 0 {
-                break;
-            }
-            total += read;
-        }
-        Ok(total)
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XzReadState {
+    Running,
+    Between { padding: usize },
+    Done,
+    Failed,
 }
 
 #[cfg(feature = "xz")]
 impl<R: Read> XzRead<R> {
-    fn new(input: R) -> Self {
-        Self {
-            decoder: Some(lzma_rust2::XzReader::new(
-                MemberInput::new(ShortReadFix(input)),
-                false,
-            )),
-            input: None,
-            failed: false,
+    fn new(input: R, limits: Limits) -> io::Result<Self> {
+        Ok(Self {
+            input,
+            decoder: PipelineCodec::new(FilterId::Xz, limits).map_err(codec_archive_io)?,
+            buffer: vec![0; BUFFER],
+            start: 0,
+            end: 0,
+            eof: false,
+            state: XzReadState::Running,
+            limits,
+        })
+    }
+
+    fn fill(&mut self) -> io::Result<()> {
+        if self.start != 0 {
+            self.buffer.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+        if self.end == self.buffer.len() || self.eof {
+            return Ok(());
+        }
+        let read = self.input.read(&mut self.buffer[self.end..])?;
+        if read == 0 {
+            self.eof = true;
+        } else {
+            self.end += read;
+        }
+        Ok(())
+    }
+
+    fn fail<T>(&mut self, error: io::Error) -> io::Result<T> {
+        self.state = XzReadState::Failed;
+        Err(error)
+    }
+
+    fn drive_between_members(&mut self) -> io::Result<()> {
+        const MAGIC: &[u8; 6] = &[0xfd, b'7', b'z', b'X', b'Z', 0];
+
+        let XzReadState::Between { mut padding } = self.state else {
+            return Ok(());
+        };
+        loop {
+            while self.buffer[self.start..self.end].first() == Some(&0) {
+                self.start += 1;
+                padding = padding.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::OutOfMemory, "XZ padding count overflow")
+                })?;
+                self.state = XzReadState::Between { padding };
+            }
+            if self.start == self.end {
+                if self.eof {
+                    if !padding.is_multiple_of(4) {
+                        return self.fail(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "XZ stream padding is not a multiple of four bytes",
+                        ));
+                    }
+                    self.state = XzReadState::Done;
+                    return Ok(());
+                }
+                self.fill()?;
+                continue;
+            }
+            if !padding.is_multiple_of(4) {
+                return self.fail(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "XZ stream padding is not a multiple of four bytes",
+                ));
+            }
+            if self.end - self.start < MAGIC.len() && !self.eof {
+                self.fill()?;
+                continue;
+            }
+            let remaining = &self.buffer[self.start..self.end];
+            if remaining.len() < MAGIC.len() || !remaining.starts_with(MAGIC) {
+                return self.fail(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-member trailing filter data",
+                ));
+            }
+            self.decoder =
+                PipelineCodec::new(FilterId::Xz, self.limits).map_err(codec_archive_io)?;
+            self.state = XzReadState::Running;
+            return Ok(());
         }
     }
 
-    #[allow(clippy::expect_used)]
     fn into_inner(self) -> R {
-        self.decoder
-            .map(lzma_rust2::XzReader::into_inner)
-            .or(self.input)
-            .expect("XZ reader always owns its member input")
-            .into_inner()
-            .0
+        self.input
     }
 }
 
 #[cfg(feature = "xz")]
 impl<R: Read> Read for XzRead<R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if self.failed {
-            return Err(io::Error::new(
+        if output.is_empty() || self.state == XzReadState::Done {
+            return Ok(0);
+        }
+        if self.state == XzReadState::Failed {
+            return self.fail(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "XZ reader is in a failed state",
             ));
         }
         loop {
-            let read = self
-                .decoder
-                .as_mut()
-                .ok_or_else(|| io::Error::other("XZ decoder is missing"))?
-                .read(output)?;
-            if read != 0 {
-                return Ok(read);
-            }
-            let decoder = self
-                .decoder
-                .take()
-                .ok_or_else(|| io::Error::other("XZ decoder disappeared"))?;
-            let mut input = decoder.into_inner();
-            match next_member(&mut input, &[0xfd, b'7', b'z', b'X', b'Z', 0]) {
-                Ok(false) => {
-                    self.input = Some(input);
+            if matches!(self.state, XzReadState::Between { .. }) {
+                self.drive_between_members()?;
+                if self.state == XzReadState::Done {
                     return Ok(0);
-                },
-                Ok(true) => {
-                    self.decoder = Some(lzma_rust2::XzReader::new(input, false));
-                },
+                }
+            }
+            if self.start == self.end && !self.eof {
+                self.fill()?;
+            }
+            let end = if self.eof {
+                EndOfInput::End
+            } else {
+                EndOfInput::More
+            };
+            let input_len = self.end - self.start;
+            let step = match self
+                .decoder
+                .process(&self.buffer[self.start..self.end], output, end)
+                .and_then(|step| step.validate(input_len, output.len()))
+            {
+                Ok(step) => step,
                 Err(error) => {
-                    self.input = Some(input);
-                    self.failed = true;
-                    return Err(error);
+                    return self.fail(codec_archive_io(error));
                 },
+            };
+            self.start += step.consumed;
+            if matches!(step.status, CodecStatus::Done) {
+                self.state = XzReadState::Between { padding: 0 };
+            }
+            if step.produced != 0 {
+                return Ok(step.produced);
+            }
+            if step.consumed == 0 {
+                match step.status {
+                    CodecStatus::NeedInput if !self.eof => {
+                        let buffered = self.end - self.start;
+                        self.fill()?;
+                        if self.end - self.start == buffered {
+                            return self.fail(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "XZ reader could not make input progress",
+                            ));
+                        }
+                    },
+                    CodecStatus::Done => {},
+                    _ => {
+                        return self.fail(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "XZ reader made no progress",
+                        ));
+                    },
+                }
             }
         }
     }
@@ -573,15 +671,6 @@ impl<R: Read> GzipRead<R> {
         }
         Ok(())
     }
-
-    fn archive_io(error: libarchive_oxide_core::ArchiveError) -> io::Error {
-        let kind = match error.kind() {
-            ErrorKind::Limit => io::ErrorKind::Other,
-            ErrorKind::Unsupported => io::ErrorKind::Unsupported,
-            _ => io::ErrorKind::InvalidData,
-        };
-        io::Error::new(kind, error)
-    }
 }
 
 impl<R: Read> Read for GzipRead<R> {
@@ -629,7 +718,7 @@ impl<R: Read> Read for GzipRead<R> {
             let step = self
                 .decoder
                 .process(&self.buffer[self.start..self.end], output, end)
-                .map_err(Self::archive_io)?;
+                .map_err(archive_io)?;
             self.start += step.consumed;
             if matches!(step.status, CodecStatus::Done) {
                 self.between_members = true;
@@ -651,6 +740,25 @@ impl<R: Read> Read for GzipRead<R> {
             }
         }
     }
+}
+
+fn archive_io(error: ArchiveError) -> io::Error {
+    let kind = match error.kind() {
+        ErrorKind::Limit => io::ErrorKind::Other,
+        ErrorKind::Unsupported => io::ErrorKind::Unsupported,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error)
+}
+
+#[cfg(feature = "xz")]
+fn codec_archive_io(error: ArchiveError) -> io::Error {
+    let kind = match error.kind() {
+        ErrorKind::Limit => io::ErrorKind::OutOfMemory,
+        ErrorKind::Unsupported => io::ErrorKind::Unsupported,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error)
 }
 
 pub(crate) struct SharedOutput<W>(Rc<RefCell<Option<W>>>);
