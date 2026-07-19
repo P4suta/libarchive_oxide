@@ -226,13 +226,13 @@ impl Lz4Decoder {
     }
 
     fn finish_frame(&mut self, record_length: usize) -> Result<(), ArchiveError> {
-        if let Some(expected) = self.content_size
-            && self.content_length != expected
-        {
-            return Err(Self::malformed(format!(
-                "LZ4 content size mismatch: expected {expected}, decoded {}",
-                self.content_length
-            )));
+        if let Some(expected) = self.content_size {
+            if self.content_length != expected {
+                return Err(Self::malformed(format!(
+                    "LZ4 content size mismatch: expected {expected}, decoded {}",
+                    self.content_length
+                )));
+            }
         }
         if self.content_checksum() {
             let expected = u32::from_le_bytes(
@@ -312,12 +312,12 @@ impl Lz4Decoder {
                     .map_err(|_| Self::malformed("LZ4 decoded length overflow"))?,
             )
             .ok_or_else(|| Self::malformed("LZ4 decoded length overflow"))?;
-        if let Some(expected) = self.content_size
-            && self.content_length > expected
-        {
-            return Err(Self::malformed(
-                "LZ4 decoded data exceeds the declared content size",
-            ));
+        if let Some(expected) = self.content_size {
+            if self.content_length > expected {
+                return Err(Self::malformed(
+                    "LZ4 decoded data exceeds the declared content size",
+                ));
+            }
         }
         if self.content_checksum() {
             self.content_hasher.write(&self.decoded);
