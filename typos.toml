@@ -16,6 +16,8 @@ zstd = "zstd"     # Zstandard codec
 lzma = "lzma"     # the LZMA/xz codec family
 ustar = "ustar"   # POSIX tar "ustar" magic
 cpio = "cpio"     # the cpio archive format
+# Rock Ridge `PN` is the POSIX device-number system-use field.
+PN = "PN"
 # `bsd*` / `ox*` are the drop-in CLI tool names (bsdtar/bsdcpio/bsdcat/bsdunzip
 # and oxtar/oxcpio/oxcat/oxunzip); not misspellings.
 bsdtar = "bsdtar"
@@ -30,6 +32,7 @@ oxunzip = "oxunzip"
 # `7ffbbd64ba73c260`), split into subtokens by the checker — not words.
 ba = "ba"
 ded = "ded"
+pn = "pn"
 # `mis-` is a valid English prefix (mis-decode, mis-read), not a misspelling.
 mis = "mis"
 

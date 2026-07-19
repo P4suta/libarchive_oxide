@@ -8,6 +8,7 @@
 #   - libarchive_oxide-core   no_std + alloc, zero external deps (sans-I/O state machines).
 #   - libarchive_oxide        the std flagship (auto-detection, FS extraction, safe paths, codecs).
 #   - libarchive_oxide-cli    the bsdtar-family bins (oxtar/oxcpio/oxcat/oxunzip).
+#   - xtask                   portable repository-policy checks used by Just and CI.
 #   - fuzz/                   cargo-fuzz targets; outside the workspace, nightly-only.
 #
 # Policy:
@@ -52,7 +53,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt
-      - run: cargo fmt --all --check
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
+      - run: just fmt-check
 
   clippy:
     name: clippy
@@ -64,8 +68,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: just lint
 
   test:
     name: test (${{ matrix.os }})
@@ -79,11 +86,14 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # This also runs libarchive_oxide/tests/fuzz_replay.rs — the portable adversarial gate that
       # mutates every committed seed through the reader/round-trip/codec invariants (catches
       # reintroduced panics on malformed input without nightly/libFuzzer), on all three OSes.
-      - run: cargo test --workspace --all-features
+      - run: just test
 
   no_std:
     name: no_std (thumbv7em)
@@ -95,10 +105,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: thumbv7em-none-eabi
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # libarchive_oxide-core must stay pure no_std + alloc; building for a bare-metal target with no
       # std available proves it. Do NOT pass --all-features here (that pulls std).
-      - run: cargo build -p libarchive_oxide-core --target thumbv7em-none-eabi
+      - run: just no-std
 
   doc:
     name: doc (rustdoc, warnings are errors)
@@ -106,12 +119,15 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Intra-doc links and doctests across the whole public surface. Keep in sync with docs.yml
       # (which additionally deploys the result to Pages).
       - env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps
+        run: just doc
 
   typos:
     name: typos
@@ -130,23 +146,28 @@ jobs:
       - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
         with:
           tool: cargo-msrv
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
       # `cargo-msrv verify` reads each crate's declared `rust-version` and proves it actually builds
       # on that floor (installing the toolchain via rustup). The two crates have different floors —
       # core's zero-dep no_std baseline (1.85) and the flagship's codec closure (1.87) — so each is
       # verified against its own manifest. The CLI inherits the flagship's floor and is covered by it.
-      - name: verify core MSRV (1.85)
-        run: cargo msrv verify --path libarchive_oxide-core
-      - name: verify flagship MSRV (1.87)
-        run: cargo msrv verify --path libarchive_oxide --all-features
+      - name: verify declared MSRVs
+        run: just msrv
 
   nodyn:
     name: no-dyn gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      # Mechanically enforce static format/codec dispatch. The script permits only the standard
-      # Error::source signature needed to preserve concrete I/O sources.
-      - run: bash scripts/check-no-dyn.sh
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
+      # Mechanically enforce static format/codec dispatch. The safe-Rust xtask permits only the
+      # standard Error::source signature needed to preserve concrete I/O sources.
+      - run: just no-dyn
 
   reuse:
     name: reuse (SPDX/REUSE compliance)
@@ -161,16 +182,12 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - run: bash scripts/check-license-sync.sh
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
+      - run: just license-sync
       - name: verify license texts are packaged
-        shell: bash
-        run: |
-          set -euo pipefail
-          for crate in libarchive_oxide-core libarchive_oxide libarchive_oxide-cli; do
-            files="$(cargo package -p "$crate" --list)"
-            grep -Fxq "LICENSES/Apache-2.0.txt" <<<"$files"
-            grep -Fxq "LICENSES/MIT.txt" <<<"$files"
-          done
+        run: just package-licenses
 
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
@@ -181,7 +198,10 @@ jobs:
       - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
         with:
           tool: cargo-deny
-      - run: cargo deny --all-features check advisories bans licenses sources
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
+      - run: just deny
 
   semver-checks:
     name: semver-checks (PR API compatibility)

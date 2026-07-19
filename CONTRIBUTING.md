@@ -12,19 +12,34 @@ mise run hooks
 
 Do not bypass hooks with `--no-verify`.
 
+The hooks use two layers:
+
+- `pre-commit` formats and spell-checks staged files, then runs the fast lint,
+  static-dispatch, and license checks;
+- `pre-push` runs `just ci`, which mirrors every practical CI gate
+  available on a developer machine, including all-feature tests, rustdoc,
+  bare-metal `no_std`, dependency policy, workflow lint, and both MSRVs.
+
+Run the same suites explicitly when needed:
+
+```sh
+just check
+just ci
+lefthook run local-ci
+```
+
+The remote CI remains authoritative for the Linux/macOS/Windows matrix,
+CodeQL, nightly libFuzzer, and big-endian s390x/QEMU execution.
+
 ## Required checks
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo doc --workspace --all-features --no-deps
-bash scripts/check-no-dyn.sh
-cargo build -p libarchive_oxide-core --target thumbv7em-none-eabi
-cargo deny check
-uvx --with charset-normalizer reuse lint
-bash scripts/check-license-sync.sh
+just ci
 ```
+
+Individual recipes such as `just test`, `just no-std`, and `just deny` run the
+same commands independently. Portable repository-specific policy checks live
+in the safe-Rust `xtask` crate instead of shell scripts.
 
 CI also runs:
 
@@ -63,7 +78,7 @@ portable assertions.
 
 | Crate | MSRV |
 |---|---:|
-| `libarchive_oxide-core` | 1.81 |
+| `libarchive_oxide-core` | 1.85 |
 | `libarchive_oxide` | 1.87 |
 | `libarchive_oxide-cli` | 1.87 |
 
@@ -92,8 +107,8 @@ PR publishes crates and creates the tag and GitHub Release.
 The repository uses [REUSE](https://reuse.software/). Run:
 
 ```sh
-uvx --with charset-normalizer reuse lint
-bash scripts/check-license-sync.sh
+just reuse
+just license-sync
 ```
 
 New files must declare `MIT OR Apache-2.0` through an SPDX header or

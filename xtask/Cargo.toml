@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license.workspace = true
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[lints]
+workspace = true
