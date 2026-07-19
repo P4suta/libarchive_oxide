@@ -18,7 +18,8 @@ The hooks use two layers:
   static-dispatch, and license checks;
 - `pre-push` runs `just ci`, which mirrors every practical CI gate
   available on a developer machine, including all-feature tests, rustdoc,
-  bare-metal `no_std`, dependency policy, workflow lint, and both MSRVs.
+  bare-metal `no_std`, dependency policy, packaged-crate consumer validation,
+  release policy, workflow lint, and both MSRVs.
 
 Run the same suites explicitly when needed:
 
@@ -40,6 +41,10 @@ just ci
 Individual recipes such as `just test`, `just no-std`, and `just deny` run the
 same commands independently. Portable repository-specific policy checks live
 in the safe-Rust `xtask` crate instead of shell scripts.
+
+`just package-smoke` builds the exact `.crate` contents in a fresh external
+consumer workspace. `just release-policy` is a non-publishing static check that
+rejects automatic release triggers and loss of the draft-first controls.
 
 CI also runs:
 
@@ -63,6 +68,11 @@ Changes must preserve [ADR-0001](docs/adr/0001-core-architecture.md):
 Propose a new ADR for a durable, cross-cutting decision. Do not use ADRs for
 implementation details, maintenance tasks, or reversals with no compatibility
 impact.
+
+Modern Replacement work uses stable `RM-NNN` identifiers and the dedicated
+Issue Form. Link independently mergeable work to its epic in
+[RM-000](https://github.com/P4suta/libarchive_oxide/issues/28), and include
+test, corpus, benchmark, or ABI evidence before closing a completion gate.
 
 ## Tests
 

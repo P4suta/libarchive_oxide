@@ -2,6 +2,12 @@
 
 Completed work belongs in [CHANGELOG.md](CHANGELOG.md).
 
+The gated path toward a modern libarchive replacement is defined in
+[Modern Replacement roadmap](docs/modern-replacement.md) and tracked from
+[RM-000](https://github.com/P4suta/libarchive_oxide/issues/28). The sections
+below are repository-level supporting work and do not replace those completion
+gates.
+
 ## OSS-Fuzz
 
 Status: deferred. Do not submit an external onboarding request without

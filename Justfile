@@ -59,6 +59,14 @@ license-sync:
 package-licenses:
     cargo run --quiet -p xtask -- package-licenses
 
+# Build the exact packaged sources in a fresh external consumer workspace.
+package-smoke:
+    cargo run --quiet -p xtask -- package-smoke
+
+# Keep publishing automation manual-only and draft-first.
+release-policy:
+    cargo run --quiet -p xtask -- release-policy
+
 # Validate GitHub Actions workflows.
 actionlint:
     actionlint -color
@@ -69,9 +77,9 @@ msrv:
     cargo msrv verify --path libarchive_oxide --all-features
 
 # Fast deterministic checks used during the edit/commit loop.
-check: fmt-check typos lint no-dyn reuse license-sync
+check: fmt-check typos lint no-dyn reuse license-sync release-policy
     @echo "fast local checks passed"
 
 # Every practical CI gate available on a developer machine.
-ci: fmt-check typos lint test doc no-dyn no-std deny reuse license-sync package-licenses actionlint msrv
+ci: fmt-check typos lint test doc no-dyn no-std deny reuse license-sync package-licenses package-smoke release-policy actionlint msrv
     @echo "local CI passed"

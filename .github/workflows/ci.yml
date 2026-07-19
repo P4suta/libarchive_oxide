@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# CI for libarchive_oxide (Pure Rust unified archive library).
+# CI for libarchive_oxide (safe-Rust unified archive library).
 #
 # Layout under test: three published crates + an excluded fuzz sub-workspace.
 #   - libarchive_oxide-core   no_std + alloc, zero external deps (sans-I/O state machines).
@@ -177,7 +177,7 @@ jobs:
       - uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
 
   license-sync:
-    name: crate license copies and package contents
+    name: crate package and release policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -188,6 +188,10 @@ jobs:
       - run: just license-sync
       - name: verify license texts are packaged
         run: just package-licenses
+      - name: compile packaged crates from an external consumer
+        run: just package-smoke
+      - name: verify manual draft-first release policy
+        run: just release-policy
 
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)

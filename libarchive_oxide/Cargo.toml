@@ -5,7 +5,7 @@
 [package]
 name = "libarchive_oxide"
 version.workspace = true
-description = "Pure-Rust archive detection, compression, extraction, and creation"
+description = "Safe-Rust archive detection, compression, extraction, and creation"
 edition.workspace = true
 # MSRV with all features.
 rust-version = "1.87"
