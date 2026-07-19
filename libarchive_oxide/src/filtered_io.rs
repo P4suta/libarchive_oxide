@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Bounded `Read` adapters for outer filters with native streaming APIs.
+//! Bounded `Read` adapters for outer filters with codec-specific streaming APIs.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -13,15 +13,15 @@ use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, EndOfInput, ErrorKind, Limits};
 
 use crate::filter::gzip::{GzipDecoder, GzipEncoder};
-#[cfg(feature = "xz")]
+#[cfg(any(feature = "zstd", feature = "xz"))]
 use crate::pipeline_codec::PipelineCodec;
 
 const BUFFER: usize = 64 * 1024;
 
 /// Auto-detecting streaming input filter.
 ///
-/// gzip uses the common sans-I/O codec. The other variants use their native
-/// incremental APIs without retaining the compressed or decoded stream.
+/// gzip uses the common sans-I/O codec. The other variants use bounded
+/// incremental Rust APIs without retaining the compressed or decoded stream.
 pub struct FilterReader<R: Read> {
     inner: FilterReaderInner<R>,
     decoded: u64,
@@ -94,7 +94,7 @@ impl<R: Read> FilterReader<R> {
         if available.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
             #[cfg(feature = "zstd")]
             {
-                return ZstdRead::new(input)
+                return ZstdRead::new(input, limits)
                     .map(Box::new)
                     .map(FilterReaderInner::Zstd)
                     .map(|inner| Self {
@@ -187,7 +187,7 @@ impl<R: Read> Read for PrefixReader<R> {
     }
 }
 
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+#[cfg(feature = "lz4")]
 struct MemberInput<R> {
     input: R,
     prefix: [u8; 6],
@@ -195,7 +195,7 @@ struct MemberInput<R> {
     prefix_position: usize,
 }
 
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+#[cfg(feature = "lz4")]
 impl<R> MemberInput<R> {
     fn new(input: R) -> Self {
         Self {
@@ -217,7 +217,7 @@ impl<R> MemberInput<R> {
     }
 }
 
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+#[cfg(feature = "lz4")]
 impl<R: Read> Read for MemberInput<R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {
@@ -234,7 +234,7 @@ impl<R: Read> Read for MemberInput<R> {
     }
 }
 
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+#[cfg(feature = "lz4")]
 fn next_member<R: Read>(input: &mut MemberInput<R>, magic: &[u8]) -> io::Result<bool> {
     let mut prefix = [0_u8; 6];
     let mut length = 0;
@@ -260,37 +260,65 @@ fn next_member<R: Read>(input: &mut MemberInput<R>, magic: &[u8]) -> io::Result<
 
 #[cfg(feature = "zstd")]
 struct ZstdRead<R: Read> {
-    decoder:
-        Option<ruzstd::decoding::StreamingDecoder<MemberInput<R>, ruzstd::decoding::FrameDecoder>>,
-    input: Option<MemberInput<R>>,
+    input: R,
+    decoder: PipelineCodec,
+    buffer: Vec<u8>,
+    start: usize,
+    end: usize,
+    eof: bool,
+    done: bool,
     failed: bool,
 }
 
 #[cfg(feature = "zstd")]
 impl<R: Read> ZstdRead<R> {
-    fn new(input: R) -> io::Result<Self> {
-        let decoder = ruzstd::decoding::StreamingDecoder::new(MemberInput::new(input))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fn new(input: R, limits: Limits) -> io::Result<Self> {
         Ok(Self {
-            decoder: Some(decoder),
-            input: None,
+            input,
+            decoder: PipelineCodec::new(FilterId::Zstd, limits).map_err(codec_archive_io)?,
+            buffer: vec![0; BUFFER],
+            start: 0,
+            end: 0,
+            eof: false,
+            done: false,
             failed: false,
         })
     }
 
-    #[allow(clippy::expect_used)]
     fn into_inner(self) -> R {
-        self.decoder
-            .map(ruzstd::decoding::StreamingDecoder::into_inner)
-            .or(self.input)
-            .expect("zstd reader always owns its member input")
-            .into_inner()
+        self.input
+    }
+
+    fn fill(&mut self) -> io::Result<()> {
+        if self.start != 0 {
+            self.buffer.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+        if self.end == self.buffer.len() || self.eof {
+            return Ok(());
+        }
+        let read = self.input.read(&mut self.buffer[self.end..])?;
+        if read == 0 {
+            self.eof = true;
+        } else {
+            self.end += read;
+        }
+        Ok(())
+    }
+
+    fn fail<T>(&mut self, error: io::Error) -> io::Result<T> {
+        self.failed = true;
+        Err(error)
     }
 }
 
 #[cfg(feature = "zstd")]
 impl<R: Read> Read for ZstdRead<R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.done {
+            return Ok(0);
+        }
         if self.failed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -298,34 +326,47 @@ impl<R: Read> Read for ZstdRead<R> {
             ));
         }
         loop {
-            let read = self
-                .decoder
-                .as_mut()
-                .ok_or_else(|| io::Error::other("zstd decoder is missing"))?
-                .read(output)?;
-            if read != 0 {
-                return Ok(read);
+            if self.start == self.end && !self.eof {
+                self.fill()?;
             }
-            let decoder = self
+            let input_length = self.end - self.start;
+            let end = if self.eof {
+                EndOfInput::End
+            } else {
+                EndOfInput::More
+            };
+            let step = match self
                 .decoder
-                .take()
-                .ok_or_else(|| io::Error::other("zstd decoder disappeared"))?;
-            let mut input = decoder.into_inner();
-            match next_member(&mut input, &[0x28, 0xb5, 0x2f, 0xfd]) {
-                Ok(false) => {
-                    self.input = Some(input);
+                .process(&self.buffer[self.start..self.end], output, end)
+                .and_then(|step| step.validate(input_length, output.len()))
+            {
+                Ok(step) => step,
+                Err(error) => return self.fail(codec_archive_io(error)),
+            };
+            self.start += step.consumed;
+            if step.produced != 0 {
+                return Ok(step.produced);
+            }
+            match step.status {
+                CodecStatus::Done => {
+                    self.done = true;
                     return Ok(0);
                 },
-                Ok(true) => {
-                    self.decoder = Some(
-                        ruzstd::decoding::StreamingDecoder::new(input)
-                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-                    );
+                CodecStatus::NeedInput if self.start == self.end && !self.eof => {
+                    self.fill()?;
                 },
-                Err(error) => {
-                    self.input = Some(input);
-                    self.failed = true;
-                    return Err(error);
+                CodecStatus::NeedOutput if step.consumed != 0 => {},
+                CodecStatus::NeedInput if self.eof => {
+                    return self.fail(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "zstd decoder requested input after the source ended",
+                    ));
+                },
+                _ => {
+                    return self.fail(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "zstd reader made no progress",
+                    ));
                 },
             }
         }
@@ -782,7 +823,7 @@ fn archive_io(error: ArchiveError) -> io::Error {
     io::Error::new(kind, error)
 }
 
-#[cfg(feature = "xz")]
+#[cfg(any(feature = "zstd", feature = "xz"))]
 fn codec_archive_io(error: ArchiveError) -> io::Error {
     let kind = match error.kind() {
         ErrorKind::Limit => io::ErrorKind::OutOfMemory,
@@ -895,6 +936,72 @@ impl<W: Write> Write for GzipFilterWrite<W> {
     }
 }
 
+#[cfg(feature = "zstd")]
+pub(crate) struct ZstdFrameWrite<W: Write> {
+    output: W,
+    input: Vec<u8>,
+    wrote_frame: bool,
+}
+
+#[cfg(feature = "zstd")]
+impl<W: Write> ZstdFrameWrite<W> {
+    pub(crate) fn new(output: W) -> Self {
+        Self {
+            output,
+            input: Vec::with_capacity(BUFFER),
+            wrote_frame: false,
+        }
+    }
+
+    fn emit_frame(&mut self) -> io::Result<()> {
+        let encoded = crate::filter::zstd::encode_frame(&self.input);
+        self.output.write_all(&encoded)?;
+        self.input.clear();
+        self.wrote_frame = true;
+        Ok(())
+    }
+
+    fn finish_output(mut self) -> io::Result<()> {
+        if !self.input.is_empty() || !self.wrote_frame {
+            self.emit_frame()?;
+        }
+        self.output.flush()
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        if !self.input.is_empty() || !self.wrote_frame {
+            self.emit_frame()?;
+        }
+        self.output.flush()?;
+        Ok(self.output)
+    }
+}
+
+#[cfg(feature = "zstd")]
+impl<W: Write> Write for ZstdFrameWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.input.len() == BUFFER {
+            self.emit_frame()?;
+        }
+        let consumed = (BUFFER - self.input.len()).min(bytes.len());
+        self.input.extend_from_slice(&bytes[..consumed]);
+        if self.input.len() == BUFFER {
+            self.emit_frame()?;
+        }
+        Ok(consumed)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.input.is_empty() {
+            self.emit_frame()?;
+        }
+        self.output.flush()
+    }
+}
+
 /// Incremental synchronous filter sink used by the common archive writer.
 pub(crate) enum SyncFilterWriter<W: Write> {
     Plain(SharedOutput<W>),
@@ -909,7 +1016,7 @@ pub(crate) enum SyncFilterWriter<W: Write> {
     },
     #[cfg(feature = "zstd")]
     Zstd {
-        writer: Box<zstd_codec::stream::write::Encoder<'static, SharedOutput<W>>>,
+        writer: Box<ZstdFrameWrite<SharedOutput<W>>>,
         output: SharedOutput<W>,
     },
     #[cfg(feature = "xz")]
@@ -950,17 +1057,10 @@ impl<W: Write> SyncFilterWriter<W> {
                 output: shared,
             }),
             #[cfg(feature = "zstd")]
-            Some(FilterId::Zstd) => {
-                let writer =
-                    zstd_codec::stream::write::Encoder::new(shared.clone(), 3).map_err(|_| {
-                        ArchiveError::new(ErrorKind::Capability)
-                            .with_context("failed to initialize incremental zstd encoder")
-                    })?;
-                Ok(Self::Zstd {
-                    writer: Box::new(writer),
-                    output: shared,
-                })
-            },
+            Some(FilterId::Zstd) => Ok(Self::Zstd {
+                writer: Box::new(ZstdFrameWrite::new(shared.clone())),
+                output: shared,
+            }),
             #[cfg(feature = "xz")]
             Some(FilterId::Xz) => {
                 let writer = lzma_rust2::XzWriter::new(
@@ -1003,7 +1103,7 @@ impl<W: Write> SyncFilterWriter<W> {
             },
             #[cfg(feature = "zstd")]
             Self::Zstd { writer, output } => {
-                drop((*writer).finish()?);
+                (*writer).finish_output()?;
                 output.take()
             },
             #[cfg(feature = "xz")]

@@ -5,6 +5,8 @@
 //! Compression filter implementations and runtime dispatch.
 
 pub mod gzip;
+#[cfg(feature = "zstd")]
+pub(crate) mod zstd;
 
 /// IEEE CRC-32 primitives.
 pub use gzip::{Crc32, crc32};
