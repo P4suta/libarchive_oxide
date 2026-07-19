@@ -5,11 +5,15 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-Archive detection, compression, extraction, and creation over
+Safe-Rust archive detection, compression, extraction, and creation over
 [`libarchive_oxide-core`](https://crates.io/crates/libarchive_oxide-core).
 
-Supported formats: tar, cpio, ar, zip, 7z, and ISO 9660. Supported filters:
-gzip, zstd, xz, and lz4. The crate forbids unsafe code.
+The crate supports tar, cpio, ar, ZIP/ZIP64, optional single-folder 7z, and
+ISO 9660 with format-specific limits. Outer filters are gzip, zstd, xz, and
+LZ4 frame. The crate forbids unsafe code, but some codec dependencies currently
+select native C backends. See the repository's
+[support matrix](https://github.com/P4suta/libarchive_oxide/blob/main/docs/support-matrix.md)
+for method- and metadata-level details.
 
 This project is independent of the upstream libarchive project. It is not a
 binding.
@@ -53,6 +57,10 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 
 `--no-default-features` retains uncompressed formats and zip store mode.
 
+The current default feature graph is not yet guaranteed C/FFI-free: zstd
+encoding uses a native backend, and async all-features builds may enable other
+native codec backends. A dependency-verified portable profile is roadmap work.
+
 Sequential, seek, futures-io, and Tokio adapters all drive the same archive
 state machines. Seek variants are named `SeekArchive*`, `AsyncSeekArchive*`,
 and `TokioSeekArchive*`; secure Tokio extraction is provided by
@@ -63,7 +71,7 @@ MSRV: Rust 1.87.
 
 ## Security
 
-All high-level readers use finite [`Limits`](https://docs.rs/libarchive_oxide-core/latest/libarchive_oxide_core/struct.Limits.html)
+All readers use finite [`Limits`](https://docs.rs/libarchive_oxide-core/latest/libarchive_oxide_core/struct.Limits.html)
 by default. Filesystem extraction uses a directory capability, atomic regular-file
 commit, and a deny-by-default policy for traversal, links, and special files. See the
 [security policy](https://github.com/P4suta/libarchive_oxide/blob/main/SECURITY.md).

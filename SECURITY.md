@@ -32,8 +32,11 @@ compatibility.
 
 ## Controls
 
-- all published crates use `#![forbid(unsafe_code)]`;
-- no FFI or C code is linked;
+- all project-owned published crates use `#![forbid(unsafe_code)]`;
+- `libarchive_oxide-core` is zero-dependency safe Rust; the current default
+  and all-feature codec dependency graphs may link native C code (notably
+  zstd encoding and some async codec backends), so they are not yet advertised
+  as FFI-free;
 - every decoder, encoder, filter pipeline, spool, and extractor receives
   finite-by-default resource limits;
 - extraction is rooted in a `cap-std` directory capability and commits regular

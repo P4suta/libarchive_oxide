@@ -1,0 +1,72 @@
+name: Modern Replacement work item
+description: Track an implementation unit or completion gate from the Modern Replacement roadmap
+title: "[RM-XXX] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use one issue for one independently verifiable outcome. Planned support
+        must not be presented as implemented until every acceptance item passes.
+  - type: dropdown
+    id: campaign
+    attributes:
+      label: Campaign
+      options:
+        - "0 — truthful public surface"
+        - "1 — measurable foundations"
+        - "2 — OCI and packages"
+        - "3 — mainstream format depth"
+        - "4 — replacement candidate"
+    validations:
+      required: true
+  - type: dropdown
+    id: work_type
+    attributes:
+      label: Work type
+      options:
+        - implementation
+        - conformance / interoperability
+        - security / fuzzing
+        - performance
+        - API / ABI design
+        - documentation / support claim
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Verifiable outcome
+      description: State the observable capability, not the implementation activity.
+      placeholder: A portable-codecs build has no C/FFI codec dependency and passes the shared codec corpus.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: Name formats, methods, metadata, platforms, and intentionally excluded work.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Use checkboxes for tests, docs, resource limits, and interoperability evidence.
+      placeholder: |
+        - [ ] Unit and malformed-input tests pass.
+        - [ ] Support matrix is updated without overclaiming.
+        - [ ] At least three producers and two consumers are recorded where applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and related RM issues
+      placeholder: Blocked by RM-100; feeds RM-400.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Completion evidence
+      description: Fill this before closing with commands, corpus versions, benchmark links, or ABI snapshots.
