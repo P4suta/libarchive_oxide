@@ -56,7 +56,28 @@ CLI tools:
 cargo install libarchive_oxide-cli --locked
 ```
 
-## Example
+## High-level engine
+
+`ArchiveEngine` is the preferred safe application surface. Opening a session
+creates a bounded immutable snapshot, so an `ExtractionPlan` cannot be applied
+to a different input. Collected inspection is metadata-budgeted; callers can
+use `ArchiveSession::next_event` instead when they need constant-memory event
+processing.
+
+```rust
+use std::io::Read;
+
+use libarchive_oxide::ArchiveEngine;
+
+fn inspect(input: impl Read) -> Result<(), Box<dyn std::error::Error>> {
+    let mut session = ArchiveEngine::new().open(input)?;
+    let inspection = session.inspect()?;
+    println!("{:?}: {} entries", inspection.format(), inspection.entries().len());
+    Ok(())
+}
+```
+
+## Low-level example
 
 ```rust
 use std::io::Read;

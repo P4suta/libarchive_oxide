@@ -511,6 +511,7 @@ dependencies = [
  "ruzstd",
  "sevenz-rust2",
  "sha1",
+ "sha2",
  "subtle",
  "tempfile",
  "tokio",
