@@ -18,7 +18,27 @@ for method- and metadata-level details.
 This project is independent of the upstream libarchive project. It is not a
 binding.
 
-## Example
+## High-level engine
+
+`ArchiveEngine` opens a bounded immutable snapshot and provides session-bound
+inspection, planning, application, and creation. Plans cannot be serialized,
+cloned, replayed, or applied to another session. Use the session event API
+instead of collected inspection for huge entry sets.
+
+```rust
+use std::io::Read;
+
+use libarchive_oxide::ArchiveEngine;
+
+fn inspect(input: impl Read) -> Result<(), Box<dyn std::error::Error>> {
+    let mut session = ArchiveEngine::new().open(input)?;
+    let inspection = session.inspect()?;
+    println!("{:?}: {} entries", inspection.format(), inspection.entries().len());
+    Ok(())
+}
+```
+
+## Low-level example
 
 ```rust
 use std::io::Read;

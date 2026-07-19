@@ -21,6 +21,7 @@ pub mod async_seek;
 #[cfg(feature = "async")]
 pub mod async_stream;
 pub mod create;
+pub mod engine;
 pub mod extractor;
 pub mod filter;
 pub mod filtered_io;
@@ -43,6 +44,10 @@ pub use async_seek::{AsyncSeekArchiveReader, AsyncSeekArchiveWriter};
 #[cfg(feature = "async")]
 pub use async_stream::{AsyncArchiveReader, AsyncArchiveWriter};
 pub use create::{CreateStreamError, StreamingArchiveBuilder};
+pub use engine::{
+    ApplyReport, ArchiveEngine, ArchiveInspection, ArchiveSession, CreateOptions, EntryDescriptor,
+    ExtractionPlan, InputDigest, PlanDisposition, PlannedEntry, Policy, ProviderSet,
+};
 pub use extractor::{
     EntryOutcome, EntryOutcomeKind, ExtractionPolicy, ExtractionReport, Extractor, RejectionReason,
 };

@@ -241,10 +241,11 @@ libarchive_oxide-core = {{ path = "{consumer_core}" }}
         smoke.join("consumer").join("src").join("main.rs"),
         r"use std::io::Cursor;
 
-use libarchive_oxide::{ArchiveReader, ReaderEvent};
+use libarchive_oxide::{ArchiveEngine, ArchiveReader, ReaderEvent};
 use libarchive_oxide_core::Limits;
 
 fn main() {
+    let _engine = ArchiveEngine::new();
     let limits = Limits::safe();
     let mut reader = ArchiveReader::with_limits(Cursor::new(Vec::<u8>::new()), limits);
     let _event: Result<ReaderEvent<'_>, _> = reader.next_event();

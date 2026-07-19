@@ -35,6 +35,12 @@ Detailed bodies used for initial issue creation live in
 [`issue-bodies`](issue-bodies/). New work should use the
 “Modern Replacement work item” Issue Form and cite its parent stable ID.
 
+## Active implementation units
+
+| ID | Parent | Outcome |
+|---|---|---|
+| [RM-101](https://github.com/P4suta/libarchive_oxide/issues/30) | RM-100 | Session-bound inspect, plan, apply, and create engine |
+
 ## Labels
 
 - `modern-replacement`: part of the gated replacement roadmap.
