@@ -242,14 +242,12 @@ jobs:
           done
 
   big-endian:
-    name: big-endian (s390x, qemu) [scaffold]
-    # SCAFFOLD, non-gating (continue-on-error). The archive formats carry big fields (zip is
-    # little-endian, tar is ASCII-octal, cpio/7z/iso mix endian): a byte-order bug hides on the
-    # little-endian CI matrix. `cross` runs both library suites under qemu on a big-endian target to
-    # surface it. The CLI contract suite is excluded because it spawns target binaries as child
-    # processes, bypassing cross's top-level qemu runner.
-    # Kept advisory until the target is proven green, so a qemu/cross hiccup cannot block merges.
-    continue-on-error: true
+    name: big-endian (s390x, qemu)
+    # The archive formats carry big fields (zip is little-endian, tar is ASCII-octal, cpio/7z/iso
+    # mix endian): a byte-order bug hides on the little-endian CI matrix. `cross` runs both library
+    # suites under qemu on a big-endian target to surface it. The CLI contract suite is excluded
+    # because it spawns target binaries as child processes, bypassing cross's top-level qemu runner.
+    # Promoted to a required gate after three consecutive green runs on main.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -280,8 +278,7 @@ jobs:
           /tmp/actionlint -color
 
   # Single aggregation gate. `if: always()` so it runs when an upstream job fails; `skipped` counts
-  # as pass, letting PR-only jobs (semver-checks) report green on push / merge_group. `big-endian` is
-  # a continue-on-error scaffold and is intentionally excluded from the gating set.
+  # as pass, letting PR-only jobs (semver-checks) report green on push / merge_group.
   ci-required:
     name: ci-required
     if: always()
@@ -299,6 +296,7 @@ jobs:
       - deny
       - semver-checks
       - fuzz
+      - big-endian
       - actionlint
     runs-on: ubuntu-latest
     steps:
