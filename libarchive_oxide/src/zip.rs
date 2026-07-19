@@ -999,7 +999,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(feature = "aes")]
 fn system_salt() -> Result<[u8; 16]> {
     let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt).map_err(|_| Error::Malformed("zip: OS RNG failure"))?;
+    getrandom::fill(&mut salt).map_err(|_| Error::Malformed("zip: OS RNG failure"))?;
     Ok(salt)
 }
 
@@ -1029,7 +1029,7 @@ fn encrypt_aes(_compressed: &[u8], _password: &[u8], _salt: [u8; 16]) -> Result<
 #[cfg(feature = "aes")]
 mod aes {
     use ctr::cipher::{KeyIvInit, StreamCipher};
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use libarchive_oxide_core::{Error, Result};
     use sha1::Sha1;
     use subtle::ConstantTimeEq;
@@ -1072,7 +1072,7 @@ mod aes {
         let mut ct = compressed.to_vec();
         cipher(aes_key)?.apply_keystream(&mut ct);
 
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(mac_key)
+        let mut mac = <HmacSha1 as KeyInit>::new_from_slice(mac_key)
             .map_err(|_| Error::Malformed("zip: HMAC key setup"))?;
         mac.update(&ct);
         let auth = mac.finalize().into_bytes();
@@ -1108,7 +1108,7 @@ mod aes {
         }
 
         // Constant-time HMAC authentication over the ciphertext.
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(mac_key)
+        let mut mac = <HmacSha1 as KeyInit>::new_from_slice(mac_key)
             .map_err(|_| Error::Malformed("zip: HMAC key setup"))?;
         mac.update(ct);
         let auth = mac.finalize().into_bytes();

@@ -30,19 +30,17 @@ Enrollment checklist:
 
 ## Big-endian verification
 
-**State: advisory scaffold present, not yet green-gated.** All parsing uses
-explicit byte-order conversions, so big-endian correctness is expected. CI now
-cross-compiles and runs the core and flagship library tests under QEMU on
-`s390x`, initially as an allow-failure scaffold. (The CLI contract suite spawns
-target binaries as child processes and therefore cannot use cross's top-level
-QEMU runner.) It will become a required gate after three consecutive green runs
-on `main`.
+**State: required green gate.** All parsing uses explicit byte-order
+conversions. CI cross-compiles and runs the core and flagship library tests
+under QEMU on `s390x`; the job joined `ci-required` after three consecutive
+green runs on `main`. (The CLI contract suite spawns target binaries as child
+processes and therefore cannot use cross's top-level QEMU runner.)
 
-- [x] Add a cross + QEMU CI job (`s390x-unknown-linux-gnu`) as
+- [x] Add a cross + QEMU CI job (`s390x-unknown-linux-gnu`) initially as
       `continue-on-error: true`.
 - [x] Triage the initial failure (CLI child-process emulation, not an endian
       divergence) and scope the job to the two library crates.
-- [ ] Promote the job to a required gate after three consecutive green `main`
+- [x] Promote the job to a required gate after three consecutive green `main`
       runs.
 
 ## `no_std` codec support

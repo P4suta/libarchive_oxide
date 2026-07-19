@@ -14,7 +14,8 @@
 # Auth is environment-scoped (the `release` GitHub Environment), never repo-level secrets:
 #   - A GitHub App mints a short-lived token via actions/create-github-app-token, so the Release PR
 #     it opens is authored by the App and retriggers CI (a GITHUB_TOKEN-authored PR does not). Set
-#     RELEASE_PLZ_APP_ID and RELEASE_PLZ_APP_PRIVATE_KEY in the `release` environment; the App needs
+#     RELEASE_PLZ_APP_CLIENT_ID (variable) and RELEASE_PLZ_APP_PRIVATE_KEY (secret) in the `release`
+#     environment; the App needs
 #     Contents: read/write and Pull requests: read/write, installed on this repository.
 #   - crates.io publish uses Trusted Publishing (OIDC) via `id-token: write`, not a stored token.
 #     Register a trusted publisher for each published crate on crates.io (owner P4suta, repo
@@ -48,7 +49,7 @@ jobs:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
-          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          client-id: ${{ vars.RELEASE_PLZ_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -79,7 +80,7 @@ jobs:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
-          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          client-id: ${{ vars.RELEASE_PLZ_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

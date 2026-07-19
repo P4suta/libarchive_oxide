@@ -49,13 +49,13 @@ lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"],
 # LZMA2 codec shared by the `xz` filter and the 7z path (features `xz`/`sevenz`). Pure Rust.
 lzma-rust2 = { version = "0.16.5", optional = true }
 # AES layer (feature `aes`). SHA-1 is a WinZip AE-2 interoperability requirement, not a strength choice.
-aes = { version = "0.8", optional = true }
-ctr = { version = "0.9", optional = true }
-hmac = { version = "0.12", optional = true }
-sha1 = { version = "0.10", optional = true }
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+aes = { version = "0.9", optional = true }
+ctr = { version = "0.10", optional = true }
+hmac = { version = "0.13", optional = true }
+sha1 = { version = "0.11", optional = true }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 subtle = { version = "2.6", default-features = false, optional = true }
-getrandom = { version = "0.2", optional = true }
+getrandom = { version = "0.4", optional = true }
 
 [dev-dependencies]
 # Portable fuzz invariants, shared with the cargo-fuzz targets (see fuzz/). Pulling it here as a
@@ -70,8 +70,8 @@ flate2 = "1"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
 lzma-rust2 = "0.16.5"
 ruzstd = "0.8.2"
-sevenz-rust2 = "0.20.2"
-zip = { version = "7.2.0", default-features = false, features = ["deflate", "aes-crypto"] }
+sevenz-rust2 = "0.21.3"
+zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }
 
 [lints]
 workspace = true

@@ -64,8 +64,8 @@ codec dependency.
 Extraction rejects path traversal (`..`, absolute paths, Windows drive/UNC), and
 [`decompress_capped`] refuses to expand past a caller-set bound (bomb defense).
 The whole crate is `#![forbid(unsafe_code)]`. See the
-[workspace threat model](../README.md#threat-model) and
-[SECURITY.md](../SECURITY.md).
+[workspace threat model](https://github.com/P4suta/libarchive_oxide#threat-model) and
+[SECURITY.md](https://github.com/P4suta/libarchive_oxide/blob/main/SECURITY.md).
 
 ## MSRV
 

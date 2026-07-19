@@ -17,6 +17,12 @@ licenses=(
 )
 
 for crate in "${crates[@]}"; do
+  if grep -nE '\]\(\.\./' "$repo_root/$crate/README.md"; then
+    echo "published README escapes its crate tarball: $crate/README.md" >&2
+    echo "use a tarball-local path or an absolute URL" >&2
+    exit 1
+  fi
+
   for license in "${licenses[@]}"; do
     source_file="$repo_root/LICENSES/$license"
     crate_file="$repo_root/$crate/LICENSES/$license"

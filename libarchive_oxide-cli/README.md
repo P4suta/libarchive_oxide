@@ -80,7 +80,8 @@ SemVer governs. Concretely:
 
 The bsd* interfaces these tools track are themselves long-frozen, so churn is
 expected to be minimal. The internal library API (`libarchive_oxide`) has its own,
-separate SemVer surface. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full
+separate SemVer surface. See
+[CONTRIBUTING.md](https://github.com/P4suta/libarchive_oxide/blob/main/CONTRIBUTING.md) for the full
 stability policy and the path to 1.0.
 
 ## License

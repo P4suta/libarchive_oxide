@@ -5,8 +5,9 @@
 # Dependabot version updates. Weekly PRs for Cargo crates (the root workspace and the excluded
 # `fuzz` sub-workspace, which resolves against its own Cargo.lock) and the GitHub Actions the
 # workflows use. Every commit is prefixed `build(deps)` so the Conventional Commits gate accepts a
-# Dependabot-authored commit. Patch and minor Cargo updates group into one PR; majors land on their
-# own so each breaking change is weighed separately.
+# Dependabot-authored commit. RustCrypto updates are grouped across version boundaries because its
+# digest/cipher traits must move as one compatible generation. Other patch and minor Cargo updates
+# group together; unrelated majors land on their own so each breaking change is weighed separately.
 version: 2
 
 updates:
@@ -18,6 +19,16 @@ updates:
     commit-message:
       prefix: "build(deps)"
     groups:
+      rustcrypto:
+        patterns:
+          - "aes"
+          - "ctr"
+          - "getrandom"
+          - "hmac"
+          - "pbkdf2"
+          - "sha1"
+          - "sha2"
+        update-types: ["major", "minor", "patch"]
       cargo-minor:
         update-types: ["minor", "patch"]
 
