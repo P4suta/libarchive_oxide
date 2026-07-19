@@ -14,31 +14,45 @@ use libarchive_oxide_core::Limits;
 const CI_PAYLOAD: u64 = 256 * 1024 * 1024;
 const MANUAL_PAYLOAD: u64 = 10 * 1024 * 1024 * 1024;
 
-fn put_octal(field: &mut [u8], mut value: u64) {
-    field.fill(b'0');
-    let last = field.len() - 1;
-    for slot in field[..last].iter_mut().rev() {
-        *slot = b'0' + u8::try_from(value & 7).unwrap();
-        value >>= 3;
+fn put_number(field: &mut [u8], mut value: u64) {
+    let digits = field.len() - 1;
+    if digits >= 22 || value < 1_u64 << (3 * digits) {
+        field.fill(b'0');
+        for slot in field[..digits].iter_mut().rev() {
+            *slot = b'0' + u8::try_from(value & 7).unwrap();
+            value >>= 3;
+        }
+        field[digits] = 0;
+        assert_eq!(value, 0);
+        return;
     }
-    field[last] = 0;
-    assert_eq!(value, 0);
+
+    field.fill(0);
+    let encoded = value.to_be_bytes();
+    let capacity = field.len() - 1;
+    assert!(
+        capacity >= encoded.len() || encoded[..encoded.len() - capacity].iter().all(|b| *b == 0)
+    );
+    let copied = capacity.min(encoded.len());
+    let destination = field.len() - copied;
+    field[destination..].copy_from_slice(&encoded[encoded.len() - copied..]);
+    field[0] = 0x80;
 }
 
 fn tar_header(payload: u64) -> [u8; 512] {
     let mut header = [0_u8; 512];
     header[..7].copy_from_slice(b"big.bin");
-    put_octal(&mut header[100..108], 0o644);
-    put_octal(&mut header[108..116], 0);
-    put_octal(&mut header[116..124], 0);
-    put_octal(&mut header[124..136], payload);
-    put_octal(&mut header[136..148], 0);
+    put_number(&mut header[100..108], 0o644);
+    put_number(&mut header[108..116], 0);
+    put_number(&mut header[116..124], 0);
+    put_number(&mut header[124..136], payload);
+    put_number(&mut header[136..148], 0);
     header[148..156].fill(b' ');
     header[156] = b'0';
     header[257..263].copy_from_slice(b"ustar\0");
     header[263..265].copy_from_slice(b"00");
     let checksum = header.iter().map(|byte| u64::from(*byte)).sum();
-    put_octal(&mut header[148..155], checksum);
+    put_number(&mut header[148..155], checksum);
     header[155] = b' ';
     header
 }
