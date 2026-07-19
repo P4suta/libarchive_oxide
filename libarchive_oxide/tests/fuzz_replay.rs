@@ -24,7 +24,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use libarchive_oxide_fuzz_cases::{run_target, TARGETS};
+use libarchive_oxide_fuzz_cases::{TARGETS, run_target};
 
 /// `<repo>/fuzz/corpus` — sibling of this crate's manifest directory (`<repo>/arca`).
 fn corpus_root() -> PathBuf {

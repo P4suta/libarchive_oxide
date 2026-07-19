@@ -1,0 +1,936 @@
+// SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Bounded `Read` adapters for outer filters with native streaming APIs.
+
+use std::cell::RefCell;
+use std::fmt;
+use std::io::{self, BufReader, Read, Write};
+use std::rc::Rc;
+
+use libarchive_oxide_core::filter::FilterId;
+use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, EndOfInput, ErrorKind, Limits};
+
+use crate::filter::gzip::{GzipDecoder, GzipEncoder};
+
+const BUFFER: usize = 64 * 1024;
+
+/// Auto-detecting streaming input filter.
+///
+/// gzip uses the common sans-I/O codec. The other variants use their native
+/// incremental APIs without retaining the compressed or decoded stream.
+pub struct FilterReader<R: Read> {
+    inner: FilterReaderInner<R>,
+    decoded: u64,
+    decoded_limit: Option<u64>,
+}
+
+enum FilterReaderInner<R: Read> {
+    /// Unfiltered input, including gzip for the common pipeline.
+    Plain(BufReader<PrefixReader<R>>),
+    /// gzip members decoded by the common sans-I/O codec.
+    Gzip(Box<GzipRead<BufReader<PrefixReader<R>>>>),
+    /// Zstandard frame.
+    #[cfg(feature = "zstd")]
+    Zstd(Box<ZstdRead<BufReader<PrefixReader<R>>>>),
+    /// Concatenated XZ streams.
+    #[cfg(feature = "xz")]
+    Xz(Box<XzRead<BufReader<PrefixReader<R>>>>),
+    /// LZ4 frame.
+    #[cfg(feature = "lz4")]
+    Lz4(Box<Lz4Read<BufReader<PrefixReader<R>>>>),
+}
+
+impl<R: Read> FilterReader<R> {
+    /// Detects an enabled outer filter from a buffered prefix.
+    pub fn new(input: R) -> io::Result<Self> {
+        Self::with_limits(input, Limits::default())
+    }
+
+    /// Detects an outer filter with explicit decoded-output budgets.
+    pub fn with_limits(mut input: R, limits: Limits) -> io::Result<Self> {
+        let mut prefix = [0_u8; 6];
+        let mut prefix_len = 0;
+        while prefix_len != prefix.len() {
+            let read = input.read(&mut prefix[prefix_len..])?;
+            if read == 0 {
+                break;
+            }
+            prefix_len += read;
+        }
+        let input = BufReader::new(PrefixReader {
+            prefix,
+            prefix_len,
+            prefix_position: 0,
+            input,
+        });
+        let available = &prefix[..prefix_len];
+        if available.starts_with(&[0x1f, 0x8b]) {
+            return Ok(Self {
+                inner: FilterReaderInner::Gzip(Box::new(GzipRead::new(input, limits))),
+                decoded: 0,
+                decoded_limit: limits.decoded_total(),
+            });
+        }
+        if available.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            #[cfg(feature = "zstd")]
+            {
+                return ZstdRead::new(input)
+                    .map(Box::new)
+                    .map(FilterReaderInner::Zstd)
+                    .map(|inner| Self {
+                        inner,
+                        decoded: 0,
+                        decoded_limit: limits.decoded_total(),
+                    })
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+            }
+            #[cfg(not(feature = "zstd"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "zstd filter is not enabled",
+            ));
+        }
+        if available.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
+            #[cfg(feature = "xz")]
+            return Ok(Self {
+                inner: FilterReaderInner::Xz(Box::new(XzRead::new(input))),
+                decoded: 0,
+                decoded_limit: limits.decoded_total(),
+            });
+            #[cfg(not(feature = "xz"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "XZ filter is not enabled",
+            ));
+        }
+        if available.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+            #[cfg(feature = "lz4")]
+            return Ok(Self {
+                inner: FilterReaderInner::Lz4(Box::new(Lz4Read::new(input))),
+                decoded: 0,
+                decoded_limit: limits.decoded_total(),
+            });
+            #[cfg(not(feature = "lz4"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "LZ4 filter is not enabled",
+            ));
+        }
+        Ok(Self {
+            inner: FilterReaderInner::Plain(input),
+            decoded: 0,
+            decoded_limit: limits.decoded_total(),
+        })
+    }
+
+    /// Returns the wrapped compressed input at its current physical position.
+    #[must_use]
+    pub fn into_inner(self) -> R {
+        match self.inner {
+            FilterReaderInner::Plain(input) => input.into_inner().input,
+            FilterReaderInner::Gzip(input) => input.input.into_inner().input,
+            #[cfg(feature = "zstd")]
+            FilterReaderInner::Zstd(input) => input.into_inner().into_inner().input,
+            #[cfg(feature = "xz")]
+            FilterReaderInner::Xz(input) => input.into_inner().into_inner().input,
+            #[cfg(feature = "lz4")]
+            FilterReaderInner::Lz4(input) => input.into_inner().into_inner().input,
+        }
+    }
+}
+
+struct PrefixReader<R> {
+    prefix: [u8; 6],
+    prefix_len: usize,
+    prefix_position: usize,
+    input: R,
+}
+
+impl<R: Read> Read for PrefixReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.prefix_position != self.prefix_len {
+            let count = (self.prefix_len - self.prefix_position).min(output.len());
+            output[..count]
+                .copy_from_slice(&self.prefix[self.prefix_position..self.prefix_position + count]);
+            self.prefix_position += count;
+            return Ok(count);
+        }
+        self.input.read(output)
+    }
+}
+
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+struct MemberInput<R> {
+    input: R,
+    prefix: [u8; 6],
+    prefix_length: usize,
+    prefix_position: usize,
+}
+
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+impl<R> MemberInput<R> {
+    fn new(input: R) -> Self {
+        Self {
+            input,
+            prefix: [0; 6],
+            prefix_length: 0,
+            prefix_position: 0,
+        }
+    }
+
+    fn replay(&mut self, prefix: &[u8]) {
+        self.prefix[..prefix.len()].copy_from_slice(prefix);
+        self.prefix_length = prefix.len();
+        self.prefix_position = 0;
+    }
+
+    fn into_inner(self) -> R {
+        self.input
+    }
+}
+
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+impl<R: Read> Read for MemberInput<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.prefix_position != self.prefix_length {
+            let count = (self.prefix_length - self.prefix_position).min(output.len());
+            output[..count]
+                .copy_from_slice(&self.prefix[self.prefix_position..self.prefix_position + count]);
+            self.prefix_position += count;
+            return Ok(count);
+        }
+        self.input.read(output)
+    }
+}
+
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+fn next_member<R: Read>(input: &mut MemberInput<R>, magic: &[u8]) -> io::Result<bool> {
+    let mut prefix = [0_u8; 6];
+    let mut length = 0;
+    while length != magic.len() {
+        let read = input.read(&mut prefix[length..magic.len()])?;
+        if read == 0 {
+            break;
+        }
+        length += read;
+    }
+    if length == 0 {
+        return Ok(false);
+    }
+    if length != magic.len() || &prefix[..length] != magic {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-member trailing filter data",
+        ));
+    }
+    input.replay(&prefix[..length]);
+    Ok(true)
+}
+
+#[cfg(feature = "zstd")]
+struct ZstdRead<R: Read> {
+    decoder:
+        Option<ruzstd::decoding::StreamingDecoder<MemberInput<R>, ruzstd::decoding::FrameDecoder>>,
+    input: Option<MemberInput<R>>,
+    failed: bool,
+}
+
+#[cfg(feature = "zstd")]
+impl<R: Read> ZstdRead<R> {
+    fn new(input: R) -> io::Result<Self> {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(MemberInput::new(input))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Self {
+            decoder: Some(decoder),
+            input: None,
+            failed: false,
+        })
+    }
+
+    #[allow(clippy::expect_used)]
+    fn into_inner(self) -> R {
+        self.decoder
+            .map(ruzstd::decoding::StreamingDecoder::into_inner)
+            .or(self.input)
+            .expect("zstd reader always owns its member input")
+            .into_inner()
+    }
+}
+
+#[cfg(feature = "zstd")]
+impl<R: Read> Read for ZstdRead<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd reader is in a failed state",
+            ));
+        }
+        loop {
+            let read = self
+                .decoder
+                .as_mut()
+                .ok_or_else(|| io::Error::other("zstd decoder is missing"))?
+                .read(output)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            let decoder = self
+                .decoder
+                .take()
+                .ok_or_else(|| io::Error::other("zstd decoder disappeared"))?;
+            let mut input = decoder.into_inner();
+            match next_member(&mut input, &[0x28, 0xb5, 0x2f, 0xfd]) {
+                Ok(false) => {
+                    self.input = Some(input);
+                    return Ok(0);
+                },
+                Ok(true) => {
+                    self.decoder = Some(
+                        ruzstd::decoding::StreamingDecoder::new(input)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    );
+                },
+                Err(error) => {
+                    self.input = Some(input);
+                    self.failed = true;
+                    return Err(error);
+                },
+            }
+        }
+    }
+}
+
+#[cfg(feature = "xz")]
+struct XzRead<R: Read> {
+    decoder: Option<lzma_rust2::XzReader<MemberInput<ShortReadFix<R>>>>,
+    input: Option<MemberInput<ShortReadFix<R>>>,
+    failed: bool,
+}
+
+#[cfg(feature = "xz")]
+struct ShortReadFix<R>(R);
+
+#[cfg(feature = "xz")]
+impl<R: Read> Read for ShortReadFix<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.len() > 8 {
+            return self.0.read(output);
+        }
+        let mut total = 0;
+        while total != output.len() {
+            let read = self.0.read(&mut output[total..])?;
+            if read == 0 {
+                break;
+            }
+            total += read;
+        }
+        Ok(total)
+    }
+}
+
+#[cfg(feature = "xz")]
+impl<R: Read> XzRead<R> {
+    fn new(input: R) -> Self {
+        Self {
+            decoder: Some(lzma_rust2::XzReader::new(
+                MemberInput::new(ShortReadFix(input)),
+                false,
+            )),
+            input: None,
+            failed: false,
+        }
+    }
+
+    #[allow(clippy::expect_used)]
+    fn into_inner(self) -> R {
+        self.decoder
+            .map(lzma_rust2::XzReader::into_inner)
+            .or(self.input)
+            .expect("XZ reader always owns its member input")
+            .into_inner()
+            .0
+    }
+}
+
+#[cfg(feature = "xz")]
+impl<R: Read> Read for XzRead<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "XZ reader is in a failed state",
+            ));
+        }
+        loop {
+            let read = self
+                .decoder
+                .as_mut()
+                .ok_or_else(|| io::Error::other("XZ decoder is missing"))?
+                .read(output)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            let decoder = self
+                .decoder
+                .take()
+                .ok_or_else(|| io::Error::other("XZ decoder disappeared"))?;
+            let mut input = decoder.into_inner();
+            match next_member(&mut input, &[0xfd, b'7', b'z', b'X', b'Z', 0]) {
+                Ok(false) => {
+                    self.input = Some(input);
+                    return Ok(0);
+                },
+                Ok(true) => {
+                    self.decoder = Some(lzma_rust2::XzReader::new(input, false));
+                },
+                Err(error) => {
+                    self.input = Some(input);
+                    self.failed = true;
+                    return Err(error);
+                },
+            }
+        }
+    }
+}
+
+#[cfg(feature = "lz4")]
+struct Lz4Read<R: Read> {
+    decoder: Option<lz4_flex::frame::FrameDecoder<MemberInput<R>>>,
+    input: Option<MemberInput<R>>,
+    failed: bool,
+}
+
+#[cfg(feature = "lz4")]
+impl<R: Read> Lz4Read<R> {
+    fn new(input: R) -> Self {
+        Self {
+            decoder: Some(lz4_flex::frame::FrameDecoder::new(MemberInput::new(input))),
+            input: None,
+            failed: false,
+        }
+    }
+
+    #[allow(clippy::expect_used)]
+    fn into_inner(self) -> R {
+        self.decoder
+            .map(lz4_flex::frame::FrameDecoder::into_inner)
+            .or(self.input)
+            .expect("LZ4 reader always owns its member input")
+            .into_inner()
+    }
+}
+
+#[cfg(feature = "lz4")]
+impl<R: Read> Read for Lz4Read<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LZ4 reader is in a failed state",
+            ));
+        }
+        loop {
+            let read = self
+                .decoder
+                .as_mut()
+                .ok_or_else(|| io::Error::other("LZ4 decoder is missing"))?
+                .read(output)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            let decoder = self
+                .decoder
+                .take()
+                .ok_or_else(|| io::Error::other("LZ4 decoder disappeared"))?;
+            let mut input = decoder.into_inner();
+            match next_member(&mut input, &[0x04, 0x22, 0x4d, 0x18]) {
+                Ok(false) => {
+                    self.input = Some(input);
+                    return Ok(0);
+                },
+                Ok(true) => {
+                    self.decoder = Some(lz4_flex::frame::FrameDecoder::new(input));
+                },
+                Err(error) => {
+                    self.input = Some(input);
+                    self.failed = true;
+                    return Err(error);
+                },
+            }
+        }
+    }
+}
+
+impl<R: Read> Read for FilterReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let allowed = match self.decoded_limit {
+            Some(limit) => {
+                let remaining = limit.saturating_sub(self.decoded);
+                if remaining == 0 {
+                    let mut probe = [0_u8; 1];
+                    let read = read_inner(&mut self.inner, &mut probe)?;
+                    return if read == 0 {
+                        Ok(0)
+                    } else {
+                        Err(io::Error::other("decoded stream exceeds configured limit"))
+                    };
+                }
+                usize::try_from(remaining.min(output.len() as u64)).unwrap_or(output.len())
+            },
+            None => output.len(),
+        };
+        let read = read_inner(&mut self.inner, &mut output[..allowed])?;
+        self.decoded = self
+            .decoded
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("decoded stream size overflow"))?;
+        Ok(read)
+    }
+}
+
+fn read_inner<R: Read>(input: &mut FilterReaderInner<R>, output: &mut [u8]) -> io::Result<usize> {
+    match input {
+        FilterReaderInner::Plain(input) => input.read(output),
+        FilterReaderInner::Gzip(input) => input.read(output),
+        #[cfg(feature = "zstd")]
+        FilterReaderInner::Zstd(input) => input.read(output),
+        #[cfg(feature = "xz")]
+        FilterReaderInner::Xz(input) => input.read(output),
+        #[cfg(feature = "lz4")]
+        FilterReaderInner::Lz4(input) => input.read(output),
+    }
+}
+
+impl<R: Read> fmt::Debug for FilterReader<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let filter = match self.inner {
+            FilterReaderInner::Plain(_) => "plain",
+            FilterReaderInner::Gzip(_) => "gzip",
+            #[cfg(feature = "zstd")]
+            FilterReaderInner::Zstd(_) => "zstd",
+            #[cfg(feature = "xz")]
+            FilterReaderInner::Xz(_) => "xz",
+            #[cfg(feature = "lz4")]
+            FilterReaderInner::Lz4(_) => "lz4",
+        };
+        f.debug_tuple("FilterReader").field(&filter).finish()
+    }
+}
+
+struct GzipRead<R> {
+    input: R,
+    decoder: GzipDecoder,
+    buffer: Vec<u8>,
+    start: usize,
+    end: usize,
+    eof: bool,
+    between_members: bool,
+    done: bool,
+    limits: Limits,
+}
+
+impl<R: Read> GzipRead<R> {
+    fn new(input: R, limits: Limits) -> Self {
+        Self {
+            input,
+            decoder: GzipDecoder::new(limits),
+            buffer: vec![0; BUFFER],
+            start: 0,
+            end: 0,
+            eof: false,
+            between_members: false,
+            done: false,
+            limits,
+        }
+    }
+
+    fn fill(&mut self) -> io::Result<()> {
+        if self.start != 0 {
+            self.buffer.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+        if self.end == self.buffer.len() || self.eof {
+            return Ok(());
+        }
+        let read = self.input.read(&mut self.buffer[self.end..])?;
+        if read == 0 {
+            self.eof = true;
+        } else {
+            self.end += read;
+        }
+        Ok(())
+    }
+
+    fn archive_io(error: libarchive_oxide_core::ArchiveError) -> io::Error {
+        let kind = match error.kind() {
+            ErrorKind::Limit => io::ErrorKind::Other,
+            ErrorKind::Unsupported => io::ErrorKind::Unsupported,
+            _ => io::ErrorKind::InvalidData,
+        };
+        io::Error::new(kind, error)
+    }
+}
+
+impl<R: Read> Read for GzipRead<R> {
+    #[allow(clippy::too_many_lines)]
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.done {
+            return Ok(0);
+        }
+        loop {
+            if self.between_members {
+                if self.end - self.start < 2 && !self.eof {
+                    self.fill()?;
+                    if self.end - self.start < 2 && !self.eof {
+                        continue;
+                    }
+                }
+                let remaining = &self.buffer[self.start..self.end];
+                if remaining.is_empty() && self.eof {
+                    self.done = true;
+                    return Ok(0);
+                }
+                if remaining.len() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "trailing byte after gzip member",
+                    ));
+                }
+                if !remaining.starts_with(&[0x1f, 0x8b]) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "trailing data after gzip member",
+                    ));
+                }
+                self.decoder = GzipDecoder::new(self.limits);
+                self.between_members = false;
+            }
+            if self.start == self.end && !self.eof {
+                self.fill()?;
+            }
+            let end = if self.eof {
+                EndOfInput::End
+            } else {
+                EndOfInput::More
+            };
+            let step = self
+                .decoder
+                .process(&self.buffer[self.start..self.end], output, end)
+                .map_err(Self::archive_io)?;
+            self.start += step.consumed;
+            if matches!(step.status, CodecStatus::Done) {
+                self.between_members = true;
+            }
+            if step.produced != 0 {
+                return Ok(step.produced);
+            }
+            if step.consumed == 0 {
+                match step.status {
+                    CodecStatus::NeedInput if !self.eof => self.fill()?,
+                    CodecStatus::Done => {},
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "gzip reader made no progress",
+                        ));
+                    },
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct SharedOutput<W>(Rc<RefCell<Option<W>>>);
+
+impl<W> SharedOutput<W> {
+    fn new(output: W) -> Self {
+        Self(Rc::new(RefCell::new(Some(output))))
+    }
+
+    fn take(self) -> io::Result<W> {
+        let cell = Rc::try_unwrap(self.0)
+            .map_err(|_| io::Error::other("filter retained an output reference after shutdown"))?;
+        cell.into_inner()
+            .ok_or_else(|| io::Error::other("filter output was already recovered"))
+    }
+}
+
+impl<W> Clone for SharedOutput<W> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<W: Write> Write for SharedOutput<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .borrow_mut()
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filter output is unavailable"))?
+            .write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0
+            .borrow_mut()
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filter output is unavailable"))?
+            .flush()
+    }
+}
+
+pub(crate) struct GzipFilterWrite<W> {
+    output: W,
+    encoder: GzipEncoder,
+    buffer: Vec<u8>,
+}
+
+impl<W: Write> GzipFilterWrite<W> {
+    fn new(output: W, limits: Limits) -> Self {
+        Self {
+            output,
+            encoder: GzipEncoder::new(limits),
+            buffer: vec![0; BUFFER],
+        }
+    }
+
+    fn finish(mut self) -> io::Result<W> {
+        loop {
+            let step = self
+                .encoder
+                .process(&[], &mut self.buffer, EndOfInput::End)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if matches!(step.status, CodecStatus::Done) {
+                self.output.flush()?;
+                return Ok(self.output);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "gzip encoder made no finish progress",
+                ));
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for GzipFilterWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let step = self
+                .encoder
+                .process(bytes, &mut self.buffer, EndOfInput::More)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.consumed != 0 {
+                return Ok(step.consumed);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "gzip encoder made no write progress",
+                ));
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+/// Incremental synchronous filter sink used by the common archive writer.
+pub(crate) enum SyncFilterWriter<W: Write> {
+    Plain(SharedOutput<W>),
+    Gzip {
+        writer: Box<GzipFilterWrite<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
+    #[cfg(feature = "zstd")]
+    Zstd {
+        writer: Box<zstd_codec::stream::write::Encoder<'static, SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
+    #[cfg(feature = "xz")]
+    Xz {
+        writer: Box<lzma_rust2::XzWriter<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
+    #[cfg(feature = "lz4")]
+    Lz4 {
+        writer: Box<lz4_flex::frame::FrameEncoder<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
+}
+
+impl<W: Write> SyncFilterWriter<W> {
+    pub(crate) fn plain(output: W) -> Self {
+        Self::Plain(SharedOutput::new(output))
+    }
+
+    pub(crate) fn new(
+        output: W,
+        filter: Option<FilterId>,
+        limits: Limits,
+    ) -> Result<Self, ArchiveError> {
+        let shared = SharedOutput::new(output);
+        match filter {
+            None => Ok(Self::Plain(shared)),
+            Some(FilterId::Gzip) => Ok(Self::Gzip {
+                writer: Box::new(GzipFilterWrite::new(shared.clone(), limits)),
+                output: shared,
+            }),
+            #[cfg(feature = "zstd")]
+            Some(FilterId::Zstd) => {
+                let writer =
+                    zstd_codec::stream::write::Encoder::new(shared.clone(), 3).map_err(|_| {
+                        ArchiveError::new(ErrorKind::Capability)
+                            .with_context("failed to initialize incremental zstd encoder")
+                    })?;
+                Ok(Self::Zstd {
+                    writer: Box::new(writer),
+                    output: shared,
+                })
+            },
+            #[cfg(feature = "xz")]
+            Some(FilterId::Xz) => {
+                let writer = lzma_rust2::XzWriter::new(
+                    shared.clone(),
+                    lzma_rust2::XzOptions::with_preset(6),
+                )
+                .map_err(|_| {
+                    ArchiveError::new(ErrorKind::Capability)
+                        .with_context("failed to initialize incremental XZ encoder")
+                })?;
+                Ok(Self::Xz {
+                    writer: Box::new(writer),
+                    output: shared,
+                })
+            },
+            #[cfg(feature = "lz4")]
+            Some(FilterId::Lz4) => Ok(Self::Lz4 {
+                writer: Box::new(lz4_flex::frame::FrameEncoder::new(shared.clone())),
+                output: shared,
+            }),
+            Some(_) => Err(ArchiveError::new(ErrorKind::Capability)
+                .with_context("filter is disabled or has no incremental writer")),
+        }
+    }
+
+    pub(crate) fn finish(self) -> io::Result<W> {
+        match self {
+            Self::Plain(mut output) => {
+                output.flush()?;
+                output.take()
+            },
+            Self::Gzip { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
+            #[cfg(feature = "zstd")]
+            Self::Zstd { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
+            #[cfg(feature = "xz")]
+            Self::Xz { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
+            #[cfg(feature = "lz4")]
+            Self::Lz4 { writer, output } => {
+                drop((*writer).finish().map_err(io::Error::from)?);
+                output.take()
+            },
+        }
+    }
+
+    pub(crate) fn abort(self) -> io::Result<W> {
+        match self {
+            Self::Plain(output) => output.take(),
+            Self::Gzip { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            #[cfg(feature = "zstd")]
+            Self::Zstd { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            #[cfg(feature = "xz")]
+            Self::Xz { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            #[cfg(feature = "lz4")]
+            Self::Lz4 { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+        }
+    }
+}
+
+impl<W: Write> Write for SyncFilterWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(output) => output.write(bytes),
+            Self::Gzip { writer, .. } => writer.write(bytes),
+            #[cfg(feature = "zstd")]
+            Self::Zstd { writer, .. } => writer.write(bytes),
+            #[cfg(feature = "xz")]
+            Self::Xz { writer, .. } => writer.write(bytes),
+            #[cfg(feature = "lz4")]
+            Self::Lz4 { writer, .. } => writer.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(output) => output.flush(),
+            Self::Gzip { writer, .. } => writer.flush(),
+            #[cfg(feature = "zstd")]
+            Self::Zstd { writer, .. } => writer.flush(),
+            #[cfg(feature = "xz")]
+            Self::Xz { writer, .. } => writer.flush(),
+            #[cfg(feature = "lz4")]
+            Self::Lz4 { writer, .. } => writer.flush(),
+        }
+    }
+}
+
+impl<W: Write> fmt::Debug for SyncFilterWriter<W> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let filter = match self {
+            Self::Plain(_) => "plain",
+            Self::Gzip { .. } => "gzip",
+            #[cfg(feature = "zstd")]
+            Self::Zstd { .. } => "zstd",
+            #[cfg(feature = "xz")]
+            Self::Xz { .. } => "xz",
+            #[cfg(feature = "lz4")]
+            Self::Lz4 { .. } => "lz4",
+        };
+        formatter
+            .debug_tuple("SyncFilterWriter")
+            .field(&filter)
+            .finish()
+    }
+}

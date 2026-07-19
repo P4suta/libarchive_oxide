@@ -10,14 +10,76 @@
 
 use std::path::PathBuf;
 
+use libarchive_oxide_core::{ArchivePath, PathEncoding};
+
 /// Turns a raw archive path into a safe relative [`PathBuf`], or `None` if it is unsafe or empty.
 ///
-/// Rejects: non-UTF-8 names, any `..` component, and components containing `:` (Windows drive or
-/// alternate data stream). Leading slashes and `.` components are dropped, so absolute paths are
-/// neutralized into relative ones. The result never escapes the directory it is joined onto.
+/// Rejects absolute paths and `..` components on every platform. Unix preserves
+/// non-UTF-8 bytes. Windows additionally rejects unrepresentable bytes, UNC
+/// paths, device names, drive prefixes, and alternate-data-stream syntax.
 #[must_use]
 pub fn sanitize(raw: &[u8]) -> Option<PathBuf> {
-    let text = std::str::from_utf8(raw).ok()?;
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        if raw.starts_with(b"/") || raw.contains(&0) {
+            return None;
+        }
+        let mut output = PathBuf::new();
+        let mut pushed = false;
+        for component in raw.split(|byte| *byte == b'/') {
+            match component {
+                b"" | b"." => {},
+                b".." => return None,
+                _ => {
+                    output.push(OsString::from_vec(component.to_vec()));
+                    pushed = true;
+                },
+            }
+        }
+        return pushed.then_some(output);
+    }
+
+    #[cfg(not(unix))]
+    sanitize_text(std::str::from_utf8(raw).ok()?)
+}
+
+/// Converts an archive-native path to a safe host path without lossy
+/// transcoding.
+#[must_use]
+pub fn sanitize_archive_path(path: &ArchivePath) -> Option<PathBuf> {
+    match path.encoding() {
+        PathEncoding::Bytes | PathEncoding::Utf8 => sanitize(path.as_bytes()),
+        PathEncoding::Utf16Le => {
+            let mut chunks = path.as_bytes().chunks_exact(2);
+            let units: Vec<u16> = chunks
+                .by_ref()
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect();
+            if !chunks.remainder().is_empty() {
+                return None;
+            }
+            let text = String::from_utf16(&units).ok()?;
+            #[cfg(unix)]
+            {
+                sanitize(text.as_bytes())
+            }
+            #[cfg(not(unix))]
+            {
+                sanitize_text(&text)
+            }
+        },
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn sanitize_text(text: &str) -> Option<PathBuf> {
+    if text.starts_with(['/', '\\']) {
+        return None;
+    }
     let mut out = PathBuf::new();
     let mut pushed = false;
 
@@ -38,11 +100,13 @@ pub fn sanitize(raw: &[u8]) -> Option<PathBuf> {
 }
 
 /// Non-numbered Windows reserved DOS device names.
+#[cfg(not(unix))]
 const RESERVED_DEVICES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
 
 /// Whether a path component is (or, with an extension, aliases) a Windows reserved DOS device
 /// name. On Windows such names resolve to a device regardless of the parent directory, so a file
 /// entry named `NUL` or `aux.h` would escape the destination or abort extraction.
+#[cfg(not(unix))]
 fn is_reserved_device_name(part: &str) -> bool {
     // The device name is matched against the stem, ignoring any extension and trailing dots/spaces.
     let stem = part
@@ -80,11 +144,10 @@ mod tests {
     }
 
     #[test]
-    fn neutralizes_absolute_paths() {
-        assert_eq!(
-            sanitize(b"/etc/passwd"),
-            Some(Path::new("etc/passwd").to_path_buf())
-        );
+    fn rejects_absolute_paths() {
+        assert_eq!(sanitize(b"/etc/passwd"), None);
+        #[cfg(windows)]
+        assert_eq!(sanitize(br"\server\share"), None);
         assert_eq!(sanitize(b"./a/./b"), Some(Path::new("a/b").to_path_buf()));
     }
 
@@ -92,11 +155,13 @@ mod tests {
     fn rejects_traversal_and_drives() {
         assert_eq!(sanitize(b"../etc/passwd"), None);
         assert_eq!(sanitize(b"a/../../b"), None);
+        #[cfg(windows)]
         assert_eq!(sanitize(b"C:/Windows"), None);
         assert_eq!(sanitize(b""), None);
         assert_eq!(sanitize(b"/"), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn rejects_windows_reserved_device_names() {
         for bad in [
@@ -114,5 +179,14 @@ mod tests {
         assert!(sanitize(b"com0").is_some());
         assert!(sanitize(b"console").is_some());
         assert!(sanitize(b"nulls.txt").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_unix_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = sanitize(b"dir/\xff.bin").unwrap();
+        assert_eq!(path.as_os_str().as_bytes(), b"dir/\xff.bin");
     }
 }

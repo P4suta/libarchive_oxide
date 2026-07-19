@@ -5,9 +5,9 @@
 //! Differential test against the independent pure-Rust `sevenz-rust2` crate, mirroring how the zip
 //! tests lean on the `zip` crate. Two directions run:
 //!
-//! (a) `sevenz-rust2` reads a `.7z` produced by arca's `SevenZWriter` — validating arca's folder /
+//! (a) `sevenz-rust2` reads a `.7z` produced by arca's seek writer — validating arca's folder /
 //!     substream / FilesInfo byte layout against an independent decoder.
-//! (b) arca's `SevenZReader` reads a `.7z` produced by `sevenz-rust2`'s `ArchiveWriter` (solid,
+//! (b) arca's seek reader reads a `.7z` produced by `sevenz-rust2`'s `ArchiveWriter` (solid,
 //!     single-folder LZMA2) — validating arca's parser against an independent encoder.
 //!
 //! Both directions stay within arca's supported subset: a single solid LZMA2 folder. Direction (b)
@@ -22,20 +22,24 @@
     clippy::many_single_char_names
 )]
 
-use std::borrow::Cow;
 use std::io::Cursor;
 
-use libarchive_oxide::sevenz::{SevenZReader, SevenZWriter};
-use libarchive_oxide_core::{EntryData, EntryKind, EntryMeta, EntryReader, EntryWriter};
+use libarchive_oxide::{ReaderEvent, SeekArchiveReader, SeekArchiveWriter};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Limits};
 
 use sevenz_rust2::{
-    ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password,
-    SourceReader,
+    ArchiveEntry, ArchiveReader as SevenReader, ArchiveWriter as SevenWriter, EncoderConfiguration,
+    EncoderMethod, Password, SourceReader,
 };
 
 /// Writes an arca 7z with a directory, two content files, and an empty file.
 fn arca_archive() -> Vec<u8> {
-    let mut w = SevenZWriter::new(Vec::new());
+    let mut writer = SeekArchiveWriter::with_format(
+        Cursor::new(Vec::new()),
+        FormatId::SevenZip,
+        Limits::default(),
+    )
+    .unwrap();
     let items: Vec<(EntryKind, &[u8], Vec<u8>)> = vec![
         (EntryKind::Dir, b"d", Vec::new()),
         (EntryKind::File, b"d/a.txt", b"alpha payload\n".to_vec()),
@@ -47,24 +51,26 @@ fn arca_archive() -> Vec<u8> {
         (EntryKind::File, b"d/empty.txt", Vec::new()),
     ];
     for (kind, name, data) in items {
-        let mut m = EntryMeta::new(kind, Cow::Borrowed(name));
-        m.mode = if kind == EntryKind::Dir { 0o755 } else { 0o644 };
-        m.size = data.len() as u64;
-        let mut sink = w.start_entry(&m).unwrap();
+        let metadata = EntryMetadata::builder(kind, ArchivePath::from_bytes(name.to_vec()))
+            .size(None)
+            .mode(Some(if kind == EntryKind::Dir { 0o755 } else { 0o644 }))
+            .build();
+        writer.start_entry(&metadata).unwrap();
         if !data.is_empty() {
-            sink.write_chunk(&data).unwrap();
+            for chunk in data.chunks(13) {
+                writer.write_data(chunk).unwrap();
+            }
         }
-        sink.close().unwrap();
+        writer.end_entry().unwrap();
     }
-    w.finish().unwrap();
-    w.into_inner()
+    writer.finish().unwrap().into_inner()
 }
 
 #[test]
 fn sevenz_rust2_reads_arca_output() {
     let bytes = arca_archive();
     let mut reader =
-        ArchiveReader::new(Cursor::new(bytes), Password::empty()).expect("sevenz-rust2 opens arca");
+        SevenReader::new(Cursor::new(bytes), Password::empty()).expect("sevenz-rust2 opens arca");
 
     // Snapshot the entry shapes first (immutable borrow), then read file contents.
     let shapes: Vec<(String, bool, u64)> = reader
@@ -95,7 +101,7 @@ fn arca_reads_sevenz_rust2_output() {
     let b = b"second independent file, a bit longer\n".repeat(20);
 
     let cursor = Cursor::new(Vec::new());
-    let mut w = ArchiveWriter::new(cursor).unwrap();
+    let mut w = SevenWriter::new(cursor).unwrap();
     let entries = vec![
         ArchiveEntry::new_file("pkg/a.txt"),
         ArchiveEntry::new_file("pkg/b.txt"),
@@ -108,23 +114,7 @@ fn arca_reads_sevenz_rust2_output() {
     let cursor = w.finish().unwrap();
     let bytes = cursor.into_inner();
 
-    // arca reads it back.
-    let mut r = SevenZReader::new(&bytes);
-    let mut got: Vec<(Vec<u8>, EntryKind, Vec<u8>)> = Vec::new();
-    while let Some(mut e) = r.next_entry().unwrap() {
-        let name = e.meta().path.to_vec();
-        let kind = e.meta().kind;
-        let mut data = Vec::new();
-        let mut buf = [0u8; 8];
-        loop {
-            let n = e.data().read_chunk(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&buf[..n]);
-        }
-        got.push((name, kind, data));
-    }
+    let got = drive_arca(&bytes);
 
     assert_eq!(got.len(), 2);
     assert_eq!(got[0].0, b"pkg/a.txt");
@@ -134,25 +124,23 @@ fn arca_reads_sevenz_rust2_output() {
     assert_eq!(got[1].2, b);
 }
 
-/// Reads every content file out of an arca `SevenZReader`, returning `(name, kind, bytes)` per entry.
+/// Reads every content file through arca's seek adapter.
 fn drive_arca(bytes: &[u8]) -> Vec<(Vec<u8>, EntryKind, Vec<u8>)> {
-    let mut r = SevenZReader::new(bytes);
-    let mut got = Vec::new();
-    while let Some(mut e) = r.next_entry().unwrap() {
-        let name = e.meta().path.to_vec();
-        let kind = e.meta().kind;
-        let mut data = Vec::new();
-        let mut buf = [0u8; 64];
-        loop {
-            let n = e.data().read_chunk(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&buf[..n]);
+    let mut reader = SeekArchiveReader::new(Cursor::new(bytes.to_vec())).unwrap();
+    let mut entries: Vec<(Vec<u8>, EntryKind, Vec<u8>)> = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Entry(metadata) => entries.push((
+                metadata.path().as_bytes().to_vec(),
+                metadata.kind(),
+                Vec::new(),
+            )),
+            ReaderEvent::Data(data) => entries.last_mut().unwrap().2.extend_from_slice(data),
+            ReaderEvent::ArchiveMetadata(_) | ReaderEvent::EndEntry => {},
+            ReaderEvent::Done => return entries,
+            _ => panic!("unexpected future 7z event"),
         }
-        got.push((name, kind, data));
     }
-    got
 }
 
 /// The plain-**LZMA** (method `03 01 01`) folder coder — what 7-Zip and `sevenz-rust2` use — must be
@@ -162,7 +150,7 @@ fn arca_reads_sevenz_rust2_lzma_folder() {
     let a = b"first lzma-coded file\n".to_vec();
     let b = b"second lzma-coded file, repeated a lot\n".repeat(40);
 
-    let mut w = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
     w.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::LZMA)]);
     let entries = vec![
         ArchiveEntry::new_file("pkg/a.txt"),
@@ -208,7 +196,7 @@ fn arca_reads_sevenz_rust2_compressed_header() {
         .map(|c| SourceReader::from(c.as_slice()))
         .collect();
 
-    let mut w = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
     w.push_archive_entries(entries, sources).unwrap();
     let bytes = w.finish().unwrap().into_inner();
 

@@ -10,9 +10,13 @@
 #![cfg(feature = "gzip")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use libarchive_oxide::filter::crc32;
 use libarchive_oxide::filter::gzip::GzipDecoder;
-use libarchive_oxide::filter::{crc32, deflate};
-use libarchive_oxide_core::transform::{Status, Transform};
+use libarchive_oxide_core::{Codec, CodecStatus, EndOfInput};
+
+fn deflate(plain: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec(plain, 6)
+}
 
 /// A gzip frame carrying an FNAME field, so the header is 19 bytes (10 fixed + "name.txt\0").
 fn gzip_with_fname(plain: &[u8]) -> Vec<u8> {
@@ -28,17 +32,22 @@ fn gzip_with_fname(plain: &[u8]) -> Vec<u8> {
 /// Drive `GzipDecoder` feeding `gz` `chunk` bytes at a time, topping up input only when a step makes
 /// no progress (the truly incremental protocol).
 fn decode_chunked(gz: &[u8], chunk: usize) -> Vec<u8> {
-    let mut dec = GzipDecoder::new();
+    let mut dec = GzipDecoder::new(libarchive_oxide_core::Limits::default());
     let mut out = Vec::new();
     let mut obuf = [0u8; 64];
     let mut pending: Vec<u8> = Vec::new();
     let mut pos = 0usize;
 
     loop {
-        let step = dec.step(&pending, &mut obuf).unwrap();
+        let end = if pos == gz.len() {
+            EndOfInput::End
+        } else {
+            EndOfInput::More
+        };
+        let step = dec.process(&pending, &mut obuf, end).unwrap();
         out.extend_from_slice(&obuf[..step.produced]);
         pending.drain(..step.consumed);
-        if step.status == Status::Done {
+        if step.status == CodecStatus::Done {
             break;
         }
         let progressed = step.consumed != 0 || step.produced != 0;
@@ -48,15 +57,7 @@ fn decode_chunked(gz: &[u8], chunk: usize) -> Vec<u8> {
                 pending.extend_from_slice(&gz[pos..end]);
                 pos = end;
             } else {
-                // Input exhausted: drain any tail via finish.
-                loop {
-                    let s = dec.finish(&mut obuf).unwrap();
-                    out.extend_from_slice(&obuf[..s.produced]);
-                    if s.status == Status::Done || s.produced == 0 {
-                        break;
-                    }
-                }
-                break;
+                panic!("gzip codec stalled at end of input");
             }
         }
     }

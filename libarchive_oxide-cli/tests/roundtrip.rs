@@ -11,11 +11,9 @@
 
 mod common;
 
-use std::borrow::Cow;
-
-use common::{code, run_in, run_stdin, TempDir};
-use libarchive_oxide::zip::{ZipOptions, ZipWriter};
-use libarchive_oxide_core::{EntryKind, EntryMeta, EntryWriter};
+use common::{TempDir, code, run_in, run_stdin};
+use libarchive_oxide::{ArchiveWriter, ZipMethod};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 
 const A: &[u8] = b"hello world\n";
 const B: &[u8] = b"nested payload for the round-trip\n";
@@ -155,17 +153,19 @@ fn oxcat_decompresses_to_stdout() {
 
 /// Builds a small zip with the library's writer and returns its bytes (entries `a.txt`, `data/b.txt`).
 fn make_zip() -> Vec<u8> {
-    let mut w = ZipWriter::with_options(Vec::new(), ZipOptions::default());
+    let mut writer =
+        ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Deflate, Limits::default());
     for (name, data) in [(&b"a.txt"[..], A), (&b"data/b.txt"[..], B)] {
-        let mut m = EntryMeta::new(EntryKind::File, Cow::Borrowed(name));
-        m.mode = 0o644;
-        m.size = data.len() as u64;
-        let mut sink = w.start_entry(&m).unwrap();
-        sink.write_chunk(data).unwrap();
-        sink.close().unwrap();
+        let metadata =
+            EntryMetadata::builder(EntryKind::File, ArchivePath::from_bytes(name.to_vec()))
+                .mode(Some(0o644))
+                .size(Some(data.len() as u64))
+                .build();
+        writer.start_entry(&metadata).unwrap();
+        writer.write_data(data).unwrap();
+        writer.end_entry().unwrap();
     }
-    w.finish().unwrap();
-    w.into_inner()
+    writer.finish().unwrap()
 }
 
 #[test]

@@ -5,7 +5,7 @@
 # CI for libarchive_oxide (Pure Rust unified archive library).
 #
 # Layout under test: three published crates + an excluded fuzz sub-workspace.
-#   - libarchive_oxide-core   no_std + alloc, zero external deps (the frozen trait algebra).
+#   - libarchive_oxide-core   no_std + alloc, zero external deps (sans-I/O state machines).
 #   - libarchive_oxide        the std flagship (auto-detection, FS extraction, safe paths, codecs).
 #   - libarchive_oxide-cli    the bsdtar-family bins (oxtar/oxcpio/oxcat/oxunzip).
 #   - fuzz/                   cargo-fuzz targets; outside the workspace, nightly-only.
@@ -38,7 +38,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
   # NOTE: `-D warnings` is applied *per job*, only on the stable toolchain we can reproduce locally
-  # (fmt/clippy/test/no_std/doc). It is deliberately NOT global: the msrv (cargo-msrv installs 1.81 /
+  # (fmt/clippy/test/no_std/doc). It is deliberately NOT global: the msrv (cargo-msrv installs 1.85 /
   # 1.87), fuzz (nightly), and big-endian (cross/qemu) jobs run toolchains or emulators the dev box
   # cannot reproduce, and a version-specific warning from the compiler or a dependency there would
   # turn CI red for a reason invisible to every local gate. Those jobs still fail on real errors.
@@ -121,7 +121,7 @@ jobs:
       - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
 
   msrv:
-    name: msrv (core 1.81, flagship 1.87)
+    name: msrv (core 1.85, flagship 1.87)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -132,9 +132,9 @@ jobs:
           tool: cargo-msrv
       # `cargo-msrv verify` reads each crate's declared `rust-version` and proves it actually builds
       # on that floor (installing the toolchain via rustup). The two crates have different floors —
-      # core's zero-dep no_std baseline (1.81) and the flagship's codec closure (1.87) — so each is
+      # core's zero-dep no_std baseline (1.85) and the flagship's codec closure (1.87) — so each is
       # verified against its own manifest. The CLI inherits the flagship's floor and is covered by it.
-      - name: verify core MSRV (1.81)
+      - name: verify core MSRV (1.85)
         run: cargo msrv verify --path libarchive_oxide-core
       - name: verify flagship MSRV (1.87)
         run: cargo msrv verify --path libarchive_oxide --all-features
@@ -144,7 +144,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      # Mechanically enforce the zero-type-erasure invariant (uses ripgrep, preinstalled on the runner).
+      # Mechanically enforce static format/codec dispatch. The script permits only the standard
+      # Error::source signature needed to preserve concrete I/O sources.
       - run: bash scripts/check-no-dyn.sh
 
   reuse:
@@ -193,18 +194,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: explain first-publish bootstrap skip
-        if: vars.RELEASE_ENABLED != 'true'
+        if: vars.V02_BASELINE_PUBLISHED != 'true'
         run: >-
-          echo "::notice::Skipping semver-checks until the first publish creates the crates.io
-          baselines; setting RELEASE_ENABLED=true enables this gate for every later PR."
+          echo "::notice::Skipping semver-checks until v0.2 establishes the new crates.io
+          baselines; setting V02_BASELINE_PUBLISHED=true enables this gate for later PRs."
       - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
-        if: vars.RELEASE_ENABLED == 'true'
+        if: vars.V02_BASELINE_PUBLISHED == 'true'
         with:
           tool: cargo-semver-checks
       # Flags an SemVer-breaking change to the two published library crates that is not paired with a
       # major bump. `release-plz` re-runs the same tool at publish time (release.yml); this is the
       # early PR-time signal.
-      - if: vars.RELEASE_ENABLED == 'true'
+      - if: vars.V02_BASELINE_PUBLISHED == 'true'
         run: cargo semver-checks check-release -p libarchive_oxide-core -p libarchive_oxide
 
   fuzz:

@@ -10,17 +10,33 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use libarchive_oxide_core::filter::{Decoder, Encoder, Filter, FilterId};
-use libarchive_oxide_core::transform::{Status, Step, Transform};
-use libarchive_oxide_core::{Error, Result};
+use libarchive_oxide_core::{
+    ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput, ErrorKind, Limits,
+};
 
-use miniz_oxide::inflate::stream::{inflate, InflateState};
-use miniz_oxide::{DataFormat, MZFlush, MZStatus};
-
-use super::push::PushBridge;
+use miniz_oxide::deflate::core::{CompressorOxide, create_comp_flags_from_zip_params};
+use miniz_oxide::deflate::stream::deflate as deflate_stream;
+use miniz_oxide::inflate::stream::{InflateState, inflate};
+use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
 /// Length of the gzip trailer (CRC32 + ISIZE).
 const TRAILER_LEN: usize = 8;
+
+type Result<T> = core::result::Result<T, ArchiveError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    NeedInput,
+    NeedOutput,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Step {
+    consumed: usize,
+    produced: usize,
+    status: Status,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -36,7 +52,12 @@ enum Phase {
 pub struct GzipDecoder {
     phase: Phase,
     inflate: Box<InflateState>,
-    trailer_left: usize,
+    trailer: [u8; TRAILER_LEN],
+    trailer_len: usize,
+    crc: Crc32,
+    output_size: u32,
+    decoded_total: u64,
+    limits: Limits,
     /// Incomplete RFC 1952 header bytes.
     header_buf: Vec<u8>,
 }
@@ -47,27 +68,82 @@ impl core::fmt::Debug for GzipDecoder {
     }
 }
 
-impl Default for GzipDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GzipDecoder {
-    /// Creates a new gzip decompressor.
+    /// Creates a new gzip decompressor with mandatory resource limits.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(limits: Limits) -> Self {
         Self {
             phase: Phase::Header,
             inflate: Box::new(InflateState::new(DataFormat::Raw)),
-            trailer_left: TRAILER_LEN,
+            trailer: [0; TRAILER_LEN],
+            trailer_len: 0,
+            crc: Crc32::new(),
+            output_size: 0,
+            decoded_total: 0,
+            limits,
             header_buf: Vec::new(),
         }
     }
-}
 
-impl Transform for GzipDecoder {
-    fn step(&mut self, input: &[u8], output: &mut [u8]) -> Result<Step> {
+    fn malformed(message: &'static str) -> ArchiveError {
+        ArchiveError::new(ErrorKind::Malformed)
+            .with_format("gzip")
+            .with_context(message)
+    }
+
+    fn verify_trailer(&self) -> Result<()> {
+        let expected_crc = u32::from_le_bytes([
+            self.trailer[0],
+            self.trailer[1],
+            self.trailer[2],
+            self.trailer[3],
+        ]);
+        let expected_size = u32::from_le_bytes([
+            self.trailer[4],
+            self.trailer[5],
+            self.trailer[6],
+            self.trailer[7],
+        ]);
+        if self.crc.finalize() != expected_crc {
+            return Err(Self::malformed("CRC32 mismatch"));
+        }
+        if self.output_size != expected_size {
+            return Err(Self::malformed("ISIZE mismatch"));
+        }
+        Ok(())
+    }
+
+    fn account_output(&mut self, output: &[u8]) -> Result<()> {
+        if output.is_empty() {
+            return Ok(());
+        }
+        let next = self
+            .decoded_total
+            .checked_add(output.len() as u64)
+            .ok_or_else(|| {
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("gzip")
+                    .with_context("decoded byte count overflow")
+            })?;
+        if self
+            .limits
+            .decoded_total()
+            .is_some_and(|maximum| next > maximum)
+        {
+            return Err(ArchiveError::new(ErrorKind::Limit)
+                .with_format("gzip")
+                .with_context("decoded stream exceeds configured limit"));
+        }
+        self.crc.update(output);
+        self.output_size = self
+            .output_size
+            .wrapping_add(u32::try_from(output.len()).unwrap_or(u32::MAX));
+        self.decoded_total = next;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn step_legacy(&mut self, input: &[u8], output: &mut [u8]) -> Result<Step> {
         match self.phase {
             Phase::Header => {
                 // `prev` is how many header bytes were already accumulated from earlier chunks. The
@@ -77,6 +153,20 @@ impl Transform for GzipDecoder {
                 let complete = if prev == 0 {
                     gzip_header_len(input)?
                 } else {
+                    let next = prev.checked_add(input.len()).ok_or_else(|| {
+                        ArchiveError::new(ErrorKind::Limit)
+                            .with_format("gzip")
+                            .with_context("gzip header length overflow")
+                    })?;
+                    if self
+                        .limits
+                        .metadata_bytes()
+                        .is_some_and(|maximum| next > maximum)
+                    {
+                        return Err(ArchiveError::new(ErrorKind::Limit)
+                            .with_format("gzip")
+                            .with_context("gzip header exceeds metadata limit"));
+                    }
                     self.header_buf.extend_from_slice(input);
                     gzip_header_len(&self.header_buf)?
                 };
@@ -89,13 +179,22 @@ impl Transform for GzipDecoder {
                     Ok(Step {
                         consumed: hlen - prev,
                         produced: 0,
-                        status: Status::MoreOutput,
+                        status: Status::NeedOutput,
                     })
                 } else {
                     // Header still incomplete: on the fast path this chunk had not yet been buffered,
                     // so buffer it now. Consuming the whole chunk keeps the driver's input cursor and
                     // our accumulation in lockstep.
                     if prev == 0 {
+                        if self
+                            .limits
+                            .metadata_bytes()
+                            .is_some_and(|maximum| input.len() > maximum)
+                        {
+                            return Err(ArchiveError::new(ErrorKind::Limit)
+                                .with_format("gzip")
+                                .with_context("gzip header exceeds metadata limit"));
+                        }
                         self.header_buf.extend_from_slice(input);
                     }
                     Ok(Step {
@@ -122,17 +221,20 @@ impl Transform for GzipDecoder {
                 let status = match res.status {
                     Ok(MZStatus::StreamEnd) => {
                         self.phase = Phase::Trailer;
-                        Status::MoreOutput
+                        Status::NeedOutput
                     },
                     Ok(_) => {
                         if res.bytes_written == output.len() {
-                            Status::MoreOutput
+                            Status::NeedOutput
                         } else {
                             Status::NeedInput
                         }
                     },
-                    Err(_) => return Err(Error::Malformed("gzip: inflate error")),
+                    Err(_) => return Err(Self::malformed("inflate error")),
                 };
+                if res.bytes_written > 0 {
+                    self.account_output(&output[..res.bytes_written])?;
+                }
                 Ok(Step {
                     consumed: res.bytes_consumed,
                     produced: res.bytes_written,
@@ -140,9 +242,12 @@ impl Transform for GzipDecoder {
                 })
             },
             Phase::Trailer => {
-                let take = input.len().min(self.trailer_left);
-                self.trailer_left -= take;
-                let status = if self.trailer_left == 0 {
+                let take = input.len().min(TRAILER_LEN - self.trailer_len);
+                self.trailer[self.trailer_len..self.trailer_len + take]
+                    .copy_from_slice(&input[..take]);
+                self.trailer_len += take;
+                let status = if self.trailer_len == TRAILER_LEN {
+                    self.verify_trailer()?;
                     self.phase = Phase::Done;
                     Status::Done
                 } else {
@@ -162,23 +267,29 @@ impl Transform for GzipDecoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Step> {
+    fn finish_legacy(&mut self, output: &mut [u8]) -> Result<Step> {
         if self.phase == Phase::Body {
             let res = inflate(&mut self.inflate, &[], output, MZFlush::Finish);
             match res.status {
                 Ok(MZStatus::StreamEnd) => {
                     self.phase = Phase::Trailer;
+                    if res.bytes_written > 0 {
+                        self.account_output(&output[..res.bytes_written])?;
+                    }
                     return Ok(Step {
                         consumed: 0,
                         produced: res.bytes_written,
-                        status: Status::MoreOutput,
+                        status: Status::NeedOutput,
                     });
                 },
                 Ok(_) => {
+                    if res.bytes_written > 0 {
+                        self.account_output(&output[..res.bytes_written])?;
+                    }
                     let status = if res.bytes_written > 0 {
-                        Status::MoreOutput
+                        Status::NeedOutput
                     } else {
-                        Status::Done
+                        return Err(Self::malformed("truncated deflate stream"));
                     };
                     return Ok(Step {
                         consumed: 0,
@@ -186,8 +297,14 @@ impl Transform for GzipDecoder {
                         status,
                     });
                 },
-                Err(_) => return Err(Error::Malformed("gzip: inflate error")),
+                Err(_) => return Err(Self::malformed("inflate error")),
             }
+        }
+        if self.phase == Phase::Header {
+            return Err(Self::malformed("truncated header"));
+        }
+        if self.phase == Phase::Trailer {
+            return Err(Self::malformed("truncated trailer"));
         }
         Ok(Step {
             consumed: 0,
@@ -197,63 +314,270 @@ impl Transform for GzipDecoder {
     }
 }
 
-impl Filter for GzipDecoder {
-    const ID: FilterId = FilterId::Gzip;
-}
+impl Codec for GzipDecoder {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> core::result::Result<CodecStep, ArchiveError> {
+        let step = self.step_legacy(input, output)?;
+        if step.status == Status::Done {
+            return CodecStep {
+                consumed: step.consumed,
+                produced: step.produced,
+                status: CodecStatus::Done,
+            }
+            .validate(input.len(), output.len());
+        }
 
-impl Decoder for GzipDecoder {}
+        if matches!(end, EndOfInput::End) && step.consumed == input.len() && step.produced == 0 {
+            let final_step = self.finish_legacy(output)?;
+            let status = match final_step.status {
+                Status::Done => CodecStatus::Done,
+                Status::NeedOutput => CodecStatus::NeedOutput,
+                Status::NeedInput => {
+                    return Err(Self::malformed("codec requested input after end of stream"));
+                },
+            };
+            return CodecStep {
+                consumed: step.consumed,
+                produced: final_step.produced,
+                status,
+            }
+            .validate(input.len(), output.len());
+        }
 
-/// gzip compressor. Buffers plaintext, then emits an RFC 1952 frame
-/// (header + raw DEFLATE via `miniz_oxide` + CRC32/ISIZE trailer). Stays `no_std`.
-pub struct GzipEncoder(PushBridge);
-
-impl core::fmt::Debug for GzipEncoder {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("GzipEncoder").finish_non_exhaustive()
+        let status = match step.status {
+            Status::NeedInput => CodecStatus::NeedInput,
+            Status::NeedOutput => CodecStatus::NeedOutput,
+            Status::Done => CodecStatus::Done,
+        };
+        CodecStep {
+            consumed: step.consumed,
+            produced: step.produced,
+            status,
+        }
+        .validate(input.len(), output.len())
     }
 }
 
-impl Default for GzipEncoder {
-    fn default() -> Self {
-        Self::new()
+const GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodePhase {
+    Header,
+    Body,
+    Trailer,
+    Done,
+}
+
+/// Incremental gzip compressor.
+///
+/// Plaintext is consumed directly by miniz's deflate state; only the fixed
+/// header/trailer and compressor workspace are retained.
+pub struct GzipEncoder {
+    phase: EncodePhase,
+    compressor: Box<CompressorOxide>,
+    header_position: usize,
+    trailer: [u8; TRAILER_LEN],
+    trailer_position: usize,
+    crc: Crc32,
+    input_size: u32,
+    encoded_input: u64,
+    limits: Limits,
+}
+
+impl core::fmt::Debug for GzipEncoder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GzipEncoder")
+            .field("phase", &self.phase)
+            .finish_non_exhaustive()
     }
 }
 
 impl GzipEncoder {
-    /// Creates a new gzip compressor.
+    /// Creates a new gzip compressor with mandatory resource limits.
     #[must_use]
-    pub fn new() -> Self {
-        Self(PushBridge::new())
+    pub fn new(limits: Limits) -> Self {
+        let flags = create_comp_flags_from_zip_params(6, 0, 0);
+        Self {
+            phase: EncodePhase::Header,
+            compressor: Box::new(CompressorOxide::new(flags)),
+            header_position: 0,
+            trailer: [0; TRAILER_LEN],
+            trailer_position: 0,
+            crc: Crc32::new(),
+            input_size: 0,
+            encoded_input: 0,
+            limits,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn process_codec(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> core::result::Result<CodecStep, ArchiveError> {
+        if matches!(self.phase, EncodePhase::Done) {
+            if !input.is_empty() {
+                return Err(ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("gzip")
+                    .with_context("input supplied after gzip completion"));
+            }
+            return Ok(CodecStep {
+                consumed: 0,
+                produced: 0,
+                status: CodecStatus::Done,
+            });
+        }
+
+        let mut consumed_total = 0;
+        let mut produced = 0;
+        if matches!(self.phase, EncodePhase::Header) {
+            let count = (GZIP_HEADER.len() - self.header_position).min(output.len());
+            output[..count]
+                .copy_from_slice(&GZIP_HEADER[self.header_position..self.header_position + count]);
+            self.header_position += count;
+            produced += count;
+            if self.header_position != GZIP_HEADER.len() {
+                return Ok(CodecStep {
+                    consumed: 0,
+                    produced,
+                    status: CodecStatus::NeedOutput,
+                });
+            }
+            self.phase = EncodePhase::Body;
+            if produced == output.len() {
+                return Ok(CodecStep {
+                    consumed: 0,
+                    produced,
+                    status: CodecStatus::NeedOutput,
+                });
+            }
+        }
+
+        if matches!(self.phase, EncodePhase::Body) {
+            let flush = if matches!(end, EndOfInput::End) {
+                MZFlush::Finish
+            } else {
+                MZFlush::None
+            };
+            let result =
+                deflate_stream(&mut self.compressor, input, &mut output[produced..], flush);
+            let consumed = result.bytes_consumed;
+            consumed_total = consumed;
+            let next = self
+                .encoded_input
+                .checked_add(consumed as u64)
+                .ok_or_else(|| {
+                    ArchiveError::new(ErrorKind::Limit)
+                        .with_format("gzip")
+                        .with_context("encoded input byte count overflow")
+                })?;
+            if self
+                .limits
+                .decoded_total()
+                .is_some_and(|maximum| next > maximum)
+            {
+                return Err(ArchiveError::new(ErrorKind::Limit)
+                    .with_format("gzip")
+                    .with_context("encoded input exceeds configured limit"));
+            }
+            self.crc.update(&input[..consumed]);
+            self.input_size = self
+                .input_size
+                .wrapping_add(u32::try_from(consumed).unwrap_or(u32::MAX));
+            self.encoded_input = next;
+            produced += result.bytes_written;
+            match result.status {
+                Ok(MZStatus::StreamEnd) => {
+                    self.trailer[..4].copy_from_slice(&self.crc.finalize().to_le_bytes());
+                    self.trailer[4..].copy_from_slice(&self.input_size.to_le_bytes());
+                    self.phase = EncodePhase::Trailer;
+                    if produced == output.len() {
+                        return Ok(CodecStep {
+                            consumed,
+                            produced,
+                            status: CodecStatus::NeedOutput,
+                        });
+                    }
+                },
+                Ok(_) => {
+                    let status = if produced == output.len() || matches!(end, EndOfInput::End) {
+                        CodecStatus::NeedOutput
+                    } else {
+                        CodecStatus::NeedInput
+                    };
+                    return CodecStep {
+                        consumed,
+                        produced,
+                        status,
+                    }
+                    .validate(input.len(), output.len());
+                },
+                Err(MZError::Buf) if input.is_empty() && matches!(end, EndOfInput::More) => {
+                    return Ok(CodecStep {
+                        consumed: 0,
+                        produced,
+                        status: CodecStatus::NeedInput,
+                    });
+                },
+                Err(_) => {
+                    return Err(ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("gzip")
+                        .with_context("deflate encoder failed"));
+                },
+            }
+        }
+
+        if matches!(self.phase, EncodePhase::Trailer) {
+            if consumed_total != input.len() {
+                return Err(ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("gzip")
+                    .with_context("deflate finished with unconsumed plaintext"));
+            }
+            let count = (TRAILER_LEN - self.trailer_position).min(output.len() - produced);
+            output[produced..produced + count].copy_from_slice(
+                &self.trailer[self.trailer_position..self.trailer_position + count],
+            );
+            self.trailer_position += count;
+            produced += count;
+            if self.trailer_position == TRAILER_LEN {
+                self.phase = EncodePhase::Done;
+                return Ok(CodecStep {
+                    consumed: consumed_total,
+                    produced,
+                    status: CodecStatus::Done,
+                });
+            }
+            return Ok(CodecStep {
+                consumed: consumed_total,
+                produced,
+                status: CodecStatus::NeedOutput,
+            });
+        }
+
+        Ok(CodecStep {
+            consumed: consumed_total,
+            produced,
+            status: CodecStatus::Done,
+        })
     }
 }
 
-impl Transform for GzipEncoder {
-    fn step(&mut self, input: &[u8], _output: &mut [u8]) -> Result<Step> {
-        Ok(self.0.push(input))
+impl Codec for GzipEncoder {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> core::result::Result<CodecStep, ArchiveError> {
+        self.process_codec(input, output, end)?
+            .validate(input.len(), output.len())
     }
-
-    fn finish(&mut self, output: &mut [u8]) -> Result<Step> {
-        self.0.drain(output, |plain| Ok(gzip_frame(plain)))
-    }
-}
-
-impl Filter for GzipEncoder {
-    const ID: FilterId = FilterId::Gzip;
-}
-
-impl Encoder for GzipEncoder {}
-
-/// Wraps `plain` into a complete gzip frame.
-fn gzip_frame(plain: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    // Header: magic, CM=deflate(8), no flags, mtime=0, XFL=0, OS=unknown(0xff).
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
-    out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(plain, 6));
-    out.extend_from_slice(&crc32(plain).to_le_bytes());
-    // ISIZE is the input size modulo 2^32 (per spec).
-    let isize_field = u32::try_from(plain.len() & 0xFFFF_FFFF).unwrap_or(0);
-    out.extend_from_slice(&isize_field.to_le_bytes());
-    out
 }
 
 /// Computes the IEEE CRC-32 of `data` (bitwise; no table, `no_std`).
@@ -316,10 +640,13 @@ fn gzip_header_len(b: &[u8]) -> Result<Option<usize>> {
         return Ok(None);
     }
     if b[0] != 0x1f || b[1] != 0x8b {
-        return Err(Error::Malformed("gzip: bad magic"));
+        return Err(gzip_error(ErrorKind::Malformed, "bad magic"));
     }
     if b[2] != 8 {
-        return Err(Error::Unsupported("gzip: non-deflate method"));
+        return Err(gzip_error(
+            ErrorKind::Unsupported,
+            "non-deflate compression method",
+        ));
     }
     let flg = b[3];
     let mut pos = 10;
@@ -355,6 +682,12 @@ fn gzip_header_len(b: &[u8]) -> Result<Option<usize>> {
         return Ok(None);
     }
     Ok(Some(pos))
+}
+
+fn gzip_error(kind: ErrorKind, message: &'static str) -> ArchiveError {
+    ArchiveError::new(kind)
+        .with_format("gzip")
+        .with_context(message)
 }
 
 /// Skips over a NUL-terminated string starting at `start` and returns the position just past the terminator. Returns `None` if incomplete.

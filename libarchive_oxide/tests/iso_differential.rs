@@ -17,22 +17,28 @@
 //!    image mastered by a mature external tool is read back with arca, cross-validating the reader.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::borrow::Cow;
+use std::io::Cursor;
 use std::process::Command;
 
-use libarchive_oxide_core::format::iso9660::IsoWriter;
-use libarchive_oxide_core::{EntryData, EntryKind, EntryMeta, EntryReader, EntryWriter};
+use libarchive_oxide::{ReaderEvent, SeekArchiveReader, SeekArchiveWriter};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Limits};
 
 const SECTOR: usize = 2048;
 
-fn write_entry<W: EntryWriter>(w: &mut W, kind: EntryKind, path: &[u8], data: &[u8]) {
-    let mut m = EntryMeta::new(kind, Cow::Borrowed(path));
-    m.size = data.len() as u64;
-    let mut sink = w.start_entry(&m).unwrap();
+fn write_entry(
+    writer: &mut SeekArchiveWriter<Cursor<Vec<u8>>>,
+    kind: EntryKind,
+    path: &[u8],
+    data: &[u8],
+) {
+    let metadata = EntryMetadata::builder(kind, ArchivePath::from_bytes(path.to_vec()))
+        .size(Some(data.len() as u64))
+        .build();
+    writer.start_entry(&metadata).unwrap();
     if !data.is_empty() {
-        sink.write_chunk(data).unwrap();
+        writer.write_data(data).unwrap();
     }
-    sink.close().unwrap();
+    writer.end_entry().unwrap();
 }
 
 fn read_u32_le(b: &[u8], off: usize) -> u32 {
@@ -43,7 +49,12 @@ fn read_u32_le(b: &[u8], off: usize) -> u32 {
 const HELLO_CONTENT: &[u8] = b"structural-check payload for the extent walk\n";
 
 fn arca_image() -> Vec<u8> {
-    let mut w = IsoWriter::new(Vec::new());
+    let mut w = SeekArchiveWriter::with_format(
+        Cursor::new(Vec::new()),
+        FormatId::Iso9660,
+        Limits::default(),
+    )
+    .unwrap();
     // Uppercase ASCII names so the *primary* tree (which mangles to d-characters) keeps them intact,
     // letting the manual primary-tree walk locate the file by its mangled identifier.
     write_entry(&mut w, EntryKind::File, b"HELLO.TXT", HELLO_CONTENT);
@@ -54,8 +65,7 @@ fn arca_image() -> Vec<u8> {
         b"SUB/DATA.BIN",
         &vec![0xABu8; 3000],
     );
-    w.finish().unwrap();
-    w.into_inner()
+    w.finish().unwrap().into_inner()
 }
 
 #[test]
@@ -196,27 +206,30 @@ fn arca_reads_system_mastered_image() {
 
     let bytes = std::fs::read(&out).unwrap();
     let mut reader =
-        libarchive_oxide::extract::reader(&bytes).expect("arca detects the system ISO");
+        SeekArchiveReader::new(Cursor::new(bytes)).expect("arca detects the system ISO");
     let mut found_hello = false;
     let mut found_data = false;
-    while let Some(mut entry) = reader.next_entry().unwrap() {
-        let path = entry.meta().path.to_vec();
-        let mut content = Vec::new();
-        let mut buf = [0u8; 512];
-        loop {
-            let n = entry.data().read_chunk(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            content.extend_from_slice(&buf[..n]);
-        }
-        if path.ends_with(b"hello.txt") {
-            assert_eq!(content, HELLO_CONTENT, "system ISO hello.txt content");
-            found_hello = true;
-        }
-        if path.ends_with(b"data.bin") {
-            assert_eq!(content, vec![0x5Au8; 4096], "system ISO data.bin content");
-            found_data = true;
+    let mut current: Option<(Vec<u8>, Vec<u8>)> = None;
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::ArchiveMetadata(_) => {},
+            ReaderEvent::Entry(metadata) => {
+                current = Some((metadata.path().as_bytes().to_vec(), Vec::new()));
+            },
+            ReaderEvent::Data(bytes) => current.as_mut().unwrap().1.extend_from_slice(bytes),
+            ReaderEvent::EndEntry => {
+                let (path, content) = current.take().unwrap();
+                if path.ends_with(b"hello.txt") {
+                    assert_eq!(content, HELLO_CONTENT, "system ISO hello.txt content");
+                    found_hello = true;
+                }
+                if path.ends_with(b"data.bin") {
+                    assert_eq!(content, vec![0x5Au8; 4096], "system ISO data.bin content");
+                    found_data = true;
+                }
+            },
+            ReaderEvent::Done => break,
+            _ => panic!("unexpected future ISO event"),
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

@@ -2,20 +2,20 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Differential test: a zip produced by arca's `ZipWriter` must be readable by the external `zip`
+//! Differential test: a ZIP produced by arca's streaming writer is read by the external `zip`
 //! crate (an independent implementation), covering store, deflate, directories, and Unix mode.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::borrow::Cow;
 use std::io::{Cursor, Read};
 
-use libarchive_oxide::zip::{ZipOptions, ZipWriter};
-use libarchive_oxide_core::{EntryKind, EntryMeta, EntryWriter};
+use libarchive_oxide::{ArchiveWriter, ZipMethod};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use zip::ZipArchive;
 
 fn build() -> (Vec<u8>, Vec<u8>) {
     let big = b"the quick brown fox jumps over the lazy dog\n".repeat(200);
-    let mut w = ZipWriter::with_options(Vec::new(), ZipOptions::default());
+    let mut writer =
+        ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Deflate, Limits::default());
 
     let entries: Vec<(EntryKind, &[u8], u32, Vec<u8>)> = vec![
         (EntryKind::File, b"readme.txt", 0o644, b"hello\n".to_vec()),
@@ -23,17 +23,17 @@ fn build() -> (Vec<u8>, Vec<u8>) {
         (EntryKind::File, b"sub/big.txt", 0o640, big.clone()),
     ];
     for (kind, name, mode, data) in entries {
-        let mut m = EntryMeta::new(kind, Cow::Borrowed(name));
-        m.mode = mode;
-        m.size = data.len() as u64;
-        let mut sink = w.start_entry(&m).unwrap();
+        let metadata = EntryMetadata::builder(kind, ArchivePath::from_bytes(name.to_vec()))
+            .size(None)
+            .mode(Some(mode))
+            .build();
+        writer.start_entry(&metadata).unwrap();
         if !data.is_empty() {
-            sink.write_chunk(&data).unwrap();
+            writer.write_data(&data).unwrap();
         }
-        sink.close().unwrap();
+        writer.end_entry().unwrap();
     }
-    w.finish().unwrap();
-    (w.into_inner(), big)
+    (writer.finish().unwrap(), big)
 }
 
 #[test]

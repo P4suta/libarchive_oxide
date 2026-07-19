@@ -40,8 +40,9 @@ path = "src/bin/oxunzip.rs"
 
 [dependencies]
 # Enable CLI-supported formats.
-libarchive_oxide = { path = "../libarchive_oxide", version = "0.1.0", features = ["aes", "sevenz"] }
-libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.1.0" }
+libarchive_oxide = { path = "../libarchive_oxide", version = "0.2.0", features = ["aes", "sevenz"] }
+libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
+cap-std = "4.0.2"
 
 [lints]
 workspace = true

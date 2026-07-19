@@ -16,54 +16,52 @@
 #![cfg(feature = "aes")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::borrow::Cow;
+use std::fs;
 use std::io::{Cursor, Read, Write};
 
-use libarchive_oxide::reader_with_password;
-use libarchive_oxide::zip::{SaltSource, ZipMethod, ZipOptions, ZipWriter};
-use libarchive_oxide_core::{EntryData, EntryKind, EntryMeta, EntryReader, EntryWriter};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+use libarchive_oxide::{
+    ArchiveWriter, Extractor, ReaderEvent, SecretBytes, SeekArchiveReader, StreamError, ZipMethod,
+};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use zip::write::SimpleFileOptions;
 use zip::{AesMode, ZipArchive};
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
 
-/// Builds a single-file arca archive encrypted with AES-256 AE-2 (deterministic fixed salt).
+/// Builds a single-file arca archive encrypted with AES-256 AE-2.
 fn arca_aes(name: &[u8], data: &[u8], method: ZipMethod) -> Vec<u8> {
-    let opts = ZipOptions {
+    let mut writer = ArchiveWriter::with_zip_password(
+        Vec::new(),
         method,
-        password: Some(PASSWORD.to_vec()),
-        salt_source: SaltSource::Fixed([0x11; 16]),
-        ..ZipOptions::default()
-    };
-    let mut w = ZipWriter::with_options(Vec::new(), opts);
-    let mut m = EntryMeta::new(EntryKind::File, Cow::Borrowed(name));
-    m.mode = 0o644;
-    m.size = data.len() as u64;
-    let mut sink = w.start_entry(&m).unwrap();
-    if !data.is_empty() {
-        sink.write_chunk(data).unwrap();
+        SecretBytes::from(PASSWORD),
+        Limits::default(),
+    );
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_bytes(name.to_vec()))
+        .size(None)
+        .mode(Some(0o644))
+        .build();
+    writer.start_entry(&metadata).unwrap();
+    for chunk in data.chunks(31) {
+        writer.write_data(chunk).unwrap();
     }
-    sink.close().unwrap();
-    w.finish().unwrap();
-    w.into_inner()
+    writer.end_entry().unwrap();
+    writer.finish().unwrap()
 }
 
-fn read_first_with_password(
-    bytes: &[u8],
-    password: &[u8],
-) -> libarchive_oxide_core::Result<Vec<u8>> {
-    let mut r = reader_with_password(bytes, Some(password)).unwrap();
-    let mut e = r.next_entry()?.unwrap();
-    let mut out = Vec::new();
-    let mut tmp = [0u8; 40];
+fn read_first_with_password(bytes: &[u8], password: &[u8]) -> Result<Vec<u8>, StreamError> {
+    let mut reader =
+        SeekArchiveReader::with_password(Cursor::new(bytes), SecretBytes::from(password))?;
+    let mut output = Vec::new();
     loop {
-        let n = e.data().read_chunk(&mut tmp)?;
-        if n == 0 {
-            break;
+        match reader.next_event()? {
+            ReaderEvent::Data(bytes) => output.extend_from_slice(bytes),
+            ReaderEvent::ArchiveMetadata(_) | ReaderEvent::Entry(_) => {},
+            ReaderEvent::EndEntry => return Ok(output),
+            _ => panic!("AES entry ended without EndEntry"),
         }
-        out.extend_from_slice(&tmp[..n]);
     }
-    Ok(out)
 }
 
 #[test]
@@ -88,11 +86,15 @@ fn wrong_password_errors_without_panic() {
 #[test]
 fn missing_password_errors_without_panic() {
     let z = arca_aes(b"secret.txt", b"top secret", ZipMethod::Store);
-    let mut r = reader_with_password(&z, None).unwrap();
-    assert!(
-        r.next_entry().is_err(),
-        "method 99 without password must error"
-    );
+    let mut reader = SeekArchiveReader::new(Cursor::new(z)).unwrap();
+    let mut rejected = false;
+    for _ in 0..4 {
+        if reader.next_event().is_err() {
+            rejected = true;
+            break;
+        }
+    }
+    assert!(rejected, "method 99 without password must error");
 }
 
 #[test]
@@ -130,4 +132,99 @@ fn arca_decrypts_zip_crate_fixture() {
 
     // Wrong password against the external fixture must error, not panic.
     assert!(read_first_with_password(&bytes, b"nope").is_err());
+}
+
+#[test]
+fn seek_reader_streams_and_authenticates_aes_before_end_entry() {
+    let payload = b"authenticated streaming payload ".repeat(8_192);
+    let archive = arca_aes(b"large-secret.txt", &payload, ZipMethod::Deflate);
+    let mut reader =
+        SeekArchiveReader::with_password(Cursor::new(archive), SecretBytes::from(PASSWORD))
+            .unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::Entry(_)
+    ));
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::EndEntry => break,
+            event => panic!("unexpected AES event: {event:?}"),
+        }
+    }
+    assert_eq!(decoded, payload);
+}
+
+#[test]
+fn aes_authentication_failure_never_commits_the_destination() {
+    let mut archive = arca_aes(
+        b"secret.txt",
+        &b"authenticated payload ".repeat(128),
+        ZipMethod::Store,
+    );
+    let name_length = usize::from(u16::from_le_bytes([archive[26], archive[27]]));
+    let extra_length = usize::from(u16::from_le_bytes([archive[28], archive[29]]));
+    let encrypted_start = 30 + name_length + extra_length + 18;
+    archive[encrypted_start] ^= 0x80;
+
+    let destination = tempfile::tempdir().unwrap();
+    let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
+    let mut extractor = Extractor::new(root);
+    let mut reader =
+        SeekArchiveReader::with_password(Cursor::new(archive), SecretBytes::from(PASSWORD))
+            .unwrap();
+    let result = extractor.extract_seek_matching(&mut reader, |_| true);
+    assert!(result.is_err());
+    assert!(!destination.path().join("secret.txt").exists());
+    assert!(
+        fs::read_dir(destination.path()).unwrap().all(|item| !item
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp"))
+    );
+}
+
+#[test]
+fn streaming_aes_writer_handles_unknown_size_without_entry_buffering() {
+    let payload = b"streaming encrypted payload ".repeat(16_384);
+    let mut writer = ArchiveWriter::with_zip_password(
+        Vec::new(),
+        ZipMethod::Deflate,
+        SecretBytes::from(PASSWORD),
+        Limits::default(),
+    );
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("streaming.txt"))
+        .size(None)
+        .build();
+    writer.start_entry(&metadata).unwrap();
+    for chunk in payload.chunks(997) {
+        writer.write_data(chunk).unwrap();
+    }
+    writer.end_entry().unwrap();
+    let archive = writer.finish().unwrap();
+
+    let mut independent = ZipArchive::new(Cursor::new(archive.clone())).unwrap();
+    let mut file = independent.by_index_decrypt(0, PASSWORD).unwrap();
+    let mut decoded = Vec::new();
+    file.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+
+    let mut reader =
+        SeekArchiveReader::with_password(Cursor::new(archive), SecretBytes::from(PASSWORD))
+            .unwrap();
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(decoded, payload);
 }

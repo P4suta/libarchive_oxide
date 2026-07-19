@@ -15,9 +15,16 @@ pub mod cpio;
 pub mod tar;
 pub mod unzip;
 
+use std::io::{Read, Seek};
 use std::path::Path;
 
-use libarchive_oxide_core::{EntryData, EntryKind, EntryMeta, EntryReader};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+use libarchive_oxide::{
+    ArchiveReader, EntryOutcomeKind, ExtractionPolicy, Extractor, FilterReader, ReaderEvent,
+    SecretBytes, SeekArchiveReader,
+};
+use libarchive_oxide_core::{EntryKind, EntryMetadata};
 
 pub use cat::run_cat;
 pub use cpio::run_cpio;
@@ -78,121 +85,156 @@ impl std::error::Error for CliError {}
 /// Convenience alias for CLI entry points.
 pub type CliResult = Result<(), CliError>;
 
-/// Reads a file or returns a runtime error.
-pub(crate) fn read_file(path: &str) -> Result<Vec<u8>, CliError> {
-    std::fs::read(path).map_err(|e| CliError::runtime(format!("cannot read {path}: {e}")))
-}
-
-/// Detects an archive and writes its entry list to standard output.
-///
-/// Verbose output includes mode, owner, size, modification time, and name.
-/// Member operands select exact paths or directory prefixes. Unmatched operands
-/// return a runtime error.
-pub(crate) fn list_bytes(
-    bytes: &[u8],
-    password: Option<&[u8]>,
-    members: &[String],
-    verbose: bool,
-) -> CliResult {
-    let plain = libarchive_oxide::decompress_capped(bytes, decompress_cap())
-        .map_err(|e| CliError::runtime(e.to_string()))?;
-    let mut reader = libarchive_oxide::reader_with_password(&plain, password)
-        .map_err(|e| CliError::runtime(e.to_string()))?;
+/// Lists a sequential archive without retaining the compressed or plain input.
+pub(crate) fn list_stream<R: Read>(input: R, members: &[String], verbose: bool) -> CliResult {
+    let input = FilterReader::new(input).map_err(|error| CliError::runtime(error.to_string()))?;
+    let mut reader = ArchiveReader::new(input);
     let mut filter = MemberFilter::new(members);
-    while let Some(entry) = reader
-        .next_entry()
-        .map_err(|e| CliError::runtime(e.to_string()))?
-    {
-        let meta = entry.meta();
-        if !filter.selects(&meta.path) {
-            continue;
-        }
-        if verbose {
-            println!("{}", format_long(meta));
-        } else {
-            println!("{}", String::from_utf8_lossy(&meta.path));
-        }
-    }
-    filter.ensure_all_matched()
-}
-
-/// Extracts an archive under `dest`.
-///
-/// Paths are sanitized and decompression is limited. Member operands select
-/// exact paths or directory prefixes.
-pub(crate) fn extract_bytes(
-    bytes: &[u8],
-    dest: &Path,
-    password: Option<&[u8]>,
-    verbose: bool,
-    members: &[String],
-) -> CliResult {
-    let plain = libarchive_oxide::decompress_capped(bytes, decompress_cap())
-        .map_err(|e| CliError::runtime(e.to_string()))?;
-    let mut reader = libarchive_oxide::reader_with_password(&plain, password)
-        .map_err(|e| CliError::runtime(e.to_string()))?;
-    if !verbose && members.is_empty() {
-        return libarchive_oxide::extract::extract(&mut reader, dest)
-            .map(|_| ())
-            .map_err(|e| CliError::runtime(e.to_string()));
-    }
-    extract_selected(&mut reader, dest, verbose, members)
-}
-
-/// Extracts selected members with optional logging.
-fn extract_selected<R: EntryReader>(
-    reader: &mut R,
-    dest: &Path,
-    verbose: bool,
-    members: &[String],
-) -> CliResult {
-    use std::io::Write;
-
-    std::fs::create_dir_all(dest).map_err(|e| CliError::runtime(e.to_string()))?;
-    let mut filter = MemberFilter::new(members);
-    while let Some(mut entry) = reader
-        .next_entry()
-        .map_err(|e| CliError::runtime(e.to_string()))?
-    {
-        let kind = entry.meta().kind;
-        if !filter.selects(&entry.meta().path) {
-            continue;
-        }
-        let Some(rel) = libarchive_oxide::sanitize(&entry.meta().path) else {
-            continue;
-        };
-        let path = dest.join(&rel);
-        match kind {
-            EntryKind::Dir => {
-                std::fs::create_dir_all(&path).map_err(|e| CliError::runtime(e.to_string()))?;
-            },
-            EntryKind::File => {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| CliError::runtime(e.to_string()))?;
-                }
-                let mut file =
-                    std::fs::File::create(&path).map_err(|e| CliError::runtime(e.to_string()))?;
-                let mut buf = [0u8; 16 * 1024];
-                loop {
-                    let n = entry
-                        .data()
-                        .read_chunk(&mut buf)
-                        .map_err(|e| CliError::runtime(e.to_string()))?;
-                    if n == 0 {
-                        break;
-                    }
-                    file.write_all(&buf[..n])
-                        .map_err(|e| CliError::runtime(e.to_string()))?;
+    loop {
+        match reader
+            .next_event()
+            .map_err(|error| CliError::runtime(error.to_string()))?
+        {
+            ReaderEvent::Entry(metadata) => {
+                if !filter.selects(metadata.path().as_bytes()) {
+                    continue;
                 }
                 if verbose {
-                    eprintln!("x {}", rel.display());
+                    println!("{}", format_long_v2(&metadata));
+                } else {
+                    println!("{}", metadata.path().display_lossy());
                 }
+            },
+            ReaderEvent::Done => return filter.ensure_all_matched(),
+            _ => {},
+        }
+    }
+}
+
+/// Extracts a sequential archive through the capability-based safe extractor.
+pub(crate) fn extract_stream<R: Read>(
+    input: R,
+    dest: &Path,
+    verbose: bool,
+    members: &[String],
+) -> CliResult {
+    std::fs::create_dir_all(dest).map_err(|error| CliError::runtime(error.to_string()))?;
+    let root = Dir::open_ambient_dir(dest, ambient_authority())
+        .map_err(|error| CliError::runtime(error.to_string()))?;
+    let input = FilterReader::new(input).map_err(|error| CliError::runtime(error.to_string()))?;
+    let mut reader = ArchiveReader::new(input);
+    let mut extractor = Extractor::new(root);
+    let mut filter = MemberFilter::new(members);
+    let report = extractor
+        .extract_matching(&mut reader, |metadata| {
+            filter.selects(metadata.path().as_bytes())
+        })
+        .map_err(|error| CliError::runtime(error.to_string()))?;
+    filter.ensure_all_matched()?;
+    for outcome in report.outcomes() {
+        match outcome.outcome() {
+            EntryOutcomeKind::File | EntryOutcomeKind::Directory if verbose => {
+                eprintln!("x {}", outcome.path().display_lossy());
+            },
+            EntryOutcomeKind::Rejected(reason) => {
+                eprintln!(
+                    "oxtar: refused {}: {reason:?}",
+                    outcome.path().display_lossy()
+                );
             },
             _ => {},
         }
     }
-    filter.ensure_all_matched()
+    if report.has_rejections() {
+        return Err(CliError::runtime(
+            "one or more archive entries were refused by the safe extraction policy",
+        ));
+    }
+    Ok(())
+}
+
+/// Lists a seek-required archive while retaining only its bounded index.
+pub(crate) fn list_seek<R: Read + Seek>(
+    input: R,
+    password: Option<&[u8]>,
+    members: &[String],
+    verbose: bool,
+) -> CliResult {
+    let mut reader = match password {
+        Some(password) => SeekArchiveReader::with_password(input, SecretBytes::from(password)),
+        None => SeekArchiveReader::new(input),
+    }
+    .map_err(|error| CliError::runtime(error.to_string()))?;
+    let mut filter = MemberFilter::new(members);
+    loop {
+        match reader
+            .next_event()
+            .map_err(|error| CliError::runtime(error.to_string()))?
+        {
+            ReaderEvent::Entry(metadata) => {
+                if filter.selects(metadata.path().as_bytes()) {
+                    if verbose {
+                        println!("{}", format_long_v2(&metadata));
+                    } else {
+                        println!("{}", metadata.path().display_lossy());
+                    }
+                }
+                reader
+                    .skip_entry()
+                    .map_err(|error| CliError::runtime(error.to_string()))?;
+            },
+            ReaderEvent::Done => return filter.ensure_all_matched(),
+            _ => {},
+        }
+    }
+}
+
+/// Extracts a seek-required archive with capability-based safe filesystem I/O.
+pub(crate) fn extract_seek<R: Read + Seek>(
+    input: R,
+    password: Option<&[u8]>,
+    dest: &Path,
+    verbose: bool,
+    members: &[String],
+    overwrite: bool,
+) -> CliResult {
+    std::fs::create_dir_all(dest).map_err(|error| CliError::runtime(error.to_string()))?;
+    let root = Dir::open_ambient_dir(dest, ambient_authority())
+        .map_err(|error| CliError::runtime(error.to_string()))?;
+    let mut reader = match password {
+        Some(password) => SeekArchiveReader::with_password(input, SecretBytes::from(password)),
+        None => SeekArchiveReader::new(input),
+    }
+    .map_err(|error| CliError::runtime(error.to_string()))?;
+    let policy = ExtractionPolicy::safe().allow_overwrite(overwrite);
+    let mut extractor = Extractor::with_policy(root, policy);
+    let mut filter = MemberFilter::new(members);
+    let report = extractor
+        .extract_seek_matching(&mut reader, |metadata| {
+            filter.selects(metadata.path().as_bytes())
+        })
+        .map_err(|error| CliError::runtime(error.to_string()))?;
+    filter.ensure_all_matched()?;
+    for outcome in report.outcomes() {
+        match outcome.outcome() {
+            EntryOutcomeKind::File | EntryOutcomeKind::Directory if verbose => {
+                eprintln!("x {}", outcome.path().display_lossy());
+            },
+            EntryOutcomeKind::Rejected(reason) => {
+                eprintln!(
+                    "oxunzip: refused {}: {reason:?}",
+                    outcome.path().display_lossy()
+                );
+            },
+            _ => {},
+        }
+    }
+    if report.has_rejections() {
+        return Err(CliError::runtime(
+            "one or more archive entries were refused by the safe extraction policy",
+        ));
+    }
+    Ok(())
 }
 
 /// Selects entries and tracks matched operands.
@@ -253,26 +295,25 @@ fn trim_trailing_slash(p: &[u8]) -> &[u8] {
     p.strip_suffix(b"/").unwrap_or(p)
 }
 
-/// Formats one entry as an `ls -l`-style long listing line for `-tv`, matching `bsdtar -tv`'s
-/// mode / owner / size / mtime / name columns (symlinks append ` -> target`).
-fn format_long(meta: &EntryMeta<'_>) -> String {
-    let mode = mode_string(meta.kind, meta.mode);
-    let date = meta.mtime.map_or_else(
+fn format_long_v2(meta: &EntryMetadata) -> String {
+    let mode = mode_string(meta.kind(), meta.mode().unwrap_or(0));
+    let date = meta.times().modified.map_or_else(
         || "1970-01-01 00:00".to_string(),
-        |t| format_timestamp(t.secs),
+        |timestamp| format_timestamp(timestamp.secs),
     );
-    let name = String::from_utf8_lossy(&meta.path);
-    match &meta.link_target {
-        Some(target) if matches!(meta.kind, EntryKind::Symlink) => format!(
-            "{mode} {}/{} {:>10} {date} {name} -> {}",
-            meta.uid,
-            meta.gid,
-            meta.size,
-            String::from_utf8_lossy(target),
+    let name = meta.path().display_lossy();
+    let owner = meta.owner();
+    let uid = owner.uid.unwrap_or(0);
+    let gid = owner.gid.unwrap_or(0);
+    match meta.link_target() {
+        Some(target) if matches!(meta.kind(), EntryKind::Symlink) => format!(
+            "{mode} {uid}/{gid} {:>10} {date} {name} -> {}",
+            meta.size().unwrap_or(0),
+            target.display_lossy(),
         ),
         _ => format!(
-            "{mode} {}/{} {:>10} {date} {name}",
-            meta.uid, meta.gid, meta.size
+            "{mode} {uid}/{gid} {:>10} {date} {name}",
+            meta.size().unwrap_or(0)
         ),
     }
 }
