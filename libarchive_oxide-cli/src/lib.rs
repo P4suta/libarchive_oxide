@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Shared implementation for `oxtar`, `oxcpio`, `oxcat`, and `oxunzip`.
+//! Shared implementation for `oxarchive`, `oxtar`, `oxcpio`, `oxcat`, and
+//! `oxunzip`.
 //!
 //! Exit codes are 0 for success, 1 for runtime errors, and 2 for usage errors.
 //! Extraction rejects path traversal. Transparent decompression is capped at
@@ -12,6 +13,7 @@
 
 pub mod cat;
 pub mod cpio;
+pub mod oxarchive;
 pub mod tar;
 pub mod unzip;
 
@@ -28,6 +30,7 @@ use libarchive_oxide_core::{EntryKind, EntryMetadata};
 
 pub use cat::run_cat;
 pub use cpio::run_cpio;
+pub use oxarchive::run_oxarchive;
 pub use tar::run_tar;
 pub use unzip::run_unzip;
 

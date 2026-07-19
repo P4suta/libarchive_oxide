@@ -15,7 +15,7 @@ use common::{TempDir, code, run, run_in};
 /// `--help` / `--version` succeed for every tool (exit 0).
 #[test]
 fn help_and_version_succeed() {
-    for tool in ["oxtar", "oxcpio", "oxcat", "oxunzip"] {
+    for tool in ["oxarchive", "oxtar", "oxcpio", "oxcat", "oxunzip"] {
         assert_eq!(code(&run(tool, &["--help"])), 0, "{tool} --help");
         assert_eq!(code(&run(tool, &["--version"])), 0, "{tool} --version");
     }
@@ -58,6 +58,9 @@ fn usage_errors_exit_2() {
         ("oxcat", &["--nope"]),                                  // unknown flag
         ("oxunzip", &["-l"]),                                    // missing archive operand
         ("oxunzip", &["--nope", "a.zip"]),                       // unknown long
+        ("oxarchive", &["unknown"]),                             // unknown command
+        ("oxarchive", &["inspect"]),                             // missing archive
+        ("oxarchive", &["plan", "--unsafe", "a.tar"]),           // unknown policy
     ];
     for (tool, args) in cases {
         let out = run(tool, args);
@@ -76,6 +79,7 @@ fn runtime_errors_exit_1() {
         ("oxcat", &["nope.gz"]),
         ("oxunzip", &["nope.zip"]),
         ("oxunzip", &["-l", "nope.zip"]),
+        ("oxarchive", &["inspect", "nope.tar"]),
     ];
     for (tool, args) in cases {
         let out = run_in(tool, args, dir.path());
