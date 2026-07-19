@@ -39,6 +39,12 @@ fn compress(plain: &[u8], filter: FilterId) -> std::io::Result<Vec<u8>> {
                 }
             }
         },
+        FilterId::Bzip2 => {
+            let mut writer =
+                bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            writer.write_all(plain)?;
+            writer.finish()
+        },
         FilterId::Zstd => zstd_codec::stream::encode_all(Cursor::new(plain), 3),
         FilterId::Xz => {
             let mut writer =
@@ -97,7 +103,11 @@ fn collect_sync(bytes: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 async fn collect_futures(bytes: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut reader = AsyncArchiveReader::new(AsyncOneByte { bytes, position: 0 });
+    collect_futures_with_limits(bytes, Limits::default()).await
+}
+
+async fn collect_futures_with_limits(bytes: Vec<u8>, limits: Limits) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut reader = AsyncArchiveReader::with_limits(AsyncOneByte { bytes, position: 0 }, limits);
     let mut entries = Vec::new();
     let mut current: Option<(Vec<u8>, Vec<u8>)> = None;
     loop {
@@ -172,7 +182,13 @@ fn futures_reader_and_writer_match_sync_contract() {
         let gzip_archive = gzip_writer.finish().await.unwrap().into_inner();
         assert_eq!(collect_sync(gzip_archive), expected);
 
-        for filter in [FilterId::Gzip, FilterId::Zstd, FilterId::Xz, FilterId::Lz4] {
+        for filter in [
+            FilterId::Gzip,
+            FilterId::Bzip2,
+            FilterId::Zstd,
+            FilterId::Xz,
+            FilterId::Lz4,
+        ] {
             let sync_archive = sync_filtered_fixture(filter);
             assert_eq!(collect_sync(sync_archive.clone()), expected, "{filter:?}");
             assert_eq!(collect_futures(sync_archive).await, expected, "{filter:?}");
@@ -201,7 +217,13 @@ fn async_reader_concatenates_every_filter_and_rejects_trailing_data() {
         let plain = fixture();
         let expected = collect_sync(plain.clone());
         let split = plain.len() / 2;
-        for filter in [FilterId::Gzip, FilterId::Zstd, FilterId::Xz, FilterId::Lz4] {
+        for filter in [
+            FilterId::Gzip,
+            FilterId::Bzip2,
+            FilterId::Zstd,
+            FilterId::Xz,
+            FilterId::Lz4,
+        ] {
             let mut members = compress(&plain[..split], filter).unwrap();
             members.extend_from_slice(&compress(&plain[split..], filter).unwrap());
             assert_eq!(collect_futures(members).await, expected, "{filter:?}");
@@ -236,7 +258,12 @@ fn async_reader_composes_four_nested_filters() {
         let plain = fixture();
         let expected = collect_sync(plain.clone());
         let mut nested = plain;
-        for filter in [FilterId::Gzip, FilterId::Zstd, FilterId::Xz, FilterId::Lz4] {
+        for filter in [
+            FilterId::Gzip,
+            FilterId::Bzip2,
+            FilterId::Zstd,
+            FilterId::Xz,
+        ] {
             nested = compress(&nested, filter).unwrap();
         }
         assert_eq!(collect_futures(nested.clone()).await, expected);
@@ -326,6 +353,37 @@ async fn tokio_reader_and_writer_match_sync_contract() {
     writer.end_entry().await.unwrap();
     let archive = writer.finish().await.unwrap();
     assert_eq!(collect_sync(archive), expected);
+
+    let bzip2_input = sync_filtered_fixture(FilterId::Bzip2);
+    let mut bzip2_reader = TokioArchiveReader::new(bzip2_input.as_slice());
+    let mut bzip2_entries = Vec::new();
+    let mut bzip2_current: Option<(Vec<u8>, Vec<u8>)> = None;
+    loop {
+        match bzip2_reader.next_event().await.unwrap() {
+            ReaderEvent::ArchiveMetadata(_) => {},
+            ReaderEvent::Entry(meta) => {
+                bzip2_current = Some((meta.path().as_bytes().to_vec(), Vec::new()));
+            },
+            ReaderEvent::Data(data) => bzip2_current.as_mut().unwrap().1.extend_from_slice(data),
+            ReaderEvent::EndEntry => bzip2_entries.push(bzip2_current.take().unwrap()),
+            ReaderEvent::Done => break,
+            _ => panic!("unknown Tokio bzip2 event"),
+        }
+    }
+    assert_eq!(bzip2_entries, expected);
+
+    let mut bzip2_writer = TokioArchiveWriter::with_filter(
+        Vec::new(),
+        FormatId::Tar,
+        Some(FilterId::Bzip2),
+        Limits::default(),
+    )
+    .unwrap();
+    bzip2_writer.start_entry(&metadata()).await.unwrap();
+    bzip2_writer.write_data(b"same payload").await.unwrap();
+    bzip2_writer.end_entry().await.unwrap();
+    let bzip2_archive = bzip2_writer.finish().await.unwrap();
+    assert_eq!(collect_sync(bzip2_archive), expected);
 
     let mut seek = TokioIo::new(Cursor::new(vec![0_u8; 8]));
     let position = poll_fn(|context| Pin::new(&mut seek).poll_seek(context, SeekFrom::Start(5)))

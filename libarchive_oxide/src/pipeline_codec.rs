@@ -4,7 +4,7 @@
 
 //! Private static dispatch for caller-driven outer codecs.
 
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+#[cfg(any(feature = "bzip2", feature = "zstd", feature = "xz", feature = "lz4"))]
 use libarchive_oxide_core::CodecStatus;
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, Codec, CodecStep, EndOfInput, ErrorKind, Limits};
@@ -14,6 +14,8 @@ use crate::filter::gzip::GzipDecoder;
 #[derive(Debug)]
 pub(crate) enum PipelineCodec {
     Gzip(Box<GzipDecoder>),
+    #[cfg(feature = "bzip2")]
+    Bzip2(compression_codecs::BzDecoder),
     #[cfg(feature = "zstd")]
     Zstd(compression_codecs::ZstdDecoder),
     #[cfg(feature = "xz")]
@@ -26,6 +28,16 @@ impl PipelineCodec {
     pub(crate) fn new(filter: FilterId, limits: Limits) -> Result<Self, ArchiveError> {
         match filter {
             FilterId::Gzip => Ok(Self::Gzip(Box::new(GzipDecoder::new(limits)))),
+            FilterId::Bzip2 => {
+                #[cfg(feature = "bzip2")]
+                {
+                    Ok(Self::Bzip2(compression_codecs::BzDecoder::new()))
+                }
+                #[cfg(not(feature = "bzip2"))]
+                {
+                    Err(disabled(filter))
+                }
+            },
             FilterId::Zstd => {
                 #[cfg(feature = "zstd")]
                 {
@@ -75,6 +87,8 @@ impl PipelineCodec {
     ) -> Result<CodecStep, ArchiveError> {
         match self {
             Self::Gzip(codec) => codec.process(input, output, end),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(codec) => external_process(codec, FilterId::Bzip2, input, output, end),
             #[cfg(feature = "zstd")]
             Self::Zstd(codec) => external_process(codec, FilterId::Zstd, input, output, end),
             #[cfg(feature = "xz")]
@@ -85,7 +99,7 @@ impl PipelineCodec {
     }
 }
 
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+#[cfg(any(feature = "bzip2", feature = "zstd", feature = "xz", feature = "lz4"))]
 fn external_process(
     decoder: &mut impl compression_codecs::Decode,
     filter: FilterId,
@@ -124,7 +138,7 @@ fn external_process(
     })
 }
 
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+#[cfg(any(feature = "bzip2", feature = "zstd", feature = "xz", feature = "lz4"))]
 fn codec_error(filter: FilterId, error: &std::io::Error) -> ArchiveError {
     let kind = if error.kind() == std::io::ErrorKind::OutOfMemory {
         ErrorKind::Limit
@@ -146,6 +160,7 @@ fn disabled(filter: FilterId) -> ArchiveError {
 const fn filter_name(filter: FilterId) -> &'static str {
     match filter {
         FilterId::Gzip => "gzip",
+        FilterId::Bzip2 => "bzip2",
         FilterId::Zstd => "zstd",
         FilterId::Xz => "xz",
         FilterId::Lz4 => "lz4",

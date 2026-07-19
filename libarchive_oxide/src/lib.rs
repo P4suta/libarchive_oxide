@@ -83,6 +83,7 @@ pub fn filter_for_name(name: &str) -> Option<FilterId> {
         .map(str::to_ascii_lowercase);
     match ext.as_deref() {
         Some("gz" | "tgz") => Some(FilterId::Gzip),
+        Some("bz2" | "tbz" | "tbz2") => Some(FilterId::Bzip2),
         Some("zst") => Some(FilterId::Zstd),
         Some("xz") => Some(FilterId::Xz),
         Some("lz4") => Some(FilterId::Lz4),

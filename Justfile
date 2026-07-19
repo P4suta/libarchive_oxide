@@ -63,6 +63,10 @@ package-licenses:
 package-smoke:
     cargo run --quiet -p xtask -- package-smoke
 
+# Keep the bzip2 Tier 1 path on its default Rust implementation.
+codec-policy:
+    cargo run --quiet -p xtask -- codec-policy
+
 # Keep publishing automation manual-only and draft-first.
 release-policy:
     cargo run --quiet -p xtask -- release-policy
@@ -77,9 +81,9 @@ msrv:
     cargo msrv verify --path libarchive_oxide --all-features
 
 # Fast deterministic checks used during the edit/commit loop.
-check: fmt-check typos lint no-dyn reuse license-sync release-policy
+check: fmt-check typos lint no-dyn reuse license-sync codec-policy release-policy
     @echo "fast local checks passed"
 
 # Every practical CI gate available on a developer machine.
-ci: fmt-check typos lint test doc no-dyn no-std deny reuse license-sync package-licenses package-smoke release-policy actionlint msrv
+ci: fmt-check typos lint test doc no-dyn no-std deny reuse license-sync package-licenses package-smoke codec-policy release-policy actionlint msrv
     @echo "local CI passed"

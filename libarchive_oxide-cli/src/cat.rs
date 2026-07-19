@@ -4,9 +4,9 @@
 
 //! `oxcat` implementation.
 //!
-//! Detects gzip, zstd, xz, and lz4. Uncompressed input passes through. Supports
-//! file operands, standard input, `--help`, and `--version`. Decompression uses
-//! the crate-level limit.
+//! Detects gzip, bzip2, zstd, xz, and lz4. Uncompressed input passes through.
+//! Supports file operands, standard input, `--help`, and `--version`.
+//! Decompression uses the crate-level limit.
 
 use std::io::{Read, Write};
 
@@ -79,8 +79,8 @@ oxcat: bsdcat-compatible transparent decompressor
 USAGE:
     oxcat [FILE...]        Decompress each FILE to stdout ('-' or none = stdin).
 
-Auto-detects gzip/zstd/xz/lz4; uncompressed input is passed through. Decompression is
-capped to defend against bombs (a documented safe default).
+Auto-detects gzip/bzip2/zstd/xz/lz4; uncompressed input is passed through.
+Decompression is capped to defend against bombs (a documented safe default).
 
     --help, --version
 

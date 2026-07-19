@@ -51,6 +51,17 @@ fn inspection_handles_compressed_tar_and_seek_zip() {
         b"gzip.txt"
     );
 
+    let bzip2 = archive(FormatId::Tar, Some(FilterId::Bzip2), b"bzip2.txt", b"bzip2");
+    let mut bzip2_session = ArchiveEngine::new()
+        .open(Cursor::new(bzip2))
+        .expect("open bzip2 session");
+    let bzip2_inspection = bzip2_session.inspect().expect("inspect bzip2 tar");
+    assert_eq!(bzip2_inspection.format(), FormatId::Tar);
+    assert_eq!(
+        bzip2_inspection.entries()[0].metadata().path().as_bytes(),
+        b"bzip2.txt"
+    );
+
     let zip = archive(FormatId::Zip, None, b"zip.txt", b"zip");
     let mut zip_session = ArchiveEngine::new()
         .open(Cursor::new(zip))

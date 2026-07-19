@@ -26,10 +26,10 @@ dependencies use native C backends; see [Codec backends](#codec-backends).
 | Outer compression | Decode | Encode | Current backend note |
 |---|:---:|:---:|---|
 | gzip/DEFLATE | yes | yes | Rust |
+| bzip2 | yes | yes | Rust `libbz2-rs-sys`; CI rejects native `bzip2-sys` |
 | zstd | yes | yes | decode is Rust; encode currently uses native zstd |
 | xz/LZMA2 | yes | yes | Rust in sync paths; async all-features may select a native backend |
 | LZ4 frame | yes | yes | Rust in sync paths; async all-features may select a native backend |
-| bzip2 | no | no | planned for the portable Tier 1 profile |
 
 The [detailed support matrix](docs/support-matrix.md) distinguishes archive
 dialects, compression methods, encryption, metadata, and unsupported cases.
@@ -114,6 +114,7 @@ fn list(input: impl Read) -> Result<(), Box<dyn std::error::Error>> {
 | Feature | Default | Enables |
 |---|:---:|---|
 | `gzip` | yes | gzip |
+| `bzip2` | yes | bzip2 through the Rust backend |
 | `zstd` | yes | zstd |
 | `xz` | yes | xz |
 | `lz4` | yes | lz4 frame |
@@ -127,7 +128,7 @@ use `SeekArchiveReader` / `SeekArchiveWriter`. The `async` feature adds both
 `AsyncArchive*` and `AsyncSeekArchive*`, while `tokio` adds the corresponding
 `TokioArchive*`, `TokioSeekArchive*`, and bounded `TokioExtractor` adapters.
 `Pipeline` is the direct caller-driven API and incrementally composes up to the
-configured number of gzip, zstd, xz, and lz4 layers.
+configured number of gzip, bzip2, zstd, xz, and lz4 layers.
 
 ## Codec backends
 

@@ -53,6 +53,12 @@ fn gzip_bytes(plain: &[u8]) -> Vec<u8> {
 fn filter_bytes(plain: &[u8], filter: FilterId) -> Vec<u8> {
     match filter {
         FilterId::Gzip => gzip_bytes(plain),
+        FilterId::Bzip2 => {
+            let mut writer =
+                bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            writer.write_all(plain).unwrap();
+            writer.finish().unwrap()
+        },
         FilterId::Zstd => zstd_codec::stream::encode_all(Cursor::new(plain), 3).unwrap(),
         FilterId::Xz => {
             let mut writer =
@@ -71,7 +77,11 @@ fn filter_bytes(plain: &[u8], filter: FilterId) -> Vec<u8> {
 }
 
 fn collect(input: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut reader = ArchiveReader::new(Cursor::new(input));
+    collect_with_limits(input, Limits::default())
+}
+
+fn collect_with_limits(input: Vec<u8>, limits: Limits) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut reader = ArchiveReader::with_limits(Cursor::new(input), limits);
     let mut entries = Vec::new();
     let mut current: Option<(Vec<u8>, Vec<u8>)> = None;
     loop {
@@ -204,7 +214,12 @@ fn nested_filter_depth_is_bounded_and_composes_statically() {
         (b"dir/b.txt".to_vec(), b"bravo".to_vec()),
     ];
     let mut nested = tar_bytes();
-    for filter in [FilterId::Gzip, FilterId::Zstd, FilterId::Xz, FilterId::Lz4] {
+    for filter in [
+        FilterId::Gzip,
+        FilterId::Bzip2,
+        FilterId::Zstd,
+        FilterId::Xz,
+    ] {
         nested = filter_bytes(&nested, filter);
     }
     assert_eq!(collect(nested.clone()), expected);
@@ -235,23 +250,35 @@ fn caller_driven_pipeline_composes_every_codec_at_one_byte_boundaries() {
         (b"dir/b.txt".to_vec(), b"bravo".to_vec()),
     ];
     let mut nested = tar_bytes();
-    for filter in [FilterId::Gzip, FilterId::Zstd, FilterId::Xz, FilterId::Lz4] {
+    for filter in [
+        FilterId::Gzip,
+        FilterId::Bzip2,
+        FilterId::Zstd,
+        FilterId::Xz,
+        FilterId::Lz4,
+    ] {
         nested = filter_bytes(&nested, filter);
     }
     assert_eq!(
-        collect_pipeline(&nested, Limits::default()).unwrap(),
+        collect_pipeline(&nested, Limits::default().with_filter_depth(Some(5))).unwrap(),
         expected
     );
 
     let error =
-        collect_pipeline(&nested, Limits::default().with_filter_depth(Some(3))).unwrap_err();
+        collect_pipeline(&nested, Limits::default().with_filter_depth(Some(4))).unwrap_err();
     assert_eq!(error.kind(), libarchive_oxide_core::ErrorKind::Limit);
 }
 
 #[test]
 fn caller_driven_pipeline_validates_concatenated_members_and_trailing_data() {
     let tar = tar_bytes();
-    for filter in [FilterId::Gzip, FilterId::Zstd, FilterId::Xz, FilterId::Lz4] {
+    for filter in [
+        FilterId::Gzip,
+        FilterId::Bzip2,
+        FilterId::Zstd,
+        FilterId::Xz,
+        FilterId::Lz4,
+    ] {
         let split = tar.len() / 2;
         let mut members = filter_bytes(&tar[..split], filter);
         if filter == FilterId::Xz {
@@ -274,6 +301,28 @@ fn caller_driven_pipeline_validates_concatenated_members_and_trailing_data() {
             "{filter:?}"
         );
     }
+}
+
+#[test]
+fn caller_driven_pipeline_rejects_bzip2_crc_failure_and_truncation() {
+    let tar = tar_bytes();
+    let mut corrupt = filter_bytes(&tar, FilterId::Bzip2);
+    *corrupt.last_mut().unwrap() ^= 0x80;
+    assert_eq!(
+        collect_pipeline(&corrupt, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+
+    let mut truncated = filter_bytes(&tar, FilterId::Bzip2);
+    truncated.truncate(truncated.len() - 3);
+    assert_eq!(
+        collect_pipeline(&truncated, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
 }
 
 #[test]

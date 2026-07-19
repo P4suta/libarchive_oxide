@@ -9,9 +9,9 @@ Safe-Rust archive detection, compression, extraction, and creation over
 [`libarchive_oxide-core`](https://crates.io/crates/libarchive_oxide-core).
 
 The crate supports tar, cpio, ar, ZIP/ZIP64, optional single-folder 7z, and
-ISO 9660 with format-specific limits. Outer filters are gzip, zstd, xz, and
-LZ4 frame. The crate forbids unsafe code, but some codec dependencies currently
-select native C backends. See the repository's
+ISO 9660 with format-specific limits. Outer filters are gzip, bzip2, zstd, xz,
+and LZ4 frame. The crate forbids unsafe code, but some codec dependencies
+currently select native C backends. See the repository's
 [support matrix](https://github.com/P4suta/libarchive_oxide/blob/main/docs/support-matrix.md)
 for method- and metadata-level details.
 
@@ -67,6 +67,7 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 | Feature | Default | Effect |
 |---|:---:|---|
 | `gzip` | yes | gzip |
+| `bzip2` | yes | bzip2 through the Rust `libbz2-rs-sys` backend |
 | `zstd` | yes | zstd |
 | `xz` | yes | xz / LZMA2 |
 | `lz4` | yes | lz4 frame |
@@ -77,9 +78,11 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 
 `--no-default-features` retains uncompressed formats and zip store mode.
 
-The current default feature graph is not yet guaranteed C/FFI-free: zstd
-encoding uses a native backend, and async all-features builds may enable other
-native codec backends. A dependency-verified portable profile is roadmap work.
+The sync-only and async/Tokio bzip2 dependency graphs are CI-checked to require
+`libbz2-rs-sys` and exclude native `bzip2-sys`. The complete default feature
+graph is not yet guaranteed C/FFI-free: zstd encoding uses a native backend,
+and async all-features builds may enable other native codec backends. A
+dependency-verified portable profile is roadmap work.
 
 Sequential, seek, futures-io, and Tokio adapters all drive the same archive
 state machines. Seek variants are named `SeekArchive*`, `AsyncSeekArchive*`,

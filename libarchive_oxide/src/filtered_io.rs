@@ -33,6 +33,9 @@ enum FilterReaderInner<R: Read> {
     Plain(BufReader<PrefixReader<R>>),
     /// gzip members decoded by the common sans-I/O codec.
     Gzip(Box<GzipRead<BufReader<PrefixReader<R>>>>),
+    /// Concatenated bzip2 streams.
+    #[cfg(feature = "bzip2")]
+    Bzip2(Box<bzip2::read::MultiBzDecoder<BufReader<PrefixReader<R>>>>),
     /// Zstandard frame.
     #[cfg(feature = "zstd")]
     Zstd(Box<ZstdRead<BufReader<PrefixReader<R>>>>),
@@ -74,6 +77,19 @@ impl<R: Read> FilterReader<R> {
                 decoded: 0,
                 decoded_limit: limits.decoded_total(),
             });
+        }
+        if available.starts_with(b"BZh") {
+            #[cfg(feature = "bzip2")]
+            return Ok(Self {
+                inner: FilterReaderInner::Bzip2(Box::new(bzip2::read::MultiBzDecoder::new(input))),
+                decoded: 0,
+                decoded_limit: limits.decoded_total(),
+            });
+            #[cfg(not(feature = "bzip2"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bzip2 filter is not enabled",
+            ));
         }
         if available.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
             #[cfg(feature = "zstd")]
@@ -136,6 +152,8 @@ impl<R: Read> FilterReader<R> {
         match self.inner {
             FilterReaderInner::Plain(input) => input.into_inner().input,
             FilterReaderInner::Gzip(input) => input.input.into_inner().input,
+            #[cfg(feature = "bzip2")]
+            FilterReaderInner::Bzip2(input) => input.into_inner().into_inner().input,
             #[cfg(feature = "zstd")]
             FilterReaderInner::Zstd(input) => input.into_inner().into_inner().input,
             #[cfg(feature = "xz")]
@@ -602,6 +620,17 @@ fn read_inner<R: Read>(input: &mut FilterReaderInner<R>, output: &mut [u8]) -> i
     match input {
         FilterReaderInner::Plain(input) => input.read(output),
         FilterReaderInner::Gzip(input) => input.read(output),
+        #[cfg(feature = "bzip2")]
+        FilterReaderInner::Bzip2(input) => input.read(output).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::UnexpectedEof
+            ) {
+                io::Error::new(io::ErrorKind::InvalidData, error)
+            } else {
+                error
+            }
+        }),
         #[cfg(feature = "zstd")]
         FilterReaderInner::Zstd(input) => input.read(output),
         #[cfg(feature = "xz")]
@@ -616,6 +645,8 @@ impl<R: Read> fmt::Debug for FilterReader<R> {
         let filter = match self.inner {
             FilterReaderInner::Plain(_) => "plain",
             FilterReaderInner::Gzip(_) => "gzip",
+            #[cfg(feature = "bzip2")]
+            FilterReaderInner::Bzip2(_) => "bzip2",
             #[cfg(feature = "zstd")]
             FilterReaderInner::Zstd(_) => "zstd",
             #[cfg(feature = "xz")]
@@ -871,6 +902,11 @@ pub(crate) enum SyncFilterWriter<W: Write> {
         writer: Box<GzipFilterWrite<SharedOutput<W>>>,
         output: SharedOutput<W>,
     },
+    #[cfg(feature = "bzip2")]
+    Bzip2 {
+        writer: Box<bzip2::write::BzEncoder<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
     #[cfg(feature = "zstd")]
     Zstd {
         writer: Box<zstd_codec::stream::write::Encoder<'static, SharedOutput<W>>>,
@@ -903,6 +939,14 @@ impl<W: Write> SyncFilterWriter<W> {
             None => Ok(Self::Plain(shared)),
             Some(FilterId::Gzip) => Ok(Self::Gzip {
                 writer: Box::new(GzipFilterWrite::new(shared.clone(), limits)),
+                output: shared,
+            }),
+            #[cfg(feature = "bzip2")]
+            Some(FilterId::Bzip2) => Ok(Self::Bzip2 {
+                writer: Box::new(bzip2::write::BzEncoder::new(
+                    shared.clone(),
+                    bzip2::Compression::default(),
+                )),
                 output: shared,
             }),
             #[cfg(feature = "zstd")]
@@ -952,6 +996,11 @@ impl<W: Write> SyncFilterWriter<W> {
                 drop((*writer).finish()?);
                 output.take()
             },
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2 { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
             #[cfg(feature = "zstd")]
             Self::Zstd { writer, output } => {
                 drop((*writer).finish()?);
@@ -974,6 +1023,11 @@ impl<W: Write> SyncFilterWriter<W> {
         match self {
             Self::Plain(output) => output.take(),
             Self::Gzip { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2 { writer, output } => {
                 drop(writer);
                 output.take()
             },
@@ -1001,6 +1055,8 @@ impl<W: Write> Write for SyncFilterWriter<W> {
         match self {
             Self::Plain(output) => output.write(bytes),
             Self::Gzip { writer, .. } => writer.write(bytes),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2 { writer, .. } => writer.write(bytes),
             #[cfg(feature = "zstd")]
             Self::Zstd { writer, .. } => writer.write(bytes),
             #[cfg(feature = "xz")]
@@ -1014,6 +1070,8 @@ impl<W: Write> Write for SyncFilterWriter<W> {
         match self {
             Self::Plain(output) => output.flush(),
             Self::Gzip { writer, .. } => writer.flush(),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2 { writer, .. } => writer.flush(),
             #[cfg(feature = "zstd")]
             Self::Zstd { writer, .. } => writer.flush(),
             #[cfg(feature = "xz")]
@@ -1029,6 +1087,8 @@ impl<W: Write> fmt::Debug for SyncFilterWriter<W> {
         let filter = match self {
             Self::Plain(_) => "plain",
             Self::Gzip { .. } => "gzip",
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2 { .. } => "bzip2",
             #[cfg(feature = "zstd")]
             Self::Zstd { .. } => "zstd",
             #[cfg(feature = "xz")]

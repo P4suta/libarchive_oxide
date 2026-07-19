@@ -43,10 +43,12 @@ fn run() -> Result {
         Some("license-sync") => check_license_sync(&root),
         Some("package-licenses") => check_package_licenses(&root),
         Some("package-smoke") => check_package_smoke(&root),
+        Some("codec-policy") => check_codec_policy(&root),
         Some("release-policy") => check_release_policy(&root),
         Some(command) => Err(format!("unknown command {command:?}").into()),
         None => Err(
-            "expected one of: no-dyn, license-sync, package-licenses, package-smoke, release-policy"
+            "expected one of: no-dyn, license-sync, package-licenses, package-smoke, \
+             codec-policy, release-policy"
                 .into(),
         ),
     }
@@ -310,6 +312,50 @@ fn workspace_version(root: &Path) -> Result<String> {
         }
     }
     Err("workspace.package version is missing".into())
+}
+
+fn check_codec_policy(root: &Path) -> Result {
+    for features in ["bzip2", "bzip2,async,tokio"] {
+        let output = Command::new(cargo())
+            .current_dir(root)
+            .args([
+                "tree",
+                "-p",
+                "libarchive_oxide",
+                "--no-default-features",
+                "--features",
+                features,
+                "--edges",
+                "normal",
+                "--prefix",
+                "none",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "cargo tree failed for bzip2 profile {features:?}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let tree = String::from_utf8(output.stdout)?;
+        let package_names: Vec<&str> = tree
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        if !package_names.contains(&"libbz2-rs-sys") {
+            return Err(
+                format!("bzip2 profile {features:?} does not select the Rust backend").into(),
+            );
+        }
+        if package_names.contains(&"bzip2-sys") {
+            return Err(format!("bzip2 profile {features:?} selected native bzip2-sys").into());
+        }
+    }
+    println!(
+        "sync and async bzip2 dependency graphs use libbz2-rs-sys and exclude native bzip2-sys"
+    );
+    Ok(())
 }
 
 fn check_release_policy(root: &Path) -> Result {
