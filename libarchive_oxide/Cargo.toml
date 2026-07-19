@@ -25,9 +25,15 @@ all-features = true
 rustdoc-args = ["--generate-link-to-definition"]
 
 [features]
-default = ["gzip", "zstd", "xz", "lz4"]
+default = ["gzip", "bzip2", "zstd", "xz", "lz4"]
 # Compression codecs.
 gzip = []
+bzip2 = [
+    "dep:bzip2",
+    "dep:compression-codecs",
+    "compression-codecs/bzip2",
+    "async-compression?/bzip2",
+]
 zstd = [
     "dep:ruzstd",
     "dep:zstd-codec",
@@ -69,6 +75,7 @@ ruzstd = { version = "0.8.2", optional = true }
 zstd-codec = { package = "zstd", version = "0.13.3", optional = true }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"], optional = true }
 compression-codecs = { version = "0.4.38", default-features = false, optional = true }
+bzip2 = { version = "0.6.1", optional = true }
 # Shared by xz and 7z.
 lzma-rust2 = { version = "0.16.5", optional = true }
 # WinZip AE-2 requires SHA-1.

@@ -102,6 +102,9 @@ impl ProviderSet {
         if matches!(filter, FilterId::Gzip) {
             return true;
         }
+        if matches!(filter, FilterId::Bzip2) {
+            return cfg!(feature = "bzip2");
+        }
         if matches!(filter, FilterId::Zstd) {
             return cfg!(feature = "zstd");
         }

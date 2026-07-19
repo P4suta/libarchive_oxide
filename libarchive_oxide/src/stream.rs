@@ -882,6 +882,7 @@ impl Pipeline {
 const fn filter_name(filter: FilterId) -> &'static str {
     match filter {
         FilterId::Gzip => "gzip",
+        FilterId::Bzip2 => "bzip2",
         FilterId::Zstd => "zstd",
         FilterId::Xz => "xz",
         FilterId::Lz4 => "lz4",

@@ -8,10 +8,10 @@
 //! - `-c`, `-x`, `-t`;
 //! - `-f FILE`, `-C DIR`;
 //! - `-v` verbose.
-//! - `-z`, `--gzip`, `-J`, `--xz`, `--zstd`, `--lz4`;
+//! - `-z`, `--gzip`, `-j`, `--bzip2`, `-J`, `--xz`, `--zstd`, `--lz4`;
 //! - `--format`, member operands, `--help`, `--version`.
 //!
-//! `-j`, `--bzip2`, `-r`, and `-u` are unsupported. Extraction rejects path
+//! `-r` and `-u` are unsupported. Extraction rejects path
 //! traversal. Decompression uses the crate-level limit.
 
 use std::io::Write;
@@ -157,14 +157,10 @@ fn parse_long(
         "help" => return Ok(Some(Parsed::Help)),
         "version" => return Ok(Some(Parsed::Version)),
         "gzip" | "gunzip" => opts.filter = Some(FilterId::Gzip),
+        "bzip2" | "bunzip2" => opts.filter = Some(FilterId::Bzip2),
         "xz" => opts.filter = Some(FilterId::Xz),
         "zstd" => opts.filter = Some(FilterId::Zstd),
         "lz4" => opts.filter = Some(FilterId::Lz4),
-        "bzip2" | "bunzip2" => {
-            return Err(CliError::unsupported(
-                "--bzip2: bzip2 was removed from libarchive_oxide; use --gzip/--xz/--zstd/--lz4",
-            ));
-        },
         "format" => {
             let value = match inline {
                 Some(v) => v,
@@ -198,12 +194,8 @@ fn apply_bool_flag(c: char, opts: &mut TarOpts) -> Result<(), CliError> {
         't' => set_mode(opts, Mode::List)?,
         'v' => opts.verbose = true,
         'z' => opts.filter = Some(FilterId::Gzip),
+        'j' => opts.filter = Some(FilterId::Bzip2),
         'J' => opts.filter = Some(FilterId::Xz),
-        'j' => {
-            return Err(CliError::unsupported(
-                "-j (bzip2): bzip2 was removed from libarchive_oxide; use -z/-J/--zstd/--lz4",
-            ));
-        },
         'r' => {
             return Err(CliError::unsupported(
                 "-r (append): rewriting an existing archive is out of scope; use -c",
@@ -361,7 +353,7 @@ const HELP: &str = "\
 oxtar: bsdtar-compatible archive tool
 
 USAGE:
-    oxtar -c [-z|-J|--zstd|--lz4] [--format FMT] [-C DIR] [-v] -f ARCHIVE PATH...
+    oxtar -c [-z|-j|-J|--zstd|--lz4] [--format FMT] [-C DIR] [-v] -f ARCHIVE PATH...
     oxtar -x [-C DIR] [-v] -f ARCHIVE [MEMBER...]
     oxtar -t -f ARCHIVE [MEMBER...]
 
@@ -375,16 +367,16 @@ OPTIONS:
     -C DIR        Change to DIR (create: before reading paths; extract: destination).
     -v            Verbose.
     -z, --gzip    Create-time gzip compression.
+    -j, --bzip2   Create-time bzip2 compression.
     -J, --xz      Create-time xz compression.
         --zstd    Create-time zstd compression.
         --lz4     Create-time lz4 compression.
         --format FMT   Create format: tar|ustar|gnutar (ustar) or cpio (newc). Default: tar.
         --help, --version
 
-Reads auto-detect compression (gzip/zstd/xz/lz4) and format (tar/cpio/ar/zip/7z/iso).
+Reads auto-detect compression (gzip/bzip2/zstd/xz/lz4) and format (tar/cpio/ar/zip/7z/iso).
 
 UNSUPPORTED (exit 2):
-    -j, --bzip2   bzip2 was removed from the library; recompress with -z/-J/--zstd/--lz4.
     -r, -u        append/update; rewriting an existing archive is out of scope (use -c).
 
 SAFE DEFAULTS:

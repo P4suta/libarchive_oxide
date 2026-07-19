@@ -141,14 +141,21 @@ fn oxcat_decompresses_to_stdout() {
         &["-c", "-z", "-f", "gz.tgz", "-C", "src", "."],
         dir.path(),
     );
+    run_in(
+        "oxtar",
+        &["-c", "-j", "-f", "bz.tbz2", "-C", "src", "."],
+        dir.path(),
+    );
 
     let plain = std::fs::read(dir.join("plain.tar")).unwrap();
-    let out = run_in("oxcat", &["gz.tgz"], dir.path());
-    assert_eq!(code(&out), 0, "{out:?}");
-    assert_eq!(
-        out.stdout, plain,
-        "oxcat output equals the uncompressed tar"
-    );
+    for archive in ["gz.tgz", "bz.tbz2"] {
+        let out = run_in("oxcat", &[archive], dir.path());
+        assert_eq!(code(&out), 0, "{archive}: {out:?}");
+        assert_eq!(
+            out.stdout, plain,
+            "oxcat output equals the uncompressed tar for {archive}"
+        );
+    }
 }
 
 /// Builds a small zip with the library's writer and returns its bytes (entries `a.txt`, `data/b.txt`).

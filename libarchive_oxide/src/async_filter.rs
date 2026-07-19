@@ -188,6 +188,8 @@ enum ReaderInner<R> {
     },
     Plain(FilterInput<R>),
     Gzip(GzipDecoder<FilterInput<R>>),
+    #[cfg(feature = "bzip2")]
+    Bzip2(async_compression::futures::bufread::BzDecoder<FilterInput<R>>),
     #[cfg(feature = "zstd")]
     Zstd(async_compression::futures::bufread::ZstdDecoder<FilterInput<R>>),
     #[cfg(feature = "xz")]
@@ -208,6 +210,7 @@ pub(crate) struct AsyncFilterReader<R> {
     inner: ReaderInner<R>,
     decoded: u64,
     decoded_limit: Option<u64>,
+    #[cfg(feature = "xz")]
     codec_memory: Option<u64>,
 }
 
@@ -222,6 +225,7 @@ impl<R> AsyncFilterReader<R> {
             },
             decoded: 0,
             decoded_limit: limits.decoded_total(),
+            #[cfg(feature = "xz")]
             codec_memory: limits
                 .codec_memory()
                 .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX)),
@@ -236,6 +240,8 @@ impl<R> AsyncFilterReader<R> {
             },
             ReaderInner::Plain(input) => input.into_inner().into_inner(),
             ReaderInner::Gzip(input) => input.into_inner().into_inner().into_inner(),
+            #[cfg(feature = "bzip2")]
+            ReaderInner::Bzip2(input) => input.into_inner().into_inner().into_inner(),
             #[cfg(feature = "zstd")]
             ReaderInner::Zstd(input) => input.into_inner().into_inner().into_inner(),
             #[cfg(feature = "xz")]
@@ -248,6 +254,7 @@ impl<R> AsyncFilterReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
+    #[allow(clippy::too_many_lines)] // One ownership-preserving dispatch over all built-in codecs.
     fn poll_detect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let ReaderInner::Detecting {
             input,
@@ -290,6 +297,22 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
             let mut decoder = GzipDecoder::new(buffered);
             decoder.multiple_members(true);
             self.inner = ReaderInner::Gzip(decoder);
+        } else if available.starts_with(b"BZh") {
+            #[cfg(feature = "bzip2")]
+            {
+                buffered.input.wrap_source_errors = true;
+                let mut decoder = async_compression::futures::bufread::BzDecoder::new(buffered);
+                decoder.multiple_members(true);
+                self.inner = ReaderInner::Bzip2(decoder);
+            }
+            #[cfg(not(feature = "bzip2"))]
+            {
+                self.inner = ReaderInner::Failed(Some(buffered.into_inner().into_inner()));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "bzip2 filter is not enabled",
+                )));
+            }
         } else if available.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
             #[cfg(feature = "zstd")]
             {
@@ -362,6 +385,10 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
                 ReaderInner::Gzip(input) => {
                     (codec_poll(Pin::new(input).poll_read(cx, output)), true)
                 },
+                #[cfg(feature = "bzip2")]
+                ReaderInner::Bzip2(input) => {
+                    (codec_poll(Pin::new(input).poll_read(cx, output)), true)
+                },
                 #[cfg(feature = "zstd")]
                 ReaderInner::Zstd(input) => {
                     (codec_poll(Pin::new(input).poll_read(cx, output)), true)
@@ -405,6 +432,8 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
                 let previous = core::mem::replace(&mut self.inner, ReaderInner::Failed(None));
                 let (input, filter) = match previous {
                     ReaderInner::Gzip(input) => (input.into_inner(), FilterId::Gzip),
+                    #[cfg(feature = "bzip2")]
+                    ReaderInner::Bzip2(input) => (input.into_inner(), FilterId::Bzip2),
                     #[cfg(feature = "zstd")]
                     ReaderInner::Zstd(input) => (input.into_inner(), FilterId::Zstd),
                     #[cfg(feature = "xz")]
@@ -475,6 +504,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for AsyncFilterReader<R> {
 pub(crate) enum AsyncFilterWriter<W> {
     Plain(W),
     Gzip(GzipEncoder<W>),
+    #[cfg(feature = "bzip2")]
+    Bzip2(async_compression::futures::write::BzEncoder<W>),
     #[cfg(feature = "zstd")]
     Zstd(async_compression::futures::write::ZstdEncoder<W>),
     #[cfg(feature = "xz")]
@@ -494,6 +525,10 @@ impl<W> AsyncFilterWriter<W> {
         let writer = match filter {
             None => Self::Plain(output),
             Some(FilterId::Gzip) => Self::Gzip(GzipEncoder::new(output)),
+            #[cfg(feature = "bzip2")]
+            Some(FilterId::Bzip2) => {
+                Self::Bzip2(async_compression::futures::write::BzEncoder::new(output))
+            },
             #[cfg(feature = "zstd")]
             Some(FilterId::Zstd) => {
                 Self::Zstd(async_compression::futures::write::ZstdEncoder::new(output))
@@ -520,6 +555,8 @@ impl<W> AsyncFilterWriter<W> {
         match self {
             Self::Plain(output) => output,
             Self::Gzip(output) => output.into_inner(),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(output) => output.into_inner(),
             #[cfg(feature = "zstd")]
             Self::Zstd(output) => output.into_inner(),
             #[cfg(feature = "xz")]
@@ -535,6 +572,8 @@ impl<W: AsyncWrite + Unpin> AsyncFilterWriter<W> {
         match self {
             Self::Plain(output) => Pin::new(output).poll_flush(cx),
             Self::Gzip(output) => Pin::new(output).poll_close(cx),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(output) => Pin::new(output).poll_close(cx),
             #[cfg(feature = "zstd")]
             Self::Zstd(output) => Pin::new(output).poll_close(cx),
             #[cfg(feature = "xz")]
@@ -554,6 +593,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for AsyncFilterWriter<W> {
         match self.get_mut() {
             Self::Plain(output) => Pin::new(output).poll_write(cx, bytes),
             Self::Gzip(output) => Pin::new(output).poll_write(cx, bytes),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(output) => Pin::new(output).poll_write(cx, bytes),
             #[cfg(feature = "zstd")]
             Self::Zstd(output) => Pin::new(output).poll_write(cx, bytes),
             #[cfg(feature = "xz")]
@@ -567,6 +608,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for AsyncFilterWriter<W> {
         match self.get_mut() {
             Self::Plain(output) => Pin::new(output).poll_flush(cx),
             Self::Gzip(output) => Pin::new(output).poll_flush(cx),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(output) => Pin::new(output).poll_flush(cx),
             #[cfg(feature = "zstd")]
             Self::Zstd(output) => Pin::new(output).poll_flush(cx),
             #[cfg(feature = "xz")]

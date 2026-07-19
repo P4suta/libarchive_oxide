@@ -22,7 +22,7 @@ cargo install libarchive_oxide-cli --locked
 | Tool | Supported |
 |---|---|
 | `oxarchive` | `--json`, `inspect`, `plan`, `apply`, `verify`, `--overwrite`, `--allow-symlinks`, `--allow-hardlinks`, `--allow-special-files` |
-| `oxtar` | `-c`, `-x`, `-t`, `-f FILE`, `-C DIR`, `-v`, `-z`, `--gzip`, `-J`, `--xz`, `--zstd`, `--lz4`, `--format`, members, bundled short flags |
+| `oxtar` | `-c`, `-x`, `-t`, `-f FILE`, `-C DIR`, `-v`, `-z`, `--gzip`, `-j`, `--bzip2`, `-J`, `--xz`, `--zstd`, `--lz4`, `--format`, members, bundled short flags |
 | `oxcpio` | `-o`, `-i`, `-t`, `-F FILE`, `-v`, `-d`, members |
 | `oxcat` | files, `-`, `--help`, `--version` |
 | `oxunzip` | `-l`, `-d DIR`, `-o`, `-P PASSWORD`, members |
@@ -51,7 +51,7 @@ silently accepted today.
 
 Unsupported flags return exit code 2. This includes:
 
-- `oxtar -j`, `--bzip2`, `-r`, and `-u`;
+- `oxtar -r` and `-u`;
 - `oxcpio -p` and `-C`;
 - `oxunzip -n` and `-x`.
 

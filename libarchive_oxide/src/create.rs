@@ -73,6 +73,8 @@ impl From<ArchiveError> for CreateStreamError {
 enum FilteredOutput<W: Write> {
     Plain(W),
     Gzip(Box<GzipWrite<W>>),
+    #[cfg(feature = "bzip2")]
+    Bzip2(Box<bzip2::write::BzEncoder<W>>),
     #[cfg(feature = "zstd")]
     Zstd(Box<zstd_codec::stream::write::Encoder<'static, W>>),
     #[cfg(feature = "xz")]
@@ -86,6 +88,11 @@ impl<W: Write> FilteredOutput<W> {
         match filter {
             None => Ok(Self::Plain(output)),
             Some(FilterId::Gzip) => Ok(Self::Gzip(Box::new(GzipWrite::new(output, limits)))),
+            #[cfg(feature = "bzip2")]
+            Some(FilterId::Bzip2) => Ok(Self::Bzip2(Box::new(bzip2::write::BzEncoder::new(
+                output,
+                bzip2::Compression::default(),
+            )))),
             #[cfg(feature = "zstd")]
             Some(FilterId::Zstd) => zstd_codec::stream::write::Encoder::new(output, 3)
                 .map(Box::new)
@@ -113,6 +120,8 @@ impl<W: Write> FilteredOutput<W> {
         match self {
             Self::Plain(output) => Ok(output),
             Self::Gzip(output) => (*output).finish(),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(output) => (*output).finish(),
             #[cfg(feature = "zstd")]
             Self::Zstd(output) => (*output).finish(),
             #[cfg(feature = "xz")]
@@ -130,6 +139,8 @@ impl<W: Write> Write for FilteredOutput<W> {
         match self {
             Self::Plain(output) => output.write(buffer),
             Self::Gzip(output) => output.write(buffer),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(output) => output.write(buffer),
             #[cfg(feature = "zstd")]
             Self::Zstd(output) => output.write(buffer),
             #[cfg(feature = "xz")]
@@ -143,6 +154,8 @@ impl<W: Write> Write for FilteredOutput<W> {
         match self {
             Self::Plain(output) => output.flush(),
             Self::Gzip(output) => output.flush(),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(output) => output.flush(),
             #[cfg(feature = "zstd")]
             Self::Zstd(output) => output.flush(),
             #[cfg(feature = "xz")]

@@ -373,6 +373,17 @@ fn format_and_filter_probes_share_the_incremental_contract() {
         FilterId::probe(&[0x1f, 0x8b]),
         ProbeResult::Match(FilterId::Gzip)
     );
+    for prefix in [b"B".as_slice(), b"BZ", b"BZh"] {
+        assert!(matches!(
+            FilterId::probe(prefix),
+            ProbeResult::NeedMore { minimum: 4 }
+        ));
+    }
+    assert_eq!(
+        FilterId::probe(b"BZh9"),
+        ProbeResult::Match(FilterId::Bzip2)
+    );
+    assert_eq!(FilterId::probe(b"BZh0"), ProbeResult::NoMatch);
     assert!(matches!(
         FormatId::probe(b"PK"),
         ProbeResult::NeedMore { minimum: 4 }
