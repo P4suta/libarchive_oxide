@@ -12,14 +12,14 @@ use crate::ProbeResult;
 pub enum FilterId {
     /// DEFLATE with gzip framing.
     Gzip,
-    /// Bzip2 stream.
-    Bzip2,
     /// Zstandard.
     Zstd,
     /// XZ / LZMA2.
     Xz,
     /// LZ4 frame.
     Lz4,
+    /// Bzip2 stream.
+    Bzip2,
 }
 
 impl FilterId {
