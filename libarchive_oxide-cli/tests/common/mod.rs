@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Absolute path to a built `ox*` binary (`oxtar`/`oxcpio`/`oxcat`/`oxunzip`).
+/// Absolute path to a built `ox*` binary.
 #[must_use]
 pub(crate) fn bin(name: &str) -> PathBuf {
     // Cargo exposes each bin's path to its own package's integration tests.
     let var = match name {
+        "oxarchive" => env!("CARGO_BIN_EXE_oxarchive"),
         "oxtar" => env!("CARGO_BIN_EXE_oxtar"),
         "oxcpio" => env!("CARGO_BIN_EXE_oxcpio"),
         "oxcat" => env!("CARGO_BIN_EXE_oxcat"),

@@ -54,7 +54,17 @@ CLI tools:
 
 ```sh
 cargo install libarchive_oxide-cli --locked
+
+# Unified safe workflow
+oxarchive inspect artifact.tar.zst
+oxarchive plan --json artifact.zip
+oxarchive apply artifact.tar.gz destination
+oxarchive verify artifact.7z
 ```
+
+`oxarchive` uses the high-level session engine. Its JSON plan is an advisory
+report and is deliberately not accepted back by `apply`; application always
+plans and applies the same immutable input snapshot in one process.
 
 ## High-level engine
 

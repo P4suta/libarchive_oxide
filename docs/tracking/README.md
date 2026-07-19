@@ -35,11 +35,12 @@ Detailed bodies used for initial issue creation live in
 [`issue-bodies`](issue-bodies/). New work should use the
 “Modern Replacement work item” Issue Form and cite its parent stable ID.
 
-## Active implementation units
+## Implementation units
 
-| ID | Parent | Outcome |
-|---|---|---|
-| [RM-101](https://github.com/P4suta/libarchive_oxide/issues/30) | RM-100 | Session-bound inspect, plan, apply, and create engine |
+| ID | Parent | State | Outcome |
+|---|---|---|---|
+| [RM-101](https://github.com/P4suta/libarchive_oxide/issues/30) | RM-100 | completed by [#31](https://github.com/P4suta/libarchive_oxide/pull/31) | Session-bound inspect, plan, apply, and create engine |
+| [RM-121](https://github.com/P4suta/libarchive_oxide/issues/32) | RM-120 | in progress | `oxarchive` inspect, plan, apply, and verify |
 
 ## Labels
 

@@ -11,6 +11,7 @@ cargo install libarchive_oxide-cli --locked
 
 | Tool | Compatible interface | Function |
 |---|---|---|
+| `oxarchive` | native high-level interface | inspect, plan, apply, verify |
 | `oxtar` | supported `bsdtar` flags | create, list, extract |
 | `oxcpio` | supported `bsdcpio` flags | create, list, extract |
 | `oxcat` | supported `bsdcat` flags | decompress to standard output |
@@ -20,10 +21,33 @@ cargo install libarchive_oxide-cli --locked
 
 | Tool | Supported |
 |---|---|
+| `oxarchive` | `--json`, `inspect`, `plan`, `apply`, `verify`, `--overwrite`, `--allow-symlinks`, `--allow-hardlinks`, `--allow-special-files` |
 | `oxtar` | `-c`, `-x`, `-t`, `-f FILE`, `-C DIR`, `-v`, `-z`, `--gzip`, `-J`, `--xz`, `--zstd`, `--lz4`, `--format`, members, bundled short flags |
 | `oxcpio` | `-o`, `-i`, `-t`, `-F FILE`, `-v`, `-d`, members |
 | `oxcat` | files, `-`, `--help`, `--version` |
 | `oxunzip` | `-l`, `-d DIR`, `-o`, `-P PASSWORD`, members |
+
+### Unified workflow
+
+```sh
+oxarchive inspect package.tar.zst
+oxarchive plan --json untrusted.zip
+oxarchive apply untrusted.zip destination
+oxarchive verify image.iso
+```
+
+`ARCHIVE` may be `-` for standard input. `apply` defaults to the conservative
+policy; restoration capabilities must be enabled explicitly with the policy
+flags above.
+
+Machine output carries schema version `oxarchive.output.v0alpha1`. That schema
+is pre-1.0 and versioned separately from the Rust and CLI APIs. Plan JSON is an
+advisory report, not a durable plan: `apply` never accepts it and instead opens,
+plans, and applies one immutable snapshot in the same process.
+
+`create` will be added after deterministic creation choices are specified.
+The `oci` command remains gated on the OCI layer engine; neither command is
+silently accepted today.
 
 Unsupported flags return exit code 2. This includes:
 

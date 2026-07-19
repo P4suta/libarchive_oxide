@@ -5,7 +5,7 @@
 [package]
 name = "libarchive_oxide-cli"
 version.workspace = true
-description = "Archive CLI tools: oxtar, oxcpio, oxcat, and oxunzip"
+description = "Archive CLI tools: oxarchive, oxtar, oxcpio, oxcat, and oxunzip"
 edition.workspace = true
 # MSRV inherited from codec dependencies.
 rust-version = "1.87"
@@ -15,13 +15,17 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/libarchive_oxide-cli"
-keywords = ["bsdtar", "cpio", "unzip", "archive", "cli"]
+keywords = ["archive", "tar", "zip", "cpio", "cli"]
 categories = ["command-line-utilities"]
 
 [package.metadata.docs.rs]
 all-features = true
 
 # Command-line entry points.
+[[bin]]
+name = "oxarchive"
+path = "src/bin/oxarchive.rs"
+
 [[bin]]
 name = "oxtar"
 path = "src/bin/oxtar.rs"
@@ -43,6 +47,7 @@ path = "src/bin/oxunzip.rs"
 libarchive_oxide = { path = "../libarchive_oxide", version = "0.2.0", features = ["aes", "sevenz"] }
 libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
 cap-std = "4.0.2"
+serde_json = "1.0.149"
 
 [lints]
 workspace = true
