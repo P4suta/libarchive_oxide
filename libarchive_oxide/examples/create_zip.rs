@@ -7,7 +7,7 @@
 //! Run it with `cargo run --example create_zip` (writes to a temp file), or pass a destination path:
 //! `cargo run --example create_zip -- out.zip`. The writer buffers each entry's plaintext, picks
 //! DEFLATE (falling back to store when it would not shrink), and emits the central directory and
-//! end-of-central-directory record at `finish` — the dual of the `ZipReader` read path.
+//! end-of-central-directory record at `finish`.
 
 use std::borrow::Cow;
 use std::path::PathBuf;

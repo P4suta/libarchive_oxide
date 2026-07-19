@@ -2,11 +2,9 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The encode-side dual of [`PullBridge`](super::bridge::PullBridge): buffer plaintext, then
-//! compress it and dole the result out into the caller's output.
+//! Buffered encoder adapter.
 //!
-//! `no_std` (alloc only). Every encoder — the hand-written gzip framer and the adapters over
-//! reused crates — is the same shape modulo one `compress: &[u8] -> Vec<u8>` closure.
+//! Buffers plaintext, compresses once, and drains output. Requires `alloc`.
 
 use alloc::vec::Vec;
 

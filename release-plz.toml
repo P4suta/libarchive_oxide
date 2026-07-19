@@ -2,35 +2,12 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# release-plz configuration — https://release-plz.dev/docs/config
-#
-# release-plz reads Conventional Commits, derives the workspace version bump, maintains the root
-# CHANGELOG, opens the Release PR, and on merge publishes in dependency order, then tags and cuts
-# the single product-level GitHub release. Run by .github/workflows/release.yml.
-#
-# Publish order (release-plz toposorts from the path deps; a manual `cargo publish`
-# sweep must follow the same order):
-#   libarchive_oxide-core -> libarchive_oxide -> libarchive_oxide-cli
-#
-# The fuzz crates are a separate workspace (`exclude = ["fuzz"]` in the root
-# Cargo.toml) and carry `publish = false`, so release-plz never sees them — there is
-# nothing to mark `release = false` here.
+# See docs/adr/0002-workspace-releases.md.
 
 [workspace]
-# One version line for the whole tree (version.workspace = true); do not let
-# release-plz split crates onto independent versions.
 dependencies_update = false
-# Publish only when a Release PR is merged — never directly on a push to main.
-# `release-plz release` then acts solely on the release-PR merge commit, so the
-# version bump and CHANGELOG are reviewed before the irreversible crates.io publish.
-# Without this (the default `true`), the first commit on main would publish the
-# current manifest version at once, skipping that checkpoint.
 release_always = false
-# Gate breaking public-API changes: run cargo-semver-checks before every release.
 semver_check = true
-# The workspace publishes three crates but presents one product release. Package-specific settings
-# below nominate the flagship as the sole owner of the shared vX.Y.Z tag, root changelog, and GitHub
-# release. All three crates are still published in dependency order.
 git_tag_enable = false
 git_release_enable = false
 changelog_update = false

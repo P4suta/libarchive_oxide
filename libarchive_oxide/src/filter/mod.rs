@@ -2,22 +2,12 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `filter` — concrete implementations of compression filters.
-//!
-//! They all sit isomorphically as [`libarchive_oxide_core::Filter`]. Whether it is a hand-written
-//! sans-IO filter (`gzip`) or an adapter wrapping `ruzstd`/`lzma_rust2`/`lz4_flex`, the caller's
-//! type cannot tell them apart (origin-opaque). The seams are sealed inside the adapters.
-//!
-//! # Implementation status
-//!
-//! - P2: `gzip` (adapts `miniz_oxide` into a sans-IO `Transform`).
-//! - P3: `zstd`/`xz`/`lz4` adapters.
+//! Compression filter implementations and runtime dispatch.
 
 #[cfg(feature = "gzip")]
 use alloc::vec::Vec;
 
-// The codec-dispatch enums and registry (`AnyDecoder`/`AnyEncoder`, `decoder`/`encoder`) only exist
-// when at least one codec is compiled in; with no codec feature there is nothing to dispatch.
+// Dispatch is omitted when no codec feature is enabled.
 #[cfg(any(feature = "gzip", feature = "zstd", feature = "xz", feature = "lz4"))]
 use libarchive_oxide_core::filter::FilterId;
 #[cfg(any(feature = "gzip", feature = "zstd", feature = "xz", feature = "lz4"))]
@@ -25,21 +15,14 @@ use libarchive_oxide_core::transform::{Step, Transform};
 #[cfg(any(feature = "gzip", feature = "zstd", feature = "xz", feature = "lz4"))]
 use libarchive_oxide_core::Result;
 
-/// One-shot raw DEFLATE decompression with an output-size cap.
-///
-/// Used by per-entry container formats (e.g. zip) whose uncompressed size is known up front; the
-/// cap defends against a lying size field (decompression bomb).
+/// Decompresses raw DEFLATE with an output limit.
 #[cfg(feature = "gzip")]
 pub fn inflate(compressed: &[u8], max_size: usize) -> libarchive_oxide_core::Result<Vec<u8>> {
     miniz_oxide::inflate::decompress_to_vec_with_limit(compressed, max_size)
         .map_err(|_| libarchive_oxide_core::Error::Malformed("deflate: decode failed"))
 }
 
-/// One-shot raw DEFLATE compression — the dual of [`inflate`].
-///
-/// Used by per-entry container formats (e.g. the zip writer) that buffer an entry's plaintext and
-/// need the compressed bytes plus their final length up front. Level 6 (the `miniz_oxide` default)
-/// balances ratio against speed.
+/// Compresses raw DEFLATE at level 6.
 #[cfg(feature = "gzip")]
 #[must_use]
 pub fn deflate(plain: &[u8]) -> Vec<u8> {
@@ -49,8 +32,7 @@ pub fn deflate(plain: &[u8]) -> Vec<u8> {
 #[cfg(feature = "gzip")]
 pub mod gzip;
 
-/// Shared CRC-32 primitives (IEEE, polynomial `0xEDB88320`), re-exported at the crate root so the
-/// zip and 7z writers reach them without depending on the gzip module path.
+/// IEEE CRC-32 primitives.
 #[cfg(feature = "gzip")]
 pub use gzip::{crc32, Crc32};
 
@@ -61,10 +43,7 @@ mod push;
 #[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 pub mod reused;
 
-/// A decompressor for any codec compiled in — a sealed enum with **zero type erasure**. Every
-/// variant is a concrete [`Transform`]; the `Transform` impl forwards each call by exhaustive
-/// `match`, so the origin (hand-written gzip vs. adapter over a reused crate) never leaks into the
-/// caller's type. Adding a codec is a compiler-checked exhaustiveness obligation, not a trait-object cast.
+/// Decoder selected from enabled codec features.
 #[cfg(any(feature = "gzip", feature = "zstd", feature = "xz", feature = "lz4"))]
 #[derive(Debug)]
 pub enum AnyDecoder {
@@ -111,8 +90,7 @@ impl Transform for AnyDecoder {
     }
 }
 
-/// A compressor for any codec compiled in — the dual of [`AnyDecoder`]. Same sealed-enum,
-/// exhaustive-forwarding shape, no type erasure.
+/// Encoder selected from enabled codec features.
 #[cfg(any(feature = "gzip", feature = "zstd", feature = "xz", feature = "lz4"))]
 #[derive(Debug)]
 pub enum AnyEncoder {
@@ -159,10 +137,7 @@ impl Transform for AnyEncoder {
     }
 }
 
-/// Builds the decoder for the given codec (only for features compiled in).
-///
-/// The single entry point of the filter layer. The format layer obtains an [`AnyDecoder`] and knows
-/// neither the kind of compression nor its origin (hand-written/reused) (orthogonal, origin-opaque).
+/// Returns a decoder when the codec feature is enabled.
 #[cfg(any(feature = "gzip", feature = "zstd", feature = "xz", feature = "lz4"))]
 #[must_use]
 pub fn decoder(id: FilterId) -> Option<AnyDecoder> {
@@ -179,7 +154,7 @@ pub fn decoder(id: FilterId) -> Option<AnyDecoder> {
     }
 }
 
-/// Builds the encoder for the given codec (only for features compiled in). The dual of [`decoder`].
+/// Returns an encoder when the codec feature is enabled.
 #[cfg(any(feature = "gzip", feature = "zstd", feature = "xz", feature = "lz4"))]
 #[must_use]
 pub fn encoder(id: FilterId) -> Option<AnyEncoder> {

@@ -2,20 +2,15 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Entry metadata. A shared type that upholds the read/write duality at the data layer.
+//! Entry metadata shared by readers and writers.
 //!
-//! The same [`EntryMeta`] is **produced** by [`EntryReader`](crate::EntryReader) and
-//! **consumed** by [`EntryWriter`](crate::EntryWriter). This way, read/write symmetry is
-//! guaranteed not only by the traits but also in the shape of the data.
-//!
-//! To stay `no_std`, paths are held as raw byte sequences rather than `std::path` (names
-//! inside an archive are not necessarily in the OS-native encoding to begin with). Wherever
-//! possible we borrow from the input buffer ([`Cow`]) to avoid per-entry allocation (zero-copy).
+//! Paths are raw bytes because archive names may not use the host encoding.
+//! [`Cow`] permits borrowed metadata.
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 
-/// Entry kind. Replaces C's `mode & S_IFMT` with a typed enum.
+/// Entry kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EntryKind {
@@ -113,7 +108,7 @@ impl<'a> PaxMap<'a> {
     }
 }
 
-/// Entry metadata. The core of the duality produced by the reader and consumed by the writer.
+/// Entry metadata used by readers and writers.
 ///
 /// The lifetime `'a` refers to the input buffer (on read) or the caller's borrow (on write),
 /// expressing zero-copy in the type.

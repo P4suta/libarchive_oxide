@@ -2,24 +2,15 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Base layer: the sans-IO byte transform [`Transform`].
+//! Sans-IO byte transform.
 //!
-//! This is the foundation for everything. Compression filters, and (eventually) format
-//! serialization too, all sit on top of this single allocation-free, caller-owned primitive.
-//!
-//! # Why step instead of push/pull
-//!
-//! The original sketch had two methods, `push`/`pull`, but that forces the transformer to hold
-//! an internal output buffer (i.e. an allocation). The more elegant primitive (allocation-free,
-//! fully caller-driven) is the zlib-style "one step = consume an input slice and produce into an
-//! output slice." push (a source where bytes arrive) and pull (`Read`-like consumption) are derived
-//! on the std side as **adapters** built on top of this `step`. The base layer is therefore kept
-//! minimal, pure, and allocation-free.
+//! Callers provide input and output buffers. Adapters may expose push, pull, or
+//! `std::io` interfaces.
 
 use crate::Result;
 use alloc::vec::Vec;
 
-/// The result of one step: how much input was consumed, how much output was produced, and what to do next.
+/// Result of one transform step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step {
     /// Number of bytes consumed from `input`.
@@ -31,7 +22,7 @@ pub struct Step {
 }
 
 impl Step {
-    /// A state making no progress (0 consumed, 0 produced) that requests more input.
+    /// Requests input without consuming or producing bytes.
     pub const STALLED: Self = Self {
         consumed: 0,
         produced: 0,
@@ -42,11 +33,11 @@ impl Step {
 /// The action the caller should take after [`Transform::step`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// Giving it more input bytes will let it make progress.
+    /// More input is required.
     NeedInput,
-    /// Input still remains but the output is full. Call again with a larger (or emptied) output.
+    /// More output capacity is required.
     MoreOutput,
-    /// The logical end of stream has been reached. Subsequent `step` calls produce 0.
+    /// End of stream.
     Done,
 }
 
@@ -54,11 +45,9 @@ pub enum Status {
 ///
 /// # Contract
 ///
-/// - `step` consumes an arbitrary amount from `input`, produces an arbitrary amount into `output`, and returns a [`Step`].
-/// - No allocation is forced. All buffers are owned by the caller.
-/// - Once input is exhausted, call `finish` to drain any trailing output held internally.
-/// - Implementations may be `no_std` (hand-written filters) or `std` (adapters over reused crates).
-///   That difference does not leak into the caller's types (origin-opaque).
+/// - `step` reports consumed and produced byte counts.
+/// - The caller owns all provided buffers.
+/// - `finish` drains buffered output after the final input.
 pub trait Transform {
     /// Advance one step, consuming `input` and producing into `output`.
     fn step(&mut self, input: &[u8], output: &mut [u8]) -> Result<Step>;
@@ -69,19 +58,15 @@ pub trait Transform {
     fn finish(&mut self, output: &mut [u8]) -> Result<Step>;
 }
 
-/// A convenience function that runs all in-memory input through a [`Transform`] and collects the output into a [`Vec`].
-///
-/// Usable even in environments without std (`alloc` only). The typical path for the std layer is to pass
-/// a slice mmapped from a file. A truly incremental driver is provided on the std adapter side.
+/// Runs a transform over a slice and returns all output.
 pub fn decode_to_vec<T: Transform + ?Sized>(t: &mut T, input: &[u8]) -> Result<Vec<u8>> {
     decode_to_vec_capped(t, input, usize::MAX)
 }
 
-/// Like [`decode_to_vec`], but fails with [`Error::LimitExceeded`](crate::Error::LimitExceeded)
-/// if the produced output would exceed `max_output` bytes.
+/// Runs a transform with an output limit.
 ///
-/// This is the guard against decompression bombs: a tiny compressed input that expands to an
-/// enormous output. Callers materializing to memory or disk should set a sane cap.
+/// Returns [`Error::LimitExceeded`](crate::Error::LimitExceeded) when output
+/// exceeds `max_output`.
 pub fn decode_to_vec_capped<T: Transform + ?Sized>(
     t: &mut T,
     mut input: &[u8],

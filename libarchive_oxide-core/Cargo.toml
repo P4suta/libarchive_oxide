@@ -5,10 +5,9 @@
 [package]
 name = "libarchive_oxide-core"
 version.workspace = true
-description = "Frozen trait algebra and sans-IO core: Transform/Filter/Format/EntryReader/EntryWriter. no_std + alloc."
+description = "no_std archive traits and uncompressed format implementations"
 edition.workspace = true
-# Lowest floor in the workspace: no_std + alloc, zero external dependencies. Uses the workspace
-# baseline (measured with cargo-msrv), so no per-crate override.
+# Workspace MSRV.
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -18,12 +17,12 @@ readme = "README.md"
 documentation = "https://docs.rs/libarchive_oxide-core"
 keywords = ["archive", "tar", "cpio", "no-std", "embedded"]
 categories = ["compression", "filesystem", "no-std"]
-# Trim the published tarball: integration tests are repo-only, not needed by consumers.
+# Repository-only integration tests.
 exclude = ["tests/"]
 
 [features]
 default = []
-# core defaults to no_std + alloc. std is only a thin addition for adaptors (future).
+# Reserved standard-library adapters.
 std = []
 
 [package.metadata.docs.rs]

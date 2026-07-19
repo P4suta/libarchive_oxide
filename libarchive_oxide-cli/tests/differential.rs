@@ -4,7 +4,7 @@
 
 //! Differential tests: cross-validate the `ox*` tools against the real system
 //! `bsdtar`/`bsdcpio`/`bsdcat`/`unzip` when they are on `PATH`, and gracefully skip when absent
-//! (the same idiom as the library's `*_differential.rs` suites). These prove genuine interop:
+//! using the same approach as the library differential tests:
 //! archives we write are read by mature independent tools, and vice-versa.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

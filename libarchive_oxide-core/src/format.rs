@@ -2,22 +2,12 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Format axis: filtered byte stream ⇄ structured entries.
+//! Archive format traits and implementations.
 //!
-//! The format layer is **orthogonal** to the filter layer and knows nothing about
-//! compression. Read/write polymorphism is expressed via the
-//! [`EntryReader`]/[`EntryWriter`] traits, which form a category-theoretic dual.
-//!
-//! There is **zero type erasure** here: [`EntryReader::Data`] and [`EntryWriter::Sink`]
-//! are associated types, and [`Entry`]/[`EntrySink`] are generic over the concrete payload
-//! cursor/sink. Runtime format choice is expressed by the sealed [`AnyReader`] enum
-//! (fully monomorphized, exhaustiveness compiler-checked) rather than a trait object.
-//!
-//! # Borrow-checked no-seek model
-//!
-//! [`EntryReader::next_entry`] returns an [`Entry`] that borrows `&mut self`. Therefore
-//! **you cannot advance to the next entry until you have read the entry's data to completion and dropped the `Entry`**,
-//! which is guaranteed at compile time. A type-level win over C's `void*` + procedural convention. No seek required.
+//! Formats consume uncompressed bytes. [`EntryReader::Data`] and
+//! [`EntryWriter::Sink`] are associated types. Runtime selection uses
+//! [`AnyReader`]. An [`Entry`] borrows its reader, so the reader cannot advance
+//! while the entry is live.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -46,10 +36,7 @@ pub enum Detection {
     NeedMore,
 }
 
-/// Detection anchor for an archive format (the entry point for the registry / auto-detection).
-///
-/// The concrete reading and writing is handled by types that implement [`EntryReader`]/[`EntryWriter`]. Thanks to this separation,
-/// adding a new format is just "add a type that implements the same traits", leaving the existing traits unchanged.
+/// Archive-format detection interface.
 pub trait ArchiveFormat {
     /// Human-readable format name (for diagnostics).
     const NAME: &'static str;
@@ -58,18 +45,13 @@ pub trait ArchiveFormat {
     fn sniff(prefix: &[u8]) -> Detection;
 }
 
-/// sans-IO reading of an entry's body (payload).
-///
-/// Because it is `no_std`, it uses chunk pull rather than `std::io::Read`. On the std side we bridge it to `Read`.
+/// Sans-IO entry data reader.
 pub trait EntryData {
     /// Pull decoded entry bytes into `out`. The return value is the amount produced. 0 means end of entry.
     fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize>;
 }
 
-/// A payload cursor over a byte slice, shared by the slice-based format readers
-/// (`tar`, `cpio`, `ar`). `&'a [u8]` is `Copy`, so the whole cursor is `Copy`; a reader can
-/// hold its own copy of the backing slice here without conflicting with borrows of the header
-/// bytes, and [`AnyReader`] can lift it out of an inner entry by value when re-homing.
+/// Payload cursor used by slice-based readers.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SliceData<'a> {
     bytes: &'a [u8],
@@ -141,24 +123,19 @@ impl EntryData for OwnedData {
     }
 }
 
-/// A streaming reader that pulls one entry at a time from an archive.
-///
-/// The payload cursor type is the associated [`EntryReader::Data`] — a concrete, statically known
-/// [`EntryData`] (e.g. [`SliceData`] for the slice readers), never a trait object.
+/// Streaming archive reader.
 pub trait EntryReader {
-    /// The concrete payload cursor this reader lends out.
+    /// Entry data type.
     type Data: EntryData;
 
-    /// Return the next entry, or `None` when the end has been reached.
+    /// Returns the next entry.
     ///
-    /// The returned [`Entry`] mutably borrows `self`, so you cannot advance until you have read its data to completion.
+    /// Returns `None` at end of archive. The returned [`Entry`] mutably borrows
+    /// the reader.
     fn next_entry(&mut self) -> Result<Option<Entry<'_, Self::Data>>>;
 }
 
-/// A single entry lent out by the reader. Holds the metadata and the payload stream.
-///
-/// The lifetime `'r` mutably borrows the parent reader, upholding the no-seek invariant at the
-/// type level. `D` is the concrete payload cursor ([`EntryReader::Data`]).
+/// Archive entry metadata and data.
 pub struct Entry<'r, D: EntryData> {
     meta: EntryMeta<'r>,
     data: &'r mut D,
@@ -166,7 +143,7 @@ pub struct Entry<'r, D: EntryData> {
 
 impl<D: EntryData> fmt::Debug for Entry<'_, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The payload stream is opaque, so we show only the meta (no `D: Debug` bound required).
+        // Avoid a `D: Debug` bound.
         f.debug_struct("Entry")
             .field("meta", &self.meta)
             .finish_non_exhaustive()
@@ -174,7 +151,7 @@ impl<D: EntryData> fmt::Debug for Entry<'_, D> {
 }
 
 impl<'r, D: EntryData> Entry<'r, D> {
-    /// Assemble an entry from metadata and a payload stream (used by format implementations).
+    /// Creates an entry.
     pub fn new(meta: EntryMeta<'r>, data: &'r mut D) -> Self {
         Self { meta, data }
     }
@@ -191,19 +168,10 @@ impl<'r, D: EntryData> Entry<'r, D> {
     }
 }
 
-/// A structural event yielded by an [`EntrySource`], borrowing the source's internal accumulation
-/// buffer for `'s`.
+/// Event returned by [`EntrySource`].
 ///
-/// # Lifetime
-///
-/// `SourceEvent<'s>` borrows **`&'s self`** — the source's growing internal buffer — not the slice
-/// last handed to [`EntrySource::feed`] (that slice is copied into the buffer and need not outlive
-/// the call). The borrow is stable only until the next `feed`/`pull`, exactly like the output slice
-/// of a [`Transform`](crate::transform::Transform): consume the event before driving the source again.
-///
-/// [`SourceEvent::Entry`] paths that sit contiguously in the buffer are `Cow::Borrowed(&'s buf)`
-/// (zero-copy); a path reassembled from a PAX record or a GNU long-name header is `Cow::Owned`
-/// (the slice reader allocates at the very same points).
+/// Events borrow the source until the next `feed` or `pull`. Reconstructed
+/// metadata may be owned.
 #[derive(Debug)]
 pub enum SourceEvent<'s> {
     /// The source needs more bytes before it can produce the next event; call [`EntrySource::feed`].
@@ -219,30 +187,20 @@ pub enum SourceEvent<'s> {
     Done,
 }
 
-/// Incremental, sans-IO reading of an archive from a caller-fed byte stream — the **format-axis dual
-/// of [`Transform`](crate::transform::Transform)** (byte axis). Where a `Transform` maps
-/// `Status{NeedInput, MoreOutput, Done}`,
-/// a source enriches that with the structure a container format adds: [`SourceEvent::Entry`] /
-/// [`SourceEvent::Data`] / [`SourceEvent::EndEntry`].
+/// Incremental sans-IO archive reader.
 ///
-/// Unlike [`EntryReader`] (which needs the whole archive as one `&[u8]`), an `EntrySource` accepts
-/// the archive in arbitrarily small pushes via [`feed`](EntrySource::feed) and yields events through
-/// [`pull`](EntrySource::pull), holding only a bounded internal buffer (about one header block plus
-/// the current extended-header record). It composes with the filter axis by feeding it the output of
-/// an [`AnyDecoder`](crate::filter) — a fully monomorphized incremental pipeline with no trait objects.
-///
-/// This is additive: it does not touch the frozen [`EntryReader`]/[`EntryWriter`] algebra. Runtime
-/// format choice would be expressed by a sealed `enum AnySource { Tar, Cpio, Ar }` (the shape of
-/// [`AnyReader`]), never a trait object.
+/// [`feed`](EntrySource::feed) accepts bytes. [`pull`](EntrySource::pull)
+/// returns structural events.
 pub trait EntrySource {
-    /// Append archive bytes to the internal buffer, returning how many were accepted (all of them).
+    /// Appends input and returns the accepted byte count.
     fn feed(&mut self, input: &[u8]) -> Result<usize>;
 
-    /// Declare that no more bytes will be fed (end of the compressed/plain stream).
+    /// Marks end of input.
     fn finish_input(&mut self);
 
-    /// Produce the next structural event, borrowing the internal buffer until the next
-    /// `feed`/`pull`. Returns [`SourceEvent::NeedInput`] when starved (and input is not finished).
+    /// Returns the next event.
+    ///
+    /// Returns [`SourceEvent::NeedInput`] when more input is required.
     fn pull(&mut self) -> Result<SourceEvent<'_>>;
 }
 
@@ -255,11 +213,10 @@ pub trait EntryDataSink {
     fn close(&mut self) -> Result<()>;
 }
 
-/// A streaming writer that writes one entry at a time into an archive. The dual of [`EntryReader`].
+/// Streaming archive writer.
 ///
-/// The body sink type is the associated [`EntryWriter::Sink`] — the dual of [`EntryReader::Data`].
-/// A format writer is typically its own sink (`type Sink = Self`), so it is `?Sized`-tolerant for
-/// symmetry with the reader side, but is always a concrete type, never a trait object.
+/// [`EntryWriter::Sink`] receives entry data. Writers are typically their own
+/// sink.
 pub trait EntryWriter {
     /// The concrete body sink this writer lends out (its dual is [`EntryReader::Data`]).
     type Sink: EntryDataSink + ?Sized;
@@ -327,13 +284,9 @@ impl EntryData for AnyEntryData<'_> {
     }
 }
 
-/// The concrete kind of core archive reader, selected at runtime. Sealed: only the crate's own
-/// formats appear, and the exhaustive `match` in [`AnyReader::next_entry`] fails to compile the
-/// moment a variant is added without being handled.
+/// Runtime-selected core reader implementation.
 ///
-/// Each inner reader is boxed (a `Box<Reader>`, an owning pointer — **not** a trait object): the
-/// readers differ widely in size, so boxing keeps every variant one word wide and symmetric. The
-/// single allocation happens once when the archive reader is constructed.
+/// Readers are boxed to bound the enum size.
 #[derive(Debug)]
 enum AnyReaderKind<'a> {
     Tar(Box<TarReader<'a>>),
@@ -342,13 +295,9 @@ enum AnyReaderKind<'a> {
     Iso(Box<IsoReader<'a>>),
 }
 
-/// Runtime-selected core (`no_std`) archive reader, dispatched over a sealed enum with **zero type
-/// erasure**. It is itself an [`EntryReader`] (`Data = AnyEntryData`), so it composes uniformly.
+/// Runtime-selected core archive reader.
 ///
-/// `next_entry` drives the chosen inner reader, then **re-homes** the entry into `self.slot`: the
-/// metadata is deep-cloned into an owned, lifetime-independent [`EntryMeta`] and the payload cursor
-/// is lifted out by value (`SliceData: Copy`, `OwnedData: Default` via `mem::take`). This one clone
-/// per entry is the necessary cost of enum dispatch, not a shortcut.
+/// Implements [`EntryReader`] with [`AnyEntryData`].
 #[derive(Debug)]
 pub struct AnyReader<'a> {
     kind: AnyReaderKind<'a>,

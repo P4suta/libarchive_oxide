@@ -2,28 +2,11 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 7z reader and writer — a deliberately narrow, fully interoperable subset.
+//! 7z reader and writer.
 //!
-//! 7z, like zip, keeps its authoritative metadata in a header (here at the *end* of the file,
-//! pointed to by a 32-byte signature header at the front) and compresses payloads independently of
-//! the outer stream. It therefore does not compose with the [`Filter`](libarchive_oxide_core::filter) pipeline;
-//! instead each entry's [`EntryData`](libarchive_oxide_core::EntryData) is a window into the decompressed folder
-//! buffer. It lives in the std crate (it needs an LZMA2 codec) yet implements the same
-//! [`libarchive_oxide_core::EntryReader`] / [`libarchive_oxide_core::EntryWriter`], so it plugs into detection, extraction,
-//! and creation exactly like every other format.
-//!
-//! ## Scope (explicit, tested)
-//!
-//! Read and write are restricted to the **single-folder, single-pack, single-coder** subset: one
-//! solid block holding any number of files as substreams, plus directories and empty files (which
-//! carry no stream). The **writer** always emits LZMA2 (method id `0x21`). The **reader** accepts
-//! either LZMA2 or plain **LZMA** (method id `03 01 01`) as the folder coder, including for a
-//! compressed (`kEncodedHeader`) next header — which is what mainstream 7-Zip and `sevenz-rust2`
-//! produce once an archive has more than a trivial number of entries. Anything outside that —
-//! BCJ/delta filters, AES, `PPMd`, multiple folders/coders, or complex coder graphs — is reported
-//! as [`Error::Unsupported`], never a panic. This is a genuine format-shape limitation, not a
-//! shortcut: the byte layout produced here is standard 7z and round-trips through independent 7z
-//! implementations.
+//! Supports one folder, pack stream, and coder. Writers emit LZMA2. Readers
+//! accept LZMA2 or LZMA, including encoded headers. BCJ, delta, AES, `PPMd`,
+//! multiple folders, multiple coders, and coder graphs are unsupported.
 
 use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
@@ -795,7 +778,7 @@ struct PendingEntry {
     plain: Vec<u8>,
 }
 
-/// 7z streaming writer — the dual of [`SevenZReader`], restricted to the single-folder LZMA2 subset.
+/// 7z writer for the single-folder LZMA2 subset.
 ///
 /// **The whole archive is buffered in memory.** Every content file's plaintext is concatenated into
 /// one solid folder that is LZMA2-compressed at `finish`, and the 32-byte signature header must be
@@ -1228,8 +1211,9 @@ impl<'a> ByteReader<'a> {
     }
 }
 
-/// Writes a 7z variable-length number (`WriteNumber`). The `as u8` casts deliberately keep the low
-/// byte at each step, which is exactly the little-endian serialization the format prescribes.
+/// Writes a 7z variable-length number (`WriteNumber`).
+///
+/// Each `as u8` cast retains the low byte required by the encoding.
 #[allow(clippy::cast_possible_truncation)]
 fn write_number(out: &mut Vec<u8>, value: u64) {
     let mut first = 0u8;

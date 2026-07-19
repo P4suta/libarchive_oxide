@@ -2,26 +2,11 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! zip reader and writer (central-directory based, store + deflate, zip64, AES-256 AE-2).
+//! zip reader and writer.
 //!
-//! zip differs in shape from tar/cpio/ar: its authoritative metadata lives in a *central
-//! directory* at the end of the file, and each entry is *individually* compressed rather than the
-//! whole stream being wrapped by an external filter. It therefore does not compose with the
-//! `Filter` pipeline; instead its `EntryData` decompresses per entry. This lives in the std crate
-//! (it needs a DEFLATE codec) yet still implements the same [`libarchive_oxide_core::EntryReader`] /
-//! [`libarchive_oxide_core::EntryWriter`], demonstrating that a format impl can live anywhere and still plug
-//! into detection, extraction, and creation.
-//!
-//! Scope: the "store" (0) and "deflate" (8) methods, Unix modes and symlinks via external
-//! attributes, zip64 (> 4 GiB sizes / offsets, > 65535 entries), and `WinZip` AES-256 (AE-2)
-//! encryption (behind the `aes` feature). Other compression methods are `Unsupported`.
-//!
-//! ## AE-2 and SHA-1
-//!
-//! The AES layer follows the `WinZip` AE-2 specification, which mandates PBKDF2-**HMAC-SHA1** for key
-//! derivation and HMAC-SHA1 for authentication. SHA-1 here is an interoperability requirement of the
-//! on-disk format, **not** a choice of "modern strength": a reader/writer that wants to interoperate
-//! with `WinZip`/7-Zip/`zip`-crate AES entries has no other option.
+//! Supports store, DEFLATE, Unix attributes, zip64, and `WinZip` AES-256 AE-2.
+//! Other compression methods are unsupported. AE-2 requires PBKDF2-HMAC-SHA1
+//! and HMAC-SHA1.
 
 use std::borrow::Cow;
 
@@ -52,14 +37,7 @@ const EXTRA_AES: u16 = 0x9901;
 /// AES pseudo-compression method.
 const METHOD_AES: u16 = 99;
 
-/// Cap on a single entry's declared uncompressed size, applied before decoding (bomb defense).
-///
-/// zip is not wrapped by an external filter, so the CLI's outer [`decompress_capped`] boundary never
-/// sees a zip entry's inflation; without this the per-entry inflate would be bounded only by the
-/// entry's own (attacker-controlled) declared size. This mirrors the 7z reader's `MAX_UNPACK` and the
-/// CLI's 4 GiB transparent-decompression cap, so every tool's bomb defense holds at the same ceiling.
-///
-/// [`decompress_capped`]: crate::decompress_capped
+/// Maximum uncompressed size of one zip entry.
 const MAX_UNCOMP: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Returns `true` if `data` looks like a zip archive (local header or empty-archive EOCD magic).
@@ -569,7 +547,7 @@ struct Pending {
     plain: Vec<u8>,
 }
 
-/// zip streaming writer — the dual of [`ZipReader`]. Buffers each entry's plaintext, then at
+/// zip streaming writer. Buffers each entry's plaintext, then at
 /// `close` chooses the method, (optionally) encrypts, and emits the local header + data; the whole
 /// central directory and EOCD (with zip64 records when needed) are emitted at `finish`.
 ///

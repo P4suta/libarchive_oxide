@@ -2,12 +2,8 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# cargo-fuzz workspace for libarchive_oxide. This is **deliberately outside** the main workspace (the root
-# Cargo.toml lists `exclude = ["fuzz"]`), so `cargo test --workspace` never tries to build the
-# libFuzzer targets — which need a nightly toolchain and the sanitizer runtime that is not available
-# on the Windows/MSVC dev box. The portable invariants live in `fuzz_lib` (a plain library) and are
-# exercised on Windows through `libarchive_oxide/tests/fuzz_replay.rs`; only this crate's `fuzz_targets/*` bins
-# require nightly `cargo fuzz`.
+# Excluded cargo-fuzz workspace. Targets require nightly and a sanitizer runtime.
+# Portable cases are in fuzz_lib and run through tests/fuzz_replay.rs.
 
 [workspace]
 resolver = "2"

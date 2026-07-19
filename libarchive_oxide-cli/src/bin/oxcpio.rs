@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `oxcpio` — bsdcpio-compatible cpio tool. Thin `main` over
+//! `oxcpio` entry point over
 //! [`libarchive_oxide_cli::run_cpio`], mapping the [`CliError`] onto the exit-code contract
 //! (0 success / 1 runtime / 2 usage). See the library docs for the full flag interface.
 //!

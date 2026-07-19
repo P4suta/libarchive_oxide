@@ -2,17 +2,10 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Adapters over reused pure-Rust decoder crates, all conformed to the sans-IO `Transform`
-//! via the shared `PullBridge`.
+//! Adapters for pure-Rust codec crates.
 //!
-//! Every reused decoder is the *same* adapter modulo two things: its [`FilterId`] and the
-//! constructor that turns the buffered input into a `Read` decoder. The `read_adapter!` macro
-//! makes that uniformity explicit — the origin (hand-written vs reused) never leaks into the
-//! caller's types.
-//!
-//! `zstd` (`ruzstd`) and `lz4` (`lz4_flex`) expose `std::io::Read` directly. `xz` (`lzma-rust2`) uses
-//! its own `Read` trait, so two thin shims (`xz_shim`) bridge std `Read` in and lzma `Read` out;
-//! that seam stays sealed inside this module.
+//! zstd and lz4 expose `std::io::Read`. The xz adapter bridges the
+//! `lzma-rust2` I/O traits.
 
 use alloc::vec::Vec;
 use std::io::{Cursor, Write};
@@ -24,9 +17,7 @@ use libarchive_oxide_core::{Error, Result};
 use super::bridge::PullBridge;
 use super::push::PushBridge;
 
-/// Generates a decoder adapter that stores a [`PullBridge`] over the **concrete** `Read` decoder
-/// type `$read` (a boxed `Read` trait object is never used — the decoder type is fully monomorphized), constructing it
-/// with `$make` on `finish`. `$make: FnOnce(Cursor<Vec<u8>>) -> Result<$read>`.
+/// Generates a decoder adapter over a concrete `Read` type.
 macro_rules! read_adapter {
     ($(#[$meta:meta])* $name:ident, $id:expr, $doc:literal, $read:ty, $make:expr) => {
         $(#[$meta])*
@@ -165,7 +156,7 @@ write_adapter!(
     #[cfg(feature = "zstd")]
     ZstdEncoder,
     FilterId::Zstd,
-    "Zstandard compressor (adapter over `ruzstd`), the dual of [`ZstdDecoder`].",
+    "Zstandard compressor using `ruzstd`.",
     |plain: &[u8]| {
         use ruzstd::encoding::{compress_to_vec, CompressionLevel};
         Ok(compress_to_vec(plain, CompressionLevel::Fastest))
@@ -176,7 +167,7 @@ write_adapter!(
     #[cfg(feature = "lz4")]
     Lz4Encoder,
     FilterId::Lz4,
-    "LZ4 frame compressor (adapter over `lz4_flex`), the dual of [`Lz4Decoder`].",
+    "LZ4 frame compressor using `lz4_flex`.",
     |plain: &[u8]| {
         let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
         enc.write_all(plain)
@@ -190,7 +181,7 @@ write_adapter!(
     #[cfg(feature = "xz")]
     XzEncoder,
     FilterId::Xz,
-    "XZ (LZMA2) compressor (adapter over `lzma-rust2`), the dual of [`XzDecoder`].",
+    "XZ (LZMA2) compressor using `lzma-rust2`.",
     |plain: &[u8]| {
         let mut w = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6))
             .map_err(|_| Error::Malformed("xz: init failed"))?;

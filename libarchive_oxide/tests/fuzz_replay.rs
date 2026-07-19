@@ -195,8 +195,7 @@ fn seed_mutants_uphold_invariants() {
         }
     }
 
-    // The six read_* targets each ship a valid seed; mutating those seeds is the whole point of this
-    // gate, so a checkout that lost them (leaving readers un-fuzzed) must fail rather than pass empty.
+    // Require seeds for all six reader targets.
     assert!(
         targets_with_seed >= 6,
         "expected committed seeds for at least the six read_* targets, saw {targets_with_seed}"

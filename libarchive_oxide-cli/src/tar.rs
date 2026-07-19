@@ -2,28 +2,17 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `oxtar` — the bsdtar-compatible tar interface over the flagship library.
+//! `oxtar` implementation.
 //!
-//! Supported (each flag is fully functional — no partial behavior):
-//!
-//! - Modes: `-c` create, `-x` extract, `-t` list (exactly one required).
-//! - `-f FILE` archive file (`-` or omitted = stdin/stdout).
-//! - `-C DIR` change directory (create: `chdir` before reading members; extract: destination).
+//! Supported:
+//! - `-c`, `-x`, `-t`;
+//! - `-f FILE`, `-C DIR`;
 //! - `-v` verbose.
-//! - Create-time compression: `-z`/`--gzip`, `-J`/`--xz`, `--zstd`, `--lz4`.
-//! - `--format FMT` create format: `tar`/`ustar`/`gnutar` (the ustar writer) or `cpio` (newc).
-//! - Trailing operands select members on `-x`/`-t`.
-//! - `--help`, `--version`.
+//! - `-z`, `--gzip`, `-J`, `--xz`, `--zstd`, `--lz4`;
+//! - `--format`, member operands, `--help`, `--version`.
 //!
-//! Intentionally unsupported (clean exit-2 error, never a silent stub):
-//!
-//! - `-j` / `--bzip2` — bzip2 was removed from the library; recompress with another codec.
-//! - `-r` / `-u` — append/update. Rewriting an existing archive's trailer is out of scope for the
-//!   0.x line (documented in the README); use `-c` to build afresh.
-//! - Any other classic flag (`-p`, `--numeric-owner`, `--strip-components`, …) → `unknown flag`.
-//!
-//! Safe defaults preserved: path-traversal rejection and the decompression-bomb cap stay on; this is
-//! a deliberate, documented divergence from historical tar (see the crate-level docs).
+//! `-j`, `--bzip2`, `-r`, and `-u` are unsupported. Extraction rejects path
+//! traversal. Decompression uses the crate-level limit.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -32,7 +21,7 @@ use libarchive_oxide_core::filter::FilterId;
 
 use crate::{extract_bytes, list_bytes, read_file, CliError, CliResult};
 
-/// The mode letter selected on the command line.
+/// Selected operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Create,
@@ -40,7 +29,7 @@ enum Mode {
     List,
 }
 
-/// The create format selected by `--format` (only the writers the library can produce faithfully).
+/// Format selected by `--format`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreateFormat {
     /// The ustar writer (`tar`/`ustar`/`gnutar`).
@@ -360,7 +349,7 @@ fn absolutize(path: &str) -> PathBuf {
 }
 
 const HELP: &str = "\
-oxtar — bsdtar-compatible archive tool (libarchive_oxide)
+oxtar: bsdtar-compatible archive tool
 
 USAGE:
     oxtar -c [-z|-J|--zstd|--lz4] [--format FMT] [-C DIR] [-v] -f ARCHIVE PATH...
@@ -385,11 +374,11 @@ OPTIONS:
 
 Reads auto-detect compression (gzip/zstd/xz/lz4) and format (tar/cpio/ar/zip/7z/iso).
 
-UNSUPPORTED (exit 2, by design — never a silent no-op):
+UNSUPPORTED (exit 2):
     -j, --bzip2   bzip2 was removed from the library; recompress with -z/-J/--zstd/--lz4.
     -r, -u        append/update; rewriting an existing archive is out of scope (use -c).
 
-SAFE DEFAULTS (a deliberate divergence from historical tar):
+SAFE DEFAULTS:
     Path-traversal entries ('../', absolute, drive/UNC) are refused, and transparent
     decompression is capped, because untrusted archives are assumed.
 
