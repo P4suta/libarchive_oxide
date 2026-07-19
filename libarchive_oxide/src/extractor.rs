@@ -12,7 +12,9 @@ use std::time::{Duration, SystemTime};
 
 use cap_fs_ext::{DirExt, SystemTimeSpec};
 use cap_std::fs::{Dir, File, OpenOptions};
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Timestamp};
+use libarchive_oxide_core::{
+    ArchiveError, ArchivePath, EntryKind, EntryMetadata, ErrorKind, Limits, Timestamp,
+};
 
 use crate::path::sanitize_archive_path;
 use crate::{ArchiveReader, ReaderEvent, SeekArchiveReader, StreamError};
@@ -238,9 +240,11 @@ struct PendingEntry {
 pub struct Extractor {
     root: Dir,
     policy: ExtractionPolicy,
+    limits: Limits,
     created_directories: BTreeSet<PathBuf>,
     directory_metadata: BTreeMap<PathBuf, FinalMetadata>,
     committed_files: BTreeSet<PathBuf>,
+    entries_seen: u64,
     temporary_counter: u64,
 }
 
@@ -248,20 +252,40 @@ impl Extractor {
     /// Creates an extractor. No ambient path is retained internally.
     #[must_use]
     pub fn new(root: Dir) -> Self {
-        Self::with_policy(root, ExtractionPolicy::safe())
+        Self::with_policy_and_limits(root, ExtractionPolicy::safe(), Limits::default())
     }
 
     /// Creates an extractor with an explicit policy.
     #[must_use]
     pub fn with_policy(root: Dir, policy: ExtractionPolicy) -> Self {
+        Self::with_policy_and_limits(root, policy, Limits::default())
+    }
+
+    /// Creates a safe-policy extractor with explicit resource budgets.
+    #[must_use]
+    pub fn with_limits(root: Dir, limits: Limits) -> Self {
+        Self::with_policy_and_limits(root, ExtractionPolicy::safe(), limits)
+    }
+
+    /// Creates an extractor with explicit policy and resource budgets.
+    #[must_use]
+    pub fn with_policy_and_limits(root: Dir, policy: ExtractionPolicy, limits: Limits) -> Self {
         Self {
             root,
             policy,
+            limits,
             created_directories: BTreeSet::new(),
             directory_metadata: BTreeMap::new(),
             committed_files: BTreeSet::new(),
+            entries_seen: 0,
             temporary_counter: 0,
         }
+    }
+
+    /// Returns the resource budgets enforced by this extractor.
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// Extracts a sequential archive while retaining at most the current chunk.
@@ -300,6 +324,7 @@ impl Extractor {
                             "entry began before the preceding entry ended",
                         )));
                     }
+                    self.observe_entry(&metadata)?;
                     pending = Some(if select(&metadata) {
                         self.prepare_entry(&metadata)?
                     } else {
@@ -377,6 +402,7 @@ impl Extractor {
                             "entry began before the preceding entry ended",
                         )));
                     }
+                    self.observe_entry(&metadata)?;
                     pending = Some(if select(&metadata) {
                         self.prepare_entry(&metadata)?
                     } else {
@@ -423,6 +449,55 @@ impl Extractor {
                 },
             }
         }
+    }
+
+    fn observe_entry(&mut self, metadata: &EntryMetadata) -> Result<(), StreamError> {
+        let index = self.entries_seen;
+        self.entries_seen = self.entries_seen.checked_add(1).ok_or_else(|| {
+            Self::limit_error(index, metadata.path(), "extractor entry count overflowed")
+        })?;
+        if self
+            .limits
+            .entries()
+            .is_some_and(|maximum| self.entries_seen > maximum)
+        {
+            return Err(Self::limit_error(
+                index,
+                metadata.path(),
+                "extractor entry count exceeds configured limit",
+            ));
+        }
+        if self
+            .limits
+            .path_bytes()
+            .is_some_and(|maximum| metadata.path().as_bytes().len() > maximum)
+        {
+            return Err(Self::limit_error(
+                index,
+                metadata.path(),
+                "extractor path length exceeds configured limit",
+            ));
+        }
+        if self
+            .limits
+            .nesting()
+            .is_some_and(|maximum| archive_path_nesting(metadata.path().as_bytes()) > maximum)
+        {
+            return Err(Self::limit_error(
+                index,
+                metadata.path(),
+                "extractor path nesting exceeds configured limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn limit_error(index: u64, path: &ArchivePath, context: &'static str) -> StreamError {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Limit)
+                .with_entry(index, path.as_bytes())
+                .with_context(context),
+        )
     }
 
     fn prepare_entry(&mut self, metadata: &EntryMetadata) -> Result<PendingEntry, StreamError> {
@@ -908,6 +983,7 @@ impl Extractor {
         self.created_directories.clear();
         self.directory_metadata.clear();
         self.committed_files.clear();
+        self.entries_seen = 0;
         self.temporary_counter = 0;
     }
 
@@ -974,6 +1050,12 @@ impl Extractor {
     }
 }
 
+fn archive_path_nesting(path: &[u8]) -> usize {
+    path.split(|byte| matches!(*byte, b'/' | b'\\'))
+        .filter(|component| !component.is_empty() && *component != b".")
+        .count()
+}
+
 fn timestamp_spec(timestamp: Timestamp) -> io::Result<SystemTimeSpec> {
     if timestamp.nanos >= 1_000_000_000 {
         return Err(io::Error::new(
@@ -1009,9 +1091,10 @@ fn timestamp_spec(timestamp: Timestamp) -> io::Result<SystemTimeSpec> {
 pub(crate) fn run_extraction_worker(
     root: Dir,
     policy: ExtractionPolicy,
+    limits: Limits,
     mut receiver: tokio::sync::mpsc::Receiver<ExtractionMessage>,
 ) -> Result<ExtractionReport, StreamError> {
-    let mut extractor = Extractor::with_policy(root, policy);
+    let mut extractor = Extractor::with_policy_and_limits(root, policy, limits);
     extractor.begin_session();
     let mut report = ExtractionReport::default();
     let mut pending: Option<PendingEntry> = None;
@@ -1025,6 +1108,7 @@ pub(crate) fn run_extraction_worker(
                         "entry began before the preceding entry ended",
                     )));
                 }
+                extractor.observe_entry(&metadata)?;
                 pending = Some(extractor.prepare_entry(&metadata)?);
             },
             ExtractionMessage::Data(bytes) => {

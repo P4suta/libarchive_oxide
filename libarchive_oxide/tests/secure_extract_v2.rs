@@ -13,7 +13,7 @@ use cap_std::fs::Dir;
 use libarchive_oxide::{
     ArchiveReader, ArchiveWriter, EntryOutcomeKind, ExtractionPolicy, Extractor, RejectionReason,
 };
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, ErrorKind, Limits};
 
 fn fixture() -> Vec<u8> {
     let mut writer = ArchiveWriter::new(Vec::new());
@@ -106,6 +106,27 @@ fn safe_policy_rejects_absolute_and_existing_destinations() {
         outcome.outcome(),
         EntryOutcomeKind::Rejected(RejectionReason::DestinationExists)
     )));
+}
+
+#[test]
+fn extractor_enforces_its_own_entry_and_path_limits() {
+    let destination = tempfile::tempdir().unwrap();
+    let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
+    let limits = Limits::default().with_entries(Some(0));
+    let mut extractor = Extractor::with_limits(root, limits);
+    let mut reader = ArchiveReader::new(Cursor::new(fixture()));
+    let error = extractor.extract(&mut reader).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+    assert!(!destination.path().join("safe.txt").exists());
+
+    let destination = tempfile::tempdir().unwrap();
+    let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
+    let limits = Limits::default().with_path_bytes(Some(4));
+    let mut extractor = Extractor::with_limits(root, limits);
+    let mut reader = ArchiveReader::new(Cursor::new(fixture()));
+    let error = extractor.extract(&mut reader).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+    assert!(!destination.path().join("safe.txt").exists());
 }
 
 #[test]
