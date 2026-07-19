@@ -2,30 +2,19 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `oxcpio` — the bsdcpio-compatible cpio interface over the flagship library.
+//! `oxcpio` implementation.
 //!
-//! Supported (each flag fully functional):
-//!
-//! - Modes: `-o` create (copy-out), `-i` extract (copy-in), `-t` list. `-t` combined with `-i`
-//!   (`-it`) lists without extracting, matching bsdcpio.
-//! - `-F FILE` archive file (`-` or omitted = stdin/stdout).
-//! - `-v` verbose.
-//! - `-d` create leading directories on extract (already unconditional here; accepted for scripts).
-//! - Trailing operands select members on `-i`/`-t` (literal name / directory-prefix match).
-//!
-//! Copy-out (`-o`) reads the list of filenames from stdin, one per line — the bsdcpio interface —
-//! and writes a newc cpio archive. Reads auto-detect any compression wrapping the cpio stream.
-//!
-//! Intentionally unsupported (clean exit-2 error): `-p` (pass-through copy), `-C` (I/O block size),
-//! and any other classic flag → `unknown flag`. Safe defaults (traversal rejection, bomb cap) stay
-//! on, as documented at the crate root.
+//! Supports `-o`, `-i`, `-t`, `-F`, `-v`, `-d`, and member operands. Copy-out
+//! reads one filename per input line and writes `newc`. `-p` and `-C` are
+//! unsupported. Extraction rejects path traversal. Decompression uses the
+//! crate-level limit.
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{extract_bytes, list_bytes, read_file, CliError, CliResult};
 
-/// The cpio operation selected on the command line.
+/// Selected operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// `-o` copy-out (create).
@@ -257,7 +246,7 @@ fn read_input(file: Option<&str>) -> Result<Vec<u8>, CliError> {
 }
 
 const HELP: &str = "\
-oxcpio — bsdcpio-compatible cpio tool (libarchive_oxide)
+oxcpio: bsdcpio-compatible cpio tool
 
 USAGE:
     ... | oxcpio -o [-v] [-F ARCHIVE]        Create (reads filenames from stdin).
@@ -276,7 +265,7 @@ OPTIONS:
 
 Reads auto-detect compression (gzip/zstd/xz/lz4).
 
-UNSUPPORTED (exit 2, by design): -p (pass-through), -C (block size), and other classic flags.
+UNSUPPORTED (exit 2): -p (pass-through), -C (block size), and other classic flags.
 
 SAFE DEFAULTS: path-traversal entries are refused and decompression is capped (untrusted input).
 

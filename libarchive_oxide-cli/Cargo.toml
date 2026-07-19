@@ -5,10 +5,9 @@
 [package]
 name = "libarchive_oxide-cli"
 version.workspace = true
-description = "bsdtar-style CLI tools (oxtar/oxcpio/oxcat/oxunzip) over the libarchive_oxide library. Dogfooding + the observation surface for round-trip integration tests."
+description = "Archive CLI tools: oxtar, oxcpio, oxcat, and oxunzip"
 edition.workspace = true
-# Override above the workspace baseline: it depends on the flagship with its default codec set
-# enabled (ruzstd et al.), inheriting the same floor as the flagship. Measured with cargo-msrv.
+# MSRV inherited from codec dependencies.
 rust-version = "1.87"
 license.workspace = true
 repository.workspace = true
@@ -22,8 +21,7 @@ categories = ["command-line-utilities"]
 [package.metadata.docs.rs]
 all-features = true
 
-# Four bsdtar-family tools. Each bin is a thin main over the shared crate library, whose documented
-# flag surface and exit-code contract are tested in the crate's integration suite.
+# Command-line entry points.
 [[bin]]
 name = "oxtar"
 path = "src/bin/oxtar.rs"
@@ -41,7 +39,7 @@ name = "oxunzip"
 path = "src/bin/oxunzip.rs"
 
 [dependencies]
-# The CLI enables AES (zip `--encrypt`/`--password`) and 7z read+write end-to-end.
+# Enable CLI-supported formats.
 libarchive_oxide = { path = "../libarchive_oxide", version = "0.1.0", features = ["aes", "sevenz"] }
 libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.1.0" }
 

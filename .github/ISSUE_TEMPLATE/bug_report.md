@@ -6,22 +6,18 @@ labels: bug
 assignees: ""
 ---
 
-<!--
-For security vulnerabilities (crashes/hangs/OOM on untrusted archives), do NOT file here — use
-GitHub's private vulnerability reporting instead: see SECURITY.md.
--->
+<!-- Use private vulnerability reporting for security issues. See SECURITY.md. -->
 
 ## Summary
 
-A clear, one-line description of the problem.
+One-line description.
 
 ## Reproduction
 
-Steps, code, or a command line that triggers it. Attach a minimal input archive if the bug depends
-on a specific byte layout (a `.tar`/`.zip`/`.7z`/`.iso` fixture, ideally the smallest that reproduces).
+Provide exact steps or a minimal command. Attach the smallest reproducing input.
 
 ```rust
-// minimal snippet, or the exact CLI invocation (oxtar / oxcpio / oxcat / oxunzip)
+// Minimal code or exact CLI command.
 ```
 
 ## Expected vs. actual
@@ -32,6 +28,6 @@ on a specific byte layout (a `.tar`/`.zip`/`.7z`/`.iso` fixture, ideally the sma
 ## Environment
 
 - libarchive_oxide version / commit:
-- Crate(s): (e.g. `libarchive_oxide`, `libarchive_oxide-core`, `libarchive_oxide-cli`)
+- Crate(s):
 - Rust / OS:
-- Feature flags: (e.g. default, `aes`, `sevenz`, `no-default-features`)
+- Feature flags:

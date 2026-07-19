@@ -2,18 +2,12 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# lefthook git hooks. Install with `mise run hooks`.
-#
-# Everything here is also a CI job; a hook is a faster failure, not the only one.
-# Only `commit-msg` and `pre-commit` are declared, so `lefthook install` leaves any
-# other hooks (e.g. signing) alone.
+# Install with `mise run hooks`.
 
 assert_lefthook_installed: true
 no_tty: false
 colors: true
 
-# The commit message is release-plz's raw material: it derives the version bump and
-# CHANGELOG from Conventional Commits. `committed` enforces the type prefix.
 commit-msg:
   commands:
     conventional:
@@ -23,26 +17,22 @@ pre-commit:
   parallel: false
   follow: true
   commands:
-    # --- formatter: fix and re-stage ---------------------------------------------
     cargo-fmt:
       tags: format
       glob: "*.rs"
       run: cargo fmt --all
       stage_fixed: true
 
-    # --- spell check: fix and re-stage -------------------------------------------
     typos:
       tags: spell
       run: typos --write-changes {staged_files}
       stage_fixed: true
 
-    # --- checks (no auto-fix) ----------------------------------------------------
     clippy:
       tags: lint
       glob: "*.rs"
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-    # Zero type erasure: no `dyn` may appear in library/binary source.
     check-no-dyn:
       tags: lint
       glob: "*.rs"

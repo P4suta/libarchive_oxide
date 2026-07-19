@@ -2,22 +2,10 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! gzip decode filter (bridges `miniz_oxide`'s streaming inflate to the sans-IO `Transform`).
+//! gzip encoder and decoder.
 //!
-//! gzip framing (RFC 1952: header + raw deflate body + CRC32/ISIZE trailer) is
-//! interpreted here, and the body is delegated to `miniz_oxide::inflate::stream` (which manages the 32KB window internally).
-//! This makes it behave, from the caller's viewpoint, as a [`Transform`] with the same shape as our hand-written filters.
-//!
-//! # Header that spans multiple feeds
-//!
-//! The gzip header is variable-length (optional FEXTRA / FNAME / FCOMMENT / FHCRC) and may be split
-//! across several `step` calls when the caller feeds bytes incrementally (the sans-IO source
-//! pipeline drives exactly this). [`GzipDecoder`] therefore accumulates the header prefix internally
-//! until it is complete: each `step` in the header phase consumes only the header bytes present in
-//! that chunk and reports [`Status::NeedInput`] while it is still short. The whole-slice caller
-//! (the std layer) hits the fast path — the header is complete on the first call and nothing is
-//! buffered. This is the genuine streaming path that lets a hand-written filter compose end-to-end
-//! with the incremental format source.
+//! Implements RFC 1952 framing over `miniz_oxide` raw DEFLATE. The decoder
+//! buffers incomplete variable-length headers across `step` calls.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -42,18 +30,14 @@ enum Phase {
     Done,
 }
 
-/// gzip decompressor. Plugs into the format layer with the same shape as a `Filter`.
+/// gzip decompressor.
 ///
-/// `InflateState` is large (~10 KB of Huffman/window state), so it is boxed here at its source:
-/// `GzipDecoder` stays one word wide, which keeps the sealed `AnyDecoder` enum small and balanced
-/// with the reused adapters. The box is a plain owning pointer, not a trait object.
+/// `InflateState` is boxed to bound the size of dispatch enums.
 pub struct GzipDecoder {
     phase: Phase,
     inflate: Box<InflateState>,
     trailer_left: usize,
-    /// Accumulated header prefix when the RFC 1952 header spans multiple `step` chunks. Empty on the
-    /// fast path (a caller that hands over the whole header at once) and freed once the header is
-    /// parsed; it only ever grows while the header itself is still incomplete.
+    /// Incomplete RFC 1952 header bytes.
     header_buf: Vec<u8>,
 }
 
@@ -219,7 +203,7 @@ impl Filter for GzipDecoder {
 
 impl Decoder for GzipDecoder {}
 
-/// gzip compressor — the dual of [`GzipDecoder`]. Buffers plaintext, then emits an RFC 1952 frame
+/// gzip compressor. Buffers plaintext, then emits an RFC 1952 frame
 /// (header + raw DEFLATE via `miniz_oxide` + CRC32/ISIZE trailer). Stays `no_std`.
 pub struct GzipEncoder(PushBridge);
 

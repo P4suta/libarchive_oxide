@@ -189,7 +189,7 @@ impl<'a> EntryReader for ArReader<'a> {
     }
 }
 
-/// `ar` streaming writer — the dual of [`ArReader`]. Writes the global magic once, then a 60-byte
+/// `ar` streaming writer. Writes the global magic once, then a 60-byte
 /// header per member (BSD `#1/LEN` inline names for names longer than 15 bytes) and an even-byte
 /// pad. Every member is a regular file.
 #[derive(Debug)]

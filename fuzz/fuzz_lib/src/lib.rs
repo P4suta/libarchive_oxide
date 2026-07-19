@@ -2,27 +2,18 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `libarchive_oxide-fuzz-cases` — the invariant bodies of libarchive_oxide's fuzzing, factored out as plain functions.
+//! Portable fuzz target implementations.
 //!
-//! This crate holds **no** libFuzzer machinery, so it builds and runs anywhere (including the
-//! Windows/MSVC dev box with a stable toolchain). Two callers share it:
+//! This crate contains no libFuzzer integration. It is called by:
 //!
-//! - `fuzz/fuzz_targets/*.rs` — thin `fuzz_target!` shims (built only under the `fuzz` crate on a
-//!   nightly Linux CI box) that delegate straight to these functions.
-//! - `libarchive_oxide/tests/fuzz_replay.rs` — a portable `cargo test` runner that replays committed corpus
-//!   files and a batch of `arbitrary`-seeded structured inputs through the **same** functions.
+//! - `fuzz/fuzz_targets/*.rs`;
+//! - `libarchive_oxide/tests/fuzz_replay.rs`.
 //!
 //! # Invariants
 //!
-//! - **Reader targets** (`read_*`): feed arbitrary bytes to a format reader, run detection +
-//!   `next_entry` + `read_chunk` to EOF. The only requirement is *no panic* and *bounded work*
-//!   (a malformed archive must never hang or allocate without bound); errors are expected and fine.
-//! - **Round-trip targets** (`roundtrip_*`): synthesize a valid file set from an `arbitrary` seed,
-//!   write it, read it back, and assert `read ∘ write = id`.
-//! - **Codec targets** (`codec_*`): decode arbitrary bytes without panicking, and — where an encoder
-//!   exists — assert `decode ∘ encode = id`.
-//!
-//! There is **zero type erasure** here: every driver is generic over the concrete reader/writer.
+//! - Readers must not panic or exceed work bounds.
+//! - Archive round trips must preserve normalized files.
+//! - Codec round trips must preserve input.
 
 #![forbid(unsafe_code)]
 
@@ -45,37 +36,31 @@ use libarchive_oxide_core::{
 use libarchive_oxide::sevenz::{SevenZReader, SevenZWriter};
 use libarchive_oxide::zip::ZipReader;
 
-// ── Bounds: the guardrails that make "no panic / bounded work" enforceable on adversarial input. ──
-
-/// Never follow a reader past this many entries (a malformed count field must not loop forever).
+/// Maximum entries processed per input.
 const MAX_ENTRIES: usize = 200_000;
-/// Never accumulate more than this many payload bytes from one archive (bomb defense).
+/// Maximum payload bytes processed per input.
 const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
-/// Cap on any single materialized decode (bomb defense for the codec targets).
+/// Maximum materialized codec output.
 const CODEC_CAP: usize = 64 * 1024 * 1024;
-/// Largest plaintext we round-trip through a codec (keeps `encode∘decode` cheap).
+/// Maximum codec round-trip input.
 const CODEC_ROUNDTRIP_MAX: usize = 256 * 1024;
-/// LZMA2 dictionary size matching `Lzma2Options::with_preset(6)` (8 MiB).
+/// LZMA2 dictionary size for preset 6.
 const LZMA2_DICT: u32 = 8 * 1024 * 1024;
 
-/// Most files a synthesized round-trip archive holds.
+/// Maximum synthesized entries.
 const MAX_ROUNDTRIP_ENTRIES: usize = 48;
-/// Longest synthesized entry name (bytes).
+/// Maximum synthesized name length.
 const MAX_NAME_LEN: usize = 40;
-/// Largest synthesized per-entry payload.
+/// Maximum synthesized entry size.
 const MAX_ROUNDTRIP_DATA: usize = 4096;
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// Reader targets: arbitrary bytes → detection + drain, asserting no panic and bounded work.
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// Drives any [`EntryReader`] to exhaustion under the bounds above. Fully monomorphized (no `dyn`).
+/// Drains an [`EntryReader`] within configured bounds.
 fn drive_reader<R: EntryReader>(mut reader: R) {
     let mut entries = 0usize;
     let mut total: u64 = 0;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        // Stop on end-of-archive (`Ok(None)`) or any parse error (`Err`) — both are acceptable.
+        // End-of-archive and parse errors terminate the case.
         let mut entry = match reader.next_entry() {
             Ok(Some(entry)) => entry,
             _ => return,
@@ -84,7 +69,7 @@ fn drive_reader<R: EntryReader>(mut reader: R) {
         if entries > MAX_ENTRIES {
             return;
         }
-        // Touch the metadata so name/link decoding is exercised too.
+        // Exercise name and link decoding.
         let _ = entry.meta().path.len();
         let _ = entry.meta().link_target.as_ref().map(|t| t.len());
         loop {
@@ -136,12 +121,7 @@ pub fn read_7z(data: &[u8]) {
     drive_reader(SevenZReader::new(data));
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// Round-trip targets: synthesized file set → write → read back → assert `read ∘ write = id`.
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// A synthesized archive member. `arbitrary` fills `name`/`data` from the fuzzer's byte stream; the
-/// raw values are then sanitized by [`normalize_files`] into a set every format can round-trip.
+/// Synthesized archive member.
 #[derive(Debug, Clone, Arbitrary)]
 pub struct FuzzEntry {
     /// Raw candidate name (sanitized before use).
@@ -150,10 +130,7 @@ pub struct FuzzEntry {
     pub data: Vec<u8>,
 }
 
-/// Turns arbitrary [`FuzzEntry`] values into a canonical set of `(name, data)` files that every
-/// writer accepts and every reader returns identically: names are restricted to a portable
-/// character set, kept non-empty, bounded in length, and made unique case-insensitively (ISO 9660's
-/// primary tree is case-folding, so case-only differences could otherwise collide).
+/// Normalizes entries for all supported writers.
 fn normalize_files(entries: &[FuzzEntry]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -165,14 +142,14 @@ fn normalize_files(entries: &[FuzzEntry]) -> Vec<(Vec<u8>, Vec<u8>)> {
             .filter(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
             .take(MAX_NAME_LEN)
             .collect();
-        // A leading '.' or '-' is awkward across shells and 8.3 mangling; drop them.
+        // Remove prefixes that conflict with shell and 8.3 handling.
         while matches!(name.first(), Some(b'.' | b'-')) {
             name.remove(0);
         }
         if name.is_empty() {
             name = format!("f{i}").into_bytes();
         }
-        // Ensure case-insensitive uniqueness; disambiguate with the index if needed.
+        // Enforce case-insensitive uniqueness.
         if !seen.insert(name.to_ascii_lowercase()) {
             let mut disamb = format!("{i}_").into_bytes();
             disamb.extend_from_slice(&name);
@@ -192,12 +169,7 @@ fn normalize_files(entries: &[FuzzEntry]) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
-/// Writes one regular-file entry, returning `Err` with the failing stage if the writer rejects it.
-///
-/// [`normalize_files`] only ever produces entries that *every* writer accepts (portable name set,
-/// bounded length, `EntryKind::File`, small payload), so a failure here is a **writer regression**,
-/// not a legitimate rejection. Callers assert on it (see [`write_file_asserted`]) rather than
-/// silently aborting — the old early-`return` made a broken writer pass the round-trip vacuously.
+/// Writes one normalized regular-file entry.
 fn write_file<W: EntryWriter>(
     writer: &mut W,
     name: &[u8],
@@ -213,24 +185,20 @@ fn write_file<W: EntryWriter>(
     sink.close().map_err(|_| "close")
 }
 
-/// Writes one entry and asserts it succeeded. A failure means a writer stage returned `Err` on an
-/// input `normalize_files` guarantees is writable — a regression that must fail loudly, never no-op.
+/// Writes one entry and fails the fuzz case on rejection.
 fn write_file_asserted<W: EntryWriter>(writer: &mut W, name: &[u8], data: &[u8], fmt: &str) {
     if let Err(stage) = write_file(writer, name, data) {
         panic!(
-            "{fmt}: writer.{stage} rejected a normalized entry (name {name:?}, {} byte(s)) — \
-             a writer regression, not a legitimate rejection",
+            "{fmt}: writer.{stage} rejected normalized entry {name:?} ({} bytes)",
             data.len()
         );
     }
 }
 
-/// Reads an archive back into a `name → data` map over its regular files. Directory order is not
-/// significant (ISO sorts its directory records), so a map is the right equality domain.
+/// Reads regular files into a name-to-data map.
 fn read_back_map<R: EntryReader>(mut reader: R) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut map = BTreeMap::new();
-    // `while let Ok(Some(..))` stops on both end-of-archive and error; a mid-stream error on our
-    // own freshly written archive then surfaces as a map mismatch.
+    // Errors produce a map mismatch.
     while let Ok(Some(mut entry)) = reader.next_entry() {
         if entry.meta().kind != EntryKind::File {
             continue;
@@ -249,7 +217,7 @@ fn read_back_map<R: EntryReader>(mut reader: R) -> BTreeMap<Vec<u8>, Vec<u8>> {
     map
 }
 
-/// The expected `name → data` map for a normalized file set.
+/// Returns the expected map for normalized files.
 fn expected_map(files: &[(Vec<u8>, Vec<u8>)]) -> BTreeMap<Vec<u8>, Vec<u8>> {
     files.iter().cloned().collect()
 }

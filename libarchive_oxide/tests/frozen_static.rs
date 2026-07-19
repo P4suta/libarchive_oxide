@@ -2,16 +2,9 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Static (compile-time) proofs of the frozen abstraction on the std side.
-//!
-//! There is **no runtime type erasure** anywhere in the pipeline: the sealed [`AnyReader`] is an
-//! [`EntryReader`] with an associated [`EntryData`]; `decoder()`/`encoder()` are origin-opaque (the
-//! hand-written gzip codec and the reused adapters share one nominal type); and [`AnyDecoder`]/
-//! [`AnyEncoder`] are [`Transform`]s (the filter-axis dual). These bounds only type-check because
-//! the abstraction is shaped exactly as frozen — that is the point of the file.
+//! Compile-time checks for std-side dispatch types.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// The match/binding constructs below exist purely to force compile-time exhaustiveness and
-// single-type checks; their "no effect" and "identical arms" are the whole point.
+// These matches enforce exhaustiveness and common result types.
 #![allow(clippy::no_effect_underscore_binding, clippy::match_same_arms)]
 
 use libarchive_oxide::extract::{AnyEntryData, AnyReader};
@@ -19,11 +12,11 @@ use libarchive_oxide::filter::{decoder, encoder, AnyDecoder, AnyEncoder};
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{EntryData, EntryReader, Transform};
 
-/// The sealed std reader satisfies `EntryReader` — statically, no `dyn`.
+/// Requires `EntryReader`.
 fn assert_is_reader<R: EntryReader>() {}
-/// Its payload cursor satisfies `EntryData`.
+/// Requires `EntryData`.
 fn assert_is_entry_data<D: EntryData>() {}
-/// The filter-axis dual: any decoder/encoder is a `Transform`.
+/// Requires `Transform`.
 fn assert_is_transform<T: Transform>() {}
 
 #[test]

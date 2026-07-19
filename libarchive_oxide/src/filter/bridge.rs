@@ -2,17 +2,10 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Bridge from a pull-based (`std::io::Read`) decoder to the sans-IO `Transform`.
+//! `std::io::Read` decoder adapter.
 //!
-//! Reused decoder crates (`ruzstd`, `lzma-rust2`, `lz4_flex`) expose a `Read`-based API.
-//! This bridge conforms them fully to the push-style [`Transform`]: compressed input is
-//! accumulated during `step`, and on `finish` a `Read` decoder is constructed over the
-//! buffered bytes and drained into the caller's output. The seam is sealed inside here, so
-//! from the caller's viewpoint these adapters are indistinguishable from a hand-written
-//! filter (origin-opaque).
-//!
-//! Matching the whole-slice source model of P1/P2, the compressed input is buffered in full
-//! before decoding. A truly incremental Read-to-sans-IO pump is a later refinement.
+//! Input is buffered during `step`. `finish` constructs the decoder and drains
+//! output through [`Transform`](libarchive_oxide_core::Transform).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -21,12 +14,9 @@ use std::io::{Cursor, Read};
 use libarchive_oxide_core::transform::{Status, Step};
 use libarchive_oxide_core::{Error, Result};
 
-/// Accumulates compressed input, then drives a `Read`-based decoder `D` to produce output.
+/// Buffers input and drives a concrete `Read` decoder.
 ///
-/// The concrete decoder `D` can be large (e.g. an LZMA reader carries several KB of window/state),
-/// so the running decoder is held behind a `Box<D>` — an owning pointer to a fully monomorphized
-/// type, **not** a trait object. This keeps every adapter (and the sealed `AnyDecoder` enum that
-/// wraps them) one word wide regardless of which codec `D` is.
+/// The decoder is boxed to bound the size of dispatch enums.
 pub(crate) enum PullBridge<D> {
     /// Still receiving compressed input.
     Buffering(Vec<u8>),

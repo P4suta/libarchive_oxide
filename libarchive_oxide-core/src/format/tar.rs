@@ -4,21 +4,9 @@
 
 //! tar format (ustar / pax / GNU).
 //!
-//! **P1**: Implements slice-based reading. Establishes here the borrow-checked
-//! `Entry` model frozen in P0 (`Entry<'r>` mutably borrows the reader and cannot
-//! advance until the payload is fully read) together with `EntryData` (sans-IO
-//! pull of the payload).
-//!
-//! Supported: ustar (`prefix`+`name` join), octal / base-256 numerics, checksum
-//! verification, PAX extensions (`x` for the next entry / `g` global), GNU
-//! longname/longlink (`L`/`K`), archive end (zero blocks). GNU sparse (`S`) is
-//! currently `Unsupported` (out of scope for P1).
-//!
-//! Two source models coexist, both additive over the same frozen traits:
-//! [`TarReader`] over an **in-memory slice** (`&[u8]`) — the std layer typically
-//! mmaps a file and hands over a `&[u8]` — and [`TarSource`], the incremental,
-//! caller-fed sans-IO [`EntrySource`] that accepts the
-//! archive in arbitrarily small pushes and reuses every field/record parser here.
+//! Supports ustar, pax extensions, GNU long names, octal and base-256 numbers,
+//! and checksum verification. GNU sparse entries are unsupported. [`TarReader`]
+//! reads a slice. [`TarSource`] accepts incremental input.
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -79,14 +67,7 @@ struct Overrides<'a> {
     gid: Option<u64>,
 }
 
-/// Owned overrides for the incremental [`TarSource`]: the same struct instantiated at `'static`.
-///
-/// `Overrides` is already generic over the `Cow` lifetime, so pinning it to `'static` yields an
-/// owned-only variant with **zero duplicated code** — the cleaner of the two options in the plan
-/// (a hand-written twin struct would just re-list the same six fields). The slice [`TarReader`]
-/// borrows PAX/long-name bytes straight from the archive slice (`Overrides<'a>`); the source cannot,
-/// because its accumulation buffer is compacted between entries, so it merges each parsed record's
-/// values into `OwnedOverrides` via an explicit `into_owned` clone (see [`merge_owned`]).
+/// Owned overrides for [`TarSource`].
 type OwnedOverrides = Overrides<'static>;
 
 /// tar streaming reader (over an in-memory slice).
@@ -298,9 +279,7 @@ enum State {
     Done,
 }
 
-/// The outcome of driving one state, before the (possibly buffer-borrowing) event is materialized.
-/// `Entry` and `Data` carry no data here — their borrowed payload is built in [`TarSource::pull`]
-/// from staged fields, keeping each state method free of a self-borrow it would have to return.
+/// Internal state-machine result.
 enum Poll {
     /// The state advanced; loop and drive again.
     Continue,
@@ -316,42 +295,31 @@ enum Poll {
     Data,
 }
 
-/// Incremental, sans-IO tar reader — the [`EntrySource`] reference implementation.
+/// Incremental sans-IO tar reader.
 ///
-/// It reuses **every** field / record parser the slice [`TarReader`] uses (`field`, `cstr`,
-/// `parse_numeric`, `verify_checksum`, `kind_from_typeflag`, `join_prefix_name`, `round_up`,
-/// `parse_pax`, `apply_pax`, `parse_pax_time`); only the driver — a state machine over a growing
-/// `Vec<u8>` with a read cursor — is new. Bytes arrive via [`feed`](EntrySource::feed) in any
-/// chunking (down to a single byte); [`pull`](EntrySource::pull) emits events borrowing the internal
-/// buffer, which is compacted (`drain(..cursor)`) at the top of every [`pull`](EntrySource::pull) —
-/// reclaiming the bytes the previous event consumed, including each payload window mid-entry — so the
-/// resident size stays bounded (about one in-flight window plus not-yet-consumed fed bytes),
-/// independent of total entry size.
-///
-/// A future `enum AnySource { Tar, Cpio, Ar }` (the shape of [`AnyReader`](crate::format::AnyReader))
-/// could wrap this and forward the three methods by exhaustive `match`, with no type erasure — this
-/// type is deliberately a plain concrete implementor to make that wrapping trivial.
+/// Reuses the slice reader parsers. Consumed buffer prefixes are removed during
+/// [`pull`](EntrySource::pull).
 #[derive(Debug)]
 pub struct TarSource {
-    /// Growing accumulation buffer of fed archive bytes.
+    /// Input buffer.
     buf: Vec<u8>,
-    /// Read position within `buf`; bytes before it are consumed and reclaimed on compaction.
+    /// Read position.
     cursor: usize,
     /// Driver state.
     state: State,
-    /// Whether `finish_input` has been called (no more bytes will arrive).
+    /// End-of-input state.
     finished: bool,
-    /// Overrides captured for the *next* real entry (PAX `x`, GNU `L`/`K`).
+    /// Overrides for the next entry.
     pending: OwnedOverrides,
-    /// Global overrides (PAX `g`) applying to all subsequent entries.
+    /// Global PAX overrides.
     global: OwnedOverrides,
-    /// Accumulator for the current extended / long header record (may span feeds).
+    /// Partial extended header.
     record: Vec<u8>,
-    /// Overrides taken for the entry whose header was just parsed, staged for [`Poll::Entry`].
+    /// Staged entry overrides.
     stage_pending: OwnedOverrides,
-    /// Payload size of the entry staged for [`Poll::Entry`].
+    /// Staged entry size.
     stage_size: u64,
-    /// Length of the payload window staged for [`Poll::Data`] (it ends at `cursor`).
+    /// Staged data length.
     stage_len: usize,
 }
 
@@ -384,18 +352,13 @@ impl TarSource {
         self.buf.len() - self.cursor
     }
 
-    /// Bytes currently held in the internal accumulation buffer (consumed-but-not-yet-reclaimed plus
-    /// unconsumed). Compaction at the top of each [`pull`](EntrySource::pull) keeps this bounded to
-    /// roughly one in-flight window plus not-yet-consumed fed bytes, independent of entry size — a
-    /// hook for callers that want to apply their own feed backpressure, and for asserting the bound.
+    /// Returns the current input buffer length.
     #[must_use]
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
     }
 
-    /// Drop consumed bytes and reset the cursor. Sound only when no event borrow is outstanding,
-    /// which holds at the top of every [`pull`](EntrySource::pull) — the sole call site — because
-    /// the previous event's borrow has ended by then.
+    /// Removes consumed bytes and resets the cursor.
     fn compact(&mut self) {
         if self.cursor > 0 {
             self.buf.drain(..self.cursor);
@@ -719,7 +682,7 @@ fn merge_owned(dst: &mut OwnedOverrides, src: Overrides<'_>) {
     }
 }
 
-/// tar streaming writer — the dual of [`TarReader`]. Emits ustar headers (with GNU longname/
+/// tar streaming writer. Emits ustar headers (with GNU longname/
 /// longlink for names over 100 bytes) into a [`Sink`], padding each entry and the trailer.
 ///
 /// The declared `size` comes from `EntryMeta`, so the header is written up front at `start_entry`;

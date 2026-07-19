@@ -2,30 +2,13 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! ISO 9660 (ECMA-119) with the Joliet extension — reader and writer.
+//! ISO 9660 reader and writer with Joliet support.
 //!
-//! Unlike the container formats that keep compressed payloads (zip/7z), an ISO image stores every
-//! file **uncompressed and LBA-contiguous**: a file's bytes are exactly `image[lba*2048 ..][..size]`.
-//! That makes the read path genuinely zero-copy — the reader lends a [`SliceData`] window straight
-//! into the backing image, so `Data = SliceData<'a>` exactly like tar/cpio/ar. Because there is no
-//! codec involved, the whole format lives in `libarchive_oxide-core` (`no_std`, `alloc` + `core` only) and stays
-//! green on `thumbv7em-none-eabi`.
-//!
-//! ## Scope (explicit, tested)
-//!
-//! **Read**: 2048-byte sectors; the volume-descriptor set from sector 16 (`0x8000`); the Primary
-//! Volume Descriptor (type 1, both-endian numeric fields, 34-byte root directory record) and — when
-//! present — the Joliet Supplementary Volume Descriptor (type 2, escape `25 2F {40,43,45}`), whose
-//! UCS-2BE names are **preferred**. Directory records are walked recursively (`.`/`..` skipped, the
-//! `;1` version suffix stripped, both-endian LBA/size read), with recursion-depth and record-count
-//! caps against malformed loops. No Rock Ridge: only files and directories, with default modes
-//! (`0o755` for directories, `0o644` for files).
-//!
-//! **Write**: ISO mastering, buffered fully in memory. Entry paths accumulate into a tree; `finish`
-//! assigns LBAs, lays out the path tables (both L- and M-endian) and directory extents for **both**
-//! the ISO 9660 and Joliet trees, writes the PVD, the Joliet SVD and the terminator, sector-aligns
-//! the (shared) file data, and performs a single [`Sink::write_all`]. Single volume, ≤ 4 GiB per
-//! file, no El Torito boot record.
+//! Files are uncompressed and LBA-contiguous. Readers expose [`SliceData`].
+//! Supported metadata includes primary and Joliet volume descriptors, both-endian
+//! numeric fields, path tables, and recursive directories. Rock Ridge and El
+//! Torito are unsupported. Writers buffer the image and support files up to 4
+//! GiB.
 
 use alloc::borrow::Cow;
 use alloc::collections::VecDeque;
@@ -430,7 +413,7 @@ struct PendingEntry {
     content: Vec<u8>,
 }
 
-/// ISO 9660 + Joliet streaming writer — the dual of [`IsoReader`].
+/// ISO 9660 and Joliet writer.
 ///
 /// **The whole image is mastered in memory.** Entries accumulate into a tree as they are written;
 /// `finish` performs the full layout (LBA assignment, path tables, directory extents for both trees,

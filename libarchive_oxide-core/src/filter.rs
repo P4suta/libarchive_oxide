@@ -2,42 +2,29 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Filter axis: a subdivision of [`Transform`] that represents compression codecs.
+//! Compression filter traits and identifiers.
 //!
-//! The filter axis is **orthogonal** to the format axis. The std layer decompresses through the
-//! sealed `AnyDecoder` enum (fully monomorphized, no type erasure), and the format layer reads the
-//! resulting plaintext bytes, knowing nothing about whether or how they were compressed.
-//!
-//! # Duality (decode ⇄ encode)
-//!
-//! [`Decoder`] and [`Encoder`] are type-level duals. For any codec, passing bytes
-//! through the `Encoder` and then through the `Decoder` yields the identity (`Decoder ∘ Encoder = id`).
-//! This invariant is enforced mechanically by property tests once the encoders are implemented.
-//!
-//! # Origin-opaque
-//!
-//! Our own `Inflate` (sans-IO, `no_std`), as well as the adapters wrapping `ruzstd`/`lzma-rs`/`lz4_flex`,
-//! all ride on the same [`Filter`] isomorphically. The seams are sealed inside each adapter,
-//! and the only compromise that surfaces is that "the zstd/xz adapters are `std` feature-gated".
+//! Filters implement [`Transform`]. Archive formats consume the resulting
+//! uncompressed bytes.
 
 use crate::transform::Transform;
 
-/// Identifier for a compression filter. Used for detection, diagnostics, and automatic layering.
+/// Compression filter identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FilterId {
-    /// DEFLATE + gzip framing (our own inflate, `no_std`).
+    /// DEFLATE with gzip framing.
     Gzip,
-    /// Zstandard (`ruzstd` adapter, std).
+    /// Zstandard.
     Zstd,
-    /// XZ / LZMA2 (`lzma-rs` adapter, std, subset).
+    /// XZ / LZMA2.
     Xz,
-    /// LZ4 frame (`lz4_flex` adapter, std).
+    /// LZ4 frame.
     Lz4,
 }
 
 impl FilterId {
-    /// Infers the filter from the magic bytes at the start of a byte stream (for auto-detection).
+    /// Detects a filter from leading magic bytes.
     ///
     /// Returns `None` when there is not enough prefix to decide, or when nothing matches.
     #[must_use]
@@ -52,14 +39,14 @@ impl FilterId {
     }
 }
 
-/// Marker indicating that a type is a compression filter. The common supertrait of [`Decoder`]/[`Encoder`].
+/// Compression filter marker.
 pub trait Filter: Transform {
     /// The codec this filter belongs to.
     const ID: FilterId;
 }
 
-/// Decompressor: compressed byte stream → plaintext byte stream. The dual of [`Encoder`].
+/// Compressed-to-plain transform.
 pub trait Decoder: Filter {}
 
-/// Compressor: plaintext byte stream → compressed byte stream. The dual of [`Decoder`].
+/// Plain-to-compressed transform.
 pub trait Encoder: Filter {}

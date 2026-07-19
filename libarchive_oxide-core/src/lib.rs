@@ -2,30 +2,12 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `libarchive_oxide-core` — a frozen trait algebra and sans-IO core.
+//! `no_std` archive traits and uncompressed formats.
 //!
-//! What this crate delivers is not a "working extraction tool" but **the trait algebra itself**.
-//! The top-level design criterion is the symmetry, orthogonality, and purity of the abstractions;
-//! implementation coverage is subordinate to that.
-//!
-//! # Invariants of beauty (this crate's acceptance criteria)
-//!
-//! - **A single sans-IO substrate**: every transformation rides on [`Transform`]. It holds no I/O,
-//!   and the caller drives the bytes (caller-owned buffers, never forcing an allocation).
-//! - **Orthogonal (format ⊥ filter)**: adding compression does not change a single line of the
-//!   [`format`] layer's code. The converse holds too. format knows nothing of filter, filter nothing of format.
-//! - **Dual (read ⇄ write, decode ⇄ encode)**: [`EntryReader`]/[`EntryWriter`] and
-//!   [`Decoder`]/[`Encoder`] are symmetric at the type level.
-//!   The design of one side forces the other.
-//! - **Purity**: all trait definitions are `no_std`. Only specific impls pull in `std`/`alloc`.
-//! - **Origin-opaque**: whether an impl is hand-written or an adapter over a reused crate never leaks into the caller's types.
-//!
-//! # Implementation status
-//!
-//! The abstractions (traits and types) are **frozen in their finished form**. The implemented read
-//! and write paths for [`format::tar`], [`format::cpio`], [`format::ar`], and [`format::iso9660`]
-//! all use the same traits, demonstrating that implementation breadth grows beneath the frozen
-//! abstractions rather than changing them.
+//! The crate provides [`Transform`], [`Filter`], [`EntryReader`],
+//! [`EntryWriter`], shared metadata, and tar/cpio/ar/ISO 9660 implementations.
+//! It requires `alloc`, has no external dependencies, and uses sealed enums for
+//! runtime dispatch.
 
 #![no_std]
 #![forbid(unsafe_code)]

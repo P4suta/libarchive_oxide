@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Archive format auto-detection and safe filesystem extraction (the std entry points).
+//! Archive detection and filesystem extraction.
 
 use std::fs;
 use std::io::{self, Write};
@@ -18,10 +18,7 @@ use libarchive_oxide_core::{EntryData, EntryKind, EntryMeta, EntryReader, OwnedD
 use crate::path::sanitize;
 use crate::zip::ZipReader;
 
-/// The payload cursor of whichever std-side archive is being read. The `EntryData` dual of
-/// [`AnyReader`]: a sealed enum bundling the core cursor kinds and zip's owned buffer, so dispatch
-/// stays fully monomorphized (no type erasure). Adding a std format is a compiler-checked exhaustiveness
-/// obligation.
+/// Runtime-selected entry data.
 #[derive(Debug)]
 pub enum AnyEntryData<'a> {
     /// A core (`no_std`) format's cursor (tar/cpio/ar).
@@ -45,8 +42,7 @@ impl EntryData for AnyEntryData<'_> {
     }
 }
 
-/// The concrete kind of std-side archive reader, selected at runtime. Sealed enum; the exhaustive
-/// `match` in [`AnyReader::next_entry`] fails to compile if a variant is added unhandled.
+/// Runtime-selected archive reader implementation.
 #[derive(Debug)]
 enum AnyReaderKind<'a> {
     Core(libarchive_oxide_core::AnyReader<'a>),
@@ -55,12 +51,9 @@ enum AnyReaderKind<'a> {
     SevenZ(crate::sevenz::SevenZReader<'a>),
 }
 
-/// Runtime-selected std archive reader, dispatched over a sealed enum with **zero type erasure**.
-/// It is itself an [`EntryReader`] (`Data = AnyEntryData`), returned by value from [`reader`].
+/// Runtime-selected archive reader.
 ///
-/// Like [`libarchive_oxide_core::AnyReader`], `next_entry` re-homes the inner entry into `self.slot`: the
-/// metadata is deep-cloned to an owned form and the payload cursor is lifted out by `mem::take`
-/// (both inner cursor kinds are `Default`).
+/// Implements [`EntryReader`] with [`AnyEntryData`].
 #[derive(Debug)]
 pub struct AnyReader<'a> {
     kind: AnyReaderKind<'a>,
@@ -107,8 +100,7 @@ impl<'a> EntryReader for AnyReader<'a> {
 
 /// Detects the archive format from `plain` (already decompressed) and builds a reader.
 ///
-/// Recognizes zip, tar, ar, and cpio. Errors if the bytes match none of them. The reader is
-/// returned **by value** (a sealed [`AnyReader`] enum), never boxed behind a trait object.
+/// Recognizes zip, 7z, tar, ISO 9660, ar, and cpio.
 pub fn reader(plain: &[u8]) -> io::Result<AnyReader<'_>> {
     reader_with_password(plain, None)
 }

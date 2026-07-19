@@ -2,23 +2,14 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `libarchive_oxide` — the std high-level API of the unified streaming archive library.
+//! Archive detection, compression, extraction, and creation.
 //!
-//! On top of [`libarchive_oxide_core`]'s frozen trait algebra, this layers a practical std layer:
-//! automatic compression/format detection, filesystem extraction, safe path sanitization, allocation caps.
-//!
-//! # Implementation status
-//!
-//! - P2: automatic compression detection + gzip decompression ([`decompress`]).
-//! - P3: zstd/xz/lz4 decompression via the same entry point.
-//! - P4: tar/cpio/ar readers (in `libarchive_oxide_core`), composed for `.deb`.
-//! - P5: format detection ([`reader`]), safe FS extraction ([`extract`]), path sanitization, CLI.
+//! This crate adds codecs, zip/7z, filesystem operations, path sanitization, and
+//! output limits to [`libarchive_oxide_core`].
 
 #![forbid(unsafe_code)]
 
-// The compression filters (merged in from the former `arca-filter` crate) use `alloc::*` paths so the
-// hand-written gzip codec stays allocator-generic; `alloc` is part of the std sysroot, so pulling it
-// in explicitly lets those modules keep their origin-opaque code unchanged.
+// Filter modules use `alloc` paths and also compile under std.
 extern crate alloc;
 
 use std::borrow::Cow;
@@ -40,20 +31,18 @@ pub use libarchive_oxide_core;
 pub use path::sanitize;
 pub use zip::{SaltSource, ZipMethod, ZipOptions};
 
-/// Auto-detects compression from the leading magic bytes and returns the decompressed archive byte stream.
+/// Detects compression and returns decompressed bytes.
 ///
-/// If no compression is detected, the input is borrowed and returned as-is (plain tar, etc., with no copy).
-/// If the detected filter is not built in (feature off), returns [`Error::Unsupported`].
-///
-/// The returned byte stream can be passed directly to an [`libarchive_oxide_core::EntryReader`] such as `TarReader`.
-///
-/// This form is uncapped. Prefer [`decompress_capped`] when handling untrusted input.
+/// Returns borrowed input when no compression is detected. Returns
+/// [`Error::Unsupported`] when the required filter feature is disabled. This
+/// function has no output limit; use [`decompress_capped`] for untrusted input.
 pub fn decompress(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
     decompress_capped(bytes, usize::MAX)
 }
 
-/// Like [`decompress`], but fails with [`Error::LimitExceeded`] if the decompressed size would
-/// exceed `max_output` bytes. Use this on untrusted archives to defend against decompression bombs.
+/// Detects compression and enforces `max_output`.
+///
+/// Returns [`Error::LimitExceeded`] when output exceeds the limit.
 pub fn decompress_capped(bytes: &[u8], max_output: usize) -> Result<Cow<'_, [u8]>> {
     match FilterId::sniff(bytes) {
         Some(id) => {
@@ -66,14 +55,14 @@ pub fn decompress_capped(bytes: &[u8], max_output: usize) -> Result<Cow<'_, [u8]
     }
 }
 
-/// Compresses `plain` with the given codec. The dual of [`decompress`].
+/// Compresses `plain` with `id`.
 pub fn compress(plain: &[u8], id: FilterId) -> Result<Vec<u8>> {
     let mut encoder =
         crate::filter::encoder(id).ok_or(Error::Unsupported("filter not built in"))?;
     decode_to_vec(&mut encoder, plain)
 }
 
-/// Guesses the compression codec from an archive filename's extension (`None` = plain).
+/// Returns the compression codec implied by a filename.
 #[must_use]
 pub fn filter_for_name(name: &str) -> Option<FilterId> {
     let ext = std::path::Path::new(name)

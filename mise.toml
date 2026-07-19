@@ -2,41 +2,29 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# Native dev toolchain (mirrors what CI installs). Install with `mise install`, then
-# `mise run hooks`. The Rust toolchain channel is owned by rust-toolchain.toml; the
-# `rust = "stable"` line here just matches it so `mise install` provisions it too.
+# Install tools with `mise install`. Rust configuration is in rust-toolchain.toml.
 
 [tools]
 rust = "stable"
 
-# Git hooks + the commit-message linter (see lefthook.yml, committed.toml).
 lefthook = "latest"
 committed = "latest"
 
-# Format/lint/CI tools the hooks and CI shell out to.
 typos = "latest"
 actionlint = "latest"
 
-# The REUSE license linter has no static binary; it runs through `uvx` (see the
-# `reuse` task below). `uv` provides an isolated, pinned invocation, and on Windows
-# `--with charset-normalizer` gives it a pure-Python encoding detector so it needs no
-# native libmagic.
+# REUSE runs through uvx.
 uv = "latest"
 
-# Lets the cargo: backend fetch prebuilt binaries instead of compiling.
 cargo-binstall = "latest"
 
-# Cargo subcommands via the cargo: backend (fetched as prebuilt binaries).
 "cargo:cargo-msrv" = "latest"
 "cargo:cargo-deny" = "latest"
 "cargo:cargo-semver-checks" = "latest"
 "cargo:release-plz" = "latest"
 
 [settings.cargo]
-# Use cargo-binstall (prebuilt binaries) for cargo: backend tools, not source builds.
 binstall = true
-
-# --- Tasks: one entry point per gate; each is also a CI job -----------------------
 
 [tasks.hooks]
 description = "Install the git hooks (see lefthook.yml)"
@@ -80,8 +68,6 @@ run = "typos"
 
 [tasks.reuse]
 description = "Check REUSE/SPDX license compliance"
-# `--with charset-normalizer` gives reuse a pure-Python encoding detector, so it
-# needs no native libmagic (required on Windows; harmless on Linux).
 run = "uvx --with charset-normalizer reuse lint"
 
 [tasks.license-sync]

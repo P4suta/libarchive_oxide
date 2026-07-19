@@ -2,14 +2,11 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `oxcat` — the bsdcat-compatible transparent decompressor.
+//! `oxcat` implementation.
 //!
-//! For each file operand (or stdin, when none are given or the operand is `-`), the leading magic
-//! bytes are sniffed and the decompressed stream is written to stdout. Supported codecs: gzip, zstd,
-//! xz, lz4. Uncompressed input is passed through unchanged (bsdcat's behavior).
-//!
-//! bsdcat has essentially no flags; `--help`/`--version` are accepted. Any other flag is a usage
-//! error (exit 2). Decompression is capped (bomb defense), a documented safe default.
+//! Detects gzip, zstd, xz, and lz4. Uncompressed input passes through. Supports
+//! file operands, standard input, `--help`, and `--version`. Decompression uses
+//! the crate-level limit.
 
 use std::io::{Read, Write};
 
@@ -83,7 +80,7 @@ fn read_stdin() -> Result<Vec<u8>, CliError> {
 }
 
 const HELP: &str = "\
-oxcat — bsdcat-compatible transparent decompressor (libarchive_oxide)
+oxcat: bsdcat-compatible transparent decompressor
 
 USAGE:
     oxcat [FILE...]        Decompress each FILE to stdout ('-' or none = stdin).

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `oxtar` — bsdtar-compatible tar tool. Thin `main` over
+//! `oxtar` entry point over
 //! [`libarchive_oxide_cli::run_tar`], mapping the [`CliError`] onto the exit-code contract
 //! (0 success / 1 runtime / 2 usage). See the library docs for the full flag interface.
 //!

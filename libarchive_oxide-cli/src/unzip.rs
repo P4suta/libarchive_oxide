@@ -2,20 +2,11 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `oxunzip` — the bsdunzip-compatible zip extractor over the flagship library.
+//! `oxunzip` implementation.
 //!
-//! Supported (each flag fully functional):
-//!
-//! - Default: extract the archive under the current directory (or `-d DIR`).
-//! - `-l` list entries instead of extracting.
-//! - `-d DIR` output directory.
-//! - `-o` overwrite existing files without prompting (always on here — the tools never prompt).
-//! - `-P PASSWORD` decryption password (`WinZip` AES-256 / zip64 are supported by the reader).
-//! - Trailing operands select members (literal name / directory-prefix match).
-//! - `--help`, `--version`.
-//!
-//! Intentionally unsupported (clean exit-2 error): `-n` (never overwrite), `-x` (exclude), and any
-//! other classic flag → `unknown flag`. Safe defaults (traversal rejection, bomb cap) stay on.
+//! Supports `-l`, `-d`, `-o`, `-P`, member operands, `--help`, and
+//! `--version`. `-n` and `-x` are unsupported. Extraction rejects path
+//! traversal.
 
 use std::path::PathBuf;
 
@@ -161,7 +152,7 @@ fn dispatch(opts: &UnzipOpts) -> CliResult {
 }
 
 const HELP: &str = "\
-oxunzip — bsdunzip-compatible zip extractor (libarchive_oxide)
+oxunzip: bsdunzip-compatible zip extractor
 
 USAGE:
     oxunzip [-o] [-d DIR] [-P PASSWORD] ARCHIVE.zip [MEMBER...]
@@ -174,7 +165,7 @@ OPTIONS:
     -P PASSWORD   Decryption password (WinZip AES-256 / zip64 supported).
     --help, --version
 
-UNSUPPORTED (exit 2, by design): -n (never overwrite), -x (exclude), other classic flags.
+UNSUPPORTED (exit 2): -n (never overwrite), -x (exclude), other classic flags.
 
 SAFE DEFAULTS: path-traversal entries are refused and decompression is capped (untrusted input).
 

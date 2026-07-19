@@ -5,17 +5,13 @@
 [workspace]
 resolver = "2"
 members = ["libarchive_oxide-core", "libarchive_oxide", "libarchive_oxide-cli"]
-# The cargo-fuzz crate needs nightly + the sanitizer runtime, unavailable on the Windows/MSVC dev
-# box, so it is kept out of the main workspace. `cargo test --workspace` never builds it. Its
-# portable invariant bodies (fuzz/fuzz_lib) are still exercised via libarchive_oxide/tests/fuzz_replay.rs.
+# cargo-fuzz requires nightly and a sanitizer runtime.
 exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Workspace baseline = the no_std core's true floor (zero external deps). Measured with cargo-msrv:
-# 1.81 is required by `core::error::Error` (the `error_in_core` feature, stabilized in Rust 1.81).
-# Higher crates override below (the flagship/CLI pull codec crates with steeper MSRVs).
+# Required by `core::error::Error`. Higher-level crates override this value.
 rust-version = "1.81"
 license = "MIT OR Apache-2.0"
 authors = ["Yasunobu Sakashita <crates.tank733@slmails.com>"]
@@ -24,12 +20,11 @@ homepage = "https://github.com/P4suta/libarchive_oxide"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-# Enforce the acceptance criteria for elegance via lints too: unwrap/panic family is a last resort.
-# Library and binary code must not panic; test modules opt out with a local `#[allow]`.
+# Production code must not use unwrap, expect, or panic.
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
-missing_errors_doc = "allow"     # Redundant since Result<T, Error> is pervasive
+missing_errors_doc = "allow"
 
 [workspace.lints.rust]
 missing_docs = "warn"

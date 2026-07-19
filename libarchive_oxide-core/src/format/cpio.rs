@@ -4,12 +4,8 @@
 
 //! cpio format (SVR4 "newc"/"crc" and POSIX "odc").
 //!
-//! **Orthogonality proof, realized**: adding a new format is just adding a type that implements
-//! the same [`EntryReader`], with no change to the existing traits or the tar implementation.
-//!
-//! Supports the two ASCII header variants used in practice: `newc`/`crc` (SVR4, 8-hex-digit
-//! fields, 4-byte-aligned) and `odc` (POSIX, 6/11-octal-digit fields, unaligned). The legacy
-//! binary format is out of P4 scope. The archive ends at the `TRAILER!!!` entry.
+//! Supports `newc`, `crc`, and `odc` ASCII headers. Legacy binary headers are
+//! unsupported. `TRAILER!!!` terminates the archive.
 
 use alloc::borrow::Cow;
 
@@ -210,7 +206,7 @@ impl<'a> EntryReader for CpioReader<'a> {
     }
 }
 
-/// cpio "newc" streaming writer — the dual of [`CpioReader`]. Emits SVR4 headers with 4-byte
+/// cpio `newc` streaming writer. Emits SVR4 headers with 4-byte
 /// alignment and closes with the `TRAILER!!!` marker.
 #[derive(Debug)]
 pub struct CpioWriter<W: Sink> {
