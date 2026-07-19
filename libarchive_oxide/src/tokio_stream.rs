@@ -333,19 +333,46 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> TokioSeekArchiveWriter<W> {
 pub struct TokioExtractor {
     root: Dir,
     policy: ExtractionPolicy,
+    limits: Limits,
 }
 
 impl TokioExtractor {
     /// Creates a safe-policy extractor rooted at a directory capability.
     #[must_use]
     pub fn new(root: Dir) -> Self {
-        Self::with_policy(root, ExtractionPolicy::safe())
+        Self::with_policy_and_limits(root, ExtractionPolicy::safe(), Limits::default())
     }
 
     /// Creates an extractor with an explicit restore policy.
     #[must_use]
     pub const fn with_policy(root: Dir, policy: ExtractionPolicy) -> Self {
-        Self { root, policy }
+        Self::with_policy_and_limits(root, policy, Limits::safe())
+    }
+
+    /// Creates a safe-policy extractor with explicit resource budgets.
+    #[must_use]
+    pub const fn with_limits(root: Dir, limits: Limits) -> Self {
+        Self::with_policy_and_limits(root, ExtractionPolicy::safe(), limits)
+    }
+
+    /// Creates an extractor with explicit policy and resource budgets.
+    #[must_use]
+    pub const fn with_policy_and_limits(
+        root: Dir,
+        policy: ExtractionPolicy,
+        limits: Limits,
+    ) -> Self {
+        Self {
+            root,
+            policy,
+            limits,
+        }
+    }
+
+    /// Returns the resource budgets enforced by this extractor.
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// Extracts from a sequential Tokio archive reader.
@@ -355,7 +382,7 @@ impl TokioExtractor {
     ) -> Result<ExtractionReport, StreamError> {
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let worker = tokio::task::spawn_blocking(move || {
-            run_extraction_worker(self.root, self.policy, receiver)
+            run_extraction_worker(self.root, self.policy, self.limits, receiver)
         });
         produce_extraction(sender, reader, worker).await
     }
@@ -367,7 +394,7 @@ impl TokioExtractor {
     ) -> Result<ExtractionReport, StreamError> {
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let worker = tokio::task::spawn_blocking(move || {
-            run_extraction_worker(self.root, self.policy, receiver)
+            run_extraction_worker(self.root, self.policy, self.limits, receiver)
         });
         produce_seek_extraction(sender, reader, worker).await
     }
