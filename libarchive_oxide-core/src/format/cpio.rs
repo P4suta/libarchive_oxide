@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use crate::Limits;
 use crate::error::{ArchiveError, Error, ErrorKind, Result};
-use crate::meta::{EntryKind, Timestamp};
+use crate::meta::{EntryKind, Timestamp, default_mode};
 use crate::metadata::{ArchivePath, Device, EntryMetadata, EntryTimes, Owner};
 use crate::protocol::{
     ArchiveDecoder, ArchiveEncoder, Chunk, DecodeEvent, DecodeStep, EncodeCommand, EncodeStatus,
@@ -1020,7 +1020,8 @@ impl CpioEncoder {
                     .with_context("pathname size overflow")
             })?;
         let mode = metadata.map_or(0, |meta| {
-            mode_bits(meta.kind()) | u64::from(meta.mode().unwrap_or(0) & 0o7777)
+            mode_bits(meta.kind())
+                | u64::from(meta.mode().unwrap_or_else(|| default_mode(meta.kind())) & 0o7777)
         });
         let uid = metadata.and_then(|meta| meta.owner().uid).unwrap_or(0);
         let gid = metadata.and_then(|meta| meta.owner().gid).unwrap_or(0);

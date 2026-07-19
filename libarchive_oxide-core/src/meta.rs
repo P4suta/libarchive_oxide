@@ -26,6 +26,16 @@ pub enum EntryKind {
     Socket,
 }
 
+/// Sensible portable permissions for formats whose mode field is mandatory.
+pub(crate) const fn default_mode(kind: EntryKind) -> u32 {
+    match kind {
+        EntryKind::Dir => 0o755,
+        EntryKind::Symlink => 0o777,
+        EntryKind::File | EntryKind::Hardlink => 0o644,
+        EntryKind::Char | EntryKind::Block | EntryKind::Fifo | EntryKind::Socket => 0o600,
+    }
+}
+
 /// A timestamp in seconds and nanoseconds, independent of `std`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp {

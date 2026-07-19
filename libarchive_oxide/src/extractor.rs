@@ -931,17 +931,6 @@ impl Extractor {
         path: &Path,
         metadata: FinalMetadata,
     ) -> Result<(), StreamError> {
-        #[cfg(unix)]
-        if let Some(mode) = metadata.mode {
-            use cap_std::fs::{Permissions, PermissionsExt};
-
-            self.root
-                .set_permissions(path, Permissions::from_mode(mode & 0o7777))
-                .map_err(StreamError::io)?;
-        }
-        #[cfg(not(unix))]
-        let _ = metadata.mode;
-
         let accessed = metadata
             .accessed
             .map(timestamp_spec)
@@ -957,6 +946,19 @@ impl Extractor {
                 .set_times(path, accessed, modified)
                 .map_err(StreamError::io)?;
         }
+
+        // Apply permissions last. A legitimate mode 0000 must not prevent the
+        // capability implementation from opening the file to restore its times.
+        #[cfg(unix)]
+        if let Some(mode) = metadata.mode {
+            use cap_std::fs::{Permissions, PermissionsExt};
+
+            self.root
+                .set_permissions(path, Permissions::from_mode(mode & 0o7777))
+                .map_err(StreamError::io)?;
+        }
+        #[cfg(not(unix))]
+        let _ = metadata.mode;
         Ok(())
     }
 

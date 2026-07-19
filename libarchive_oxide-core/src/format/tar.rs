@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::mem;
 
 use crate::error::{Error, Result};
-use crate::meta::{EntryKind, Timestamp};
+use crate::meta::{EntryKind, Timestamp, default_mode};
 use crate::metadata::{
     ArchiveMetadata, ArchivePath, Device, EntryMetadata, EntryMetadataBuilder, EntryTimes,
     Extension, Owner, SparseExtent,
@@ -1088,7 +1088,9 @@ impl<'a> HeaderView<'a> {
         Self {
             kind: metadata.kind(),
             path: metadata.path().as_bytes(),
-            mode: metadata.mode().unwrap_or(0),
+            mode: metadata
+                .mode()
+                .unwrap_or_else(|| default_mode(metadata.kind())),
             uid: metadata.owner().uid.unwrap_or(0),
             gid: metadata.owner().gid.unwrap_or(0),
             modified: metadata.times().modified,

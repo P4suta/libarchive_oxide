@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 
 use crate::Limits;
 use crate::error::{ArchiveError, Error, ErrorKind, Result};
-use crate::meta::{EntryKind, Timestamp};
+use crate::meta::{EntryKind, Timestamp, default_mode};
 use crate::metadata::{ArchivePath, EntryMetadata, EntryTimes, Extension, Owner};
 use crate::protocol::{
     ArchiveDecoder, ArchiveEncoder, Chunk, DecodeEvent, DecodeStep, EncodeCommand, EncodeStatus,
@@ -709,7 +709,13 @@ impl ArEncoder {
         put_field(
             &mut header[F_MODE.0..F_MODE.1],
             radix_bytes(
-                0o100_000 | u64::from(metadata.mode().unwrap_or(0) & 0o7777),
+                0o100_000
+                    | u64::from(
+                        metadata
+                            .mode()
+                            .unwrap_or_else(|| default_mode(metadata.kind()))
+                            & 0o7777,
+                    ),
                 8,
                 &mut buffer,
             ),

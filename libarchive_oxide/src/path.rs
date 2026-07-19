@@ -39,7 +39,7 @@ pub fn sanitize(raw: &[u8]) -> Option<PathBuf> {
                 },
             }
         }
-        return pushed.then_some(output);
+        pushed.then_some(output)
     }
 
     #[cfg(not(unix))]

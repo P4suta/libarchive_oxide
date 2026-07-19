@@ -47,23 +47,72 @@ fn encode_one<E: ArchiveEncoder>(mut encoder: E, path: &[u8], body: &[u8]) -> Ve
         .size(Some(body.len() as u64))
         .mode(Some(0o644))
         .build();
+    encode_metadata(&mut encoder, &metadata, body)
+}
+
+fn encode_metadata<E: ArchiveEncoder>(
+    encoder: &mut E,
+    metadata: &EntryMetadata,
+    body: &[u8],
+) -> Vec<u8> {
     let mut output = Vec::new();
     assert_eq!(
-        emit_control(&mut encoder, &mut output, || {
-            EncodeCommand::BeginEntry(&metadata)
+        emit_control(encoder, &mut output, || {
+            EncodeCommand::BeginEntry(metadata)
         }),
         EncodeStatus::NeedCommand
     );
-    emit_data(&mut encoder, &mut output, body);
+    emit_data(encoder, &mut output, body);
     assert_eq!(
-        emit_control(&mut encoder, &mut output, || EncodeCommand::EndEntry),
+        emit_control(encoder, &mut output, || EncodeCommand::EndEntry),
         EncodeStatus::NeedCommand
     );
     assert_eq!(
-        emit_control(&mut encoder, &mut output, || EncodeCommand::Finish),
+        emit_control(encoder, &mut output, || EncodeCommand::Finish),
         EncodeStatus::Done
     );
     output
+}
+
+fn decode_first_metadata<D: ArchiveDecoder>(decoder: &mut D, archive: &[u8]) -> EntryMetadata {
+    let mut position = 0;
+    let mut scratch = [0_u8; 17];
+    loop {
+        let step = decoder
+            .step(&archive[position..], &mut scratch, EndOfInput::End)
+            .unwrap();
+        position += step.consumed;
+        if let DecodeEvent::Entry(metadata) = step.event {
+            return metadata;
+        }
+        assert!(
+            step.consumed != 0 || step.produced != 0,
+            "decoder made no progress before its first entry"
+        );
+    }
+}
+
+#[test]
+fn mandatory_mode_fields_receive_safe_defaults() {
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("default-mode.txt"))
+            .size(Some(0))
+            .build();
+
+    let mut tar_encoder = TarEncoder::new(Limits::default());
+    let tar = encode_metadata(&mut tar_encoder, &metadata, b"");
+    let tar_metadata = decode_first_metadata(&mut TarDecoder::new(Limits::default()), &tar);
+    assert_eq!(tar_metadata.mode(), Some(0o644));
+
+    let mut cpio_encoder = CpioEncoder::new(Limits::default());
+    let cpio = encode_metadata(&mut cpio_encoder, &metadata, b"");
+    let cpio_metadata = decode_first_metadata(&mut CpioDecoder::new(Limits::default()), &cpio);
+    assert_eq!(cpio_metadata.mode(), Some(0o644));
+
+    let mut ar_encoder = ArEncoder::new(Limits::default());
+    let ar = encode_metadata(&mut ar_encoder, &metadata, b"");
+    let ar_metadata = decode_first_metadata(&mut ArDecoder::new(Limits::default()), &ar);
+    assert_eq!(ar_metadata.mode(), Some(0o644));
 }
 
 fn tar_bytes() -> Vec<u8> {

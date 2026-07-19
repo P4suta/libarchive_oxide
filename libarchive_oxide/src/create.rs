@@ -404,6 +404,7 @@ fn platform_metadata(metadata: &fs::Metadata) -> (u32, Owner, Option<Timestamp>)
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible signature across host path encodings.
 fn os_bytes_checked(value: &OsStr) -> io::Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
 
