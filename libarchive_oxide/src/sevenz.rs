@@ -309,10 +309,26 @@ enum SevenInput<R> {
 }
 
 impl<R: Read> SevenDecoder<R> {
+    fn source_ref(&self) -> &R {
+        match self {
+            Self::Lzma2(reader) => reader.inner().get_ref(),
+            Self::Lzma(reader) => reader.inner().get_ref(),
+        }
+    }
+
     fn into_inner(self) -> R {
         match self {
             Self::Lzma2(reader) => reader.into_inner().into_inner(),
             Self::Lzma(reader) => reader.into_inner().into_inner(),
+        }
+    }
+}
+
+impl<R: Read> SevenInput<R> {
+    fn source_ref(&self) -> &R {
+        match self {
+            Self::Source(source) => source,
+            Self::Decoder(decoder) => decoder.source_ref(),
         }
     }
 }
@@ -485,6 +501,10 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
             SevenInput::Source(source) => source,
             SevenInput::Decoder(decoder) => (*decoder).into_inner(),
         }
+    }
+
+    pub(crate) fn source_ref(&self) -> &R {
+        self.input.source_ref()
     }
 
     fn prepare_record(

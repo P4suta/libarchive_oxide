@@ -35,13 +35,13 @@ struct DemandState {
 }
 
 #[derive(Debug, Clone)]
-struct DemandReader {
+pub(crate) struct DemandReader {
     shared: Arc<Mutex<DemandState>>,
     position: u64,
 }
 
 impl DemandReader {
-    fn new(length: u64, limits: Limits) -> Self {
+    pub(crate) fn new(length: u64, limits: Limits) -> Self {
         Self {
             shared: Arc::new(Mutex::new(DemandState {
                 length,
@@ -64,11 +64,29 @@ impl DemandReader {
             .map_err(|_| io::Error::other("async seek demand cache was poisoned"))
     }
 
-    fn take_demand(&self) -> io::Result<Option<(u64, usize)>> {
-        Ok(self.lock()?.demand.take())
+    pub(crate) fn take_fetch_request(&self) -> Result<(u64, usize), StreamError> {
+        let mut state = self.lock().map_err(StreamError::io)?;
+        let (offset, requested) = state.demand.take().ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_context("seek parser blocked without requesting a range"),
+            )
+        })?;
+        if state.cache_limit.is_some_and(|limit| requested > limit) {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_context("async seek request exceeds configured cache budget"),
+            ));
+        }
+        let remaining = usize::try_from(state.length.saturating_sub(offset)).unwrap_or(usize::MAX);
+        let desired = requested.max(state.read_ahead).min(remaining);
+        let length = state
+            .cache_limit
+            .map_or(desired, |limit| desired.min(limit.max(requested)));
+        Ok((offset, length))
     }
 
-    fn insert(&self, offset: u64, bytes: Vec<u8>) -> Result<(), StreamError> {
+    pub(crate) fn insert(&self, offset: u64, bytes: Vec<u8>) -> Result<(), StreamError> {
         let mut state = self.lock().map_err(StreamError::io)?;
         let previous = state.cache.get(&offset).map_or(0, Vec::len);
         let next = state
@@ -92,7 +110,7 @@ impl DemandReader {
         Ok(())
     }
 
-    fn clear_cache(&self) -> Result<(), StreamError> {
+    pub(crate) fn clear_cache(&self) -> Result<(), StreamError> {
         let mut state = self.lock().map_err(StreamError::io)?;
         state.cache.clear();
         state.cached_bytes = 0;
@@ -285,7 +303,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncSeekArchiveReader<R> {
     }
 }
 
-fn is_demand(error: &StreamError) -> bool {
+pub(crate) fn is_demand(error: &StreamError) -> bool {
     error
         .io_error()
         .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
@@ -295,32 +313,7 @@ async fn fulfill<R: AsyncRead + AsyncSeek + Unpin>(
     input: &mut R,
     demand: &DemandReader,
 ) -> Result<(), StreamError> {
-    let (offset, requested) = demand
-        .take_demand()
-        .map_err(StreamError::io)?
-        .ok_or_else(|| {
-            StreamError::archive(
-                ArchiveError::new(ErrorKind::Protocol)
-                    .with_context("seek parser blocked without requesting a range"),
-            )
-        })?;
-    let (length, cache_limit) = {
-        let state = demand.lock().map_err(StreamError::io)?;
-        let remaining = usize::try_from(state.length.saturating_sub(offset)).unwrap_or(usize::MAX);
-        let desired = requested.max(state.read_ahead).min(remaining);
-        (
-            state
-                .cache_limit
-                .map_or(desired, |limit| desired.min(limit.max(requested))),
-            state.cache_limit,
-        )
-    };
-    if cache_limit.is_some_and(|limit| requested > limit) {
-        return Err(StreamError::archive(
-            ArchiveError::new(ErrorKind::Limit)
-                .with_context("async seek request exceeds configured cache budget"),
-        ));
-    }
+    let (offset, length) = demand.take_fetch_request()?;
     poll_fn(|context| Pin::new(&mut *input).poll_seek(context, SeekFrom::Start(offset)))
         .await
         .map_err(StreamError::io)?;
