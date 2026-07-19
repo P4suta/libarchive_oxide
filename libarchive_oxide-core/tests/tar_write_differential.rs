@@ -2,23 +2,39 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Differential test: a tar produced by `TarWriter` must be extractable by the real GNU/BSD
+//! Differential test: a tar produced by `TarEncoder` must be extractable by the real GNU/BSD
 //! `tar`. Skips gracefully if no `tar` binary is on PATH.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use libarchive_oxide_core::format::tar::TarWriter;
-use libarchive_oxide_core::{EntryKind, EntryMeta, EntryWriter};
+use libarchive_oxide_core::{
+    ArchiveEncoder, ArchivePath, EncodeCommand, EncodeStatus, EntryKind, EntryMetadata, Limits,
+    TarEncoder,
+};
 
 fn temp_dir(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("arca-difftar-{}-{tag}-{n}", std::process::id()))
+}
+
+fn control<'a>(
+    encoder: &mut TarEncoder,
+    output: &mut Vec<u8>,
+    command: impl Fn() -> EncodeCommand<'a>,
+) -> EncodeStatus {
+    loop {
+        let mut buffer = [0_u8; 73];
+        let step = encoder.step(command(), &mut buffer).unwrap();
+        output.extend_from_slice(&buffer[..step.produced]);
+        if step.status != EncodeStatus::NeedOutput {
+            return step.status;
+        }
+    }
 }
 
 #[test]
@@ -31,24 +47,43 @@ fn system_tar_extracts_our_archive() {
         (long.as_str(), b"LONG"),
     ];
 
-    let mut w = TarWriter::new(Vec::new());
+    let mut encoder = TarEncoder::new(Limits::default());
+    let mut bytes = Vec::new();
     for (path, data) in entries {
         let kind = if path.ends_with('/') {
             EntryKind::Dir
         } else {
             EntryKind::File
         };
-        let mut m = EntryMeta::new(kind, Cow::Borrowed(path.as_bytes()));
-        m.mode = if kind == EntryKind::Dir { 0o755 } else { 0o644 };
-        m.size = data.len() as u64;
-        let mut sink = w.start_entry(&m).unwrap();
-        if !data.is_empty() {
-            sink.write_chunk(data).unwrap();
+        let metadata =
+            EntryMetadata::builder(kind, ArchivePath::from_bytes(path.as_bytes().to_vec()))
+                .mode(Some(if kind == EntryKind::Dir { 0o755 } else { 0o644 }))
+                .size(Some(data.len() as u64))
+                .build();
+        assert_eq!(
+            control(&mut encoder, &mut bytes, || {
+                EncodeCommand::BeginEntry(&metadata)
+            }),
+            EncodeStatus::NeedCommand
+        );
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let mut buffer = [0_u8; 2];
+            let step = encoder
+                .step(EncodeCommand::Data(remaining), &mut buffer)
+                .unwrap();
+            bytes.extend_from_slice(&buffer[..step.produced]);
+            remaining = &remaining[step.consumed..];
         }
-        sink.close().unwrap();
+        assert_eq!(
+            control(&mut encoder, &mut bytes, || EncodeCommand::EndEntry),
+            EncodeStatus::NeedCommand
+        );
     }
-    w.finish().unwrap();
-    let bytes = w.into_inner();
+    assert_eq!(
+        control(&mut encoder, &mut bytes, || EncodeCommand::Finish),
+        EncodeStatus::Done
+    );
 
     let dir = temp_dir("root");
     fs::create_dir_all(&dir).unwrap();

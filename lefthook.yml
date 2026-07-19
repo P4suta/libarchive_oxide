@@ -4,6 +4,7 @@
 
 # Install with `mise run hooks`.
 
+min_version: 2.1.9
 assert_lefthook_installed: true
 no_tty: false
 colors: true
@@ -11,7 +12,7 @@ colors: true
 commit-msg:
   commands:
     conventional:
-      run: committed --commit-file {1}
+      run: mise exec -- committed --commit-file {1}
 
 pre-commit:
   parallel: false
@@ -20,30 +21,48 @@ pre-commit:
     cargo-fmt:
       tags: format
       glob: "*.rs"
-      run: cargo fmt --all
+      run: mise exec -- just fmt
       stage_fixed: true
 
     typos:
       tags: spell
-      run: typos --write-changes {staged_files}
+      run: mise exec -- typos --write-changes {staged_files}
       stage_fixed: true
 
     clippy:
       tags: lint
       glob: "*.rs"
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      run: mise exec -- just lint
 
     check-no-dyn:
       tags: lint
       glob: "*.rs"
-      run: bash scripts/check-no-dyn.sh
+      run: mise exec -- just no-dyn
 
     reuse:
       tags: license
-      glob: "{**/*.rs,**/*.toml,**/*.md,**/*.yml,**/*.sh,REUSE.toml,**/LICENSES/*}"
-      run: uvx --with charset-normalizer reuse lint
+      glob: "{**/*.rs,**/*.toml,**/*.md,**/*.yml,Justfile,REUSE.toml,**/LICENSES/*}"
+      run: mise exec -- just reuse
 
     license-sync:
       tags: license
       glob: "{LICENSES/*,**/LICENSES/*}"
-      run: bash scripts/check-license-sync.sh
+      run: mise exec -- just license-sync
+
+pre-push:
+  parallel: false
+  follow: true
+  commands:
+    local-ci:
+      tags: ci
+      run: mise exec -- just ci
+      fail_text: "Local CI failed; fix the reported gate before pushing."
+
+# Explicit manual entry point: `lefthook run local-ci`.
+local-ci:
+  parallel: false
+  follow: true
+  commands:
+    all:
+      tags: ci
+      run: mise exec -- just ci

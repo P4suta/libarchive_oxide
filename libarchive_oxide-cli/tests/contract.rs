@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{code, run, run_in, TempDir};
+use common::{TempDir, code, run, run_in};
 
 /// `--help` / `--version` succeed for every tool (exit 0).
 #[test]

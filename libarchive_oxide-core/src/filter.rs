@@ -2,12 +2,9 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Compression filter traits and identifiers.
-//!
-//! Filters implement [`Transform`]. Archive formats consume the resulting
-//! uncompressed bytes.
+//! Compression-filter identifiers and incremental probing.
 
-use crate::transform::Transform;
+use crate::ProbeResult;
 
 /// Compression filter identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -24,29 +21,28 @@ pub enum FilterId {
 }
 
 impl FilterId {
-    /// Detects a filter from leading magic bytes.
-    ///
-    /// Returns `None` when there is not enough prefix to decide, or when nothing matches.
+    /// Probes a potentially incomplete prefix.
     #[must_use]
-    pub fn sniff(prefix: &[u8]) -> Option<Self> {
-        match prefix {
-            [0x1f, 0x8b, ..] => Some(Self::Gzip),
-            [0x28, 0xb5, 0x2f, 0xfd, ..] => Some(Self::Zstd),
-            [0xfd, b'7', b'z', b'X', b'Z', 0x00, ..] => Some(Self::Xz),
-            [0x04, 0x22, 0x4d, 0x18, ..] => Some(Self::Lz4),
-            _ => None,
+    pub fn probe(prefix: &[u8]) -> ProbeResult<Self> {
+        const SIGNATURES: &[(FilterId, &[u8])] = &[
+            (FilterId::Gzip, &[0x1f, 0x8b]),
+            (FilterId::Zstd, &[0x28, 0xb5, 0x2f, 0xfd]),
+            (FilterId::Xz, &[0xfd, b'7', b'z', b'X', b'Z', 0x00]),
+            (FilterId::Lz4, &[0x04, 0x22, 0x4d, 0x18]),
+        ];
+        let mut minimum = usize::MAX;
+        for (identifier, signature) in SIGNATURES {
+            if prefix.len() >= signature.len() && prefix.starts_with(signature) {
+                return ProbeResult::Match(*identifier);
+            }
+            if prefix.len() < signature.len() && signature.starts_with(prefix) {
+                minimum = minimum.min(signature.len());
+            }
+        }
+        if minimum == usize::MAX {
+            ProbeResult::NoMatch
+        } else {
+            ProbeResult::NeedMore { minimum }
         }
     }
 }
-
-/// Compression filter marker.
-pub trait Filter: Transform {
-    /// The codec this filter belongs to.
-    const ID: FilterId;
-}
-
-/// Compressed-to-plain transform.
-pub trait Decoder: Filter {}
-
-/// Plain-to-compressed transform.
-pub trait Encoder: Filter {}

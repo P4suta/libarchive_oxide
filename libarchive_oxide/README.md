@@ -17,18 +17,20 @@ binding.
 ## Example
 
 ```rust
-use libarchive_oxide::{decompress_capped, reader};
-use libarchive_oxide_core::{EntryData, EntryReader};
+use std::io::Read;
 
-fn list(bytes: &[u8]) -> std::io::Result<()> {
-    let plain = decompress_capped(bytes, 64 * 1024 * 1024)
-        .map_err(std::io::Error::other)?;
-    let mut archive = reader(&plain)?;
+use libarchive_oxide::{ArchiveReader, ReaderEvent};
 
-    while let Some(mut entry) = archive.next_entry()? {
-        println!("{}", String::from_utf8_lossy(&entry.meta().path));
-        let mut buffer = [0_u8; 8192];
-        while entry.data().read_chunk(&mut buffer)? != 0 {}
+fn list(input: impl Read) -> Result<(), Box<dyn std::error::Error>> {
+    let mut archive = ArchiveReader::new(input);
+    loop {
+        match archive.next_event()? {
+            ReaderEvent::Entry(metadata) => {
+                println!("{}", metadata.path().display_lossy());
+            }
+            ReaderEvent::Done => break,
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -46,15 +48,24 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 | `lz4` | yes | lz4 frame |
 | `aes` | no | WinZip AES-256 AE-2 |
 | `sevenz` | no | 7z read/write |
+| `async` | no | runtime-neutral `futures-io` adapters |
+| `tokio` | no | Tokio I/O adapters |
 
 `--no-default-features` retains uncompressed formats and zip store mode.
+
+Sequential, seek, futures-io, and Tokio adapters all drive the same archive
+state machines. Seek variants are named `SeekArchive*`, `AsyncSeekArchive*`,
+and `TokioSeekArchive*`; secure Tokio extraction is provided by
+`TokioExtractor`. Archive-level properties can be supplied before the first
+entry with `set_archive_metadata`.
 
 MSRV: Rust 1.87.
 
 ## Security
 
-Use `decompress_capped` for untrusted compressed input. Filesystem extraction
-rejects path traversal. See the
+All high-level readers use finite [`Limits`](https://docs.rs/libarchive_oxide-core/latest/libarchive_oxide_core/struct.Limits.html)
+by default. Filesystem extraction uses a directory capability, atomic regular-file
+commit, and a deny-by-default policy for traversal, links, and special files. See the
 [security policy](https://github.com/P4suta/libarchive_oxide/blob/main/SECURITY.md).
 
 ## License

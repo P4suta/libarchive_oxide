@@ -2,21 +2,29 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 7z reader and writer.
+//! Seek-capable, payload-streaming 7z reader and writer.
 //!
 //! Supports one folder, pack stream, and coder. Writers emit LZMA2. Readers
 //! accept LZMA2 or LZMA, including encoded headers. BCJ, delta, AES, `PPMd`,
 //! multiple folders, multiple coders, and coder graphs are unsupported.
 
-use std::borrow::Cow;
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Seek, SeekFrom, Take, Write};
 
-use libarchive_oxide_core::format::{ArchiveFormat, Detection};
-use libarchive_oxide_core::format::{
-    Entry, EntryDataSink, EntryReader, EntrySink, EntryWriter, OwnedData,
+use libarchive_oxide_core::{
+    ArchiveError, ArchiveMetadata, ArchivePath, EntryKind, EntryMetadata, EntryTimes, ErrorKind,
+    Extension, Limits, Owner, PathEncoding, Timestamp,
 };
-use libarchive_oxide_core::io::Sink;
-use libarchive_oxide_core::{EntryKind, EntryMeta, Error, Result, Timestamp};
+
+use crate::{ReaderEvent, StreamError};
+
+type Result<T> = core::result::Result<T, HeaderError>;
+
+#[derive(Debug, Clone, Copy)]
+enum HeaderError {
+    Malformed(&'static str),
+    Unsupported(&'static str),
+    LimitExceeded(&'static str),
+}
 
 /// The 6-byte 7z signature magic (`'7' 'z' 0xBC 0xAF 0x27 0x1C`).
 const SIGNATURE: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
@@ -39,10 +47,14 @@ const K_CODERS_UNPACK_SIZE: u8 = 0x0C;
 const K_NUM_UNPACK_STREAM: u8 = 0x0D;
 const K_EMPTY_STREAM: u8 = 0x0E;
 const K_EMPTY_FILE: u8 = 0x0F;
+const K_ANTI: u8 = 0x10;
 const K_NAME: u8 = 0x11;
+const K_CTIME: u8 = 0x12;
+const K_ATIME: u8 = 0x13;
 const K_MTIME: u8 = 0x14;
 const K_WIN_ATTRIBUTES: u8 = 0x15;
 const K_ENCODED_HEADER: u8 = 0x17;
+const K_START_POS: u8 = 0x18;
 
 /// LZMA2 coder method id (1 byte).
 const METHOD_LZMA2: u8 = 0x21;
@@ -57,8 +69,6 @@ const ATTR_UNIX_EXTENSION: u32 = 0x8000;
 /// Seconds between the Windows `FILETIME` epoch (1601-01-01) and the Unix epoch (1970-01-01).
 const FILETIME_EPOCH_DIFF: i64 = 11_644_473_600;
 
-/// Cap on a folder's declared uncompressed size, applied before allocating (bomb defense).
-const MAX_UNPACK: u64 = 4 * 1024 * 1024 * 1024;
 /// Cap on the file count declared in `FilesInfo`, applied before allocating.
 const MAX_FILES: u64 = 1 << 24;
 
@@ -66,31 +76,6 @@ const MAX_FILES: u64 = 1 << 24;
 const WRITER_DICT_SIZE: u32 = 1 << 23;
 /// The LZMA2 encoder preset the writer uses.
 const WRITER_PRESET: u32 = 6;
-
-/// Returns `true` if `data` begins with the 7z signature magic.
-#[must_use]
-pub fn is_7z(data: &[u8]) -> bool {
-    data.starts_with(&SIGNATURE)
-}
-
-/// Detection anchor for the 7z format.
-#[derive(Debug)]
-pub struct SevenZ;
-
-impl ArchiveFormat for SevenZ {
-    const NAME: &'static str = "7z";
-
-    fn sniff(prefix: &[u8]) -> Detection {
-        if prefix.len() < SIGNATURE.len() {
-            return Detection::NeedMore;
-        }
-        if prefix.starts_with(&SIGNATURE) {
-            Detection::Match
-        } else {
-            Detection::NoMatch
-        }
-    }
-}
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // Parsed structures
@@ -104,6 +89,8 @@ enum FolderCoder {
     Lzma2 { dict_prop: u8 },
     /// LZMA (v1), carrying its 5 property bytes: `lc/lp/pb` byte + little-endian `u32` dict size.
     Lzma { props: [u8; 5] },
+    /// A coder whose metadata can be listed but whose payload cannot be decoded.
+    Unsupported,
 }
 
 /// The restricted single-folder description parsed from a `StreamsInfo`.
@@ -128,93 +115,28 @@ struct FileRec {
     name: Vec<u8>,
     kind: EntryKind,
     mode: u32,
-    mtime: Option<Timestamp>,
+    times: EntryTimes,
+    anti: bool,
+    start_position: Option<u64>,
     has_stream: bool,
     stream_offset: usize,
     size: usize,
 }
 
-/// 7z streaming reader over an in-memory archive slice.
-///
-/// Following the zip `OwnedData` pattern, the whole folder is decompressed once into
-/// an internal `unpacked` buffer and each content file is handed a fresh owned window; directories and empty
-/// files get an empty window.
-#[derive(Debug)]
-pub struct SevenZReader<'a> {
-    data: &'a [u8],
+/// Bounded parser for the 7z next-header metadata.
+#[derive(Debug, Default)]
+struct HeaderParser {
     files: Vec<FileRec>,
     folder: Option<FolderInfo>,
-    index: usize,
-    parsed: bool,
-    unpacked: Option<Vec<u8>>,
-    owned: OwnedData,
+    header_extensions: Vec<libarchive_oxide_core::Extension>,
 }
 
-impl<'a> SevenZReader<'a> {
-    /// Builds a reader over the whole 7z archive bytes.
-    #[must_use]
-    pub fn new(data: &'a [u8]) -> Self {
+impl HeaderParser {
+    fn new() -> Self {
         Self {
-            data,
             files: Vec::new(),
             folder: None,
-            index: 0,
-            parsed: false,
-            unpacked: None,
-            owned: OwnedData::default(),
-        }
-    }
-
-    /// Parses the signature header and the (possibly LZMA2-encoded) next header.
-    fn parse(&mut self) -> Result<()> {
-        let data = self.data;
-        if data.len() < SIGNATURE_HEADER_SIZE || !data.starts_with(&SIGNATURE) {
-            return Err(Error::Malformed("7z: bad signature header"));
-        }
-        // The start-header CRC covers bytes 12..32 (the NextHeader offset/size/CRC triple).
-        let start_crc = u32_le(data, 8)?;
-        if crate::filter::crc32(&data[12..32]) != start_crc {
-            return Err(Error::Malformed("7z: bad start header CRC"));
-        }
-        let nh_offset = u64_le(data, 12)?;
-        let nh_size = u64_le(data, 20)?;
-        let nh_crc = u32_le(data, 28)?;
-
-        // An empty archive has no next header.
-        if nh_size == 0 {
-            return Ok(());
-        }
-
-        let header_start = SIGNATURE_HEADER_SIZE
-            .checked_add(usize_of(nh_offset)?)
-            .ok_or(Error::Malformed("7z: header offset overflow"))?;
-        let header_end = header_start
-            .checked_add(usize_of(nh_size)?)
-            .ok_or(Error::Malformed("7z: header size overflow"))?;
-        let header = data
-            .get(header_start..header_end)
-            .ok_or(Error::Malformed("7z: truncated next header"))?;
-        if crate::filter::crc32(header) != nh_crc {
-            return Err(Error::Malformed("7z: bad next header CRC"));
-        }
-
-        let mut r = ByteReader::new(header);
-        match r.u8()? {
-            K_HEADER => self.parse_header(&mut r),
-            K_ENCODED_HEADER => {
-                // The header itself is a compressed stream; decode it, then re-parse as a plain
-                // kHeader. The decode path is the same restricted LZMA2 single-folder pipeline.
-                let folder = parse_streams_info(&mut r)?;
-                let decoded = self.decode_folder(&folder)?;
-                let mut r2 = ByteReader::new(&decoded);
-                if r2.u8()? != K_HEADER {
-                    return Err(Error::Unsupported(
-                        "7z: encoded header is not a plain kHeader",
-                    ));
-                }
-                self.parse_header(&mut r2)
-            },
-            _ => Err(Error::Malformed("7z: unexpected next-header id")),
+            header_extensions: Vec::new(),
         }
     }
 
@@ -224,14 +146,31 @@ impl<'a> SevenZReader<'a> {
         loop {
             match r.u8()? {
                 K_END => break,
-                K_ARCHIVE_PROPERTIES => skip_archive_properties(r)?,
+                K_ARCHIVE_PROPERTIES => self.parse_archive_properties(r)?,
                 K_MAIN_STREAMS_INFO => folder = Some(parse_streams_info(r)?),
                 K_FILES_INFO => self.parse_files_info(r, folder.as_ref())?,
-                _ => return Err(Error::Unsupported("7z: unsupported header property")),
+                _ => return Err(HeaderError::Unsupported("7z: unsupported header property")),
             }
         }
         self.folder = folder;
         Ok(())
+    }
+
+    fn parse_archive_properties(&mut self, r: &mut ByteReader<'_>) -> Result<()> {
+        loop {
+            let property = r.u8()?;
+            if property == K_END {
+                return Ok(());
+            }
+            let size = usize_of(r.number()?)?;
+            let value = r.bytes(size)?;
+            self.header_extensions
+                .push(libarchive_oxide_core::Extension::new(
+                    "7z-archive-property",
+                    vec![property],
+                    value.to_vec(),
+                ));
+        }
     }
 
     /// Parses `FilesInfo`, assembling [`FileRec`]s and assigning content-file windows in order.
@@ -243,7 +182,7 @@ impl<'a> SevenZReader<'a> {
     ) -> Result<()> {
         let num_files = usize_of(r.number()?)?;
         if num_files as u64 > MAX_FILES {
-            return Err(Error::LimitExceeded("7z: too many files"));
+            return Err(HeaderError::LimitExceeded("7z: too many files"));
         }
         // Bomb defense: the entire next-header is already resident, so no honest archive can declare
         // more files than there are header bytes left to describe them (each file carries at least a
@@ -251,13 +190,17 @@ impl<'a> SevenZReader<'a> {
         // against the remaining bytes keeps the per-file allocations below proportional to the input
         // and blocks a tiny header from forcing a multi-hundred-megabyte allocation up front.
         if num_files > r.remaining() {
-            return Err(Error::Malformed("7z: file count exceeds header size"));
+            return Err(HeaderError::Malformed("7z: file count exceeds header size"));
         }
 
         let mut empty_stream = vec![false; num_files];
         let mut empty_file: Vec<bool> = Vec::new();
+        let mut anti_empty: Vec<bool> = Vec::new();
         let mut names: Vec<Vec<u8>> = Vec::new();
-        let mut mtimes: Vec<Option<Timestamp>> = vec![None; num_files];
+        let mut created: Vec<Option<Timestamp>> = vec![None; num_files];
+        let mut accessed: Vec<Option<Timestamp>> = vec![None; num_files];
+        let mut modified: Vec<Option<Timestamp>> = vec![None; num_files];
+        let mut start_positions: Vec<Option<u64>> = vec![None; num_files];
         let mut modes: Vec<Option<u32>> = vec![None; num_files];
 
         loop {
@@ -274,12 +217,24 @@ impl<'a> SevenZReader<'a> {
                     let num_empty = empty_stream.iter().filter(|&&b| b).count();
                     empty_file = br.bit_vector(num_empty)?;
                 },
+                K_ANTI => {
+                    let num_empty = empty_stream.iter().filter(|&&value| value).count();
+                    anti_empty = br.bit_vector(num_empty)?;
+                },
                 K_NAME => names = parse_names(&mut br, num_files)?,
-                K_MTIME => mtimes = parse_times(&mut br, num_files)?,
+                K_CTIME => created = parse_times(&mut br, num_files)?,
+                K_ATIME => accessed = parse_times(&mut br, num_files)?,
+                K_MTIME => modified = parse_times(&mut br, num_files)?,
                 K_WIN_ATTRIBUTES => modes = parse_attributes(&mut br, num_files)?,
-                // kCTime/kATime/kAnti/kStartPos/kDummy and any other property: body already skipped.
+                K_START_POS => start_positions = parse_positions(&mut br, num_files)?,
                 _ => {},
             }
+            self.header_extensions
+                .push(libarchive_oxide_core::Extension::new(
+                    "7z-files-property",
+                    prop.to_le_bytes().to_vec(),
+                    body.to_vec(),
+                ));
         }
 
         // Assemble records. Content files consume substream windows in file order; empty-stream
@@ -294,32 +249,31 @@ impl<'a> SevenZReader<'a> {
             let full_mode = modes.get(i).copied().flatten();
             let has_stream = !empty_stream[i];
 
-            let (kind, offset, size) = if has_stream {
-                let size = usize_of(
-                    *sizes
-                        .get(content_index)
-                        .ok_or(Error::Malformed("7z: content stream index out of range"))?,
-                )?;
+            let (kind, offset, size, is_anti) = if has_stream {
+                let size = usize_of(*sizes.get(content_index).ok_or(HeaderError::Malformed(
+                    "7z: content stream index out of range",
+                ))?)?;
                 let offset = running;
                 running = running
                     .checked_add(size)
-                    .ok_or(Error::Malformed("7z: folder offset overflow"))?;
+                    .ok_or(HeaderError::Malformed("7z: folder offset overflow"))?;
                 content_index += 1;
                 let kind = if full_mode.is_some_and(|m| m & 0o170_000 == 0o120_000) {
                     EntryKind::Symlink
                 } else {
                     EntryKind::File
                 };
-                (kind, offset, size)
+                (kind, offset, size, false)
             } else {
                 let is_empty_file = empty_file.get(empty_index).copied().unwrap_or(false);
+                let is_anti = anti_empty.get(empty_index).copied().unwrap_or(false);
                 empty_index += 1;
                 let kind = if is_empty_file {
                     EntryKind::File
                 } else {
                     EntryKind::Dir
                 };
-                (kind, 0, 0)
+                (kind, 0, 0, is_anti)
             };
 
             let mode = permission_bits(full_mode, kind);
@@ -327,7 +281,14 @@ impl<'a> SevenZReader<'a> {
                 name,
                 kind,
                 mode,
-                mtime: mtimes.get(i).copied().flatten(),
+                times: EntryTimes {
+                    modified: modified.get(i).copied().flatten(),
+                    accessed: accessed.get(i).copied().flatten(),
+                    changed: None,
+                    created: created.get(i).copied().flatten(),
+                },
+                anti: is_anti,
+                start_position: start_positions.get(i).copied().flatten(),
                 has_stream,
                 stream_offset: offset,
                 size,
@@ -335,138 +296,699 @@ impl<'a> SevenZReader<'a> {
         }
         Ok(())
     }
+}
 
-    /// Decompresses a folder's packed stream into a fresh buffer, capping the size first.
-    fn decode_folder(&self, f: &FolderInfo) -> Result<Vec<u8>> {
-        if f.unpack_size > MAX_UNPACK {
-            return Err(Error::LimitExceeded("7z: folder unpack size exceeds cap"));
-        }
-        let end = f
-            .pack_offset
-            .checked_add(f.pack_size)
-            .ok_or(Error::Malformed("7z: pack range overflow"))?;
-        let packed = self
-            .data
-            .get(f.pack_offset..end)
-            .ok_or(Error::Malformed("7z: truncated packed stream"))?;
+enum SevenDecoder<R> {
+    Lzma2(lzma_rust2::Lzma2Reader<Take<R>>),
+    Lzma(lzma_rust2::LzmaReader<Take<R>>),
+}
 
-        let cap = usize_of(f.unpack_size)?;
-        match f.coder {
-            FolderCoder::Lzma2 { dict_prop } => {
-                let dict = lzma2_dict_size(dict_prop)?;
-                let reader = lzma_rust2::Lzma2Reader::new(Cursor::new(packed.to_vec()), dict, None);
-                drain_exact(reader, cap)
-            },
-            FolderCoder::Lzma { props } => {
-                let dict = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
-                let reader = lzma_rust2::LzmaReader::new_with_props(
-                    Cursor::new(packed.to_vec()),
-                    f.unpack_size,
-                    props[0],
-                    dict,
-                    None,
-                )
-                .map_err(|_| Error::Malformed("7z: LZMA stream setup failed"))?;
-                drain_exact(reader, cap)
-            },
+enum SevenInput<R> {
+    Source(R),
+    Decoder(Box<SevenDecoder<R>>),
+}
+
+impl<R: Read> SevenDecoder<R> {
+    fn into_inner(self) -> R {
+        match self {
+            Self::Lzma2(reader) => reader.into_inner().into_inner(),
+            Self::Lzma(reader) => reader.into_inner().into_inner(),
         }
     }
 }
 
-/// Reads exactly `cap` decompressed bytes from `reader` into a fresh buffer.
-///
-/// Bomb defense: unlike a `vec![0u8; cap]` pre-fill, the buffer grows only with bytes actually
-/// produced, so a tiny packed stream that *declares* a near-`MAX_UNPACK` size but decodes to little
-/// (or errors early) never forces a multi-gigabyte allocation. A short or over-long decode is an
-/// error, matching the strict `read_exact` contract the format requires.
-fn drain_exact<R: Read>(mut reader: R, cap: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    while out.len() < cap {
-        let want = (cap - out.len()).min(buf.len());
-        let n = reader
-            .read(&mut buf[..want])
-            .map_err(|_| Error::Malformed("7z: LZMA decode failed"))?;
-        if n == 0 {
-            break;
+impl<R: Read> Read for SevenDecoder<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Lzma2(reader) => reader.read(output),
+            Self::Lzma(reader) => reader.read(output),
         }
-        out.extend_from_slice(&buf[..n]);
     }
-    if out.len() != cap {
-        return Err(Error::Malformed(
-            "7z: decoded size does not match declared unpack size",
-        ));
-    }
-    Ok(out)
 }
 
-impl EntryReader for SevenZReader<'_> {
-    type Data = OwnedData;
+#[derive(Debug, Clone, Copy)]
+enum SevenPhase {
+    Idle,
+    Data { remaining: usize },
+    Unsupported,
+    EndEntry,
+    Done,
+}
 
-    fn next_entry(&mut self) -> Result<Option<Entry<'_, OwnedData>>> {
-        if !self.parsed {
-            self.parse()?;
-            self.parsed = true;
+/// Seek-capable 7z reader used by the opaque runtime dispatch.
+pub(crate) struct SevenZSeekReader<R> {
+    input: SevenInput<R>,
+    limits: Limits,
+    archive_metadata: Option<ArchiveMetadata>,
+    files: Vec<FileRec>,
+    folder: Option<FolderInfo>,
+    next_file: usize,
+    phase: SevenPhase,
+    event_data: Vec<u8>,
+    decoded_position: usize,
+    decoded_total: u64,
+}
+
+impl<R> std::fmt::Debug for SevenZSeekReader<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SevenZSeekReader")
+            .field("files", &self.files.len())
+            .field("next_file", &self.next_file)
+            .field("phase", &self.phase)
+            .field("decoded_position", &self.decoded_position)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: Read + Seek> SevenZSeekReader<R> {
+    pub(crate) fn new(mut input: R, limits: Limits) -> core::result::Result<Self, StreamError> {
+        let (archive_metadata, files, folder) = parse_seek_layout(&mut input, limits)?;
+        validate_seek_layout(&files, folder.as_ref(), limits)?;
+        let input = match folder.as_ref().map(|folder| folder.coder) {
+            None | Some(FolderCoder::Unsupported) => SevenInput::Source(input),
+            Some(coder) => {
+                let folder = folder
+                    .as_ref()
+                    .ok_or_else(|| seven_error(ErrorKind::Protocol, "folder state disappeared"))?;
+                input
+                    .seek(SeekFrom::Start(u64::try_from(folder.pack_offset).map_err(
+                        |_| seven_error(ErrorKind::Limit, "pack offset exceeds u64"),
+                    )?))
+                    .map_err(StreamError::io)?;
+                let take = input.take(
+                    u64::try_from(folder.pack_size)
+                        .map_err(|_| seven_error(ErrorKind::Limit, "pack size exceeds u64"))?,
+                );
+                let decoder = build_seven_decoder(take, coder, folder.unpack_size, limits)?;
+                SevenInput::Decoder(Box::new(decoder))
+            },
+        };
+        Ok(Self {
+            input,
+            limits,
+            archive_metadata: Some(archive_metadata),
+            files,
+            folder,
+            next_file: 0,
+            phase: SevenPhase::Idle,
+            event_data: Vec::with_capacity(64 * 1024),
+            decoded_position: 0,
+            decoded_total: 0,
+        })
+    }
+
+    pub(crate) fn next_event(&mut self) -> core::result::Result<ReaderEvent<'_>, StreamError> {
+        self.event_data.clear();
+        if let Some(metadata) = self.archive_metadata.take() {
+            return Ok(ReaderEvent::ArchiveMetadata(metadata));
         }
-        if self.index >= self.files.len() {
-            return Ok(None);
-        }
-        let idx = self.index;
-        self.index += 1;
-
-        // Copy the scalar fields out before mutating `self` (decode buffer + owned slot).
-        let rec = self.files[idx].clone();
-
-        let content: Vec<u8> = if rec.has_stream {
-            if self.unpacked.is_none() {
-                let folder = self
-                    .folder
-                    .clone()
-                    .ok_or(Error::Malformed("7z: content stream without a folder"))?;
-                self.unpacked = Some(self.decode_folder(&folder)?);
+        loop {
+            match self.phase {
+                SevenPhase::Idle => {
+                    let Some(record) = self.files.get(self.next_file).cloned() else {
+                        self.verify_folder_end()?;
+                        self.phase = SevenPhase::Done;
+                        return Ok(ReaderEvent::Done);
+                    };
+                    let index = self.next_file;
+                    self.next_file += 1;
+                    let metadata = self.prepare_record(index, &record)?;
+                    return Ok(ReaderEvent::Entry(metadata));
+                },
+                SevenPhase::Data { remaining: 0 } => {
+                    self.phase = SevenPhase::EndEntry;
+                },
+                SevenPhase::Data { remaining } => {
+                    let amount = remaining.min(64 * 1024);
+                    self.event_data.resize(amount, 0);
+                    let count = self.read_decoded_into_event(amount)?;
+                    if count == 0 {
+                        return Err(seven_error(
+                            ErrorKind::Malformed,
+                            "folder ended before the declared substream size",
+                        ));
+                    }
+                    self.event_data.truncate(count);
+                    self.phase = SevenPhase::Data {
+                        remaining: remaining - count,
+                    };
+                    return Ok(ReaderEvent::Data(&self.event_data));
+                },
+                SevenPhase::Unsupported => {
+                    return Err(seven_error(
+                        ErrorKind::Unsupported,
+                        "payload coder is unsupported",
+                    ));
+                },
+                SevenPhase::EndEntry => {
+                    self.phase = SevenPhase::Idle;
+                    return Ok(ReaderEvent::EndEntry);
+                },
+                SevenPhase::Done => return Ok(ReaderEvent::Done),
             }
-            let buf = self
-                .unpacked
-                .as_ref()
-                .ok_or(Error::Malformed("7z: folder not decoded"))?;
-            let end = rec
-                .stream_offset
-                .checked_add(rec.size)
-                .ok_or(Error::Malformed("7z: stream window overflow"))?;
-            buf.get(rec.stream_offset..end)
-                .ok_or(Error::Malformed("7z: stream window out of range"))?
-                .to_vec()
-        } else {
-            Vec::new()
-        };
-        self.owned = OwnedData::new(content);
-
-        let link_target = matches!(rec.kind, EntryKind::Symlink)
-            .then(|| Cow::Owned(self.owned.as_bytes().to_vec()));
-        let meta = EntryMeta {
-            kind: rec.kind,
-            path: Cow::Owned(rec.name),
-            mode: rec.mode,
-            uid: 0,
-            gid: 0,
-            mtime: rec.mtime,
-            size: self.owned.as_bytes().len() as u64,
-            link_target,
-            pax: libarchive_oxide_core::PaxMap::new(),
-        };
-        Ok(Some(Entry::new(meta, &mut self.owned)))
+        }
     }
-}
 
-/// Skips a `kArchiveProperties` block (a sequence of typed property blobs ended by `kEnd`).
-fn skip_archive_properties(r: &mut ByteReader<'_>) -> Result<()> {
-    loop {
-        if r.u8()? == K_END {
+    pub(crate) fn skip_entry(&mut self) -> core::result::Result<(), StreamError> {
+        match self.phase {
+            SevenPhase::Data { mut remaining } => {
+                let mut scratch = vec![0_u8; 64 * 1024];
+                while remaining != 0 {
+                    let amount = remaining.min(scratch.len());
+                    let count = self.read_decoded(&mut scratch[..amount])?;
+                    if count == 0 {
+                        return Err(seven_error(
+                            ErrorKind::Malformed,
+                            "folder ended while skipping a substream",
+                        ));
+                    }
+                    remaining -= count;
+                }
+                self.phase = SevenPhase::EndEntry;
+                Ok(())
+            },
+            SevenPhase::Unsupported => {
+                self.phase = SevenPhase::EndEntry;
+                Ok(())
+            },
+            SevenPhase::EndEntry => Ok(()),
+            SevenPhase::Idle | SevenPhase::Done => Err(seven_error(
+                ErrorKind::Protocol,
+                "skip_entry called without an open 7z entry",
+            )),
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> R {
+        match self.input {
+            SevenInput::Source(source) => source,
+            SevenInput::Decoder(decoder) => (*decoder).into_inner(),
+        }
+    }
+
+    fn prepare_record(
+        &mut self,
+        _index: usize,
+        record: &FileRec,
+    ) -> core::result::Result<EntryMetadata, StreamError> {
+        if record.has_stream && self.has_decoder() {
+            self.drain_to(record.stream_offset)?;
+        }
+        let mut link_target = None;
+        if record.has_stream && record.kind == EntryKind::Symlink && self.has_decoder() {
+            if self
+                .limits
+                .path_bytes()
+                .is_some_and(|maximum| record.size > maximum)
+            {
+                return Err(seven_error(
+                    ErrorKind::Limit,
+                    "symbolic-link target exceeds path limit",
+                ));
+            }
+            let mut target = vec![0; record.size];
+            self.read_decoded_exact(&mut target)?;
+            link_target = Some(ArchivePath::from_encoded(target, PathEncoding::Utf8));
+            self.phase = SevenPhase::EndEntry;
+        } else if record.has_stream {
+            self.phase = if self.has_decoder() {
+                SevenPhase::Data {
+                    remaining: record.size,
+                }
+            } else {
+                SevenPhase::Unsupported
+            };
+        } else {
+            self.phase = SevenPhase::EndEntry;
+        }
+        let mut builder = EntryMetadata::builder(
+            record.kind,
+            ArchivePath::from_encoded(record.name.clone(), PathEncoding::Utf8),
+        )
+        .size(Some(u64::try_from(record.size).map_err(|_| {
+            seven_error(ErrorKind::Limit, "entry size exceeds u64")
+        })?))
+        .mode(Some(record.mode))
+        .owner(Owner::default())
+        .times(record.times)
+        .link_target(link_target)
+        .extension(libarchive_oxide_core::Extension::new(
+            "7z-property",
+            b"stream-offset".to_vec(),
+            record.stream_offset.to_le_bytes().to_vec(),
+        ));
+        if record.anti {
+            builder = builder.extension(libarchive_oxide_core::Extension::new(
+                "7z-property",
+                b"anti".to_vec(),
+                vec![1],
+            ));
+        }
+        if let Some(position) = record.start_position {
+            builder = builder.extension(libarchive_oxide_core::Extension::new(
+                "7z-property",
+                b"start-position".to_vec(),
+                position.to_le_bytes().to_vec(),
+            ));
+        }
+        Ok(builder.build())
+    }
+
+    fn drain_to(&mut self, offset: usize) -> core::result::Result<(), StreamError> {
+        if offset < self.decoded_position {
+            return Err(seven_error(
+                ErrorKind::Malformed,
+                "substream offsets are not monotonic",
+            ));
+        }
+        let mut remaining = offset - self.decoded_position;
+        let mut scratch = vec![0_u8; 64 * 1024];
+        while remaining != 0 {
+            let amount = remaining.min(scratch.len());
+            let count = self.read_decoded(&mut scratch[..amount])?;
+            if count == 0 {
+                return Err(seven_error(
+                    ErrorKind::Malformed,
+                    "folder ended before a substream offset",
+                ));
+            }
+            remaining -= count;
+        }
+        Ok(())
+    }
+
+    fn read_decoded_exact(&mut self, output: &mut [u8]) -> core::result::Result<(), StreamError> {
+        let mut filled = 0;
+        while filled < output.len() {
+            let count = self.read_decoded(&mut output[filled..])?;
+            if count == 0 {
+                return Err(seven_error(
+                    ErrorKind::Malformed,
+                    "folder ended before the declared entry size",
+                ));
+            }
+            filled += count;
+        }
+        Ok(())
+    }
+
+    fn read_decoded_into_event(
+        &mut self,
+        amount: usize,
+    ) -> core::result::Result<usize, StreamError> {
+        let count = match &mut self.input {
+            SevenInput::Decoder(decoder) => decoder
+                .read(&mut self.event_data[..amount])
+                .map_err(seven_decode_error)?,
+            SevenInput::Source(_) => {
+                return Err(seven_error(
+                    ErrorKind::Unsupported,
+                    "payload coder is unsupported",
+                ));
+            },
+        };
+        self.account_decoded(count)?;
+        Ok(count)
+    }
+
+    fn read_decoded(&mut self, output: &mut [u8]) -> core::result::Result<usize, StreamError> {
+        let decoder = self
+            .decoder_mut()
+            .ok_or_else(|| seven_error(ErrorKind::Unsupported, "payload coder is unsupported"))?;
+        let count = decoder.read(output).map_err(seven_decode_error)?;
+        self.account_decoded(count)?;
+        Ok(count)
+    }
+
+    fn account_decoded(&mut self, count: usize) -> core::result::Result<(), StreamError> {
+        self.decoded_position = self
+            .decoded_position
+            .checked_add(count)
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "folder position overflow"))?;
+        self.decoded_total = self
+            .decoded_total
+            .checked_add(count as u64)
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "decoded total overflow"))?;
+        if self
+            .limits
+            .decoded_total()
+            .is_some_and(|maximum| self.decoded_total > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "decoded total exceeds configured limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_folder_end(&mut self) -> core::result::Result<(), StreamError> {
+        let Some(folder) = &self.folder else {
+            return Ok(());
+        };
+        if !self.has_decoder() {
             return Ok(());
         }
-        let size = usize_of(r.number()?)?;
-        let _ = r.bytes(size)?;
+        let expected = usize::try_from(folder.unpack_size)
+            .map_err(|_| seven_error(ErrorKind::Limit, "folder size exceeds address space"))?;
+        if self.decoded_position != expected {
+            return Err(seven_error(
+                ErrorKind::Malformed,
+                "decoded folder size does not match its header",
+            ));
+        }
+        let mut extra = [0_u8; 1];
+        if self.read_decoded(&mut extra)? != 0 {
+            return Err(seven_error(
+                ErrorKind::Integrity,
+                "folder produced data past its declared size",
+            ));
+        }
+        Ok(())
     }
+
+    const fn has_decoder(&self) -> bool {
+        matches!(&self.input, SevenInput::Decoder(_))
+    }
+
+    fn decoder_mut(&mut self) -> Option<&mut SevenDecoder<R>> {
+        match &mut self.input {
+            SevenInput::Source(_) => None,
+            SevenInput::Decoder(decoder) => Some(decoder.as_mut()),
+        }
+    }
+}
+
+fn parse_seek_layout(
+    input: &mut (impl Read + Seek),
+    limits: Limits,
+) -> core::result::Result<(ArchiveMetadata, Vec<FileRec>, Option<FolderInfo>), StreamError> {
+    let image_length = input.seek(SeekFrom::End(0)).map_err(StreamError::io)?;
+    input.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
+    let mut signature = [0_u8; SIGNATURE_HEADER_SIZE];
+    input.read_exact(&mut signature).map_err(StreamError::io)?;
+    if !signature.starts_with(&SIGNATURE) {
+        return Err(seven_error(ErrorKind::Malformed, "bad signature header"));
+    }
+    let start_crc = u32_le(&signature, 8).map_err(seven_legacy_error)?;
+    if crate::filter::crc32(&signature[12..32]) != start_crc {
+        return Err(seven_error(
+            ErrorKind::Integrity,
+            "start-header CRC mismatch",
+        ));
+    }
+    let header_offset = u64_le(&signature, 12).map_err(seven_legacy_error)?;
+    let header_size = u64_le(&signature, 20).map_err(seven_legacy_error)?;
+    let header_crc = u32_le(&signature, 28).map_err(seven_legacy_error)?;
+    if header_size == 0 {
+        return Ok((ArchiveMetadata::new(), Vec::new(), None));
+    }
+    if limits
+        .metadata_bytes()
+        .is_some_and(|maximum| header_size > maximum as u64)
+    {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "next header exceeds metadata limit",
+        ));
+    }
+    let header_start = u64::try_from(SIGNATURE_HEADER_SIZE)
+        .ok()
+        .and_then(|base| base.checked_add(header_offset))
+        .ok_or_else(|| seven_error(ErrorKind::Malformed, "next-header offset overflow"))?;
+    if header_start
+        .checked_add(header_size)
+        .is_none_or(|end| end > image_length)
+    {
+        return Err(seven_error(
+            ErrorKind::Malformed,
+            "next header is outside the archive",
+        ));
+    }
+    input
+        .seek(SeekFrom::Start(header_start))
+        .map_err(StreamError::io)?;
+    let mut header = vec![
+        0;
+        usize::try_from(header_size).map_err(|_| {
+            seven_error(ErrorKind::Limit, "next-header size exceeds address space")
+        })?
+    ];
+    input.read_exact(&mut header).map_err(StreamError::io)?;
+    if crate::filter::crc32(&header) != header_crc {
+        return Err(seven_error(
+            ErrorKind::Integrity,
+            "next-header CRC mismatch",
+        ));
+    }
+    let decoded_header = match header.first().copied() {
+        Some(K_HEADER) => header,
+        Some(K_ENCODED_HEADER) => {
+            let mut encoded = ByteReader::new(&header[1..]);
+            let folder = parse_streams_info(&mut encoded).map_err(seven_legacy_error)?;
+            if matches!(folder.coder, FolderCoder::Unsupported) {
+                return Err(seven_error(
+                    ErrorKind::Unsupported,
+                    "encoded-header coder is unsupported",
+                ));
+            }
+            decode_seek_header(input, &folder, limits, image_length)?
+        },
+        _ => {
+            return Err(seven_error(
+                ErrorKind::Malformed,
+                "unexpected next-header property",
+            ));
+        },
+    };
+    if decoded_header.first() != Some(&K_HEADER) {
+        return Err(seven_error(
+            ErrorKind::Malformed,
+            "decoded header does not begin with kHeader",
+        ));
+    }
+    let mut parser = HeaderParser::new();
+    let mut bytes = ByteReader::new(&decoded_header[1..]);
+    parser
+        .parse_header(&mut bytes)
+        .map_err(seven_legacy_error)?;
+    if let Some(folder) = &parser.folder {
+        validate_folder_range(folder, image_length)?;
+    }
+    let archive_metadata = parser
+        .header_extensions
+        .into_iter()
+        .fold(ArchiveMetadata::new(), ArchiveMetadata::with_extension);
+    Ok((archive_metadata, parser.files, parser.folder))
+}
+
+fn decode_seek_header(
+    input: &mut (impl Read + Seek),
+    folder: &FolderInfo,
+    limits: Limits,
+    image_length: u64,
+) -> core::result::Result<Vec<u8>, StreamError> {
+    if limits
+        .metadata_bytes()
+        .is_some_and(|maximum| folder.unpack_size > maximum as u64)
+    {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "decoded header exceeds metadata limit",
+        ));
+    }
+    validate_folder_range(folder, image_length)?;
+    input
+        .seek(SeekFrom::Start(u64::try_from(folder.pack_offset).map_err(
+            |_| seven_error(ErrorKind::Limit, "encoded-header offset exceeds u64"),
+        )?))
+        .map_err(StreamError::io)?;
+    let take = input.take(
+        u64::try_from(folder.pack_size)
+            .map_err(|_| seven_error(ErrorKind::Limit, "encoded-header pack size exceeds u64"))?,
+    );
+    let mut decoder = build_seven_decoder(take, folder.coder, folder.unpack_size, limits)?;
+    let length = usize::try_from(folder.unpack_size)
+        .map_err(|_| seven_error(ErrorKind::Limit, "decoded header exceeds address space"))?;
+    let mut output = vec![0; length];
+    decoder
+        .read_exact(&mut output)
+        .map_err(seven_decode_error)?;
+    let mut extra = [0_u8; 1];
+    if decoder.read(&mut extra).map_err(seven_decode_error)? != 0 {
+        return Err(seven_error(
+            ErrorKind::Integrity,
+            "encoded header exceeds its declared size",
+        ));
+    }
+    Ok(output)
+}
+
+fn validate_seek_layout(
+    files: &[FileRec],
+    folder: Option<&FolderInfo>,
+    limits: Limits,
+) -> core::result::Result<(), StreamError> {
+    if limits
+        .entries()
+        .is_some_and(|maximum| files.len() as u64 > maximum)
+    {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "file count exceeds configured limit",
+        ));
+    }
+    let mut metadata = 0usize;
+    for file in files {
+        if limits
+            .path_bytes()
+            .is_some_and(|maximum| file.name.len() > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "file name exceeds configured path limit",
+            ));
+        }
+        if limits
+            .entry_bytes()
+            .is_some_and(|maximum| file.size as u64 > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "file size exceeds configured limit",
+            ));
+        }
+        metadata = metadata
+            .checked_add(file.name.len())
+            .and_then(|value| value.checked_add(core::mem::size_of::<FileRec>()))
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+    }
+    if limits
+        .metadata_bytes()
+        .is_some_and(|maximum| metadata > maximum)
+    {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "file metadata exceeds configured limit",
+        ));
+    }
+    if let Some(folder) = folder {
+        if limits
+            .decoded_total()
+            .is_some_and(|maximum| folder.unpack_size > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "folder output exceeds decoded-total limit",
+            ));
+        }
+        let total = files
+            .iter()
+            .filter(|file| file.has_stream)
+            .try_fold(0usize, |sum, file| sum.checked_add(file.size))
+            .ok_or_else(|| seven_error(ErrorKind::Malformed, "substream size sum overflow"))?;
+        if u64::try_from(total).ok() != Some(folder.unpack_size) {
+            return Err(seven_error(
+                ErrorKind::Malformed,
+                "substream sizes do not equal folder size",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_folder_range(
+    folder: &FolderInfo,
+    image_length: u64,
+) -> core::result::Result<(), StreamError> {
+    let start = u64::try_from(folder.pack_offset)
+        .map_err(|_| seven_error(ErrorKind::Limit, "pack offset exceeds u64"))?;
+    let size = u64::try_from(folder.pack_size)
+        .map_err(|_| seven_error(ErrorKind::Limit, "pack size exceeds u64"))?;
+    if start.checked_add(size).is_none_or(|end| end > image_length) {
+        return Err(seven_error(
+            ErrorKind::Malformed,
+            "packed stream is outside the archive",
+        ));
+    }
+    Ok(())
+}
+
+fn build_seven_decoder<R: Read>(
+    input: Take<R>,
+    coder: FolderCoder,
+    unpack_size: u64,
+    limits: Limits,
+) -> core::result::Result<SevenDecoder<R>, StreamError> {
+    match coder {
+        FolderCoder::Lzma2 { dict_prop } => {
+            let dictionary = lzma2_dict_size(dict_prop).map_err(seven_legacy_error)?;
+            validate_dictionary(dictionary, limits)?;
+            Ok(SevenDecoder::Lzma2(lzma_rust2::Lzma2Reader::new(
+                input, dictionary, None,
+            )))
+        },
+        FolderCoder::Lzma { props } => {
+            let dictionary = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+            validate_dictionary(dictionary, limits)?;
+            Ok(SevenDecoder::Lzma(
+                lzma_rust2::LzmaReader::new_with_props(
+                    input,
+                    unpack_size,
+                    props[0],
+                    dictionary,
+                    None,
+                )
+                .map_err(|_| seven_error(ErrorKind::Malformed, "LZMA decoder setup failed"))?,
+            ))
+        },
+        FolderCoder::Unsupported => Err(seven_error(
+            ErrorKind::Unsupported,
+            "payload coder is unsupported",
+        )),
+    }
+}
+
+fn validate_dictionary(dictionary: u32, limits: Limits) -> core::result::Result<(), StreamError> {
+    if limits
+        .codec_memory()
+        .is_some_and(|maximum| u64::from(dictionary) > maximum as u64)
+    {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "LZMA dictionary exceeds codec workspace limit",
+        ));
+    }
+    Ok(())
+}
+
+fn seven_decode_error(error: std::io::Error) -> StreamError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+    ) {
+        seven_error(ErrorKind::Malformed, "LZMA payload decode failed")
+    } else {
+        StreamError::io(error)
+    }
+}
+
+fn seven_legacy_error(error: HeaderError) -> StreamError {
+    let (kind, context) = match error {
+        HeaderError::Malformed(context) => (ErrorKind::Malformed, context),
+        HeaderError::Unsupported(context) => (ErrorKind::Unsupported, context),
+        HeaderError::LimitExceeded(context) => (ErrorKind::Limit, context),
+    };
+    seven_error(kind, context)
+}
+
+fn seven_error(kind: ErrorKind, context: &'static str) -> StreamError {
+    StreamError::archive(
+        ArchiveError::new(kind)
+            .with_format("7z")
+            .with_context(context),
+    )
 }
 
 /// Parses a `StreamsInfo` (`PackInfo`, `UnpackInfo`, `SubStreamsInfo`) restricted to one pack, one folder,
@@ -490,7 +1012,7 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
                 pack_pos = r.number()?;
                 let num_pack = r.number()?;
                 if num_pack != 1 {
-                    return Err(Error::Unsupported(
+                    return Err(HeaderError::Unsupported(
                         "7z: only a single pack stream is supported",
                     ));
                 }
@@ -499,23 +1021,29 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
                         K_END => break,
                         K_SIZE => pack_size = Some(r.number()?),
                         K_CRC => read_digests(r, 1)?,
-                        _ => return Err(Error::Unsupported("7z: unsupported pack-info property")),
+                        _ => {
+                            return Err(HeaderError::Unsupported(
+                                "7z: unsupported pack-info property",
+                            ));
+                        },
                     }
                 }
             },
             K_UNPACK_INFO => {
                 if r.u8()? != K_FOLDER {
-                    return Err(Error::Malformed("7z: unpack info missing kFolder"));
+                    return Err(HeaderError::Malformed("7z: unpack info missing kFolder"));
                 }
                 if r.number()? != 1 {
-                    return Err(Error::Unsupported("7z: only a single folder is supported"));
+                    return Err(HeaderError::Unsupported(
+                        "7z: only a single folder is supported",
+                    ));
                 }
                 if r.u8()? != 0 {
-                    return Err(Error::Unsupported("7z: external folder definitions"));
+                    return Err(HeaderError::Unsupported("7z: external folder definitions"));
                 }
                 coder = Some(read_folder(r)?);
                 if r.u8()? != K_CODERS_UNPACK_SIZE {
-                    return Err(Error::Malformed("7z: missing coders-unpack-size"));
+                    return Err(HeaderError::Malformed("7z: missing coders-unpack-size"));
                 }
                 unpack_size = r.number()?;
                 loop {
@@ -526,7 +1054,9 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
                             read_digests(r, 1)?;
                         },
                         _ => {
-                            return Err(Error::Unsupported("7z: unsupported unpack-info property"))
+                            return Err(HeaderError::Unsupported(
+                                "7z: unsupported unpack-info property",
+                            ));
                         },
                     }
                 }
@@ -536,12 +1066,16 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
                 num_substreams = n;
                 substream_sizes = Some(sizes);
             },
-            _ => return Err(Error::Unsupported("7z: unsupported streams-info property")),
+            _ => {
+                return Err(HeaderError::Unsupported(
+                    "7z: unsupported streams-info property",
+                ));
+            },
         }
     }
 
-    let pack_size = pack_size.ok_or(Error::Malformed("7z: missing pack size"))?;
-    let coder = coder.ok_or(Error::Malformed("7z: missing coder properties"))?;
+    let pack_size = pack_size.ok_or(HeaderError::Malformed("7z: missing pack size"))?;
+    let coder = coder.ok_or(HeaderError::Malformed("7z: missing coder properties"))?;
     let substream_sizes = match substream_sizes {
         Some(s) => s,
         None => vec![unpack_size],
@@ -549,7 +1083,7 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
     let _ = num_substreams;
     let pack_offset = SIGNATURE_HEADER_SIZE
         .checked_add(usize_of(pack_pos)?)
-        .ok_or(Error::Malformed("7z: pack offset overflow"))?;
+        .ok_or(HeaderError::Malformed("7z: pack offset overflow"))?;
 
     Ok(FolderInfo {
         pack_offset,
@@ -563,42 +1097,48 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
 /// Parses a single folder definition, returning its coder (LZMA2 or plain LZMA) and properties.
 fn read_folder(r: &mut ByteReader<'_>) -> Result<FolderCoder> {
     if r.number()? != 1 {
-        return Err(Error::Unsupported("7z: only a single coder is supported"));
+        return Err(HeaderError::Unsupported(
+            "7z: only a single coder is supported",
+        ));
     }
     let flags = r.u8()?;
     let id_size = usize::from(flags & 0x0F);
     let is_complex = flags & 0x10 != 0;
     let has_attributes = flags & 0x20 != 0;
     if flags & 0x80 != 0 {
-        return Err(Error::Unsupported("7z: reserved coder flag set"));
+        return Err(HeaderError::Unsupported("7z: reserved coder flag set"));
     }
     let codec = r.bytes(id_size)?;
     if is_complex {
-        return Err(Error::Unsupported("7z: complex coders are not supported"));
+        return Err(HeaderError::Unsupported(
+            "7z: complex coders are not supported",
+        ));
     }
     if !has_attributes {
-        return Err(Error::Unsupported("7z: coder without properties"));
+        return Err(HeaderError::Unsupported("7z: coder without properties"));
     }
     let prop_size = usize_of(r.number()?)?;
     let props = r.bytes(prop_size)?;
     if codec == [METHOD_LZMA2] {
         if prop_size != 1 {
-            return Err(Error::Unsupported("7z: unexpected LZMA2 property size"));
+            return Err(HeaderError::Unsupported(
+                "7z: unexpected LZMA2 property size",
+            ));
         }
         Ok(FolderCoder::Lzma2 {
             dict_prop: props[0],
         })
     } else if codec == METHOD_LZMA {
         if prop_size != 5 {
-            return Err(Error::Unsupported("7z: unexpected LZMA property size"));
+            return Err(HeaderError::Unsupported(
+                "7z: unexpected LZMA property size",
+            ));
         }
         let mut p = [0u8; 5];
         p.copy_from_slice(props);
         Ok(FolderCoder::Lzma { props: p })
     } else {
-        Err(Error::Unsupported(
-            "7z: only the LZMA2 and LZMA coders are supported",
-        ))
+        Ok(FolderCoder::Unsupported)
     }
 }
 
@@ -626,12 +1166,12 @@ fn parse_substreams_info(
                     let s = r.number()?;
                     sum = sum
                         .checked_add(s)
-                        .ok_or(Error::Malformed("7z: substream size overflow"))?;
+                        .ok_or(HeaderError::Malformed("7z: substream size overflow"))?;
                     sizes.push(s);
                 }
                 let last = folder_unpack
                     .checked_sub(sum)
-                    .ok_or(Error::Malformed("7z: substream sizes exceed folder"))?;
+                    .ok_or(HeaderError::Malformed("7z: substream sizes exceed folder"))?;
                 sizes.push(last);
                 have_sizes = true;
             },
@@ -641,7 +1181,11 @@ fn parse_substreams_info(
                 let unknown = if num == 1 && folder_has_crc { 0 } else { num };
                 read_digests(r, unknown)?;
             },
-            _ => return Err(Error::Unsupported("7z: unsupported substreams property")),
+            _ => {
+                return Err(HeaderError::Unsupported(
+                    "7z: unsupported substreams property",
+                ));
+            },
         }
     }
 
@@ -649,11 +1193,11 @@ fn parse_substreams_info(
         if num == 1 {
             sizes = vec![folder_unpack];
         } else {
-            return Err(Error::Malformed("7z: missing substream sizes"));
+            return Err(HeaderError::Malformed("7z: missing substream sizes"));
         }
     }
     if sizes.len() != num {
-        return Err(Error::Malformed("7z: substream count mismatch"));
+        return Err(HeaderError::Malformed("7z: substream count mismatch"));
     }
     Ok((num, sizes))
 }
@@ -679,7 +1223,7 @@ fn read_digests(r: &mut ByteReader<'_>, count: usize) -> Result<()> {
 /// Parses the `kName` property: an external byte (must be 0) then null-terminated UTF-16LE names.
 fn parse_names(r: &mut ByteReader<'_>, num_files: usize) -> Result<Vec<Vec<u8>>> {
     if r.u8()? != 0 {
-        return Err(Error::Unsupported("7z: names in an external stream"));
+        return Err(HeaderError::Unsupported("7z: names in an external stream"));
     }
     let mut names = Vec::with_capacity(num_files);
     for _ in 0..num_files {
@@ -692,7 +1236,7 @@ fn parse_names(r: &mut ByteReader<'_>, num_files: usize) -> Result<Vec<Vec<u8>>>
         let raw = r
             .data
             .get(start..r.pos - 2)
-            .ok_or(Error::Malformed("7z: bad name range"))?;
+            .ok_or(HeaderError::Malformed("7z: bad name range"))?;
         names.push(utf16le_to_bytes(raw));
     }
     Ok(names)
@@ -702,7 +1246,7 @@ fn parse_names(r: &mut ByteReader<'_>, num_files: usize) -> Result<Vec<Vec<u8>>>
 fn parse_times(r: &mut ByteReader<'_>, num_files: usize) -> Result<Vec<Option<Timestamp>>> {
     let defined = read_all_defined(r, num_files)?;
     if r.u8()? != 0 {
-        return Err(Error::Unsupported("7z: times in an external stream"));
+        return Err(HeaderError::Unsupported("7z: times in an external stream"));
     }
     let mut out = vec![None; num_files];
     for (i, &is_def) in defined.iter().enumerate() {
@@ -713,12 +1257,30 @@ fn parse_times(r: &mut ByteReader<'_>, num_files: usize) -> Result<Vec<Option<Ti
     Ok(out)
 }
 
+fn parse_positions(r: &mut ByteReader<'_>, num_files: usize) -> Result<Vec<Option<u64>>> {
+    let defined = read_all_defined(r, num_files)?;
+    if r.u8()? != 0 {
+        return Err(HeaderError::Unsupported(
+            "7z: start positions in an external stream",
+        ));
+    }
+    let mut out = vec![None; num_files];
+    for (index, is_defined) in defined.into_iter().enumerate() {
+        if is_defined {
+            out[index] = Some(r.u64()?);
+        }
+    }
+    Ok(out)
+}
+
 /// Parses the `kWinAttributes` property into a per-file optional full Unix mode (with type bits),
 /// present only when the entry carries the Unix-extension marker.
 fn parse_attributes(r: &mut ByteReader<'_>, num_files: usize) -> Result<Vec<Option<u32>>> {
     let defined = read_all_defined(r, num_files)?;
     if r.u8()? != 0 {
-        return Err(Error::Unsupported("7z: attributes in an external stream"));
+        return Err(HeaderError::Unsupported(
+            "7z: attributes in an external stream",
+        ));
     }
     let mut out = vec![None; num_files];
     for (i, &is_def) in defined.iter().enumerate() {
@@ -752,258 +1314,564 @@ fn permission_bits(full_mode: Option<u32>, kind: EntryKind) -> u32 {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// Writer
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// A finalized entry held until [`SevenZWriter::finish`].
 #[derive(Debug)]
-struct StoredEntry {
+struct SeekStoredEntry {
     name: Vec<u8>,
     kind: EntryKind,
     mode: u32,
     mtime: Option<Timestamp>,
-    content: Vec<u8>,
+    size: u64,
     has_stream: bool,
+    crc32: u32,
 }
 
-/// The metadata captured when an entry is opened (payload buffered until `close`).
 #[derive(Debug)]
-struct PendingEntry {
+struct SeekPendingEntry {
     name: Vec<u8>,
     kind: EntryKind,
     mode: u32,
     mtime: Option<Timestamp>,
     link_target: Option<Vec<u8>>,
-    plain: Vec<u8>,
+    declared_size: Option<u64>,
+    size: u64,
+    crc: crate::filter::Crc32,
 }
 
-/// 7z writer for the single-folder LZMA2 subset.
+/// Payload-streaming 7z writer for seekable destinations.
 ///
-/// **The whole archive is buffered in memory.** Every content file's plaintext is concatenated into
-/// one solid folder that is LZMA2-compressed at `finish`, and the 32-byte signature header must be
-/// back-filled with the (then-known) next-header offset/size/CRC. Because a [`Sink`] is append-only
-/// (no seek), the writer assembles the entire archive into a single `Vec<u8>` and performs exactly
-/// one `sink.write_all` at the end.
-#[derive(Debug)]
-pub struct SevenZWriter<W: Sink> {
-    sink: W,
-    entries: Vec<StoredEntry>,
-    pending: Option<PendingEntry>,
+/// Only entry metadata is retained. File bytes flow directly into one solid
+/// LZMA2 folder; finish appends the next header and seeks back only to the
+/// fixed 32-byte signature header.
+pub(crate) struct SevenZSeekWriter<W: Write + Seek> {
+    encoder: Option<lzma_rust2::Lzma2Writer<W>>,
+    entries: Vec<SeekStoredEntry>,
+    pending: Option<SeekPendingEntry>,
+    limits: Limits,
+    metadata_used: usize,
+    decoded_total: u64,
+    folder_crc: crate::filter::Crc32,
+    archive_metadata: ArchiveMetadata,
 }
 
-impl<W: Sink> SevenZWriter<W> {
-    /// Builds a writer over a byte sink.
-    pub fn new(sink: W) -> Self {
-        Self {
-            sink,
+impl<W: Write + Seek> std::fmt::Debug for SevenZSeekWriter<W> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SevenZSeekWriter")
+            .field("entries", &self.entries.len())
+            .field("pending", &self.pending.is_some())
+            .field("decoded_total", &self.decoded_total)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W: Write + Seek> SevenZSeekWriter<W> {
+    pub(crate) fn new(mut output: W, limits: Limits) -> core::result::Result<Self, StreamError> {
+        validate_dictionary(WRITER_DICT_SIZE, limits)?;
+        output.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
+        output
+            .write_all(&[0_u8; SIGNATURE_HEADER_SIZE])
+            .map_err(StreamError::io)?;
+        let options = lzma_rust2::Lzma2Options::with_preset(WRITER_PRESET);
+        Ok(Self {
+            encoder: Some(lzma_rust2::Lzma2Writer::new(output, options)),
             entries: Vec::new(),
             pending: None,
+            limits,
+            metadata_used: 0,
+            decoded_total: 0,
+            folder_crc: crate::filter::Crc32::new(),
+            archive_metadata: ArchiveMetadata::new(),
+        })
+    }
+
+    pub(crate) fn set_archive_metadata(
+        &mut self,
+        metadata: &ArchiveMetadata,
+    ) -> core::result::Result<(), StreamError> {
+        if self.pending.is_some() || !self.entries.is_empty() || self.decoded_total != 0 {
+            return Err(seven_error(
+                ErrorKind::Protocol,
+                "7z archive metadata must be set before the first entry",
+            ));
         }
+        if metadata.volume_name().is_some()
+            || metadata.comment().is_some()
+            || metadata.extensions().iter().any(|extension| {
+                !matches!(
+                    extension.namespace(),
+                    "7z-archive-property" | "7z-files-property"
+                )
+            })
+        {
+            return Err(seven_error(
+                ErrorKind::Unsupported,
+                "7z archive metadata contains an unrepresentable property",
+            ));
+        }
+        let cost = metadata
+            .extensions()
+            .iter()
+            .try_fold(
+                core::mem::size_of::<ArchiveMetadata>(),
+                |total, extension| {
+                    total
+                        .checked_add(extension.namespace().len())
+                        .and_then(|value| value.checked_add(extension.key().len()))
+                        .and_then(|value| value.checked_add(extension.value().len()))
+                },
+            )
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+        if self
+            .limits
+            .metadata_bytes()
+            .is_some_and(|maximum| self.metadata_used.saturating_add(cost) > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "7z archive metadata exceeds configured limit",
+            ));
+        }
+        validate_archive_extensions(metadata.extensions())?;
+        self.metadata_used = self
+            .metadata_used
+            .checked_add(cost)
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+        self.archive_metadata = metadata.clone();
+        Ok(())
     }
 
-    /// Consumes the writer and returns the underlying sink.
-    pub fn into_inner(self) -> W {
-        self.sink
-    }
-
-    /// Finalizes the currently open entry into a [`StoredEntry`].
-    fn close_entry(&mut self) -> Result<()> {
-        let Some(p) = self.pending.take() else {
-            return Err(Error::InvalidState("7z: no open entry"));
-        };
-        // A symlink's content is its target; directories carry nothing; files use the buffered bytes.
-        let content = match p.kind {
-            EntryKind::Symlink => p.link_target.unwrap_or_default(),
-            EntryKind::Dir => Vec::new(),
-            _ => p.plain,
-        };
-        let has_stream = !matches!(p.kind, EntryKind::Dir) && !content.is_empty();
-        self.entries.push(StoredEntry {
-            name: p.name,
-            kind: p.kind,
-            mode: p.mode,
-            mtime: p.mtime,
-            content,
-            has_stream,
+    pub(crate) fn start_entry(
+        &mut self,
+        metadata: &EntryMetadata,
+    ) -> core::result::Result<(), StreamError> {
+        if self.pending.is_some() {
+            return Err(seven_error(
+                ErrorKind::Protocol,
+                "previous 7z entry is still open",
+            ));
+        }
+        if self
+            .limits
+            .entries()
+            .is_some_and(|maximum| self.entries.len() as u64 >= maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "entry count exceeds configured limit",
+            ));
+        }
+        let mut name = metadata.path().as_bytes().to_vec();
+        if metadata.kind() == EntryKind::Dir {
+            while name.ends_with(b"/") {
+                name.pop();
+            }
+        }
+        if self
+            .limits
+            .path_bytes()
+            .is_some_and(|maximum| name.len() > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "entry path exceeds configured limit",
+            ));
+        }
+        let accounted = name
+            .len()
+            .checked_add(core::mem::size_of::<SeekStoredEntry>())
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+        self.metadata_used = self
+            .metadata_used
+            .checked_add(accounted)
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+        if self
+            .limits
+            .metadata_bytes()
+            .is_some_and(|maximum| self.metadata_used > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "entry metadata exceeds configured limit",
+            ));
+        }
+        self.pending = Some(SeekPendingEntry {
+            name,
+            kind: metadata.kind(),
+            mode: metadata.mode().unwrap_or(match metadata.kind() {
+                EntryKind::Dir => 0o755,
+                _ => 0o644,
+            }),
+            mtime: metadata.times().modified,
+            link_target: metadata
+                .link_target()
+                .map(|target| target.as_bytes().to_vec()),
+            declared_size: metadata.size(),
+            size: 0,
+            crc: crate::filter::Crc32::new(),
         });
         Ok(())
     }
 
-    /// Assembles the whole archive in memory and writes it with a single `write_all`.
-    fn assemble(&mut self) -> Result<()> {
-        // Concatenate content streams into one solid folder and record substream sizes/CRCs.
-        let mut unpacked: Vec<u8> = Vec::new();
-        let mut sub_sizes: Vec<u64> = Vec::new();
-        let mut sub_crcs: Vec<u32> = Vec::new();
-        for e in &self.entries {
-            if e.has_stream {
-                sub_sizes.push(e.content.len() as u64);
-                sub_crcs.push(crate::filter::crc32(&e.content));
-                unpacked.extend_from_slice(&e.content);
-            }
+    pub(crate) fn write_data(&mut self, bytes: &[u8]) -> core::result::Result<(), StreamError> {
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "7z data supplied outside an entry"))?;
+        if pending.kind != EntryKind::File {
+            return Err(seven_error(
+                ErrorKind::Protocol,
+                "only regular-file entries accept 7z payload commands",
+            ));
         }
-        let num_content = sub_sizes.len();
-        let folder_crc = crate::filter::crc32(&unpacked);
-        let packed = if num_content > 0 {
-            lzma2_compress(&unpacked)?
-        } else {
-            Vec::new()
-        };
-        let dict_prop = lzma2_dict_prop(WRITER_DICT_SIZE);
+        let next_size = pending
+            .size
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| seven_error(ErrorKind::Limit, "write size exceeds u64"))?,
+            )
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "entry size overflow"))?;
+        self.check_output_limits(next_size, bytes.len())?;
+        self.encoder_mut()?
+            .write_all(bytes)
+            .map_err(seven_encode_error)?;
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "7z pending entry disappeared"))?;
+        pending.crc.update(bytes);
+        pending.size = next_size;
+        self.folder_crc.update(bytes);
+        self.decoded_total = self
+            .decoded_total
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| seven_error(ErrorKind::Limit, "write size exceeds u64"))?,
+            )
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "decoded total overflow"))?;
+        Ok(())
+    }
 
-        // Build the plain kHeader.
-        let mut header = Vec::new();
-        header.push(K_HEADER);
-        if num_content > 0 {
+    pub(crate) fn end_entry(&mut self) -> core::result::Result<(), StreamError> {
+        let mut pending = self
+            .pending
+            .take()
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "end_entry called without an entry"))?;
+        if pending.kind == EntryKind::Symlink {
+            let target = pending
+                .link_target
+                .take()
+                .ok_or_else(|| seven_error(ErrorKind::Malformed, "symbolic link has no target"))?;
+            let size = u64::try_from(target.len())
+                .map_err(|_| seven_error(ErrorKind::Limit, "link target size exceeds u64"))?;
+            self.check_output_limits(size, target.len())?;
+            self.encoder_mut()?
+                .write_all(&target)
+                .map_err(seven_encode_error)?;
+            pending.crc.update(&target);
+            pending.size = size;
+            self.folder_crc.update(&target);
+            self.decoded_total += size;
+        }
+        if pending.kind == EntryKind::Dir && pending.size != 0 {
+            return Err(seven_error(
+                ErrorKind::Protocol,
+                "directory entry carried payload",
+            ));
+        }
+        if pending
+            .declared_size
+            .is_some_and(|declared| declared != pending.size)
+        {
+            return Err(seven_error(
+                ErrorKind::Protocol,
+                "7z entry size does not match its declared size",
+            ));
+        }
+        let has_stream = pending.kind != EntryKind::Dir && pending.size != 0;
+        self.entries.push(SeekStoredEntry {
+            name: pending.name,
+            kind: pending.kind,
+            mode: pending.mode,
+            mtime: pending.mtime,
+            size: pending.size,
+            has_stream,
+            crc32: pending.crc.finalize(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> core::result::Result<W, StreamError> {
+        if self.pending.is_some() {
+            return Err(seven_error(
+                ErrorKind::Protocol,
+                "7z entry is open at finish",
+            ));
+        }
+        let encoder = self
+            .encoder
+            .take()
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "7z writer was already finalized"))?;
+        let mut output = encoder.finish().map_err(seven_encode_error)?;
+        let packed_end = output.stream_position().map_err(StreamError::io)?;
+        let packed_size = packed_end
+            .checked_sub(SIGNATURE_HEADER_SIZE as u64)
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "packed output position underflow"))?;
+        let sub_sizes: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.has_stream)
+            .map(|entry| entry.size)
+            .collect();
+        let sub_crcs: Vec<u32> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.has_stream)
+            .map(|entry| entry.crc32)
+            .collect();
+        let mut header = vec![K_HEADER];
+        write_archive_properties(&mut header, self.archive_metadata.extensions())?;
+        if !sub_sizes.is_empty() {
             header.push(K_MAIN_STREAMS_INFO);
-            write_pack_info(&mut header, packed.len() as u64);
-            write_unpack_info(&mut header, dict_prop, unpacked.len() as u64, folder_crc);
-            write_substreams_info(&mut header, num_content, &sub_sizes, &sub_crcs);
+            write_pack_info(&mut header, packed_size);
+            write_unpack_info(
+                &mut header,
+                lzma2_dict_prop(WRITER_DICT_SIZE),
+                self.decoded_total,
+                self.folder_crc.finalize(),
+            );
+            write_substreams_info(&mut header, sub_sizes.len(), &sub_sizes, &sub_crcs);
             header.push(K_END);
         }
-        self.write_files_info(&mut header);
+        write_seek_files_info(
+            &mut header,
+            &self.entries,
+            self.archive_metadata.extensions(),
+        )?;
         header.push(K_END);
-
-        // Layout: [32-byte signature header][packed folder][next header]. Assemble, then back-fill.
-        let mut out = vec![0u8; SIGNATURE_HEADER_SIZE];
-        out[0..6].copy_from_slice(&SIGNATURE);
-        out[6] = 0; // format major version
-        out[7] = 4; // format minor version
-        out.extend_from_slice(&packed);
-        let nh_offset = packed.len() as u64;
-        let nh_size = header.len() as u64;
-        let nh_crc = crate::filter::crc32(&header);
-        out.extend_from_slice(&header);
-
-        out[12..20].copy_from_slice(&nh_offset.to_le_bytes());
-        out[20..28].copy_from_slice(&nh_size.to_le_bytes());
-        out[28..32].copy_from_slice(&nh_crc.to_le_bytes());
-        let start_crc = crate::filter::crc32(&out[12..32]);
-        out[8..12].copy_from_slice(&start_crc.to_le_bytes());
-
-        self.sink.write_all(&out)
+        if self
+            .limits
+            .metadata_bytes()
+            .is_some_and(|maximum| header.len() > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "final 7z header exceeds metadata limit",
+            ));
+        }
+        let header_crc = crate::filter::crc32(&header);
+        output.write_all(&header).map_err(StreamError::io)?;
+        let archive_end = output.stream_position().map_err(StreamError::io)?;
+        let mut signature = [0_u8; SIGNATURE_HEADER_SIZE];
+        signature[..6].copy_from_slice(&SIGNATURE);
+        signature[7] = 4;
+        signature[12..20].copy_from_slice(&packed_size.to_le_bytes());
+        signature[20..28].copy_from_slice(
+            &u64::try_from(header.len())
+                .map_err(|_| seven_error(ErrorKind::Limit, "header size exceeds u64"))?
+                .to_le_bytes(),
+        );
+        signature[28..32].copy_from_slice(&header_crc.to_le_bytes());
+        let start_crc = crate::filter::crc32(&signature[12..32]);
+        signature[8..12].copy_from_slice(&start_crc.to_le_bytes());
+        output.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
+        output.write_all(&signature).map_err(StreamError::io)?;
+        output
+            .seek(SeekFrom::Start(archive_end))
+            .map_err(StreamError::io)?;
+        output.flush().map_err(StreamError::io)?;
+        Ok(output)
     }
 
-    /// Emits the `FilesInfo` block (names, empty-stream/empty-file vectors, attributes, mtimes).
-    fn write_files_info(&self, header: &mut Vec<u8>) {
-        header.push(K_FILES_INFO);
-        write_number(header, self.entries.len() as u64);
+    pub(crate) fn abort(mut self) -> core::result::Result<W, StreamError> {
+        self.encoder
+            .take()
+            .map(lzma_rust2::Lzma2Writer::into_inner)
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "7z writer is finalized"))
+    }
 
-        // kEmptyStream: files that carry no stream (directories and empty files).
-        let empty_stream: Vec<bool> = self.entries.iter().map(|e| !e.has_stream).collect();
-        if empty_stream.iter().any(|&b| b) {
+    fn encoder_mut(
+        &mut self,
+    ) -> core::result::Result<&mut lzma_rust2::Lzma2Writer<W>, StreamError> {
+        self.encoder
+            .as_mut()
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "7z writer is finalized"))
+    }
+
+    fn check_output_limits(
+        &self,
+        entry_size: u64,
+        additional: usize,
+    ) -> core::result::Result<(), StreamError> {
+        if self
+            .limits
+            .entry_bytes()
+            .is_some_and(|maximum| entry_size > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "entry exceeds configured size limit",
+            ));
+        }
+        let total = self
+            .decoded_total
+            .checked_add(additional as u64)
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "decoded total overflow"))?;
+        if self
+            .limits
+            .decoded_total()
+            .is_some_and(|maximum| total > maximum)
+        {
+            return Err(seven_error(
+                ErrorKind::Limit,
+                "decoded total exceeds configured limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn write_seek_files_info(
+    header: &mut Vec<u8>,
+    entries: &[SeekStoredEntry],
+    extensions: &[Extension],
+) -> core::result::Result<(), StreamError> {
+    header.push(K_FILES_INFO);
+    write_number(header, entries.len() as u64);
+    let empty_stream: Vec<bool> = entries.iter().map(|entry| !entry.has_stream).collect();
+    if empty_stream.iter().any(|value| *value) {
+        let mut body = Vec::new();
+        write_bit_vector(&mut body, &empty_stream);
+        header.push(K_EMPTY_STREAM);
+        write_number(header, body.len() as u64);
+        header.extend_from_slice(&body);
+        let empty_file: Vec<bool> = entries
+            .iter()
+            .filter(|entry| !entry.has_stream)
+            .map(|entry| entry.kind != EntryKind::Dir)
+            .collect();
+        if empty_file.iter().any(|value| *value) {
             let mut body = Vec::new();
-            write_bit_vector(&mut body, &empty_stream);
-            header.push(K_EMPTY_STREAM);
+            write_bit_vector(&mut body, &empty_file);
+            header.push(K_EMPTY_FILE);
             write_number(header, body.len() as u64);
             header.extend_from_slice(&body);
-
-            // kEmptyFile: among empty-stream files, which are empty regular files (not directories).
-            let empty_file: Vec<bool> = self
-                .entries
-                .iter()
-                .filter(|e| !e.has_stream)
-                .map(|e| !matches!(e.kind, EntryKind::Dir))
-                .collect();
-            if empty_file.iter().any(|&b| b) {
-                let mut fbody = Vec::new();
-                write_bit_vector(&mut fbody, &empty_file);
-                header.push(K_EMPTY_FILE);
-                write_number(header, fbody.len() as u64);
-                header.extend_from_slice(&fbody);
-            }
         }
-
-        // kName: external byte (0) then null-terminated UTF-16LE names.
-        let mut name_body = vec![0u8];
-        for e in &self.entries {
-            bytes_to_utf16le(&e.name, &mut name_body);
-        }
-        header.push(K_NAME);
-        write_number(header, name_body.len() as u64);
-        header.extend_from_slice(&name_body);
-
-        // kWinAttributes: always defined, carrying the Unix mode + directory bit.
-        let mut attr_body = vec![1u8, 0u8]; // AllAreDefined = 1, external = 0
-        for e in &self.entries {
-            attr_body.extend_from_slice(&windows_attributes(e.kind, e.mode).to_le_bytes());
-        }
-        header.push(K_WIN_ATTRIBUTES);
-        write_number(header, attr_body.len() as u64);
-        header.extend_from_slice(&attr_body);
-
-        // kMTime: only when at least one entry has a timestamp.
-        let defined: Vec<bool> = self.entries.iter().map(|e| e.mtime.is_some()).collect();
-        if defined.iter().any(|&b| b) {
-            let mut time_body = Vec::new();
-            if defined.iter().all(|&b| b) {
-                time_body.push(1u8);
-            } else {
-                time_body.push(0u8);
-                write_bit_vector(&mut time_body, &defined);
-            }
-            time_body.push(0u8); // external
-            for e in &self.entries {
-                if let Some(ts) = e.mtime {
-                    time_body.extend_from_slice(&timestamp_to_filetime(ts).to_le_bytes());
-                }
-            }
-            header.push(K_MTIME);
-            write_number(header, time_body.len() as u64);
-            header.extend_from_slice(&time_body);
-        }
-
-        header.push(K_END); // end of FilesInfo (property id kEnd)
     }
+    let mut names = vec![0];
+    for entry in entries {
+        bytes_to_utf16le(&entry.name, &mut names);
+    }
+    header.push(K_NAME);
+    write_number(header, names.len() as u64);
+    header.extend_from_slice(&names);
+    let mut attributes = vec![1, 0];
+    for entry in entries {
+        attributes.extend_from_slice(&windows_attributes(entry.kind, entry.mode).to_le_bytes());
+    }
+    header.push(K_WIN_ATTRIBUTES);
+    write_number(header, attributes.len() as u64);
+    header.extend_from_slice(&attributes);
+    let defined: Vec<bool> = entries.iter().map(|entry| entry.mtime.is_some()).collect();
+    if defined.iter().any(|value| *value) {
+        let mut times = Vec::new();
+        if defined.iter().all(|value| *value) {
+            times.push(1);
+        } else {
+            times.push(0);
+            write_bit_vector(&mut times, &defined);
+        }
+        times.push(0);
+        for entry in entries {
+            if let Some(timestamp) = entry.mtime {
+                times.extend_from_slice(&timestamp_to_filetime(timestamp).to_le_bytes());
+            }
+        }
+        header.push(K_MTIME);
+        write_number(header, times.len() as u64);
+        header.extend_from_slice(&times);
+    }
+    for extension in extensions
+        .iter()
+        .filter(|extension| extension.namespace() == "7z-files-property")
+    {
+        let key: [u8; 8] = extension.key().try_into().map_err(|_| {
+            seven_error(
+                ErrorKind::Malformed,
+                "preserved 7z file property has an invalid key",
+            )
+        })?;
+        let property = u64::from_le_bytes(key);
+        if matches!(
+            u8::try_from(property),
+            Ok(K_EMPTY_STREAM
+                | K_EMPTY_FILE
+                | K_ANTI
+                | K_NAME
+                | K_CTIME
+                | K_ATIME
+                | K_MTIME
+                | K_WIN_ATTRIBUTES
+                | K_START_POS)
+        ) {
+            continue;
+        }
+        write_number(header, property);
+        write_number(header, extension.value().len() as u64);
+        header.extend_from_slice(extension.value());
+    }
+    header.push(K_END);
+    Ok(())
 }
 
-impl<W: Sink> EntryWriter for SevenZWriter<W> {
-    type Sink = Self;
-
-    fn start_entry(&mut self, meta: &EntryMeta<'_>) -> Result<EntrySink<'_, Self>> {
-        if self.pending.is_some() {
-            return Err(Error::InvalidState("7z: previous entry not closed"));
-        }
-        // Directory names never carry a trailing '/' in 7z (unlike zip); strip it if present.
-        let mut name = meta.path.to_vec();
-        if meta.kind == EntryKind::Dir {
-            while name.last() == Some(&b'/') {
-                name.pop();
-            }
-        }
-        self.pending = Some(PendingEntry {
-            name,
-            kind: meta.kind,
-            mode: meta.mode & 0o7777,
-            mtime: meta.mtime,
-            link_target: meta.link_target.as_ref().map(|t| t.to_vec()),
-            plain: Vec::new(),
-        });
-        Ok(EntrySink::new(self))
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        if self.pending.is_some() {
-            return Err(Error::InvalidState("7z: entry open at finish"));
-        }
-        self.assemble()
-    }
-}
-
-impl<W: Sink> EntryDataSink for SevenZWriter<W> {
-    fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
-        match &mut self.pending {
-            Some(p) => {
-                p.plain.extend_from_slice(data);
-                Ok(())
+fn validate_archive_extensions(extensions: &[Extension]) -> core::result::Result<(), StreamError> {
+    for extension in extensions {
+        match extension.namespace() {
+            "7z-archive-property" if extension.key().len() == 1 => {},
+            "7z-files-property" if extension.key().len() == 8 => {},
+            "7z-archive-property" | "7z-files-property" => {
+                return Err(seven_error(
+                    ErrorKind::Malformed,
+                    "preserved 7z property has an invalid key",
+                ));
             },
-            None => Err(Error::InvalidState("7z: write without an open entry")),
+            _ => {},
         }
     }
+    Ok(())
+}
 
-    fn close(&mut self) -> Result<()> {
-        self.close_entry()
+fn write_archive_properties(
+    header: &mut Vec<u8>,
+    extensions: &[Extension],
+) -> core::result::Result<(), StreamError> {
+    let properties: Vec<_> = extensions
+        .iter()
+        .filter(|extension| extension.namespace() == "7z-archive-property")
+        .collect();
+    if properties.is_empty() {
+        return Ok(());
+    }
+    header.push(K_ARCHIVE_PROPERTIES);
+    for extension in properties {
+        let property = *extension.key().first().ok_or_else(|| {
+            seven_error(
+                ErrorKind::Malformed,
+                "preserved 7z archive property has no id",
+            )
+        })?;
+        header.push(property);
+        write_number(header, extension.value().len() as u64);
+        header.extend_from_slice(extension.value());
+    }
+    header.push(K_END);
+    Ok(())
+}
+
+fn seven_encode_error(error: std::io::Error) -> StreamError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        seven_error(ErrorKind::Malformed, "LZMA2 encoder failed")
+    } else {
+        StreamError::io(error)
     }
 }
 
@@ -1023,7 +1891,7 @@ fn write_unpack_info(header: &mut Vec<u8>, dict_prop: u8, unpack_size: u64, fold
     header.push(K_FOLDER);
     write_number(header, 1); // NumFolders
     header.push(0); // External = 0
-                    // One coder: flags = idSize(1) | kAttributes(0x20) = 0x21; codec id = LZMA2 (0x21); 1 prop byte.
+    // One coder: flags = idSize(1) | kAttributes(0x20) = 0x21; codec id = LZMA2 (0x21); 1 prop byte.
     write_number(header, 1); // NumCoders
     header.push(0x21);
     header.push(METHOD_LZMA2);
@@ -1077,24 +1945,14 @@ fn windows_attributes(kind: EntryKind, mode: u32) -> u32 {
 // LZMA2 glue
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
-/// LZMA2-compresses `plain` into a raw LZMA2 stream (exactly what a 7z folder stores).
-fn lzma2_compress(plain: &[u8]) -> Result<Vec<u8>> {
-    let options = lzma_rust2::Lzma2Options::with_preset(WRITER_PRESET);
-    let mut writer = lzma_rust2::Lzma2Writer::new(Vec::new(), options);
-    writer
-        .write_all(plain)
-        .map_err(|_| Error::Malformed("7z: LZMA2 encode failed"))?;
-    writer
-        .finish()
-        .map_err(|_| Error::Malformed("7z: LZMA2 finish failed"))
-}
-
 /// Decodes an LZMA2 dictionary-size property byte into a dictionary size in bytes.
 ///
 /// `dict_size = (2 | (p & 1)) << (p / 2 + 11)`, with `40` reserved for `u32::MAX`.
 fn lzma2_dict_size(prop: u8) -> Result<u32> {
     if prop > 40 {
-        return Err(Error::Unsupported("7z: invalid LZMA2 dictionary property"));
+        return Err(HeaderError::Unsupported(
+            "7z: invalid LZMA2 dictionary property",
+        ));
     }
     if prop == 40 {
         return Ok(u32::MAX);
@@ -1138,7 +1996,7 @@ impl<'a> ByteReader<'a> {
         let b = *self
             .data
             .get(self.pos)
-            .ok_or(Error::Malformed("7z: unexpected end of header"))?;
+            .ok_or(HeaderError::Malformed("7z: unexpected end of header"))?;
         self.pos += 1;
         Ok(b)
     }
@@ -1152,11 +2010,11 @@ impl<'a> ByteReader<'a> {
         let end = self
             .pos
             .checked_add(n)
-            .ok_or(Error::Malformed("7z: header length overflow"))?;
+            .ok_or(HeaderError::Malformed("7z: header length overflow"))?;
         let s = self
             .data
             .get(self.pos..end)
-            .ok_or(Error::Malformed("7z: truncated header field"))?;
+            .ok_or(HeaderError::Malformed("7z: truncated header field"))?;
         self.pos = end;
         Ok(s)
     }
@@ -1301,7 +2159,7 @@ fn bytes_to_utf16le(name: &[u8], out: &mut Vec<u8>) {
 fn u32_le(data: &[u8], off: usize) -> Result<u32> {
     let b = data
         .get(off..off + 4)
-        .ok_or(Error::Malformed("7z: truncated signature field"))?;
+        .ok_or(HeaderError::Malformed("7z: truncated signature field"))?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
@@ -1309,7 +2167,7 @@ fn u32_le(data: &[u8], off: usize) -> Result<u32> {
 fn u64_le(data: &[u8], off: usize) -> Result<u64> {
     let b = data
         .get(off..off + 8)
-        .ok_or(Error::Malformed("7z: truncated signature field"))?;
+        .ok_or(HeaderError::Malformed("7z: truncated signature field"))?;
     Ok(u64::from_le_bytes([
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
     ]))
@@ -1317,5 +2175,5 @@ fn u64_le(data: &[u8], off: usize) -> Result<u64> {
 
 /// `u64` to `usize`, mapped to a limit error where it would truncate (32-bit hosts).
 fn usize_of(v: u64) -> Result<usize> {
-    usize::try_from(v).map_err(|_| Error::LimitExceeded("7z: value exceeds usize"))
+    usize::try_from(v).map_err(|_| HeaderError::LimitExceeded("7z: value exceeds usize"))
 }

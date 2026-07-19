@@ -7,11 +7,12 @@
 [tools]
 rust = "stable"
 
-lefthook = "latest"
+lefthook = "2.1.9"
 committed = "latest"
+just = "1.50.0"
 
-typos = "latest"
-actionlint = "latest"
+typos = "1.48.0"
+actionlint = "1.7.12"
 
 # REUSE runs through uvx.
 uv = "latest"
@@ -29,47 +30,3 @@ binstall = true
 [tasks.hooks]
 description = "Install the git hooks (see lefthook.yml)"
 run = "lefthook install"
-
-[tasks.fmt]
-description = "Format the workspace"
-run = "cargo fmt --all"
-
-[tasks.lint]
-description = "Clippy over the whole workspace, warnings as errors"
-run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
-
-[tasks.test]
-description = "Run the workspace tests"
-run = "cargo test --workspace --all-features"
-
-[tasks.nodyn]
-description = "Guard the zero-type-erasure invariant (no dyn in library source)"
-run = "bash scripts/check-no-dyn.sh"
-
-[tasks.no-std]
-description = "Cross-build the no_std core for a bare-metal target (zero external deps)"
-run = "cargo build -p libarchive_oxide-core --target thumbv7em-none-eabi"
-
-[tasks.deny]
-description = "Check the dependency graph: advisories, licenses, wildcard pins, sources"
-run = "cargo deny check"
-
-[tasks.msrv]
-description = "Verify each crate still builds on its declared rust-version"
-run = "cargo msrv verify"
-
-[tasks.semver]
-description = "Gate breaking public-API changes"
-run = "cargo semver-checks check-release --workspace"
-
-[tasks.typos]
-description = "Spell-check the repository"
-run = "typos"
-
-[tasks.reuse]
-description = "Check REUSE/SPDX license compliance"
-run = "uvx --with charset-normalizer reuse lint"
-
-[tasks.license-sync]
-description = "Verify each published crate carries the canonical license texts"
-run = "bash scripts/check-license-sync.sh"

@@ -12,55 +12,54 @@
 // Filter modules use `alloc` paths and also compile under std.
 extern crate alloc;
 
-use std::borrow::Cow;
-
 use libarchive_oxide_core::filter::FilterId;
-use libarchive_oxide_core::{decode_to_vec, decode_to_vec_capped, Error, Result};
 
+#[cfg(feature = "async")]
+mod async_filter;
+#[cfg(feature = "async")]
+pub mod async_seek;
+#[cfg(feature = "async")]
+pub mod async_stream;
 pub mod create;
-pub mod extract;
+pub mod extractor;
 pub mod filter;
+pub mod filtered_io;
+mod iso_stream;
 pub mod path;
+mod pipeline_codec;
+pub mod secret;
+pub mod seek_stream;
 #[cfg(feature = "sevenz")]
-pub mod sevenz;
-pub mod zip;
+mod sevenz;
+pub mod spool;
+pub mod stream;
+#[cfg(feature = "tokio")]
+pub mod tokio_stream;
+mod zip;
+mod zip_stream;
 
-pub use create::{build_archive, build_archive_with, build_cpio, build_tar, CreateOptions};
-pub use extract::{reader, reader_with_password, Stats};
+#[cfg(feature = "async")]
+pub use async_seek::{AsyncSeekArchiveReader, AsyncSeekArchiveWriter};
+#[cfg(feature = "async")]
+pub use async_stream::{AsyncArchiveReader, AsyncArchiveWriter};
+pub use create::{CreateStreamError, StreamingArchiveBuilder};
+pub use extractor::{
+    EntryOutcome, EntryOutcomeKind, ExtractionPolicy, ExtractionReport, Extractor, RejectionReason,
+};
+pub use filtered_io::FilterReader;
 pub use libarchive_oxide_core;
-pub use path::sanitize;
-pub use zip::{SaltSource, ZipMethod, ZipOptions};
-
-/// Detects compression and returns decompressed bytes.
-///
-/// Returns borrowed input when no compression is detected. Returns
-/// [`Error::Unsupported`] when the required filter feature is disabled. This
-/// function has no output limit; use [`decompress_capped`] for untrusted input.
-pub fn decompress(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
-    decompress_capped(bytes, usize::MAX)
-}
-
-/// Detects compression and enforces `max_output`.
-///
-/// Returns [`Error::LimitExceeded`] when output exceeds the limit.
-pub fn decompress_capped(bytes: &[u8], max_output: usize) -> Result<Cow<'_, [u8]>> {
-    match FilterId::sniff(bytes) {
-        Some(id) => {
-            let mut decoder =
-                crate::filter::decoder(id).ok_or(Error::Unsupported("filter not built in"))?;
-            let plain = decode_to_vec_capped(&mut decoder, bytes, max_output)?;
-            Ok(Cow::Owned(plain))
-        },
-        None => Ok(Cow::Borrowed(bytes)),
-    }
-}
-
-/// Compresses `plain` with `id`.
-pub fn compress(plain: &[u8], id: FilterId) -> Result<Vec<u8>> {
-    let mut encoder =
-        crate::filter::encoder(id).ok_or(Error::Unsupported("filter not built in"))?;
-    decode_to_vec(&mut encoder, plain)
-}
+pub use libarchive_oxide_core::CpioDialect;
+pub use path::{sanitize, sanitize_archive_path};
+pub use secret::SecretBytes;
+pub use seek_stream::{SeekArchiveReader, SeekArchiveWriter};
+pub use spool::{SpoolReader, SpoolWriter};
+pub use stream::{ArchiveReader, ArchiveWriter, Pipeline, PipelineEvent, ReaderEvent, StreamError};
+#[cfg(feature = "tokio")]
+pub use tokio_stream::{
+    TokioArchiveReader, TokioArchiveWriter, TokioExtractor, TokioIo, TokioSeekArchiveReader,
+    TokioSeekArchiveWriter,
+};
+pub use zip::ZipMethod;
 
 /// Returns the compression codec implied by a filename.
 #[must_use]

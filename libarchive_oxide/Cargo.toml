@@ -27,21 +27,48 @@ rustdoc-args = ["--generate-link-to-definition"]
 [features]
 default = ["gzip", "zstd", "xz", "lz4"]
 # Compression codecs.
-gzip = ["dep:miniz_oxide"]
-zstd = ["dep:ruzstd"]
-xz = ["dep:lzma-rust2"]
-lz4 = ["dep:lz4_flex"]
+gzip = []
+zstd = [
+    "dep:ruzstd",
+    "dep:zstd-codec",
+    "dep:compression-codecs",
+    "compression-codecs/zstd",
+    "async-compression?/zstd",
+]
+xz = [
+    "dep:lzma-rust2",
+    "dep:compression-codecs",
+    "compression-codecs/xz",
+    "async-compression?/xz",
+]
+lz4 = [
+    "dep:lz4_flex",
+    "dep:compression-codecs",
+    "compression-codecs/lz4",
+    "async-compression?/lz4",
+]
 # WinZip AES-256 AE-2.
 aes = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1", "dep:pbkdf2", "dep:subtle", "dep:getrandom"]
 # 7z single-folder LZMA2 and shared CRC-32.
 sevenz = ["dep:lzma-rust2", "gzip"]
+# Runtime-neutral and Tokio I/O adapters. Both drive the same sans-I/O
+# pipeline; Tokio is a thin poll shim and does not enable a second parser.
+async = [
+    "dep:futures-io",
+    "dep:async-compression",
+    "async-compression/futures-io",
+    "async-compression/gzip",
+]
+tokio = ["async", "dep:tokio"]
 
 [dependencies]
-libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.1.0" }
+libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
 # Feature-gated codecs.
-miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"], optional = true }
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 ruzstd = { version = "0.8.2", optional = true }
+zstd-codec = { package = "zstd", version = "0.13.3", optional = true }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"], optional = true }
+compression-codecs = { version = "0.4.38", default-features = false, optional = true }
 # Shared by xz and 7z.
 lzma-rust2 = { version = "0.16.5", optional = true }
 # WinZip AE-2 requires SHA-1.
@@ -52,6 +79,16 @@ sha1 = { version = "0.11", optional = true }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 subtle = { version = "2.6", default-features = false, optional = true }
 getrandom = { version = "0.4", optional = true }
+futures-io = { version = "0.3.31", optional = true }
+async-compression = { version = "0.4.42", default-features = false, optional = true }
+tokio = { version = "1.48", default-features = false, features = ["io-util", "rt", "sync"], optional = true }
+cap-std = "4.0.2"
+cap-fs-ext = "4.0.2"
+tempfile = "3.27.0"
+zeroize = { version = "1.8.2", features = ["derive"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 # Shared portable fuzz cases.
@@ -65,6 +102,8 @@ lzma-rust2 = "0.16.5"
 ruzstd = "0.8.2"
 sevenz-rust2 = "0.21.3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }
+futures-lite = "2.6.1"
+tokio = { version = "1.48", features = ["io-util", "macros", "rt"] }
 
 [lints]
 workspace = true

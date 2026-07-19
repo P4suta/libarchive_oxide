@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Force LF in the working tree on every platform. The toolchain expects LF
-# everywhere — rustfmt (`newline_style = "Unix"`), taplo, the `.editorconfig`, the
-# `scripts/*.sh` hooks. Without this, Git's `core.autocrlf=true` (the Windows
-# default) checks files out as CRLF, so `cargo fmt --check` and the lefthook
-# pre-commit hooks fail on a native Windows host even though the repo blobs are LF.
+# everywhere — rustfmt (`newline_style = "Unix"`), taplo, and `.editorconfig`.
+# Without this, Git's `core.autocrlf=true` (the Windows default) checks files out
+# as CRLF, so formatting checks and Lefthook can fail on a native Windows host
+# even though the repository blobs are LF.
 # `text=auto` still lets Git auto-detect and leave binaries alone.
 #
 # Existing Windows clones: after pulling this file, run once to refresh the working

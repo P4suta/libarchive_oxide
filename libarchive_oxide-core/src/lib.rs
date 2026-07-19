@@ -4,29 +4,36 @@
 
 //! `no_std` archive traits and uncompressed formats.
 //!
-//! The crate provides [`Transform`], [`Filter`], [`EntryReader`],
-//! [`EntryWriter`], shared metadata, and tar/cpio/ar/ISO 9660 implementations.
-//! It requires `alloc`, has no external dependencies, and uses sealed enums for
-//! runtime dispatch.
+//! The crate provides unified [`Codec`], [`ArchiveDecoder`], and
+//! [`ArchiveEncoder`] state machines plus typed metadata. It requires `alloc`
+//! and has no external dependencies.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-pub mod error;
+mod error;
 pub mod filter;
-pub mod format;
-pub mod io;
-pub mod meta;
-pub mod transform;
+mod format;
+pub mod limits;
+mod meta;
+pub mod metadata;
+pub mod protocol;
 
-pub use error::{Error, Result};
-pub use filter::{Decoder, Encoder, Filter};
-pub use format::{
-    AnyEntryData, AnyReader, ArchiveFormat, Detection, Entry, EntryData, EntryDataSink,
-    EntryReader, EntrySink, EntrySource, EntryWriter, OwnedData, SliceData, SourceEvent,
+pub use error::{ArchiveError, ErrorKind};
+pub use filter::FilterId;
+pub use format::FormatId;
+pub use format::ar::{ArDecoder, ArEncoder};
+pub use format::cpio::{CpioDecoder, CpioDialect, CpioEncoder};
+pub use format::tar::{TarDecoder, TarEncoder};
+pub use limits::Limits;
+pub use meta::{EntryKind, Timestamp};
+pub use metadata::{
+    ArchiveMetadata, ArchivePath, Device, EntryMetadata, EntryMetadataBuilder, EntryTimes,
+    Extension, Owner, PathEncoding, SparseExtent,
 };
-pub use io::Sink;
-pub use meta::{EntryKind, EntryMeta, PaxMap, Timestamp};
-pub use transform::{decode_to_vec, decode_to_vec_capped, Status, Step, Transform};
+pub use protocol::{
+    ArchiveDecoder, ArchiveEncoder, Chunk, Codec, CodecStatus, CodecStep, DecodeEvent, DecodeStep,
+    EncodeCommand, EncodeStatus, EncodeStep, EndOfInput, ProbeResult,
+};

@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: Type "publish-0.1.0" to publish all three crates
+        description: Type "publish-0.2.0" to publish the v0.2 baseline
         required: true
         type: string
 
@@ -28,12 +28,12 @@ jobs:
     name: core → flagship → cli
     if: >-
       github.repository == 'P4suta/libarchive_oxide' &&
-      inputs.confirmation == 'publish-0.1.0'
+      inputs.confirmation == 'publish-0.2.0'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: release
     env:
-      VERSION: 0.1.0
+      VERSION: 0.2.0
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable

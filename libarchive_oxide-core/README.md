@@ -12,14 +12,17 @@ binding.
 
 ## Contents
 
-- `Transform`, `Filter`, `Format`, `EntryReader`, and `EntryWriter`
-- shared entry metadata
-- sans-IO transform interfaces
-- tar, cpio, ar, and ISO 9660 readers and writers
-- sealed-enum runtime dispatch
+- `Codec`, `ArchiveDecoder`, and `ArchiveEncoder` sans-I/O state machines
+- private-field `EntryMetadata`, raw `ArchivePath`, `ArchiveMetadata`, and
+  namespaced extension preservation
+- finite-by-default `Limits` and context-rich `ArchiveError`
+- incremental tar, cpio, and ar decoders/encoders, including newc/crc/odc and
+  binary LE/BE cpio plus typed hardlink normalization
+- opaque format identifiers for adapter-side static dispatch
 
 Use [`libarchive_oxide`](https://crates.io/crates/libarchive_oxide) for codecs,
-zip/7z, detection, and filesystem extraction.
+zip/7z/ISO, sync and async I/O adapters, explicit spooling, and capability-based
+filesystem extraction.
 
 ## Feature
 
@@ -27,7 +30,7 @@ zip/7z, detection, and filesystem extraction.
 |---|:---:|---|
 | `std` | no | reserved standard-library adapters |
 
-MSRV: Rust 1.81.
+MSRV: Rust 1.85.
 
 ## License
 

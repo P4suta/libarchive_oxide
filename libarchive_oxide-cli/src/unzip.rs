@@ -10,12 +10,13 @@
 
 use std::path::PathBuf;
 
-use crate::{extract_bytes, list_bytes, read_file, CliError, CliResult};
+use crate::{CliError, CliResult, extract_seek, list_seek};
 
 /// Parsed `oxunzip` invocation.
 #[derive(Debug, Default)]
 struct UnzipOpts {
     list: bool,
+    overwrite: bool,
     dest: Option<String>,
     password: Option<String>,
     archive: Option<String>,
@@ -76,7 +77,7 @@ fn parse(args: Vec<String>) -> Result<Parsed, CliError> {
                 let c = cluster[idx];
                 match c {
                     'l' => opts.list = true,
-                    'o' => {}, // Always overwrite (non-interactive); accepted for compatibility.
+                    'o' => opts.overwrite = true,
                     'd' | 'P' => {
                         let rest: String = cluster[idx + 1..].iter().collect();
                         let value = if rest.is_empty() {
@@ -95,12 +96,12 @@ fn parse(args: Vec<String>) -> Result<Parsed, CliError> {
                     'n' => {
                         return Err(CliError::unsupported(
                             "-n (never overwrite): not supported; extraction always overwrites",
-                        ))
+                        ));
                     },
                     'x' => {
                         return Err(CliError::unsupported(
                             "-x (exclude): not supported; select members positionally instead",
-                        ))
+                        ));
                     },
                     other => return Err(CliError::usage(format!("unknown flag: -{other}"))),
                 }
@@ -128,27 +129,18 @@ fn dispatch(opts: &UnzipOpts) -> CliResult {
         .archive
         .as_deref()
         .ok_or_else(|| CliError::usage("missing zip archive operand. Try --help"))?;
-    let bytes = read_file(archive)?;
-
-    // Unlike the auto-detecting tar/cpio tools, a zip extractor must reject non-zip input rather
-    // than transparently handle whatever format it happens to be (as bsdunzip/Info-ZIP do:
-    // "cannot find zipfile directory"). The reader below would otherwise auto-detect and extract a
-    // plain tar/cpio/7z, turning a wrong-tool invocation into a false success.
-    if !libarchive_oxide::zip::is_zip(&bytes) {
-        return Err(CliError::runtime(format!(
-            "{archive}: not a zip file (cannot find zipfile directory)"
-        )));
-    }
-    let password = opts.password.as_deref().map(str::as_bytes);
-
-    if opts.list {
-        return list_bytes(&bytes, password, &opts.members, false);
-    }
     let dest = opts
         .dest
         .as_deref()
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    extract_bytes(&bytes, &dest, password, false, &opts.members)
+    let input = std::fs::File::open(archive)
+        .map_err(|error| CliError::runtime(format!("cannot read {archive}: {error}")))?;
+    let password = opts.password.as_deref().map(str::as_bytes);
+    if opts.list {
+        list_seek(input, password, &opts.members, false)
+    } else {
+        extract_seek(input, password, &dest, false, &opts.members, opts.overwrite)
+    }
 }
 
 const HELP: &str = "\
@@ -161,7 +153,7 @@ USAGE:
 OPTIONS:
     -l            List entries instead of extracting.
     -d DIR        Extract into DIR (default: current directory).
-    -o            Overwrite existing files (always on; accepted for compatibility).
+    -o            Atomically replace existing regular files (explicit restore opt-in).
     -P PASSWORD   Decryption password (WinZip AES-256 / zip64 supported).
     --help, --version
 

@@ -10,7 +10,7 @@
 
 use std::io::{Read, Write};
 
-use crate::{decompress_cap, CliError, CliResult};
+use crate::{CliError, CliResult};
 
 /// `oxcat` entry point.
 ///
@@ -48,35 +48,29 @@ pub fn run_cat(args: Vec<String>) -> CliResult {
     let mut out = stdout.lock();
 
     if files.is_empty() {
-        return cat_stream(&read_stdin()?, &mut out);
+        let stdin = std::io::stdin();
+        return cat_stream(stdin.lock(), &mut out);
     }
     for file in &files {
-        let bytes = if file == "-" {
-            read_stdin()?
+        if file == "-" {
+            let stdin = std::io::stdin();
+            cat_stream(stdin.lock(), &mut out)?;
         } else {
-            std::fs::read(file)
-                .map_err(|e| CliError::runtime(format!("cannot read {file}: {e}")))?
-        };
-        cat_stream(&bytes, &mut out)?;
+            let input = std::fs::File::open(file)
+                .map_err(|error| CliError::runtime(format!("cannot read {file}: {error}")))?;
+            cat_stream(input, &mut out)?;
+        }
     }
     Ok(())
 }
 
-/// Decompresses (or passes through) `bytes` and writes the result to `out`.
-fn cat_stream<W: Write>(bytes: &[u8], out: &mut W) -> CliResult {
-    let plain = libarchive_oxide::decompress_capped(bytes, decompress_cap())
-        .map_err(|e| CliError::runtime(e.to_string()))?;
-    out.write_all(&plain)
-        .map_err(|e| CliError::runtime(format!("cannot write stdout: {e}")))
-}
-
-/// Reads all of stdin into memory.
-fn read_stdin() -> Result<Vec<u8>, CliError> {
-    let mut buf = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut buf)
-        .map_err(|e| CliError::runtime(format!("cannot read stdin: {e}")))?;
-    Ok(buf)
+/// Decompresses (or passes through) a stream and copies it to `out`.
+fn cat_stream<R: Read, W: Write>(input: R, out: &mut W) -> CliResult {
+    let mut input = libarchive_oxide::FilterReader::new(input)
+        .map_err(|error| CliError::runtime(error.to_string()))?;
+    std::io::copy(&mut input, out)
+        .map(|_| ())
+        .map_err(|error| CliError::runtime(format!("cannot copy stream: {error}")))
 }
 
 const HELP: &str = "\

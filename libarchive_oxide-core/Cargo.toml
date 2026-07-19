@@ -5,7 +5,7 @@
 [package]
 name = "libarchive_oxide-core"
 version.workspace = true
-description = "no_std archive traits and uncompressed format implementations"
+description = "no_std sans-I/O archive state machines and uncompressed formats"
 edition.workspace = true
 # Workspace MSRV.
 rust-version.workspace = true

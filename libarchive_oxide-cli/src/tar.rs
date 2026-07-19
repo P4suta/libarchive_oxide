@@ -14,12 +14,13 @@
 //! `-j`, `--bzip2`, `-r`, and `-u` are unsupported. Extraction rejects path
 //! traversal. Decompression uses the crate-level limit.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use libarchive_oxide_core::filter::FilterId;
+use libarchive_oxide_core::{FormatId, Limits};
 
-use crate::{extract_bytes, list_bytes, read_file, CliError, CliResult};
+use crate::{CliError, CliResult, extract_stream, list_stream};
 
 /// Selected operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +163,7 @@ fn parse_long(
         "bzip2" | "bunzip2" => {
             return Err(CliError::unsupported(
                 "--bzip2: bzip2 was removed from libarchive_oxide; use --gzip/--xz/--zstd/--lz4",
-            ))
+            ));
         },
         "format" => {
             let value = match inline {
@@ -201,17 +202,17 @@ fn apply_bool_flag(c: char, opts: &mut TarOpts) -> Result<(), CliError> {
         'j' => {
             return Err(CliError::unsupported(
                 "-j (bzip2): bzip2 was removed from libarchive_oxide; use -z/-J/--zstd/--lz4",
-            ))
+            ));
         },
         'r' => {
             return Err(CliError::unsupported(
                 "-r (append): rewriting an existing archive is out of scope; use -c",
-            ))
+            ));
         },
         'u' => {
             return Err(CliError::unsupported(
                 "-u (update): rewriting an existing archive is out of scope; use -c",
-            ))
+            ));
         },
         other => return Err(CliError::usage(format!("unknown flag: -{other}"))),
     }
@@ -263,76 +264,84 @@ fn create(opts: &TarOpts) -> CliResult {
             .map_err(|e| CliError::runtime(format!("cannot chdir to {dir}: {e}")))?;
     }
 
-    let format = opts.format.unwrap_or(CreateFormat::Tar);
-    let raw = match format {
-        CreateFormat::Tar => libarchive_oxide::build_tar(&opts.members),
-        CreateFormat::Cpio => libarchive_oxide::build_cpio(&opts.members),
-    }
-    .map_err(|e| CliError::runtime(e.to_string()))?;
-
-    let bytes = match opts.filter {
-        Some(id) => {
-            libarchive_oxide::compress(&raw, id).map_err(|e| CliError::runtime(e.to_string()))?
-        },
-        None => raw,
+    let format = match opts.format.unwrap_or(CreateFormat::Tar) {
+        CreateFormat::Tar => FormatId::Tar,
+        CreateFormat::Cpio => FormatId::Cpio,
     };
+    match target {
+        OutTarget::Stdout => {
+            let stdout = std::io::stdout();
+            stream_create(stdout.lock(), opts, format)
+        },
+        OutTarget::File(path) => {
+            let output = std::fs::File::create(&path)
+                .map_err(|e| CliError::runtime(format!("cannot write {}: {e}", path.display())))?;
+            stream_create(output, opts, format)
+        },
+    }
+}
 
-    if opts.verbose {
-        for m in &opts.members {
-            eprintln!("a {m}");
+fn stream_create<W: Write>(output: W, opts: &TarOpts, format: FormatId) -> CliResult {
+    let mut builder = libarchive_oxide::StreamingArchiveBuilder::new(
+        output,
+        format,
+        opts.filter,
+        Limits::default(),
+    )
+    .map_err(|error| CliError::runtime(error.to_string()))?;
+    for member in &opts.members {
+        builder
+            .append_path(member)
+            .map_err(|error| CliError::runtime(error.to_string()))?;
+        if opts.verbose {
+            eprintln!("a {member}");
         }
     }
-
-    match target {
-        OutTarget::Stdout => write_stdout(&bytes),
-        OutTarget::File(path) => std::fs::write(&path, &bytes)
-            .map_err(|e| CliError::runtime(format!("cannot write {}: {e}", path.display()))),
-    }
+    builder
+        .finish()
+        .map(|_| ())
+        .map_err(|error| CliError::runtime(error.to_string()))
 }
 
 /// `-x`: read the archive (auto-detecting compression + format) and extract under `-C` (or `.`).
 fn extract(opts: &TarOpts) -> CliResult {
-    let bytes = read_input(opts.file.as_deref())?;
     let dest = opts
         .chdir
         .as_deref()
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    extract_bytes(&bytes, &dest, None, opts.verbose, &opts.members)
+    match opts.file.as_deref() {
+        None | Some("-") => {
+            let stdin = std::io::stdin();
+            extract_stream(stdin.lock(), &dest, opts.verbose, &opts.members)
+        },
+        Some(path) => {
+            let input = std::fs::File::open(path)
+                .map_err(|error| CliError::runtime(format!("cannot read {path}: {error}")))?;
+            extract_stream(input, &dest, opts.verbose, &opts.members)
+        },
+    }
 }
 
 /// `-t`: read the archive and list entries (optionally filtered by member operands). `-v` promotes
 /// the bare one-name-per-line output to an `ls -l`-style long listing, mirroring `bsdtar -tv`.
 fn list(opts: &TarOpts) -> CliResult {
-    let bytes = read_input(opts.file.as_deref())?;
-    list_bytes(&bytes, None, &opts.members, opts.verbose)
+    match opts.file.as_deref() {
+        None | Some("-") => {
+            let stdin = std::io::stdin();
+            list_stream(stdin.lock(), &opts.members, opts.verbose)
+        },
+        Some(path) => {
+            let input = std::fs::File::open(path)
+                .map_err(|error| CliError::runtime(format!("cannot read {path}: {error}")))?;
+            list_stream(input, &opts.members, opts.verbose)
+        },
+    }
 }
 
 /// Where a created archive is written.
 enum OutTarget {
     Stdout,
     File(PathBuf),
-}
-
-/// Reads archive bytes from `file` (or stdin when `None`/`-`).
-fn read_input(file: Option<&str>) -> Result<Vec<u8>, CliError> {
-    match file {
-        None | Some("-") => {
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .map_err(|e| CliError::runtime(format!("cannot read stdin: {e}")))?;
-            Ok(buf)
-        },
-        Some(path) => read_file(path),
-    }
-}
-
-/// Writes bytes to stdout as a whole (used for `-c -f -`).
-fn write_stdout(bytes: &[u8]) -> CliResult {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    out.write_all(bytes)
-        .map_err(|e| CliError::runtime(format!("cannot write stdout: {e}")))
 }
 
 /// Makes `path` absolute against the current directory (without touching the filesystem), so it

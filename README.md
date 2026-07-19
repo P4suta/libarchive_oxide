@@ -29,20 +29,21 @@ This project is independent of the upstream
 | lz4 frame | yes | yes |
 
 Additional support includes pax, GNU tar extensions, zip64, WinZip AES-256
-AE-2, Joliet, and single-folder LZMA2 7z archives.
+AE-2, all standard cpio header dialects, Joliet, and solid LZMA/LZMA2 7z
+archives.
 
 ## Installation
 
 ```toml
 [dependencies]
-libarchive_oxide = "0.1"
+libarchive_oxide = "0.2"
 ```
 
 For `no_std`:
 
 ```toml
 [dependencies]
-libarchive_oxide-core = "0.1"
+libarchive_oxide-core = "0.2"
 ```
 
 CLI tools:
@@ -54,20 +55,21 @@ cargo install libarchive_oxide-cli --locked
 ## Example
 
 ```rust
-use libarchive_oxide::libarchive_oxide_core::{EntryData, EntryReader};
-use libarchive_oxide::{decompress_capped, reader};
+use std::io::Read;
 
-fn list(bytes: &[u8]) -> std::io::Result<()> {
-    let plain = decompress_capped(bytes, 64 * 1024 * 1024)
-        .map_err(std::io::Error::other)?;
-    let mut archive = reader(&plain)?;
+use libarchive_oxide::{ArchiveReader, ReaderEvent};
 
-    while let Some(mut entry) = archive.next_entry()? {
-        println!("{}", String::from_utf8_lossy(&entry.meta().path));
-        let mut buffer = [0_u8; 8192];
-        while entry.data().read_chunk(&mut buffer)? != 0 {}
+fn list(input: impl Read) -> Result<(), Box<dyn std::error::Error>> {
+    let mut archive = ArchiveReader::new(input);
+    loop {
+        match archive.next_event()? {
+            ReaderEvent::Entry(metadata) => {
+                println!("{}", metadata.path().display_lossy());
+            }
+            ReaderEvent::Done => break,
+            _ => {}
+        }
     }
-
     Ok(())
 }
 ```
@@ -82,12 +84,21 @@ fn list(bytes: &[u8]) -> std::io::Result<()> {
 | `lz4` | yes | lz4 frame |
 | `aes` | no | WinZip AES-256 AE-2 |
 | `sevenz` | no | 7z |
+| `async` | no | runtime-neutral futures-io adapters |
+| `tokio` | no | Tokio I/O adapters |
+
+Sequential I/O uses `ArchiveReader` / `ArchiveWriter`; seek-required formats
+use `SeekArchiveReader` / `SeekArchiveWriter`. The `async` feature adds both
+`AsyncArchive*` and `AsyncSeekArchive*`, while `tokio` adds the corresponding
+`TokioArchive*`, `TokioSeekArchive*`, and bounded `TokioExtractor` adapters.
+`Pipeline` is the direct caller-driven API and incrementally composes up to the
+configured number of gzip, zstd, xz, and lz4 layers.
 
 ## Requirements
 
 | Crate | MSRV |
 |---|---:|
-| `libarchive_oxide-core` | Rust 1.81 |
+| `libarchive_oxide-core` | Rust 1.85 |
 | `libarchive_oxide` | Rust 1.87 |
 | `libarchive_oxide-cli` | Rust 1.87 |
 
@@ -100,6 +111,7 @@ All published crates use `#![forbid(unsafe_code)]`.
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 - [Architecture decisions](docs/adr/)
+- [v0.1 → v0.2 migration](docs/migration-0.2.md)
 
 ## License
 

@@ -4,15 +4,15 @@
 
 [workspace]
 resolver = "2"
-members = ["libarchive_oxide-core", "libarchive_oxide", "libarchive_oxide-cli"]
+members = ["libarchive_oxide-core", "libarchive_oxide", "libarchive_oxide-cli", "xtask"]
 # cargo-fuzz requires nightly and a sanitizer runtime.
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
-# Required by `core::error::Error`. Higher-level crates override this value.
-rust-version = "1.81"
+version = "0.2.0"
+edition = "2024"
+# Rust 2024's baseline. Higher-level crates keep their existing 1.87 MSRV.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["Yasunobu Sakashita <crates.tank733@slmails.com>"]
 repository = "https://github.com/P4suta/libarchive_oxide"

@@ -6,11 +6,6 @@ State the change, reason, and related issue.
 
 ## Checklist
 
-- [ ] `cargo fmt --all --check` passes
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes
-- [ ] `cargo test --workspace --all-features` passes
-- [ ] `bash scripts/check-no-dyn.sh` passes
-- [ ] REUSE/SPDX headers present on new files (`reuse lint`)
-- [ ] `cargo semver-checks check-release --workspace` passes
-- [ ] `libarchive_oxide-core` builds for `thumbv7em-none-eabi`
+- [ ] `just ci` passes
+- [ ] `cargo semver-checks check-release --workspace` passes when the v0.2 baseline is enabled
 - [ ] User-facing documentation is updated

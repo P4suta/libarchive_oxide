@@ -10,12 +10,11 @@
 
 mod common;
 
-use std::borrow::Cow;
 use std::process::{Command, Stdio};
 
-use common::{code, run_in, TempDir};
-use libarchive_oxide::zip::{ZipOptions, ZipWriter};
-use libarchive_oxide_core::{EntryKind, EntryMeta, EntryWriter};
+use common::{TempDir, code, run_in};
+use libarchive_oxide::{ArchiveWriter, ZipMethod};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 
 /// Lenient probe: the first candidate name that spawns and emits *some* output (or exits 0) when
 /// asked for its version. Returns the resolved command name. Accepts both `bsdtar` and the Windows
@@ -192,17 +191,19 @@ fn zip_read_by_system_unzip() {
     let dir = TempDir::new("diff_unzip");
 
     // Build a zip with the library writer, then have system unzip list it.
-    let mut w = ZipWriter::with_options(Vec::new(), ZipOptions::default());
+    let mut writer =
+        ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Deflate, Limits::default());
     for (name, data) in [(&b"a.txt"[..], A), (&b"data/b.txt"[..], B)] {
-        let mut m = EntryMeta::new(EntryKind::File, Cow::Borrowed(name));
-        m.mode = 0o644;
-        m.size = data.len() as u64;
-        let mut sink = w.start_entry(&m).unwrap();
-        sink.write_chunk(data).unwrap();
-        sink.close().unwrap();
+        let metadata =
+            EntryMetadata::builder(EntryKind::File, ArchivePath::from_bytes(name.to_vec()))
+                .mode(Some(0o644))
+                .size(Some(data.len() as u64))
+                .build();
+        writer.start_entry(&metadata).unwrap();
+        writer.write_data(data).unwrap();
+        writer.end_entry().unwrap();
     }
-    w.finish().unwrap();
-    std::fs::write(dir.join("ox.zip"), w.into_inner()).unwrap();
+    std::fs::write(dir.join("ox.zip"), writer.finish().unwrap()).unwrap();
 
     let sys = Command::new(&unzip)
         .args(["-l", "ox.zip"])
