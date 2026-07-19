@@ -2,34 +2,61 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# Build the four CLI binaries on native GitHub-hosted runners and attach one archive plus SHA-256
-# checksum per target to the workspace's single vX.Y.Z GitHub Release. workflow_dispatch is a
-# no-upload preflight: it builds and smoke-tests the same matrix at a requested ref.
+# Manual native build and optional draft-release upload for the four CLI
+# binaries. Published releases are immutable, so this workflow never reacts to
+# a release event. Upload mode targets the draft created by release-plz; after
+# every matrix job succeeds, a maintainer inspects and publishes that draft in
+# the GitHub UI.
 
 name: release assets
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       ref:
-        description: Git ref to build without uploading
+        description: Git ref to build (normally an unpublished draft's vX.Y.Z tag)
         required: true
-        default: main
+        type: string
+      upload:
+        description: Upload archives and checksums to the draft GitHub Release
+        required: true
+        default: false
+        type: boolean
+      confirm:
+        description: Type PREFLIGHT without upload, or ASSETS with upload
+        required: true
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-assets-${{ github.event.release.tag_name || inputs.ref }}
+  group: release-assets-${{ inputs.ref }}
   cancel-in-progress: false
 
 jobs:
+  authorize:
+    name: validate manual asset request
+    runs-on: ubuntu-latest
+    steps:
+      - name: require an exact typed confirmation
+        env:
+          UPLOAD: ${{ inputs.upload }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$UPLOAD" = "true" ] && [ "$CONFIRM" = "ASSETS" ]; then
+            exit 0
+          fi
+          if [ "$UPLOAD" != "true" ] && [ "$CONFIRM" = "PREFLIGHT" ]; then
+            exit 0
+          fi
+          echo "::error::confirmation does not match upload mode"
+          exit 1
+
   cli-binaries:
     name: cli binaries (${{ matrix.target }})
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
+    needs: authorize
+    environment: release
     permissions:
       contents: write
     strategy:
@@ -50,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.release.tag_name || inputs.ref }}
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
@@ -70,14 +97,14 @@ jobs:
           for bin in oxtar oxcpio oxcat oxunzip; do
             "target/$TARGET/release/$bin$suffix" --version
           done
-      - name: upload archives and checksums
-        if: github.event_name == 'release'
+      - name: upload archives and checksums to the draft
+        if: inputs.upload
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: oxtar,oxcpio,oxcat,oxunzip
           target: ${{ matrix.target }}
           archive: libarchive_oxide-cli-$tag-$target
           checksum: sha256
-          ref: refs/tags/${{ github.event.release.tag_name }}
+          ref: refs/tags/${{ inputs.ref }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

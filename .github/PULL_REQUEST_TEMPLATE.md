@@ -7,5 +7,6 @@ State the change, reason, and related issue.
 ## Checklist
 
 - [ ] `just ci` passes
-- [ ] `cargo semver-checks check-release --workspace` passes when the v0.2 baseline is enabled
+- [ ] `cargo semver-checks check-release -p libarchive_oxide-core -p libarchive_oxide` passes
 - [ ] User-facing documentation is updated
+- [ ] Release PR only: a maintainer manually applied `release-approved`

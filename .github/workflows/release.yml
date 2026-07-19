@@ -2,80 +2,87 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# Release automation via release-plz (https://release-plz.dev). On push to main:
-#   - release-plz-pr:      opens/updates a Release PR (version bump + CHANGELOG) from the
-#                          Conventional Commits since the last tag.
-#   - release-plz-release: when that PR merges, publishes the newly-versioned crates to crates.io in
-#                          dependency order (core -> flagship -> cli) and cuts the git tag + GitHub
-#                          release. cargo-semver-checks gates breaking API changes (release-plz.toml).
-# CLI release assets are built by release-assets.yml in response to the single vX.Y.Z GitHub
-# Release published by the flagship package.
+# Deliberately manual release control.
 #
-# Auth is environment-scoped (the `release` GitHub Environment), never repo-level secrets:
-#   - A GitHub App mints a short-lived token via actions/create-github-app-token, so the Release PR
-#     it opens is authored by the App and retriggers CI (a GITHUB_TOKEN-authored PR does not). Set
-#     RELEASE_PLZ_APP_CLIENT_ID (variable) and RELEASE_PLZ_APP_PRIVATE_KEY (secret) in the `release`
-#     environment; the App needs
-#     Contents: read/write and Pull requests: read/write, installed on this repository.
-#   - crates.io publish uses Trusted Publishing (OIDC) via `id-token: write`, not a stored token.
-#     Register a trusted publisher for each published crate on crates.io (owner P4suta, repo
-#     libarchive_oxide, workflow release.yml, environment release). A brand-new crate's first publish
-#     must be done once with a token; OIDC covers every release after that.
+# 1. Dispatch `prepare` and approve the `release` Environment to open/update
+#    the release-plz PR.
+# 2. Apply the protected `release-approved` label and merge that PR.
+# 3. Dispatch `publish`, type RELEASE, provide the exact expected tag, and
+#    approve the `release` Environment again.
+# 4. release-plz publishes crates in dependency order, creates the tag, and
+#    leaves the GitHub Release as a draft.
+# 5. Run release-assets.yml in upload mode, inspect its assets, then publish
+#    the draft in the GitHub UI. Publishing makes the release immutable.
+#
+# No push, PR, schedule, or release event can invoke either release-plz command.
 
 name: release
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Release operation
+        required: true
+        type: choice
+        options:
+          - prepare
+          - publish
+      expected_tag:
+        description: Exact tag for publish (for example v0.3.0); empty for prepare
+        required: false
+        type: string
+      confirm:
+        description: Type PREPARE or RELEASE to match the selected operation
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-jobs:
-  # Publish + GitHub release. Runs on every push to main but no-ops unless a Release PR merge
-  # introduced a new version (release_always = false); merging that PR is the human gate.
-  release-plz-release:
-    name: release-plz release
-    if: vars.RELEASE_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: write # create the git tag + GitHub release
-      id-token: write # crates.io Trusted Publishing (OIDC)
-    outputs:
-      releases_created: ${{ steps.release-plz.outputs.releases_created }}
-      releases: ${{ steps.release-plz.outputs.releases }}
-    steps:
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
-        with:
-          client-id: ${{ vars.RELEASE_PLZ_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0 # release-plz reads the full tag history to derive the bump
-          token: ${{ steps.app-token.outputs.token }}
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
-        id: release-plz
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+concurrency:
+  group: release-control
+  cancel-in-progress: false
 
-  # Open/update the Release PR. Same App token so the PR retriggers CI.
+jobs:
+  authorize:
+    name: validate manual release request
+    runs-on: ubuntu-latest
+    steps:
+      - name: require an exact typed confirmation
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CONFIRM: ${{ inputs.confirm }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+        run: |
+          case "$OPERATION:$CONFIRM" in
+            prepare:PREPARE)
+              if [ -n "$EXPECTED_TAG" ]; then
+                echo "::error::expected_tag must be empty for prepare"
+                exit 1
+              fi
+              ;;
+            publish:RELEASE)
+              if [ -z "$EXPECTED_TAG" ]; then
+                echo "::error::expected_tag is required for publish"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::confirmation does not match the selected operation"
+              exit 1
+              ;;
+          esac
+
   release-plz-pr:
-    name: release-plz pr
-    if: vars.RELEASE_ENABLED == 'true'
+    name: release-plz prepare PR
+    if: inputs.operation == 'prepare' && vars.RELEASE_ENABLED == 'true'
+    needs: authorize
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: write
       pull-requests: write
-    # Serialize PR updates; a second push must not race the first. cancel-in-progress is false.
-    concurrency:
-      group: release-plz-pr
-      cancel-in-progress: false
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
@@ -90,5 +97,46 @@ jobs:
       - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  release-plz-release:
+    name: release-plz publish crates and draft release
+    if: inputs.operation == 'publish' && vars.RELEASE_ENABLED == 'true'
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ vars.RELEASE_PLZ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: verify the expected tag against the workspace version
+        env:
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "libarchive_oxide") | .version')"
+          actual_tag="v$version"
+          if [ "$EXPECTED_TAG" != "$actual_tag" ]; then
+            echo "::error::expected $EXPECTED_TAG but workspace version is $actual_tag"
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$EXPECTED_TAG"; then
+            echo "::error::tag $EXPECTED_TAG already exists"
+            exit 1
+          fi
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

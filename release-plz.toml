@@ -7,8 +7,9 @@
 [workspace]
 dependencies_update = false
 release_always = false
-# Re-enable after 0.2.0 establishes the intentionally breaking baseline.
-semver_check = false
+# v0.2.0 is the intentionally breaking baseline; later releases must remain
+# semver-compatible with the published API.
+semver_check = true
 git_tag_enable = false
 git_release_enable = false
 changelog_update = false
@@ -26,6 +27,7 @@ changelog_include = ["libarchive_oxide-core", "libarchive_oxide-cli"]
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true
+git_release_draft = true
 
 [[package]]
 name = "libarchive_oxide-cli"
