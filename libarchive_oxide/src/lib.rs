@@ -17,6 +17,8 @@ use libarchive_oxide_core::filter::FilterId;
 #[cfg(feature = "async")]
 mod async_filter;
 #[cfg(feature = "async")]
+pub mod async_range;
+#[cfg(feature = "async")]
 pub mod async_seek;
 #[cfg(feature = "async")]
 pub mod async_stream;
@@ -28,6 +30,7 @@ pub mod filtered_io;
 mod iso_stream;
 pub mod path;
 mod pipeline_codec;
+pub mod range_source;
 pub mod secret;
 pub mod seek_stream;
 #[cfg(feature = "sevenz")]
@@ -39,6 +42,8 @@ pub mod tokio_stream;
 mod zip;
 mod zip_stream;
 
+#[cfg(feature = "async")]
+pub use async_range::{AsyncRangeArchiveReader, AsyncRangeSource};
 #[cfg(feature = "async")]
 pub use async_seek::{AsyncSeekArchiveReader, AsyncSeekArchiveWriter};
 #[cfg(feature = "async")]
@@ -55,6 +60,9 @@ pub use filtered_io::FilterReader;
 pub use libarchive_oxide_core;
 pub use libarchive_oxide_core::CpioDialect;
 pub use path::{sanitize, sanitize_archive_path};
+pub use range_source::{
+    RangeArchiveReader, RangeMetrics, RangeReadError, RangeReader, RangeSource, SourceIdentity,
+};
 pub use secret::SecretBytes;
 pub use seek_stream::{SeekArchiveReader, SeekArchiveWriter};
 pub use spool::{SpoolReader, SpoolWriter};

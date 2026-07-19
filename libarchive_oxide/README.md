@@ -87,6 +87,13 @@ and `TokioSeekArchive*`; secure Tokio extraction is provided by
 `TokioExtractor`. Archive-level properties can be supplied before the first
 entry with `set_archive_metadata`.
 
+Immutable remote or application-owned ZIP, 7z, and ISO objects can implement
+`RangeSource` or feature-gated `AsyncRangeSource`. The adapters require a
+stable opaque identity, revalidate it around I/O, enforce bounded read-ahead,
+report exact request/byte metrics, and continue to use the same
+`SeekArchiveReader` parser. SDK-specific HTTP/S3/GCS/Azure adapters remain
+outside this crate; see the [`range_source` example](examples/range_source.rs).
+
 MSRV: Rust 1.87.
 
 ## Security

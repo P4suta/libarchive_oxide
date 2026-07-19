@@ -40,7 +40,8 @@ Detailed bodies used for initial issue creation live in
 | ID | Parent | State | Outcome |
 |---|---|---|---|
 | [RM-101](https://github.com/P4suta/libarchive_oxide/issues/30) | RM-100 | completed by [#31](https://github.com/P4suta/libarchive_oxide/pull/31) | Session-bound inspect, plan, apply, and create engine |
-| [RM-121](https://github.com/P4suta/libarchive_oxide/issues/32) | RM-120 | in progress | `oxarchive` inspect, plan, apply, and verify |
+| [RM-102](https://github.com/P4suta/libarchive_oxide/issues/34) | RM-100 | completed by [#35](https://github.com/P4suta/libarchive_oxide/pull/35) | Immutable sync/async range sources over the shared seek parser |
+| [RM-121](https://github.com/P4suta/libarchive_oxide/issues/32) | RM-120 | completed by [#33](https://github.com/P4suta/libarchive_oxide/pull/33) | `oxarchive` inspect, plan, apply, and verify |
 
 ## Labels
 

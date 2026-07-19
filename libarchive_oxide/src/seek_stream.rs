@@ -317,6 +317,14 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
             SeekDispatch::SevenZ(reader) => reader.into_inner(),
         }
     }
+
+    pub(crate) fn source_ref(&self) -> &R {
+        match &self.inner {
+            SeekDispatch::Indexed(reader) => reader.source_ref(),
+            #[cfg(feature = "sevenz")]
+            SeekDispatch::SevenZ(reader) => reader.source_ref(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -947,6 +955,10 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
     #[must_use]
     fn into_inner(self) -> R {
         self.input
+    }
+
+    fn source_ref(&self) -> &R {
+        &self.input
     }
 
     fn prepare_zip_body(&mut self, entry: &ZipIndex) -> Result<(), StreamError> {
