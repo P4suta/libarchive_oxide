@@ -1,87 +1,61 @@
 # libarchive_oxide
 
 [![CI](https://github.com/P4suta/libarchive_oxide/actions/workflows/ci.yml/badge.svg)](https://github.com/P4suta/libarchive_oxide/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.87%20flagship%20%2F%201.81%20core-blue.svg)](#msrv)
-[![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 [![crates.io](https://img.shields.io/crates/v/libarchive_oxide.svg)](https://crates.io/crates/libarchive_oxide)
 [![docs.rs](https://img.shields.io/docsrs/libarchive_oxide.svg)](https://docs.rs/libarchive_oxide)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-Pure-Rust archive reading, writing, compression, extraction, and CLI tools.
-
-- `#![forbid(unsafe_code)]` in every published crate
-- `no_std` + `alloc` core with no external dependencies
-- sans-IO transforms
-- sealed-enum runtime dispatch; no `dyn` in library source
+Pure-Rust archive reading, writing, compression, and extraction.
 
 This project is independent of the upstream
-[libarchive](https://www.libarchive.org/) project. It is not a binding and links
-no C code.
+[libarchive](https://www.libarchive.org/) project. It is not a binding.
 
-## Formats
+## Support
 
-| Format | Read | Write | Scope |
-|---|:---:|:---:|---|
-| tar | yes | yes | ustar, pax, GNU read; GNU long-name write |
-| cpio | yes | yes | newc, odc read; newc write |
-| ar | yes | yes | GNU, BSD, SysV read; BSD long-name write |
-| zip | yes | yes | zip64; WinZip AES-256 AE-2 |
-| 7z | yes | yes | single-folder LZMA2 |
-| ISO 9660 | yes | yes | Joliet |
+| Format | Read | Write |
+|---|:---:|:---:|
+| tar | yes | yes |
+| cpio | yes | yes |
+| ar | yes | yes |
+| zip | yes | yes |
+| 7z | yes | yes |
+| ISO 9660 | yes | yes |
 
-| Filter | Decode | Encode | Backend |
-|---|:---:|:---:|---|
-| gzip | yes | yes | `miniz_oxide` |
-| zstd | yes | yes | `ruzstd` |
-| xz | yes | yes | `lzma-rust2` |
-| lz4 frame | yes | yes | `lz4_flex` |
-| bzip2 | no | no | out of scope |
+| Compression | Decode | Encode |
+|---|:---:|:---:|
+| gzip | yes | yes |
+| zstd | yes | yes |
+| xz | yes | yes |
+| lz4 frame | yes | yes |
 
-Filters are independent of archive formats. Supported combinations include
-`.tar.gz`, `.tar.zst`, `.tar.xz`, and `.tar.lz4`.
+Additional support includes pax, GNU tar extensions, zip64, WinZip AES-256
+AE-2, Joliet, and single-folder LZMA2 7z archives.
 
-## Architecture
+## Installation
 
-```text
-Format   tar / cpio / ar / ISO / zip / 7z   EntryReader <-> EntryWriter
-Filter   gzip / zstd / xz / lz4             Decoder     <-> Encoder
-Base     Transform::{step, finish}           sans-IO
+```toml
+[dependencies]
+libarchive_oxide = "0.1"
 ```
 
-See [ADR-0001](docs/adr/0001-core-architecture.md) for the constraints and
-trade-offs.
+For `no_std`:
 
-## Features
+```toml
+[dependencies]
+libarchive_oxide-core = "0.1"
+```
 
-Features are defined by `libarchive_oxide`.
+CLI tools:
 
-| Feature | Default | Effect |
-|---|:---:|---|
-| `gzip` | yes | gzip |
-| `zstd` | yes | zstd |
-| `xz` | yes | xz / LZMA2 |
-| `lz4` | yes | lz4 frame |
-| `aes` | no | WinZip AES-256 AE-2 |
-| `sevenz` | no | 7z read/write; enables `gzip` for CRC-32 |
+```sh
+cargo install libarchive_oxide-cli --locked
+```
 
-`--no-default-features` retains uncompressed formats and zip store mode.
-
-## MSRV
-
-| Crate | Rust |
-|---|---:|
-| `libarchive_oxide-core` | 1.81 |
-| `libarchive_oxide` | 1.87 |
-| `libarchive_oxide-cli` | 1.87 |
-
-CI verifies each declared `rust-version`. MSRV increases require a minor release
-before 1.0.
-
-## Library example
+## Example
 
 ```rust
+use libarchive_oxide::libarchive_oxide_core::{EntryData, EntryReader};
 use libarchive_oxide::{decompress_capped, reader};
-use libarchive_oxide_core::{EntryData, EntryReader};
 
 fn list(bytes: &[u8]) -> std::io::Result<()> {
     let plain = decompress_capped(bytes, 64 * 1024 * 1024)
@@ -93,58 +67,41 @@ fn list(bytes: &[u8]) -> std::io::Result<()> {
         let mut buffer = [0_u8; 8192];
         while entry.data().read_chunk(&mut buffer)? != 0 {}
     }
+
     Ok(())
 }
 ```
 
-See [docs.rs](https://docs.rs/libarchive_oxide) and
-[`libarchive_oxide/examples`](libarchive_oxide/examples).
+## Features
 
-## CLI
+| Feature | Default | Enables |
+|---|:---:|---|
+| `gzip` | yes | gzip |
+| `zstd` | yes | zstd |
+| `xz` | yes | xz |
+| `lz4` | yes | lz4 frame |
+| `aes` | no | WinZip AES-256 AE-2 |
+| `sevenz` | no | 7z |
 
-```sh
-cargo install libarchive_oxide-cli --locked
-```
+## Requirements
 
-| Tool | Function |
-|---|---|
-| `oxtar` | create, list, and extract tar/cpio archives |
-| `oxcpio` | create, list, and extract cpio archives |
-| `oxcat` | decompress to standard output |
-| `oxunzip` | list and extract zip archives |
+| Crate | MSRV |
+|---|---:|
+| `libarchive_oxide-core` | Rust 1.81 |
+| `libarchive_oxide` | Rust 1.87 |
+| `libarchive_oxide-cli` | Rust 1.87 |
 
-Supported flags and exit codes are documented in the
-[CLI README](libarchive_oxide-cli/README.md).
+All published crates use `#![forbid(unsafe_code)]`.
 
-## Security
+## Documentation
 
-- extraction rejects absolute paths, parent traversal, Windows drive/UNC paths,
-  and device names;
-- `decompress_capped` enforces an output bound;
-- the CLI decompression cap is 4 GiB;
-- header-derived sizes use checked conversions and arithmetic.
-
-Report vulnerabilities through
-[GitHub private vulnerability reporting](https://github.com/P4suta/libarchive_oxide/security/advisories/new).
-See [SECURITY.md](SECURITY.md).
-
-## Repository
-
-| Path | Purpose |
-|---|---|
-| `libarchive_oxide-core` | traits and uncompressed formats |
-| `libarchive_oxide` | codecs, zip/7z, detection, extraction |
-| `libarchive_oxide-cli` | command-line tools |
-| `fuzz` | unpublished fuzz targets and shared cases |
-| `docs/adr` | accepted architecture decisions |
-
-See [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), and
-[CHANGELOG.md](CHANGELOG.md).
+- [API documentation](https://docs.rs/libarchive_oxide)
+- [CLI reference](libarchive_oxide-cli/README.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Architecture decisions](docs/adr/)
 
 ## License
 
 Licensed under either [MIT](LICENSES/MIT.txt) or
 [Apache-2.0](LICENSES/Apache-2.0.txt), at your option.
-
-Contributions are licensed under the same terms unless explicitly stated
-otherwise.
