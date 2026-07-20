@@ -306,14 +306,9 @@ jobs:
     # because it spawns target binaries as child processes, bypassing cross's top-level qemu runner.
     # Promoted to a required gate after three consecutive green runs on main. Stable/native replay
     # and nightly libFuzzer already cover the full corpus; skip those CPU-heavy invariant batches
-    # under QEMU and use optimized code so this gate remains focused on byte-order behavior.
-    # Opt level 1 keeps release semantics and fast QEMU execution without paying opt-level 3's
-    # disproportionate first-build codegen cost for platform-specific filesystem code.
+    # under QEMU so this debug-profile gate remains focused on byte-order behavior without paying
+    # release-profile codegen cost for platform-specific filesystem code.
     runs-on: ubuntu-latest
-    env:
-      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
-      CARGO_PROFILE_RELEASE_LTO: "off"
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -328,7 +323,6 @@ jobs:
           -p libarchive_oxide
           --no-default-features
           --features libarchive_oxide/portable-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio
-          --release
           --target s390x-unknown-linux-gnu
           --
           --skip generated_256_mib_archive_streams_in_bounded_chunks
