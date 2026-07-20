@@ -17,7 +17,7 @@ pub mod oxarchive;
 pub mod tar;
 pub mod unzip;
 
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use cap_std::ambient_authority;
@@ -88,6 +88,19 @@ impl std::error::Error for CliError {}
 /// Convenience alias for CLI entry points.
 pub type CliResult = Result<(), CliError>;
 
+/// Maps a command result to the shared process contract and writes failures to
+/// standard error without panicking if the diagnostic stream is closed.
+#[must_use]
+pub fn report_exit(tool: &str, result: CliResult) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            let stderr = std::io::stderr();
+            let _ = writeln!(stderr.lock(), "{tool}: {error}");
+            std::process::ExitCode::from(error.code)
+        },
+    }
+}
 /// Lists a sequential archive without retaining the compressed or plain input.
 pub(crate) fn list_stream<R: Read>(input: R, members: &[String], verbose: bool) -> CliResult {
     let input = FilterReader::new(input).map_err(|error| CliError::runtime(error.to_string()))?;

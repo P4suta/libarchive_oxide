@@ -27,6 +27,9 @@ v0.2 intentionally has no source-compatible v0.1 shim.
   `SizeRequired` when it is absent; no implicit entry buffering occurs.
 - Call `finish(self)` to obtain the underlying output. `abort(self)` is the
   only way to recover an intentionally incomplete destination.
+- `StreamingArchiveBuilder::new` remains available, but now delegates to the
+  same `ArchiveEngine` / `CreateOptions` writer path. Use
+  `StreamingArchiveBuilder::with_engine` when engine limits are authoritative.
 
 ## Async
 
@@ -68,3 +71,15 @@ v0.2 intentionally has no source-compatible v0.1 shim.
   memory threshold and a 4 GiB maximum by default.
 - Outer compression removes seek capability; seek-required formats therefore
   require explicit spooling after decompression.
+
+## Command line
+
+- `oxarchive create --format FORMAT [--filter FILTER] ARCHIVE INPUT...` uses the
+  shared bounded filesystem builder. Existing file destinations are refused;
+  successful file output is atomically published from a sibling.
+- `oxarchive --json inspect` is JSON Lines, not one collected JSON object.
+  Consume `inspect_start`, `inspect_entry*`, and the required
+  `inspect_complete` success sentinel.
+- Exit meanings are 0 success, 1 operational failure, and 2 usage/unsupported
+  option. Diagnostics use stderr. A stdout archive can be partial on exit 1;
+  JSON is never mixed with binary archive output.

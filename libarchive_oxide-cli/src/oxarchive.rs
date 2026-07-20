@@ -2,20 +2,21 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Unified high-level archive inspection, planning, application, and
-//! verification commands.
+//! Unified high-level archive inspection, planning, application, creation,
+//! and verification commands.
 
-use std::fs::File;
-use std::io;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use libarchive_oxide::{
-    ArchiveEngine, ArchiveInspection, ArchiveSession, EntryOutcomeKind, ExtractionPlan,
-    PlanDisposition, Policy, ReaderEvent,
+    ArchiveEngine, ArchiveSession, CreateOptions, EntryOutcomeKind, ExtractionPlan,
+    PlanDisposition, Policy, ReaderEvent, StreamingArchiveBuilder,
 };
-use libarchive_oxide_core::{ArchivePath, EntryMetadata, FormatId};
+use libarchive_oxide_core::{ArchivePath, EntryMetadata, FilterId, FormatId};
 use serde_json::{Value, json};
 
 use crate::{CliError, CliResult};
@@ -24,6 +25,8 @@ use crate::{CliError, CliResult};
 /// and command-line APIs and may change before its own stability declaration.
 pub const JSON_SCHEMA_VERSION: &str = "oxarchive.output.v0alpha1";
 
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(1);
+
 const HELP: &str = "\
 oxarchive - safe high-level archive operations
 
@@ -31,9 +34,12 @@ Usage:
   oxarchive [--json] inspect ARCHIVE
   oxarchive [--json] plan [POLICY FLAGS] ARCHIVE
   oxarchive [--json] apply [POLICY FLAGS] ARCHIVE DEST
+  oxarchive [--json] create --format FORMAT [--filter FILTER] ARCHIVE INPUT...
   oxarchive [--json] verify ARCHIVE
 
-ARCHIVE may be '-' to read standard input.
+ARCHIVE may be '-' to read standard input, or for create to write standard output.
+Create formats: tar, cpio, ar, zip. Filters: none, gzip, bzip2, xz, zstd, lz4.
+`--json create -` is refused so machine records never mix with archive bytes.
 
 Policy flags:
   --overwrite
@@ -50,19 +56,17 @@ pub fn run_oxarchive(mut args: Vec<String>) -> CliResult {
         return Err(CliError::usage(HELP));
     }
     if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
-        println!("{HELP}");
-        return Ok(());
+        return print_human(format_args!("{HELP}"));
     }
     if args.len() == 1 && args[0] == "--version" {
-        println!("oxarchive {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return print_human(format_args!("oxarchive {}", env!("CARGO_PKG_VERSION")));
     }
     if args
         .iter()
+        .take_while(|argument| argument.as_str() != "--")
         .any(|argument| argument == "--help" || argument == "-h")
     {
-        println!("{HELP}");
-        return Ok(());
+        return print_human(format_args!("{HELP}"));
     }
 
     let json_output = remove_json_flag(&mut args)?;
@@ -72,6 +76,7 @@ pub fn run_oxarchive(mut args: Vec<String>) -> CliResult {
         "inspect" => run_inspect(operands, json_output),
         "plan" => run_plan(operands, json_output),
         "apply" => run_apply(operands, json_output),
+        "create" => run_create(operands, json_output),
         "verify" => run_verify(operands, json_output),
         flag if flag.starts_with('-') => Err(CliError::unsupported(flag)),
         _ => Err(CliError::usage(format!(
@@ -84,6 +89,9 @@ fn remove_json_flag(args: &mut Vec<String>) -> Result<bool, CliError> {
     let mut found = false;
     let mut index = 0;
     while index < args.len() {
+        if args[index] == "--" {
+            break;
+        }
         if args[index] == "--json" {
             if found {
                 return Err(CliError::usage("--json may be specified only once"));
@@ -100,30 +108,344 @@ fn remove_json_flag(args: &mut Vec<String>) -> Result<bool, CliError> {
 fn run_inspect(args: &[String], json_output: bool) -> CliResult {
     let archive = one_archive_operand(args)?;
     let mut session = open_session(archive)?;
-    let inspection = session
-        .inspect()
-        .map_err(|error| CliError::runtime(error.to_string()))?;
+    let digest = session.digest().to_string();
+    let stdout = io::stdout();
+    let mut output = io::BufWriter::new(stdout.lock());
     if json_output {
-        print_json(&inspection_json(&inspection))
+        write_json_record(
+            &mut output,
+            &json!({
+                "schema_version": JSON_SCHEMA_VERSION,
+                "type": "inspect_start",
+                "digest": digest,
+            }),
+        )?;
     } else {
-        println!("format: {}", format_name(inspection.format()));
-        println!("digest: {}", inspection.digest());
-        println!("entries: {}", inspection.entries().len());
-        for entry in inspection.entries() {
-            let metadata = entry.metadata();
-            println!(
-                "{}\t{}\t{}",
-                kind_name(metadata),
-                metadata
-                    .size()
-                    .map_or("-".to_string(), |size| size.to_string()),
-                metadata.path().display_lossy()
-            );
+        write_human_line(&mut output, format_args!("inspect-start\tdigest={digest}"))?;
+    }
+
+    let mut entries = 0_u64;
+    loop {
+        match session
+            .next_event()
+            .map_err(|error| CliError::runtime(error.to_string()))?
+        {
+            ReaderEvent::Entry(metadata) => {
+                entries = entries
+                    .checked_add(1)
+                    .ok_or_else(|| CliError::runtime("inspection entry count overflow"))?;
+                if json_output {
+                    let mut value = metadata_json(&metadata);
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "schema_version".to_string(),
+                            Value::String(JSON_SCHEMA_VERSION.to_string()),
+                        );
+                        object.insert(
+                            "type".to_string(),
+                            Value::String("inspect_entry".to_string()),
+                        );
+                        object.insert("index".to_string(), Value::from(entries - 1));
+                    }
+                    write_json_record(&mut output, &value)?;
+                } else {
+                    write_human_line(
+                        &mut output,
+                        format_args!(
+                            "entry\t{}\t{}\t{}",
+                            kind_name(&metadata),
+                            metadata
+                                .size()
+                                .map_or("-".to_string(), |size| size.to_string()),
+                            metadata.path().display_lossy()
+                        ),
+                    )?;
+                }
+            },
+            ReaderEvent::Done => {
+                let format = session.format().ok_or_else(|| {
+                    CliError::runtime("archive completed without a detected format")
+                })?;
+                if json_output {
+                    write_json_record(
+                        &mut output,
+                        &json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "inspect_complete",
+                            "format": format_name(format),
+                            "digest": digest,
+                            "entry_count": entries,
+                            "complete": true,
+                        }),
+                    )?;
+                } else {
+                    write_human_line(
+                        &mut output,
+                        format_args!(
+                            "inspect-complete\tformat={}\tdigest={}\tentries={entries}",
+                            format_name(format),
+                            digest,
+                        ),
+                    )?;
+                }
+                return output
+                    .flush()
+                    .map_err(|error| CliError::runtime(format!("cannot flush stdout: {error}")));
+            },
+            ReaderEvent::ArchiveMetadata(_) | ReaderEvent::Data(_) | ReaderEvent::EndEntry => {},
+            _ => {
+                return Err(CliError::runtime(
+                    "archive produced an event this CLI does not understand",
+                ));
+            },
         }
-        Ok(())
     }
 }
 
+#[derive(Debug)]
+struct CreateSelection<'a> {
+    format: FormatId,
+    filter: Option<FilterId>,
+    archive: &'a str,
+    inputs: Vec<&'a str>,
+}
+
+fn run_create(args: &[String], json_output: bool) -> CliResult {
+    let selection = parse_create(args)?;
+    if selection.archive == "-" {
+        if json_output {
+            return Err(CliError::usage(
+                "--json create - would mix JSON records with archive bytes",
+            ));
+        }
+        let stdout = io::stdout();
+        let mut output = stream_create(stdout.lock(), &selection)?;
+        return output
+            .flush()
+            .map_err(|error| CliError::runtime(format!("cannot flush stdout: {error}")));
+    }
+
+    let destination = PathBuf::from(selection.archive);
+    validate_create_destination(&destination, &selection.inputs)?;
+    let (temporary, output) = create_temporary_archive(&destination)?;
+    let result = stream_create(output, &selection);
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        },
+    };
+    if let Err(error) = output.sync_all() {
+        drop(output);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(CliError::runtime(format!(
+            "cannot synchronize temporary archive: {error}"
+        )));
+    }
+    drop(output);
+    if let Err(error) = std::fs::hard_link(&temporary, &destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(CliError::runtime(format!(
+            "cannot atomically publish {}: {error}",
+            destination.display()
+        )));
+    }
+    if let Err(error) = std::fs::remove_file(&temporary) {
+        return Err(CliError::runtime(format!(
+            "archive committed at {} but temporary-link cleanup failed: {error}",
+            destination.display()
+        )));
+    }
+
+    if json_output {
+        print_json(&json!({
+            "schema_version": JSON_SCHEMA_VERSION,
+            "type": "create",
+            "format": format_name(selection.format),
+            "filter": selection.filter.map(filter_name),
+            "archive": selection.archive,
+            "input_count": selection.inputs.len(),
+            "complete": true,
+        }))
+    } else {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        write_human_line(
+            &mut output,
+            format_args!(
+                "created\tformat={}\tfilter={}\tarchive={}\tinputs={}",
+                format_name(selection.format),
+                selection.filter.map_or("none", filter_name),
+                selection.archive,
+                selection.inputs.len(),
+            ),
+        )
+    }
+}
+
+fn parse_create(args: &[String]) -> Result<CreateSelection<'_>, CliError> {
+    let mut format = None;
+    let mut filter = None;
+    let mut operands = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if argument == "--" {
+            operands.extend(args[index + 1..].iter().map(String::as_str));
+            break;
+        }
+        if argument == "--format" || argument == "--filter" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| CliError::usage(format!("{argument} requires a value")))?;
+            if argument == "--format" {
+                if format.replace(parse_create_format(value)?).is_some() {
+                    return Err(CliError::usage("--format may be specified only once"));
+                }
+            } else if filter.replace(parse_create_filter(value)?).is_some() {
+                return Err(CliError::usage("--filter may be specified only once"));
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--format=") {
+            if format.replace(parse_create_format(value)?).is_some() {
+                return Err(CliError::usage("--format may be specified only once"));
+            }
+        } else if let Some(value) = argument.strip_prefix("--filter=") {
+            if filter.replace(parse_create_filter(value)?).is_some() {
+                return Err(CliError::usage("--filter may be specified only once"));
+            }
+        } else if argument.starts_with('-') && argument != "-" {
+            return Err(CliError::unsupported(argument));
+        } else {
+            operands.push(argument);
+        }
+        index += 1;
+    }
+    let format = format.ok_or_else(|| CliError::usage("create requires --format FORMAT"))?;
+    if operands.len() < 2 {
+        return Err(CliError::usage(
+            "create requires ARCHIVE and at least one INPUT operand",
+        ));
+    }
+    Ok(CreateSelection {
+        format,
+        filter: filter.unwrap_or(None),
+        archive: operands[0],
+        inputs: operands[1..].to_vec(),
+    })
+}
+
+fn parse_create_format(value: &str) -> Result<FormatId, CliError> {
+    match value.to_ascii_lowercase().as_str() {
+        "tar" | "ustar" | "pax" => Ok(FormatId::Tar),
+        "cpio" | "newc" => Ok(FormatId::Cpio),
+        "ar" => Ok(FormatId::Ar),
+        "zip" => Ok(FormatId::Zip),
+        _ => Err(CliError::unsupported(format!(
+            "--format {value} (supported: tar, cpio, ar, zip)"
+        ))),
+    }
+}
+
+fn parse_create_filter(value: &str) -> Result<Option<FilterId>, CliError> {
+    match value.to_ascii_lowercase().as_str() {
+        "none" => Ok(None),
+        "gzip" | "gz" => Ok(Some(FilterId::Gzip)),
+        "bzip2" | "bz2" => Ok(Some(FilterId::Bzip2)),
+        "xz" => Ok(Some(FilterId::Xz)),
+        "zstd" | "zst" => Ok(Some(FilterId::Zstd)),
+        "lz4" => Ok(Some(FilterId::Lz4)),
+        _ => Err(CliError::unsupported(format!(
+            "--filter {value} (supported: none, gzip, bzip2, xz, zstd, lz4)"
+        ))),
+    }
+}
+
+fn stream_create<W: Write>(output: W, selection: &CreateSelection<'_>) -> Result<W, CliError> {
+    let options = CreateOptions::new()
+        .with_format(selection.format)
+        .with_filter(selection.filter);
+    let mut builder = StreamingArchiveBuilder::with_engine(ArchiveEngine::new(), output, options)
+        .map_err(|error| CliError::runtime(error.to_string()))?;
+    for input in &selection.inputs {
+        builder
+            .append_path(input)
+            .map_err(|error| CliError::runtime(format!("cannot archive {input}: {error}")))?;
+    }
+    builder
+        .finish()
+        .map_err(|error| CliError::runtime(error.to_string()))
+}
+
+fn validate_create_destination(destination: &Path, inputs: &[&str]) -> CliResult {
+    if destination.file_name().is_none() {
+        return Err(CliError::runtime("archive destination must name a file"));
+    }
+    if destination.exists() {
+        return Err(CliError::runtime(format!(
+            "archive destination already exists: {}",
+            destination.display()
+        )));
+    }
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| CliError::runtime(format!("cannot resolve archive parent: {error}")))?;
+    let destination = parent.join(
+        destination
+            .file_name()
+            .ok_or_else(|| CliError::runtime("archive destination must name a file"))?,
+    );
+    for input in inputs {
+        let metadata = std::fs::symlink_metadata(input)
+            .map_err(|error| CliError::runtime(format!("cannot inspect input {input}: {error}")))?;
+        let source = std::fs::canonicalize(input)
+            .map_err(|error| CliError::runtime(format!("cannot resolve input {input}: {error}")))?;
+        if source == destination || (metadata.is_dir() && destination.starts_with(&source)) {
+            return Err(CliError::runtime(format!(
+                "archive destination {} is inside create input {input}",
+                destination.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn create_temporary_archive(destination: &Path) -> Result<(PathBuf, File), CliError> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for _ in 0..128 {
+        let counter = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".oxarchive-{}-{counter:016x}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(error) => {
+                return Err(CliError::runtime(format!(
+                    "cannot create temporary archive beside {}: {error}",
+                    destination.display()
+                )));
+            },
+        }
+    }
+    Err(CliError::runtime(
+        "cannot allocate a unique temporary archive sibling",
+    ))
+}
 fn run_plan(args: &[String], json_output: bool) -> CliResult {
     let (selection, operands) = parse_policy(args)?;
     if operands.len() != 1 {
@@ -136,16 +458,30 @@ fn run_plan(args: &[String], json_output: bool) -> CliResult {
     if json_output {
         print_json(&plan_json(&plan, selection))
     } else {
-        println!("format: {}", format_name(plan.format()));
-        println!("digest: {}", plan.digest());
-        println!("policy: {}", selection.human_name());
-        println!("entries: {}", plan.entries().len());
+        let stdout = io::stdout();
+        let mut output = io::BufWriter::new(stdout.lock());
+        write_human_line(
+            &mut output,
+            format_args!("format: {}", format_name(plan.format())),
+        )?;
+        write_human_line(&mut output, format_args!("digest: {}", plan.digest()))?;
+        write_human_line(
+            &mut output,
+            format_args!("policy: {}", selection.human_name()),
+        )?;
+        write_human_line(
+            &mut output,
+            format_args!("entries: {}", plan.entries().len()),
+        )?;
         for entry in plan.entries() {
-            println!(
-                "{}\t{}",
-                disposition_name(entry.disposition()),
-                entry.descriptor().metadata().path().display_lossy()
-            );
+            write_human_line(
+                &mut output,
+                format_args!(
+                    "{}\t{}",
+                    disposition_name(entry.disposition()),
+                    entry.descriptor().metadata().path().display_lossy()
+                ),
+            )?;
         }
         Ok(())
     }
@@ -181,6 +517,21 @@ fn run_apply(args: &[String], json_output: bool) -> CliResult {
                 })
             })
             .collect();
+        let filesystem_findings: Vec<Value> = report
+            .filesystem_findings()
+            .iter()
+            .map(|finding| {
+                json!({
+                    "path": finding.path().display_lossy(),
+                    "path_raw_hex": hex(finding.path().as_bytes()),
+                    "operation": format!("{:?}", finding.operation()).to_ascii_lowercase(),
+                    "kind": format!("{:?}", finding.kind()).to_ascii_lowercase(),
+                    "detail": finding.detail(),
+                    "io_error_kind": finding.io_error_kind().map(|kind| format!("{kind:?}").to_ascii_lowercase()),
+                    "raw_os_error": finding.raw_os_error(),
+                })
+            })
+            .collect();
         print_json(&json!({
             "schema_version": JSON_SCHEMA_VERSION,
             "type": "apply",
@@ -188,17 +539,39 @@ fn run_apply(args: &[String], json_output: bool) -> CliResult {
             "digest": report.digest().to_string(),
             "policy": selection.json(),
             "rejected": report.extraction().has_rejections(),
+            "filesystem_incomplete": report.has_filesystem_findings(),
             "outcomes": outcomes,
+            "filesystem_findings": filesystem_findings,
         }))?;
     } else {
-        println!("format: {}", format_name(report.format()));
-        println!("digest: {}", report.digest());
+        let stdout = io::stdout();
+        let mut output = io::BufWriter::new(stdout.lock());
+        write_human_line(
+            &mut output,
+            format_args!("format: {}", format_name(report.format())),
+        )?;
+        write_human_line(&mut output, format_args!("digest: {}", report.digest()))?;
         for outcome in report.extraction().outcomes() {
-            println!(
-                "{}\t{}",
-                outcome_name(outcome.outcome()),
-                outcome.path().display_lossy()
-            );
+            write_human_line(
+                &mut output,
+                format_args!(
+                    "{}\t{}",
+                    outcome_name(outcome.outcome()),
+                    outcome.path().display_lossy()
+                ),
+            )?;
+        }
+        for finding in report.filesystem_findings() {
+            write_human_line(
+                &mut output,
+                format_args!(
+                    "filesystem:{:?}\t{:?}\t{}\t{}",
+                    finding.kind(),
+                    finding.operation(),
+                    finding.path().display_lossy(),
+                    finding.detail(),
+                ),
+            )?;
         }
     }
     if report.extraction().has_rejections() {
@@ -252,22 +625,29 @@ fn run_verify(args: &[String], json_output: bool) -> CliResult {
             "verified": true,
         }))
     } else {
-        println!("verified: true");
-        println!("format: {}", format_name(format));
-        println!("digest: {}", session.digest());
-        println!("entries: {entries}");
-        println!("payload-bytes: {payload_bytes}");
-        Ok(())
+        let stdout = io::stdout();
+        let mut output = io::BufWriter::new(stdout.lock());
+        write_human_line(&mut output, format_args!("verified: true"))?;
+        write_human_line(&mut output, format_args!("format: {}", format_name(format)))?;
+        write_human_line(&mut output, format_args!("digest: {}", session.digest()))?;
+        write_human_line(&mut output, format_args!("entries: {entries}"))?;
+        write_human_line(&mut output, format_args!("payload-bytes: {payload_bytes}"))
     }
 }
 
 fn one_archive_operand(args: &[String]) -> Result<&str, CliError> {
+    let explicitly_positional = args.first().is_some_and(|argument| argument == "--");
+    let args = if explicitly_positional {
+        &args[1..]
+    } else {
+        args
+    };
     if args.len() != 1 {
         return Err(CliError::usage(
             "command requires exactly one ARCHIVE operand",
         ));
     }
-    if args[0].starts_with('-') && args[0] != "-" {
+    if !explicitly_positional && args[0].starts_with('-') && args[0] != "-" {
         return Err(CliError::unsupported(&args[0]));
     }
     Ok(&args[0])
@@ -350,22 +730,6 @@ fn open_session(path: &str) -> Result<ArchiveSession, CliError> {
     }
 }
 
-fn inspection_json(inspection: &ArchiveInspection) -> Value {
-    let entries: Vec<Value> = inspection
-        .entries()
-        .iter()
-        .map(|entry| metadata_json(entry.metadata()))
-        .collect();
-    json!({
-        "schema_version": JSON_SCHEMA_VERSION,
-        "type": "inspection",
-        "format": format_name(inspection.format()),
-        "digest": inspection.digest().to_string(),
-        "entry_count": entries.len(),
-        "entries": entries,
-    })
-}
-
 fn plan_json(plan: &ExtractionPlan, selection: PolicySelection) -> Value {
     let entries: Vec<Value> = plan
         .entries()
@@ -406,14 +770,48 @@ fn metadata_json(metadata: &EntryMetadata) -> Value {
 }
 
 fn print_json(value: &Value) -> CliResult {
-    let encoded = serde_json::to_string_pretty(value)
-        .map_err(|error| CliError::runtime(error.to_string()))?;
-    println!("{encoded}");
-    Ok(())
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, value)
+        .map_err(|error| CliError::runtime(format!("cannot write JSON output: {error}")))?;
+    output
+        .write_all(b"\n")
+        .and_then(|()| output.flush())
+        .map_err(|error| CliError::runtime(format!("cannot flush stdout: {error}")))
+}
+
+fn write_json_record<W: Write>(output: &mut W, value: &Value) -> CliResult {
+    serde_json::to_writer(&mut *output, value)
+        .map_err(|error| CliError::runtime(format!("cannot write JSON record: {error}")))?;
+    output
+        .write_all(b"\n")
+        .and_then(|()| output.flush())
+        .map_err(|error| CliError::runtime(format!("cannot flush JSON record: {error}")))
+}
+
+fn print_human(arguments: std::fmt::Arguments<'_>) -> CliResult {
+    let stdout = io::stdout();
+    write_human_line(&mut stdout.lock(), arguments)
+}
+fn write_human_line<W: Write>(output: &mut W, arguments: std::fmt::Arguments<'_>) -> CliResult {
+    writeln!(output, "{arguments}")
+        .and_then(|()| output.flush())
+        .map_err(|error| CliError::runtime(format!("cannot write stdout: {error}")))
 }
 
 fn format_name(format: FormatId) -> String {
     format!("{format:?}").to_ascii_lowercase()
+}
+
+fn filter_name(filter: FilterId) -> &'static str {
+    match filter {
+        FilterId::Gzip => "gzip",
+        FilterId::Bzip2 => "bzip2",
+        FilterId::Xz => "xz",
+        FilterId::Zstd => "zstd",
+        FilterId::Lz4 => "lz4",
+        _ => "unknown",
+    }
 }
 
 fn kind_name(metadata: &EntryMetadata) -> String {

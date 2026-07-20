@@ -895,14 +895,6 @@ impl<W: Write> ZstdFrameWrite<W> {
         }
         self.output.flush()
     }
-
-    pub(crate) fn finish(mut self) -> io::Result<W> {
-        if !self.input.is_empty() || !self.wrote_frame {
-            self.emit_frame()?;
-        }
-        self.output.flush()?;
-        Ok(self.output)
-    }
 }
 
 #[cfg(feature = "zstd")]
@@ -961,14 +953,6 @@ impl<W: Write> XzFrameWrite<W> {
         }
         self.output.flush()
     }
-
-    pub(crate) fn finish(mut self) -> io::Result<W> {
-        if !self.input.is_empty() || !self.wrote_frame {
-            self.emit_frame()?;
-        }
-        self.output.flush()?;
-        Ok(self.output)
-    }
 }
 
 #[cfg(feature = "xz")]
@@ -1026,14 +1010,6 @@ impl<W: Write> Lz4FrameWrite<W> {
             self.emit_frame()?;
         }
         self.output.flush()
-    }
-
-    pub(crate) fn finish(mut self) -> io::Result<W> {
-        if !self.input.is_empty() || !self.wrote_frame {
-            self.emit_frame()?;
-        }
-        self.output.flush()?;
-        Ok(self.output)
     }
 }
 

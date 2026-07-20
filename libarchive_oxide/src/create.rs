@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
@@ -16,7 +16,8 @@ use libarchive_oxide_core::{
     Owner, PathEncoding, Timestamp,
 };
 
-use crate::{ArchiveWriter, StreamError};
+use crate::path::sanitize_archive_path;
+use crate::{ArchiveEngine, ArchiveWriter, CreateOptions, StreamError};
 
 const COPY_BUFFER: usize = 64 * 1024;
 
@@ -27,7 +28,7 @@ pub enum CreateStreamError {
     Io(io::Error),
     /// Archive protocol, capability, or output-adapter failure.
     Archive(StreamError),
-    /// The requested archive/filter configuration is unavailable.
+    /// Archive configuration, resource limit, or safe-name contract failed.
     Contract(ArchiveError),
 }
 
@@ -69,105 +70,14 @@ impl From<ArchiveError> for CreateStreamError {
     }
 }
 
-enum FilteredOutput<W: Write> {
-    Plain(W),
-    Gzip(Box<crate::filtered_io::GzipFilterWrite<W>>),
-    #[cfg(feature = "bzip2")]
-    Bzip2(Box<bzip2::write::BzEncoder<W>>),
-    #[cfg(feature = "zstd")]
-    Zstd(Box<crate::filtered_io::ZstdFrameWrite<W>>),
-    #[cfg(feature = "xz")]
-    Xz(Box<crate::filtered_io::XzFrameWrite<W>>),
-    #[cfg(feature = "lz4")]
-    Lz4(Box<crate::filtered_io::Lz4FrameWrite<W>>),
-}
-
-impl<W: Write> FilteredOutput<W> {
-    fn new(output: W, filter: Option<FilterId>, limits: Limits) -> Result<Self, CreateStreamError> {
-        match filter {
-            None => Ok(Self::Plain(output)),
-            Some(FilterId::Gzip) => Ok(Self::Gzip(Box::new(
-                crate::filtered_io::GzipFilterWrite::new(output, limits),
-            ))),
-            #[cfg(feature = "bzip2")]
-            Some(FilterId::Bzip2) => Ok(Self::Bzip2(Box::new(bzip2::write::BzEncoder::new(
-                output,
-                bzip2::Compression::default(),
-            )))),
-            #[cfg(feature = "zstd")]
-            Some(FilterId::Zstd) => Ok(Self::Zstd(Box::new(
-                crate::filtered_io::ZstdFrameWrite::new(output),
-            ))),
-            #[cfg(feature = "xz")]
-            Some(FilterId::Xz) => Ok(Self::Xz(Box::new(crate::filtered_io::XzFrameWrite::new(
-                output,
-            )))),
-            #[cfg(feature = "lz4")]
-            Some(FilterId::Lz4) => Ok(Self::Lz4(Box::new(crate::filtered_io::Lz4FrameWrite::new(
-                output,
-            )))),
-            Some(_) => Err(CreateStreamError::Contract(
-                ArchiveError::new(ErrorKind::Capability)
-                    .with_context("filter has no incremental filesystem writer"),
-            )),
-        }
-    }
-
-    fn finish(self) -> io::Result<W> {
-        match self {
-            Self::Plain(output) => Ok(output),
-            Self::Gzip(output) => (*output).finish(),
-            #[cfg(feature = "bzip2")]
-            Self::Bzip2(output) => (*output).finish(),
-            #[cfg(feature = "zstd")]
-            Self::Zstd(output) => (*output).finish(),
-            #[cfg(feature = "xz")]
-            Self::Xz(output) => (*output).finish(),
-            #[cfg(feature = "lz4")]
-            Self::Lz4(output) => (*output).finish(),
-        }
-    }
-}
-
-impl<W: Write> Write for FilteredOutput<W> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Plain(output) => output.write(buffer),
-            Self::Gzip(output) => output.write(buffer),
-            #[cfg(feature = "bzip2")]
-            Self::Bzip2(output) => output.write(buffer),
-            #[cfg(feature = "zstd")]
-            Self::Zstd(output) => output.write(buffer),
-            #[cfg(feature = "xz")]
-            Self::Xz(output) => output.write(buffer),
-            #[cfg(feature = "lz4")]
-            Self::Lz4(output) => output.write(buffer),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Plain(output) => output.flush(),
-            Self::Gzip(output) => output.flush(),
-            #[cfg(feature = "bzip2")]
-            Self::Bzip2(output) => output.flush(),
-            #[cfg(feature = "zstd")]
-            Self::Zstd(output) => output.flush(),
-            #[cfg(feature = "xz")]
-            Self::Xz(output) => output.flush(),
-            #[cfg(feature = "lz4")]
-            Self::Lz4(output) => output.flush(),
-        }
-    }
-}
-
 /// Filesystem walker backed by the common bounded archive state machine.
 ///
 /// Regular-file payload is copied in 64 KiB chunks. The builder never retains
 /// a complete file or archive.
 pub struct StreamingArchiveBuilder<W: Write> {
-    writer: ArchiveWriter<FilteredOutput<W>>,
+    writer: ArchiveWriter<W>,
     copy_buffer: Vec<u8>,
+    limits: Limits,
 }
 
 impl<W: Write> fmt::Debug for StreamingArchiveBuilder<W> {
@@ -180,17 +90,35 @@ impl<W: Write> fmt::Debug for StreamingArchiveBuilder<W> {
 
 impl<W: Write> StreamingArchiveBuilder<W> {
     /// Creates a builder for a sequential format and optional outer filter.
+    ///
+    /// This compatibility constructor delegates to [`Self::with_engine`] so
+    /// filesystem creation and direct engine creation use the same writer
+    /// state machine and [`CreateOptions`] contract.
     pub fn new(
         output: W,
         format: FormatId,
         filter: Option<FilterId>,
         limits: Limits,
     ) -> Result<Self, CreateStreamError> {
-        let output = FilteredOutput::new(output, filter, limits)?;
-        let writer = ArchiveWriter::with_format_and_limits(output, format, limits)?;
+        Self::with_engine(
+            ArchiveEngine::new().with_limits(limits),
+            output,
+            CreateOptions::new().with_format(format).with_filter(filter),
+        )
+    }
+
+    /// Creates a bounded filesystem builder through an [`ArchiveEngine`].
+    pub fn with_engine(
+        engine: ArchiveEngine,
+        output: W,
+        options: CreateOptions,
+    ) -> Result<Self, CreateStreamError> {
+        let limits = options.limits().unwrap_or(engine.limits());
+        let writer = engine.create(output, options)?;
         Ok(Self {
             writer,
             copy_buffer: vec![0; COPY_BUFFER],
+            limits,
         })
     }
 
@@ -200,6 +128,9 @@ impl<W: Write> StreamingArchiveBuilder<W> {
         filesystem_path: impl AsRef<Path>,
         archive_path: &ArchivePath,
     ) -> Result<(), CreateStreamError> {
+        if archive_path.as_bytes() != b"." && sanitize_archive_path(archive_path).is_none() {
+            return Err(unsafe_archive_name(archive_path.as_bytes()));
+        }
         self.append_path_bytes(filesystem_path.as_ref(), archive_path.as_bytes())
     }
 
@@ -209,18 +140,13 @@ impl<W: Write> StreamingArchiveBuilder<W> {
         filesystem_path: impl AsRef<Path>,
     ) -> Result<(), CreateStreamError> {
         let path = filesystem_path.as_ref();
-        let display = path.to_string_lossy();
-        let name = normalize_name(&display);
+        let name = normalize_name(path)?;
         self.append_path_bytes(path, &name)
     }
 
     /// Finalizes the archive and returns the destination.
     pub fn finish(self) -> Result<W, CreateStreamError> {
-        self.writer
-            .finish()
-            .map_err(CreateStreamError::Archive)?
-            .finish()
-            .map_err(CreateStreamError::Io)
+        self.writer.finish().map_err(CreateStreamError::Archive)
     }
 
     fn append_path_bytes(
@@ -228,6 +154,7 @@ impl<W: Write> StreamingArchiveBuilder<W> {
         filesystem_path: &Path,
         archive_name: &[u8],
     ) -> Result<(), CreateStreamError> {
+        validate_archive_name(archive_name, self.limits)?;
         let metadata = fs::symlink_metadata(filesystem_path)?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
@@ -286,8 +213,13 @@ impl<W: Write> StreamingArchiveBuilder<W> {
                 self.writer.write_data(&self.copy_buffer[..read])?;
             }
             self.writer.end_entry()?;
+            return Ok(());
         }
-        Ok(())
+        Err(CreateStreamError::Contract(
+            ArchiveError::new(ErrorKind::Capability).with_context(
+                "input filesystem object is not a regular file, directory, or symlink",
+            ),
+        ))
     }
 }
 
@@ -366,35 +298,98 @@ fn os_bytes_checked(value: &OsStr) -> io::Result<Vec<u8>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path is not representable"))
 }
 
-/// Normalizes a filesystem argument into a safe relative tar entry name (raw bytes):
-/// strips a leading `/` (so members are never absolute) and any `./` prefix or trailing `/`.
-/// On Windows, backslashes are treated as separators; on other platforms they are left literal.
-fn normalize_name(arg: &str) -> Vec<u8> {
-    #[cfg(windows)]
-    let owned = arg.replace('\\', "/");
-    #[cfg(windows)]
-    let mut s: &str = &owned;
-    #[cfg(not(windows))]
-    let mut s: &str = arg;
-
-    s = s.trim_end_matches('/');
-    while let Some(rest) = s.strip_prefix("./") {
-        s = rest;
+/// Derives a safe relative archive name without lossy host-path conversion.
+fn normalize_name(path: &Path) -> io::Result<Vec<u8>> {
+    let mut name = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                if !name.is_empty() {
+                    name.push(b'/');
+                }
+                name.extend_from_slice(&os_bytes_checked(value)?);
+            },
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "create input contains a parent-directory component",
+                ));
+            },
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {},
+        }
     }
-    s = s.trim_start_matches('/');
-    s.as_bytes().to_vec()
+    if name.is_empty() && path == Path::new(".") {
+        return Ok(b".".to_vec());
+    }
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "create input has no safe relative archive name",
+        ));
+    }
+    Ok(name)
 }
 
+fn validate_archive_name(name: &[u8], limits: Limits) -> Result<(), CreateStreamError> {
+    if name != b"." && name != b"./" {
+        let archive_path = ArchivePath::from_bytes(name.to_vec());
+        if sanitize_archive_path(&archive_path).is_none() {
+            return Err(unsafe_archive_name(name));
+        }
+    }
+    if limits
+        .path_bytes()
+        .is_some_and(|maximum| name.len() > maximum)
+    {
+        return Err(CreateStreamError::Contract(
+            ArchiveError::new(ErrorKind::Limit)
+                .with_entry(0, name)
+                .with_context("create path exceeds the configured byte limit"),
+        ));
+    }
+    let nesting = name
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty() && *component != b".")
+        .count();
+    if limits.nesting().is_some_and(|maximum| nesting > maximum) {
+        return Err(CreateStreamError::Contract(
+            ArchiveError::new(ErrorKind::Limit)
+                .with_entry(0, name)
+                .with_context("create path exceeds the configured nesting limit"),
+        ));
+    }
+    Ok(())
+}
+
+fn unsafe_archive_name(name: &[u8]) -> CreateStreamError {
+    CreateStreamError::Contract(
+        ArchiveError::new(ErrorKind::Policy)
+            .with_entry(0, name)
+            .with_context("create input would produce an unsafe archive path"),
+    )
+}
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::path::Path;
+
     use super::normalize_name;
 
     #[test]
-    fn normalize_strips_leading_slash_and_dot() {
-        assert_eq!(normalize_name("/etc/hosts"), b"etc/hosts");
-        assert_eq!(normalize_name("./a/b"), b"a/b");
-        assert_eq!(normalize_name("dir/"), b"dir");
-        assert_eq!(normalize_name("plain"), b"plain");
+    fn normalize_strips_roots_and_dot_without_lossy_text_conversion() {
+        assert_eq!(
+            normalize_name(Path::new("/etc/hosts")).unwrap(),
+            b"etc/hosts"
+        );
+        assert_eq!(normalize_name(Path::new("./a/b")).unwrap(), b"a/b");
+        assert_eq!(normalize_name(Path::new("dir/")).unwrap(), b"dir");
+        assert_eq!(normalize_name(Path::new("plain")).unwrap(), b"plain");
+        assert_eq!(normalize_name(Path::new(".")).unwrap(), b".");
+    }
+
+    #[test]
+    fn normalize_rejects_parent_components() {
+        assert!(normalize_name(Path::new("../outside")).is_err());
+        assert!(normalize_name(Path::new("inside/../../outside")).is_err());
     }
 }

@@ -48,6 +48,12 @@ compatibility.
 - safe extraction rejects traversal, pre-existing destinations, links, and
   special files; applied, unsupported, refused, partial, and OS-error
   filesystem outcomes remain typed in `ApplyReport`;
+- `oxarchive create` rejects unsafe derived archive names and stages file
+  output in a unique sibling; input or writer failure removes the sibling and
+  existing destinations are never replaced;
+- bounded inspection emits one flushed event record at a time and requires an
+  explicit completion record; stdout archive creation is binary-only and its
+  documented partial-stream risk is signaled by exit 1;
 - decoded output and CLI processing are capped at 4 GiB by default;
 - header-derived offsets and sizes use checked conversions and arithmetic;
 - fuzz targets run in CI;

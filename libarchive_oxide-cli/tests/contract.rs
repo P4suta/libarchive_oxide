@@ -16,8 +16,12 @@ use common::{TempDir, code, run, run_in};
 #[test]
 fn help_and_version_succeed() {
     for tool in ["oxarchive", "oxtar", "oxcpio", "oxcat", "oxunzip"] {
-        assert_eq!(code(&run(tool, &["--help"])), 0, "{tool} --help");
-        assert_eq!(code(&run(tool, &["--version"])), 0, "{tool} --version");
+        for argument in ["--help", "--version"] {
+            let output = run(tool, &[argument]);
+            assert_eq!(code(&output), 0, "{tool} {argument}");
+            assert!(!output.stdout.is_empty(), "{tool} {argument} stdout");
+            assert!(output.stderr.is_empty(), "{tool} {argument}: {output:?}");
+        }
     }
 }
 
@@ -59,10 +63,21 @@ fn usage_errors_exit_2() {
         ("oxarchive", &["unknown"]),                             // unknown command
         ("oxarchive", &["inspect"]),                             // missing archive
         ("oxarchive", &["plan", "--unsafe", "a.tar"]),           // unknown policy
+        ("oxarchive", &["create", "out.tar", "input"]),          // missing --format
+        ("oxarchive", &["create", "--format", "rar", "out", "in"]),
+        ("oxarchive", &["create", "--format", "tar", "out.tar"]),
     ];
     for (tool, args) in cases {
         let out = run(tool, args);
         assert_eq!(code(&out), 2, "{tool} {args:?} should be exit 2: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "usage output leaked to stdout: {out:?}"
+        );
+        assert!(
+            !out.stderr.is_empty(),
+            "usage error missing stderr: {out:?}"
+        );
     }
 }
 
@@ -78,10 +93,22 @@ fn runtime_errors_exit_1() {
         ("oxunzip", &["nope.zip"]),
         ("oxunzip", &["-l", "nope.zip"]),
         ("oxarchive", &["inspect", "nope.tar"]),
+        (
+            "oxarchive",
+            &["create", "--format", "tar", "out.tar", "nope"],
+        ),
     ];
     for (tool, args) in cases {
         let out = run_in(tool, args, dir.path());
         assert_eq!(code(&out), 1, "{tool} {args:?} should be exit 1: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "runtime error leaked status to stdout: {out:?}"
+        );
+        assert!(
+            !out.stderr.is_empty(),
+            "runtime error missing stderr: {out:?}"
+        );
     }
 }
 

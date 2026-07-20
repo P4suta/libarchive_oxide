@@ -73,7 +73,7 @@ evidence is converted to `Partial`.
 | numeric uid/gid | reported unsupported | yes; permission errors remain typed |
 | xattr | reported unsupported | yes |
 | POSIX ACL | reported unsupported | numeric access/default ACL text |
-| sparse extents | logical holes preserved | logical and allocated-block evidence tested |
+| sparse extents | Unix targets; Windows reported unsupported | logical and allocated-block evidence tested |
 | symlink/hardlink | explicit policy only | explicit policy only |
 | FIFO/socket/device | reported unsupported | explicit policy only |
 | change/birth time, filesystem flags | reported unsupported | reported unsupported |
@@ -81,6 +81,23 @@ evidence is converted to `Partial`.
 The default policy still rejects traversal, pre-existing destinations, links,
 and special files. Commit failure removes the sibling without publishing an
 invalid destination. See [the filesystem adapter contract](filesystem-adapters.md).
+
+## Command-line surface
+
+| Surface | Implemented contract | Bounded/atomic behavior |
+|---|---|---|
+| `oxarchive inspect` | human events or schema-versioned JSON Lines | streams `ReaderEvent`; no collected entry list; completion sentinel |
+| `oxarchive plan` | human or advisory JSON | finite entry/metadata limits; never reusable apply input |
+| `oxarchive apply` | human or JSON outcomes plus filesystem findings | same immutable session; per-file atomic commit |
+| `oxarchive create` | tar/cpio/ar/zip; optional gzip/bzip2/xz/zstd/lz4 | common `CreateOptions`; 64 KiB copy buffer; file output staged and no-replace published |
+| `oxarchive verify` | human or JSON digest/count result | streams payload events with checked counters |
+| `oxtar`, `oxcpio`, `oxcat`, `oxunzip` | documented compatibility subsets | shared exit 0/1/2, stdout/stderr, limits, and safe extraction contracts |
+
+`create ARCHIVE=-` reserves stdout for archive bytes and can leave a partial
+prefix on a late exit-1 failure. JSON inspection records already flushed remain
+valid after a late parser error, but only `inspect_complete` marks success. See
+the [CLI and streaming-output contract](cli-contract.md) and
+[ADR-0008](adr/0008-bounded-cli-streams.md).
 
 ## Profiles
 

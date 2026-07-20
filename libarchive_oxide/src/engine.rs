@@ -280,6 +280,12 @@ impl CreateOptions {
     pub const fn filter(self) -> Option<FilterId> {
         self.filter
     }
+
+    /// Explicit writer limits, or `None` to inherit the engine limits.
+    #[must_use]
+    pub const fn limits(self) -> Option<Limits> {
+        self.limits
+    }
 }
 
 impl Default for CreateOptions {

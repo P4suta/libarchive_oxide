@@ -86,6 +86,14 @@ codec-policy:
 release-policy:
     cargo run --quiet -p xtask -- release-policy
 
+# Run the bounded nightly panic-abort and libFuzzer campaign (requires FUZZ_TARGET).
+fuzz-ci:
+    cargo run --quiet -p xtask -- fuzz-ci
+
+# Run the optimized s390x test selection through cross/qemu.
+big-endian-ci:
+    cargo run --quiet -p xtask -- big-endian-ci
+
 # Validate GitHub Actions workflows.
 actionlint:
     actionlint -color
