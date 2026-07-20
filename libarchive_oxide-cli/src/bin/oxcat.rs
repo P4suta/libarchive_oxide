@@ -12,11 +12,5 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match libarchive_oxide_cli::run_cat(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("oxcat: {e}");
-            ExitCode::from(e.code)
-        },
-    }
+    libarchive_oxide_cli::report_exit("oxcat", libarchive_oxide_cli::run_cat(args))
 }

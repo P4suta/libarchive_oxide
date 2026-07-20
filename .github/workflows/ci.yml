@@ -77,12 +77,22 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     env:
       RUSTFLAGS: -D warnings
+      RUST_TEST_THREADS: ${{ matrix.test_threads }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            test_threads: 4
+          - os: windows-latest
+            test_threads: 4
+          # Pure-Rust preset-6 XZ cases contend heavily on the macOS runner when libtest schedules
+          # them together. Serial execution is faster and makes the last printed test causal.
+          - os: macos-latest
+            test_threads: 1
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -242,6 +252,7 @@ jobs:
   fuzz:
     name: fuzz (nightly, build + short run)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # cargo-binstall distributes cargo-fuzz as a musl-linked executable. Explicitly select the
       # runner's GNU target so cargo-fuzz does not mistake its own build target for the fuzz target;
@@ -261,42 +272,10 @@ jobs:
         run: rustup toolchain install nightly --profile minimal --no-self-update
       # A panic in a dependency must fail as a process abort here as it does under libFuzzer.
       # Overflow checks keep malformed length arithmetic on the same fail-closed path.
-      - name: malformed-codec regression (both profiles, panic abort, overflow checks)
-        run: |
-          cargo +nightly test -Z panic-abort-tests \
-            -p libarchive_oxide --no-default-features \
-            --features portable-codecs,aes,sevenz,async,tokio \
-            --test filtered_io_v2 malformed_zstd_block_does_not_panic
-          cargo +nightly test -Z panic-abort-tests \
-            -p libarchive_oxide --no-default-features \
-            --features native-codecs,aes,sevenz,async,tokio \
-            --test filtered_io_v2 malformed_zstd_block_does_not_panic
-      # Every target must compile against libFuzzer with each mutually exclusive profile.
-      - run: cargo +nightly fuzz build --target "$FUZZ_TARGET"
-      - run: >-
-          cargo +nightly fuzz build --no-default-features --features native-codecs
-          --target "$FUZZ_TARGET"
       # Both profiles run the same target list and committed corpus. The portable budget remains the
       # deeper default campaign; native gets a shorter differential run on the identical seeds.
-      - name: portable coverage-guided fuzz run per target
-        run: |
-          set -euo pipefail
-          targets=$(cargo +nightly fuzz list)
-          for t in $targets; do
-            echo "::group::portable fuzz $t"
-            cargo +nightly fuzz run "$t" --target "$FUZZ_TARGET" -- -max_total_time=30 -rss_limit_mb=4096
-            echo "::endgroup::"
-          done
-      - name: native coverage-guided fuzz run per target
-        run: |
-          set -euo pipefail
-          targets=$(cargo +nightly fuzz list)
-          for t in $targets; do
-            echo "::group::native fuzz $t"
-            cargo +nightly fuzz run "$t" --no-default-features --features native-codecs \
-              --target "$FUZZ_TARGET" -- -max_total_time=10 -rss_limit_mb=4096
-            echo "::endgroup::"
-          done
+      - name: panic-abort regressions and bounded fuzz campaign
+        run: cargo run --quiet -p xtask -- fuzz-ci
 
   big-endian:
     name: big-endian (s390x, qemu)
@@ -309,7 +288,8 @@ jobs:
     # under QEMU so this debug-profile gate remains focused on byte-order behavior without paying
     # release-profile codegen cost for platform-specific filesystem code. The one-byte XZ writer
     # case remains in every native OS job; under QEMU it measures encoder throughput rather than
-    # byte-order behavior and takes over 20 minutes.
+    # byte-order behavior and takes over 20 minutes. The xtask owns both command lines and the skip
+    # list so CI and local reproduction cannot drift apart.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -320,31 +300,9 @@ jobs:
         with:
           tool: cross
       - name: compile big-endian s390x test binaries
-        run: >-
-          cross test
-          -p libarchive_oxide-core
-          -p libarchive_oxide
-          --no-default-features
-          --features libarchive_oxide/portable-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio
-          --target s390x-unknown-linux-gnu
-          --no-run
+        run: cargo run --quiet -p xtask -- big-endian-ci-compile
       - name: test suite on big-endian s390x under qemu
-        run: >-
-          cross test
-          -p libarchive_oxide-core
-          -p libarchive_oxide
-          --no-default-features
-          --features libarchive_oxide/portable-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio
-          --target s390x-unknown-linux-gnu
-          --
-          --test-threads=1
-          --nocapture
-          --skip generated_256_mib_archive_streams_in_bounded_chunks
-          --skip linux_reference_adapter_restores_mode_time_xattr_acl_and_sparse_layout
-          --skip selected_xz_writer_is_deterministic_and_interoperable
-          --skip corpus_files_replay_without_panic
-          --skip arbitrary_seeds_uphold_invariants
-          --skip seed_mutants_uphold_invariants
+        run: cargo run --quiet -p xtask -- big-endian-ci
 
   actionlint:
     name: actionlint (workflow self-check)

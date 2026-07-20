@@ -40,8 +40,15 @@ just ci
 ```
 
 Individual recipes such as `just test`, `just no-std`, and `just deny` run the
-same commands independently. Portable repository-specific policy checks live
-in the safe-Rust `xtask` crate instead of shell scripts.
+same commands independently. Portable repository-specific policy and CI
+orchestration that branches, loops, or constructs command matrices lives in
+the safe-Rust `xtask` crate instead of shell scripts. Straight-line tool calls
+remain visible in `Justfile` and workflow setup steps rather than being wrapped
+without adding portability or validation.
+
+`just fuzz-ci` runs the nightly panic-abort and bounded two-profile libFuzzer
+campaign when `FUZZ_TARGET` is set. `just big-endian-ci` runs the exact optimized
+s390x/QEMU selection used remotely; both require their CI tools to be installed.
 
 `just package-smoke` builds the exact `.crate` contents in a fresh external
 consumer workspace. `just release-policy` is a non-publishing static check that

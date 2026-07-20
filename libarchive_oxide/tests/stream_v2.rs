@@ -419,34 +419,40 @@ fn selected_zstd_writer_is_deterministic_and_independently_decodable() {
 
 #[test]
 fn selected_xz_writer_is_deterministic_and_interoperable() {
-    // One-byte adapter boundaries do not need a compression-benchmark-sized payload. Keeping this
-    // above 16 KiB still crosses parser/output chunks while bounding preset-6 debug builds on every
-    // required OS runner and under emulation.
+    // Keep the interoperability payload above 16 KiB so it crosses parser/output chunks, but use a
+    // small independent payload for one-byte writer boundaries. Feeding preset-6 LZMA one byte at a
+    // time is intentionally adversarial and otherwise makes debug CI time scale with call count.
     let payload: Vec<u8> = (0_u8..=251).cycle().take(16 * 1024 + 17).collect();
-    let metadata = EntryMetadata::builder(
-        EntryKind::File,
-        ArchivePath::from_bytes(b"portable-xz.bin".to_vec()),
-    )
-    .size(Some(payload.len() as u64))
-    .build();
+    let boundary_payload: Vec<u8> = (0_u8..=251).cycle().take(257).collect();
 
-    let build = |filter, chunk: usize| {
+    let build = |input: &[u8], filter, chunk: usize| {
+        let metadata = EntryMetadata::builder(
+            EntryKind::File,
+            ArchivePath::from_bytes(b"portable-xz.bin".to_vec()),
+        )
+        .size(Some(input.len() as u64))
+        .build();
         let mut writer =
             ArchiveWriter::with_filter(Vec::new(), FormatId::Tar, filter, Limits::default())
                 .unwrap();
         writer.start_entry(&metadata).unwrap();
-        for bytes in payload.chunks(chunk) {
+        for bytes in input.chunks(chunk) {
             writer.write_data(bytes).unwrap();
         }
         writer.end_entry().unwrap();
         writer.finish().unwrap()
     };
 
-    let plain = build(None, payload.len());
+    let plain = build(&payload, None, payload.len());
     let expected = collect(plain.clone());
-    let one_write = build(Some(FilterId::Xz), payload.len());
-    let one_byte_writes = build(Some(FilterId::Xz), 1);
-    assert_eq!(one_write, one_byte_writes);
+    let one_write = build(&payload, Some(FilterId::Xz), payload.len());
+    let boundary_one_write = build(
+        &boundary_payload,
+        Some(FilterId::Xz),
+        boundary_payload.len(),
+    );
+    let boundary_one_byte_writes = build(&boundary_payload, Some(FilterId::Xz), 1);
+    assert_eq!(boundary_one_write, boundary_one_byte_writes);
 
     let mut native_decoder = xz_codec::read::XzDecoder::new_multi_decoder(one_write.as_slice());
     let mut native_plain = Vec::new();

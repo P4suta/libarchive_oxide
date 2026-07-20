@@ -59,12 +59,17 @@ cargo install libarchive_oxide-cli --locked
 oxarchive inspect artifact.tar.zst
 oxarchive plan --json artifact.zip
 oxarchive apply artifact.tar.gz destination
+oxarchive create --format tar --filter zstd artifact.tar.zst input/
 oxarchive verify artifact.7z
 ```
 
 `oxarchive` uses the high-level session engine. Its JSON plan is an advisory
 report and is deliberately not accepted back by `apply`; application always
-plans and applies the same immutable input snapshot in one process.
+plans and applies the same immutable input snapshot in one process. Inspection
+uses flushed, schema-versioned JSON Lines directly from `ReaderEvent`, and
+creation shares `ArchiveEngine`, `CreateOptions`, finite limits, and the safe
+filesystem walker. File archives are staged and published without replacement;
+stdout archives remain explicit binary streams.
 
 ## High-level engine
 
@@ -186,6 +191,7 @@ All published crates use `#![forbid(unsafe_code)]`.
 - [Architecture decisions](docs/adr/)
 - [Compile-time provider contract](docs/providers.md)
 - [Filesystem adapter contract](docs/filesystem-adapters.md)
+- [CLI and streaming-output contract](docs/cli-contract.md)
 - [Detailed support matrix](docs/support-matrix.md)
 - [Modern Replacement roadmap](docs/modern-replacement.md)
 - [Modern Replacement issue tracker](https://github.com/P4suta/libarchive_oxide/issues/28)

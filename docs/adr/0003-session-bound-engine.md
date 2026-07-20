@@ -28,6 +28,8 @@ time-of-check/time-of-use boundary.
 - Collected inspection accounts for cumulative owned metadata against
   `Limits::metadata_bytes`. Callers that cannot accept collection use the
   session event API.
+  The `oxarchive inspect` CLI is such a caller and emits records directly from
+  that event API.
 - Seek-native ZIP, 7z, and ISO inputs use `SeekArchiveReader`; sequential and
   outer-filtered inputs reuse `ArchiveReader`. Both continue to drive the same
   format and codec state machines.
@@ -51,4 +53,5 @@ time-of-check/time-of-use boundary.
 - Compile-time external provider chains are specified by
   [ADR-0006](0006-compile-time-providers.md); capability-reporting application
   by [ADR-0007](0007-capability-filesystem.md); immutable range-source identity
-  by [ADR-0004](0004-immutable-range-sources.md).
+  by [ADR-0004](0004-immutable-range-sources.md); and bounded CLI/create streams
+  by [ADR-0008](0008-bounded-cli-streams.md).

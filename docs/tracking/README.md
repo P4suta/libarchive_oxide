@@ -41,7 +41,19 @@ Detailed bodies used for initial issue creation live in
 |---|---|---|---|
 | [RM-101](https://github.com/P4suta/libarchive_oxide/issues/30) | RM-100 | completed by [#31](https://github.com/P4suta/libarchive_oxide/pull/31) | Session-bound inspect, plan, apply, and create engine |
 | [RM-102](https://github.com/P4suta/libarchive_oxide/issues/34) | RM-100 | completed by [#35](https://github.com/P4suta/libarchive_oxide/pull/35) | Immutable sync/async range sources over the shared seek parser |
+| [RM-103](https://github.com/P4suta/libarchive_oxide/issues/46) | RM-100 | implementation [#49](https://github.com/P4suta/libarchive_oxide/pull/49) | Compile-time format/codec registration and capability queries |
+| [RM-104](https://github.com/P4suta/libarchive_oxide/issues/47) | RM-100 | implementation [#50](https://github.com/P4suta/libarchive_oxide/pull/50) | Capability-reporting filesystem contract and Linux adapter |
+| [RM-111](https://github.com/P4suta/libarchive_oxide/issues/36) | RM-110 | completed by [#37](https://github.com/P4suta/libarchive_oxide/pull/37) | Pure-Rust bzip2 outer-filter read/write |
+| [RM-112](https://github.com/P4suta/libarchive_oxide/issues/38) | RM-110 | completed by [#39](https://github.com/P4suta/libarchive_oxide/pull/39) | Pure-Rust zstd outer-filter read/write |
+| [RM-113](https://github.com/P4suta/libarchive_oxide/issues/40) | RM-110 | completed by [#41](https://github.com/P4suta/libarchive_oxide/pull/41) | Pure-Rust LZ4 outer-filter read/write and zstd abort regression |
+| [RM-114](https://github.com/P4suta/libarchive_oxide/issues/42) | RM-110 | completed by [#43](https://github.com/P4suta/libarchive_oxide/pull/43) | Pure-Rust XZ/LZMA2 outer-filter read/write |
+| [RM-115](https://github.com/P4suta/libarchive_oxide/issues/44) | RM-110 | completed by [#45](https://github.com/P4suta/libarchive_oxide/pull/45) | Default portable and explicit native codec profiles |
 | [RM-121](https://github.com/P4suta/libarchive_oxide/issues/32) | RM-120 | completed by [#33](https://github.com/P4suta/libarchive_oxide/pull/33) | `oxarchive` inspect, plan, apply, and verify |
+| [RM-122](https://github.com/P4suta/libarchive_oxide/issues/48) | RM-120 | implementation [#51](https://github.com/P4suta/libarchive_oxide/pull/51) | Bounded create, streamed inspection, and unified CLI contracts |
+
+The cross-epic acceptance mapping, local reproductions, performance/RSS data,
+and remote-only gates are collected in the
+[Campaign 1 completion evidence](campaign-1-evidence.md).
 
 ## Labels
 

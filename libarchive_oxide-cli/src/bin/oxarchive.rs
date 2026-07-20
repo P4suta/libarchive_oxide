@@ -9,11 +9,5 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match libarchive_oxide_cli::run_oxarchive(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("oxarchive: {error}");
-            ExitCode::from(error.code)
-        },
-    }
+    libarchive_oxide_cli::report_exit("oxarchive", libarchive_oxide_cli::run_oxarchive(args))
 }

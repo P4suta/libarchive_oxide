@@ -25,6 +25,11 @@ const SOURCE_TREES: &[&str] = &[
     "libarchive_oxide/src",
     "libarchive_oxide-cli/src",
 ];
+const PORTABLE_CODEC_FEATURES: &str = "portable-codecs,aes,sevenz,async,tokio";
+const NATIVE_CODEC_FEATURES: &str = "native-codecs,aes,sevenz,async,tokio";
+const BIG_ENDIAN_FEATURES: &str = "libarchive_oxide/portable-codecs,\
+libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,\
+libarchive_oxide/tokio";
 
 const PACKAGE_CONSUMER_MAIN: &str = r#"use std::io::Cursor;
 
@@ -160,10 +165,13 @@ fn run() -> Result {
         Some("package-smoke") => check_package_smoke(&root),
         Some("codec-policy") => check_codec_policy(&root),
         Some("release-policy") => check_release_policy(&root),
+        Some("fuzz-ci") => run_fuzz_ci(&root),
+        Some("big-endian-ci-compile") => compile_big_endian_ci(&root),
+        Some("big-endian-ci") => run_big_endian_ci(&root),
         Some(command) => Err(format!("unknown command {command:?}").into()),
         None => Err(
             "expected one of: no-dyn, license-sync, package-licenses, package-smoke, \
-             codec-policy, release-policy"
+             codec-policy, release-policy, fuzz-ci, big-endian-ci-compile, big-endian-ci"
                 .into(),
         ),
     }
@@ -657,6 +665,212 @@ fn require_all(name: &str, text: &str, required: &[&str]) -> Result {
         if !text.contains(needle) {
             return Err(format!("{name} is missing required policy marker {needle:?}").into());
         }
+    }
+    Ok(())
+}
+
+fn run_fuzz_ci(root: &Path) -> Result {
+    let fuzz_target = env::var("FUZZ_TARGET")
+        .map_err(|_| "FUZZ_TARGET must name the libFuzzer compilation target")?;
+
+    for (profile, features) in [
+        ("portable", PORTABLE_CODEC_FEATURES),
+        ("native", NATIVE_CODEC_FEATURES),
+    ] {
+        run_command(
+            root,
+            cargo(),
+            &[
+                "+nightly",
+                "test",
+                "-Z",
+                "panic-abort-tests",
+                "-p",
+                "libarchive_oxide",
+                "--no-default-features",
+                "--features",
+                features,
+                "--test",
+                "filtered_io_v2",
+                "malformed_zstd_block_does_not_panic",
+            ],
+            &format!("{profile} malformed-codec panic-abort regression"),
+        )?;
+    }
+
+    run_command(
+        root,
+        cargo(),
+        &["+nightly", "fuzz", "build", "--target", &fuzz_target],
+        "portable libFuzzer build",
+    )?;
+    run_command(
+        root,
+        cargo(),
+        &[
+            "+nightly",
+            "fuzz",
+            "build",
+            "--no-default-features",
+            "--features",
+            "native-codecs",
+            "--target",
+            &fuzz_target,
+        ],
+        "native libFuzzer build",
+    )?;
+
+    let targets = fuzz_targets(root)?;
+    for (profile, features, budget) in [
+        ("portable", None, "30"),
+        ("native", Some("native-codecs"), "10"),
+    ] {
+        for target in &targets {
+            let mut arguments = vec![
+                "+nightly".to_owned(),
+                "fuzz".to_owned(),
+                "run".to_owned(),
+                target.clone(),
+            ];
+            if let Some(features) = features {
+                arguments.extend([
+                    "--no-default-features".to_owned(),
+                    "--features".to_owned(),
+                    features.to_owned(),
+                ]);
+            }
+            arguments.extend([
+                "--target".to_owned(),
+                fuzz_target.clone(),
+                "--".to_owned(),
+                format!("-max_total_time={budget}"),
+                "-rss_limit_mb=4096".to_owned(),
+            ]);
+            run_owned_command(
+                root,
+                cargo(),
+                &arguments,
+                &format!("{profile} fuzz {target}"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn fuzz_targets(root: &Path) -> Result<Vec<String>> {
+    let output = Command::new(cargo())
+        .current_dir(root)
+        .args(["+nightly", "fuzz", "list"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo fuzz list failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let targets: Vec<String> = String::from_utf8(output.stdout)?
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if targets.is_empty() {
+        return Err("cargo fuzz list returned no targets".into());
+    }
+    Ok(targets)
+}
+
+fn compile_big_endian_ci(root: &Path) -> Result {
+    run_command(
+        root,
+        if cfg!(windows) { "cross.exe" } else { "cross" },
+        &[
+            "test",
+            "-p",
+            "libarchive_oxide-core",
+            "-p",
+            "libarchive_oxide",
+            "--no-default-features",
+            "--features",
+            BIG_ENDIAN_FEATURES,
+            "--target",
+            "s390x-unknown-linux-gnu",
+            "--no-run",
+        ],
+        "compile big-endian s390x test binaries",
+    )
+}
+
+fn run_big_endian_ci(root: &Path) -> Result {
+    run_command(
+        root,
+        if cfg!(windows) { "cross.exe" } else { "cross" },
+        &[
+            "test",
+            "-p",
+            "libarchive_oxide-core",
+            "-p",
+            "libarchive_oxide",
+            "--no-default-features",
+            "--features",
+            BIG_ENDIAN_FEATURES,
+            "--target",
+            "s390x-unknown-linux-gnu",
+            "--",
+            "--test-threads=1",
+            "--nocapture",
+            "--skip",
+            "generated_256_mib_archive_streams_in_bounded_chunks",
+            "--skip",
+            "linux_reference_adapter_restores_mode_time_xattr_acl_and_sparse_layout",
+            "--skip",
+            "selected_xz_writer_is_deterministic_and_interoperable",
+            "--skip",
+            "corpus_files_replay_without_panic",
+            "--skip",
+            "arbitrary_seeds_uphold_invariants",
+            "--skip",
+            "seed_mutants_uphold_invariants",
+        ],
+        "big-endian s390x suite",
+    )
+}
+
+fn run_command(root: &Path, program: &str, arguments: &[&str], description: &str) -> Result {
+    run_command_with_env(root, program, arguments, &[], description)
+}
+
+fn run_command_with_env(
+    root: &Path,
+    program: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    description: &str,
+) -> Result {
+    println!("xtask: {description}");
+    let status = Command::new(program)
+        .current_dir(root)
+        .args(arguments)
+        .envs(environment.iter().copied())
+        .status()?;
+    if !status.success() {
+        return Err(format!("{description} failed with {status}").into());
+    }
+    Ok(())
+}
+
+fn run_owned_command(
+    root: &Path,
+    program: &str,
+    arguments: &[String],
+    description: &str,
+) -> Result {
+    println!("xtask: {description}");
+    let status = Command::new(program)
+        .current_dir(root)
+        .args(arguments)
+        .status()?;
+    if !status.success() {
+        return Err(format!("{description} failed with {status}").into());
     }
     Ok(())
 }
