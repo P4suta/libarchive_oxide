@@ -4,7 +4,7 @@
 
 //! Private static dispatch for caller-driven outer codecs.
 
-#[cfg(any(feature = "bzip2", feature = "xz", feature = "lz4"))]
+#[cfg(any(feature = "bzip2", feature = "xz"))]
 use libarchive_oxide_core::CodecStatus;
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, Codec, CodecStep, EndOfInput, ErrorKind, Limits};
@@ -21,7 +21,7 @@ pub(crate) enum PipelineCodec {
     #[cfg(feature = "xz")]
     Xz(compression_codecs::XzDecoder),
     #[cfg(feature = "lz4")]
-    Lz4(compression_codecs::Lz4Decoder),
+    Lz4(Box<crate::filter::lz4::Lz4Decoder>),
 }
 
 impl PipelineCodec {
@@ -66,7 +66,7 @@ impl PipelineCodec {
             FilterId::Lz4 => {
                 #[cfg(feature = "lz4")]
                 {
-                    Ok(Self::Lz4(compression_codecs::Lz4Decoder::new()))
+                    Ok(Self::Lz4(Box::default()))
                 }
                 #[cfg(not(feature = "lz4"))]
                 {
@@ -94,12 +94,12 @@ impl PipelineCodec {
             #[cfg(feature = "xz")]
             Self::Xz(codec) => external_process(codec, FilterId::Xz, input, output, end),
             #[cfg(feature = "lz4")]
-            Self::Lz4(codec) => external_process(codec, FilterId::Lz4, input, output, end),
+            Self::Lz4(codec) => codec.process(input, output, end),
         }
     }
 }
 
-#[cfg(any(feature = "bzip2", feature = "xz", feature = "lz4"))]
+#[cfg(any(feature = "bzip2", feature = "xz"))]
 fn external_process(
     decoder: &mut impl compression_codecs::Decode,
     filter: FilterId,
@@ -138,7 +138,7 @@ fn external_process(
     })
 }
 
-#[cfg(any(feature = "bzip2", feature = "xz", feature = "lz4"))]
+#[cfg(any(feature = "bzip2", feature = "xz"))]
 fn codec_error(filter: FilterId, error: &std::io::Error) -> ArchiveError {
     let kind = if error.kind() == std::io::ErrorKind::OutOfMemory {
         ErrorKind::Limit

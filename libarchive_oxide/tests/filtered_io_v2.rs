@@ -99,6 +99,22 @@ fn every_outer_filter_decodes_from_one_byte_reads() {
 }
 
 #[test]
+fn linked_lz4_blocks_decode_from_one_byte_reads() {
+    let plain: Vec<u8> = (0_u8..=251).cycle().take(300_000).collect();
+    let info = lz4_flex::frame::FrameInfo::new()
+        .content_size(Some(plain.len() as u64))
+        .block_size(lz4_flex::frame::BlockSize::Max64KB)
+        .block_mode(lz4_flex::frame::BlockMode::Linked)
+        .block_checksums(true)
+        .content_checksum(true);
+    let mut writer = lz4_flex::frame::FrameEncoder::with_frame_info(info, Vec::new());
+    writer.write_all(&plain).unwrap();
+    let encoded = writer.finish().unwrap();
+
+    assert_eq!(decode(encoded).unwrap(), plain);
+}
+
+#[test]
 fn gzip_members_concatenate_and_trailing_data_is_rejected() {
     let mut members = compress(b"first", FilterId::Gzip).unwrap();
     members.extend_from_slice(&compress(b"second", FilterId::Gzip).unwrap());
@@ -163,6 +179,29 @@ fn bzip2_accepts_an_independent_python_fixture_and_rejects_corruption() {
 }
 
 #[test]
+fn malformed_zstd_block_does_not_panic() {
+    // Minimized by the codec_zstd fuzz target after mutating a valid frame.
+    const MALFORMED: &[u8] =
+        include_bytes!("fixtures/zstd/crash-142bc61adb972f47b2d1ef33ae89832307ea82d5.zst");
+    const CORPUS: &[u8] =
+        include_bytes!("../../fuzz/corpus/codec_zstd/142bc61adb972f47b2d1ef33ae89832307ea82d5");
+    assert_eq!(MALFORMED, CORPUS);
+
+    let mut reader = FilterReader::new(Cursor::new(MALFORMED)).unwrap();
+    let mut output = Vec::new();
+    assert_eq!(
+        reader.read_to_end(&mut output).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    let mut retry = [0_u8; 1];
+    assert_eq!(
+        reader.read(&mut retry).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
 fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
     let limits = Limits::default().with_decoded_total(Some(4));
     for bytes in [
@@ -170,6 +209,7 @@ fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
         compress(b"12345", FilterId::Gzip).unwrap(),
         compress(b"12345", FilterId::Bzip2).unwrap(),
         compress(b"12345", FilterId::Zstd).unwrap(),
+        compress(b"12345", FilterId::Lz4).unwrap(),
     ] {
         let mut reader = FilterReader::with_limits(OneByte::new(bytes), limits).unwrap();
         let mut output = Vec::new();

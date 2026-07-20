@@ -13,7 +13,7 @@ use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, EndOfInput, ErrorKind, Limits};
 
 use crate::filter::gzip::{GzipDecoder, GzipEncoder};
-#[cfg(any(feature = "zstd", feature = "xz"))]
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 use crate::pipeline_codec::PipelineCodec;
 
 const BUFFER: usize = 64 * 1024;
@@ -38,13 +38,13 @@ enum FilterReaderInner<R: Read> {
     Bzip2(Box<bzip2::read::MultiBzDecoder<BufReader<PrefixReader<R>>>>),
     /// Zstandard frame.
     #[cfg(feature = "zstd")]
-    Zstd(Box<ZstdRead<BufReader<PrefixReader<R>>>>),
+    Zstd(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
     /// Concatenated XZ streams.
     #[cfg(feature = "xz")]
     Xz(Box<XzRead<BufReader<PrefixReader<R>>>>),
     /// LZ4 frame.
     #[cfg(feature = "lz4")]
-    Lz4(Box<Lz4Read<BufReader<PrefixReader<R>>>>),
+    Lz4(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
 }
 
 impl<R: Read> FilterReader<R> {
@@ -94,7 +94,7 @@ impl<R: Read> FilterReader<R> {
         if available.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
             #[cfg(feature = "zstd")]
             {
-                return ZstdRead::new(input, limits)
+                return PipelineRead::new(input, FilterId::Zstd, limits)
                     .map(Box::new)
                     .map(FilterReaderInner::Zstd)
                     .map(|inner| Self {
@@ -128,11 +128,14 @@ impl<R: Read> FilterReader<R> {
         }
         if available.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
             #[cfg(feature = "lz4")]
-            return Ok(Self {
-                inner: FilterReaderInner::Lz4(Box::new(Lz4Read::new(input))),
-                decoded: 0,
-                decoded_limit: limits.decoded_total(),
-            });
+            return PipelineRead::new(input, FilterId::Lz4, limits)
+                .map(Box::new)
+                .map(FilterReaderInner::Lz4)
+                .map(|inner| Self {
+                    inner,
+                    decoded: 0,
+                    decoded_limit: limits.decoded_total(),
+                });
             #[cfg(not(feature = "lz4"))]
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -187,81 +190,11 @@ impl<R: Read> Read for PrefixReader<R> {
     }
 }
 
-#[cfg(feature = "lz4")]
-struct MemberInput<R> {
-    input: R,
-    prefix: [u8; 6],
-    prefix_length: usize,
-    prefix_position: usize,
-}
-
-#[cfg(feature = "lz4")]
-impl<R> MemberInput<R> {
-    fn new(input: R) -> Self {
-        Self {
-            input,
-            prefix: [0; 6],
-            prefix_length: 0,
-            prefix_position: 0,
-        }
-    }
-
-    fn replay(&mut self, prefix: &[u8]) {
-        self.prefix[..prefix.len()].copy_from_slice(prefix);
-        self.prefix_length = prefix.len();
-        self.prefix_position = 0;
-    }
-
-    fn into_inner(self) -> R {
-        self.input
-    }
-}
-
-#[cfg(feature = "lz4")]
-impl<R: Read> Read for MemberInput<R> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        if self.prefix_position != self.prefix_length {
-            let count = (self.prefix_length - self.prefix_position).min(output.len());
-            output[..count]
-                .copy_from_slice(&self.prefix[self.prefix_position..self.prefix_position + count]);
-            self.prefix_position += count;
-            return Ok(count);
-        }
-        self.input.read(output)
-    }
-}
-
-#[cfg(feature = "lz4")]
-fn next_member<R: Read>(input: &mut MemberInput<R>, magic: &[u8]) -> io::Result<bool> {
-    let mut prefix = [0_u8; 6];
-    let mut length = 0;
-    while length != magic.len() {
-        let read = input.read(&mut prefix[length..magic.len()])?;
-        if read == 0 {
-            break;
-        }
-        length += read;
-    }
-    if length == 0 {
-        return Ok(false);
-    }
-    if length != magic.len() || &prefix[..length] != magic {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "non-member trailing filter data",
-        ));
-    }
-    input.replay(&prefix[..length]);
-    Ok(true)
-}
-
-#[cfg(feature = "zstd")]
-struct ZstdRead<R: Read> {
+#[cfg(any(feature = "zstd", feature = "lz4"))]
+struct PipelineRead<R: Read> {
     input: R,
     decoder: PipelineCodec,
+    filter_name: &'static str,
     buffer: Vec<u8>,
     start: usize,
     end: usize,
@@ -270,12 +203,18 @@ struct ZstdRead<R: Read> {
     failed: bool,
 }
 
-#[cfg(feature = "zstd")]
-impl<R: Read> ZstdRead<R> {
-    fn new(input: R, limits: Limits) -> io::Result<Self> {
+#[cfg(any(feature = "zstd", feature = "lz4"))]
+impl<R: Read> PipelineRead<R> {
+    fn new(input: R, filter: FilterId, limits: Limits) -> io::Result<Self> {
+        let filter_name = match filter {
+            FilterId::Zstd => "zstd",
+            FilterId::Lz4 => "LZ4",
+            _ => "codec",
+        };
         Ok(Self {
             input,
-            decoder: PipelineCodec::new(FilterId::Zstd, limits).map_err(codec_archive_io)?,
+            decoder: PipelineCodec::new(filter, limits).map_err(codec_archive_io)?,
+            filter_name,
             buffer: vec![0; BUFFER],
             start: 0,
             end: 0,
@@ -313,8 +252,8 @@ impl<R: Read> ZstdRead<R> {
     }
 }
 
-#[cfg(feature = "zstd")]
-impl<R: Read> Read for ZstdRead<R> {
+#[cfg(any(feature = "zstd", feature = "lz4"))]
+impl<R: Read> Read for PipelineRead<R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() || self.done {
             return Ok(0);
@@ -322,7 +261,7 @@ impl<R: Read> Read for ZstdRead<R> {
         if self.failed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "zstd reader is in a failed state",
+                format!("{} reader is in a failed state", self.filter_name),
             ));
         }
         loop {
@@ -359,13 +298,16 @@ impl<R: Read> Read for ZstdRead<R> {
                 CodecStatus::NeedInput if self.eof => {
                     return self.fail(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "zstd decoder requested input after the source ended",
+                        format!(
+                            "{} decoder requested input after the source ended",
+                            self.filter_name
+                        ),
                     ));
                 },
                 _ => {
                     return self.fail(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "zstd reader made no progress",
+                        format!("{} reader made no progress", self.filter_name),
                     ));
                 },
             }
@@ -554,74 +496,6 @@ impl<R: Read> Read for XzRead<R> {
                         ));
                     },
                 }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "lz4")]
-struct Lz4Read<R: Read> {
-    decoder: Option<lz4_flex::frame::FrameDecoder<MemberInput<R>>>,
-    input: Option<MemberInput<R>>,
-    failed: bool,
-}
-
-#[cfg(feature = "lz4")]
-impl<R: Read> Lz4Read<R> {
-    fn new(input: R) -> Self {
-        Self {
-            decoder: Some(lz4_flex::frame::FrameDecoder::new(MemberInput::new(input))),
-            input: None,
-            failed: false,
-        }
-    }
-
-    #[allow(clippy::expect_used)]
-    fn into_inner(self) -> R {
-        self.decoder
-            .map(lz4_flex::frame::FrameDecoder::into_inner)
-            .or(self.input)
-            .expect("LZ4 reader always owns its member input")
-            .into_inner()
-    }
-}
-
-#[cfg(feature = "lz4")]
-impl<R: Read> Read for Lz4Read<R> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if self.failed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "LZ4 reader is in a failed state",
-            ));
-        }
-        loop {
-            let read = self
-                .decoder
-                .as_mut()
-                .ok_or_else(|| io::Error::other("LZ4 decoder is missing"))?
-                .read(output)?;
-            if read != 0 {
-                return Ok(read);
-            }
-            let decoder = self
-                .decoder
-                .take()
-                .ok_or_else(|| io::Error::other("LZ4 decoder disappeared"))?;
-            let mut input = decoder.into_inner();
-            match next_member(&mut input, &[0x04, 0x22, 0x4d, 0x18]) {
-                Ok(false) => {
-                    self.input = Some(input);
-                    return Ok(0);
-                },
-                Ok(true) => {
-                    self.decoder = Some(lz4_flex::frame::FrameDecoder::new(input));
-                },
-                Err(error) => {
-                    self.input = Some(input);
-                    self.failed = true;
-                    return Err(error);
-                },
             }
         }
     }
@@ -823,7 +697,7 @@ fn archive_io(error: ArchiveError) -> io::Error {
     io::Error::new(kind, error)
 }
 
-#[cfg(any(feature = "zstd", feature = "xz"))]
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 fn codec_archive_io(error: ArchiveError) -> io::Error {
     let kind = match error.kind() {
         ErrorKind::Limit => io::ErrorKind::OutOfMemory,
@@ -1002,6 +876,72 @@ impl<W: Write> Write for ZstdFrameWrite<W> {
     }
 }
 
+#[cfg(feature = "lz4")]
+pub(crate) struct Lz4FrameWrite<W: Write> {
+    output: W,
+    input: Vec<u8>,
+    wrote_frame: bool,
+}
+
+#[cfg(feature = "lz4")]
+impl<W: Write> Lz4FrameWrite<W> {
+    pub(crate) fn new(output: W) -> Self {
+        Self {
+            output,
+            input: Vec::with_capacity(BUFFER),
+            wrote_frame: false,
+        }
+    }
+
+    fn emit_frame(&mut self) -> io::Result<()> {
+        let encoded = crate::filter::lz4::encode_frame(&self.input)?;
+        self.output.write_all(&encoded)?;
+        self.input.clear();
+        self.wrote_frame = true;
+        Ok(())
+    }
+
+    fn finish_output(mut self) -> io::Result<()> {
+        if !self.input.is_empty() || !self.wrote_frame {
+            self.emit_frame()?;
+        }
+        self.output.flush()
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        if !self.input.is_empty() || !self.wrote_frame {
+            self.emit_frame()?;
+        }
+        self.output.flush()?;
+        Ok(self.output)
+    }
+}
+
+#[cfg(feature = "lz4")]
+impl<W: Write> Write for Lz4FrameWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.input.len() == BUFFER {
+            self.emit_frame()?;
+        }
+        let consumed = (BUFFER - self.input.len()).min(bytes.len());
+        self.input.extend_from_slice(&bytes[..consumed]);
+        if self.input.len() == BUFFER {
+            self.emit_frame()?;
+        }
+        Ok(consumed)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.input.is_empty() {
+            self.emit_frame()?;
+        }
+        self.output.flush()
+    }
+}
+
 /// Incremental synchronous filter sink used by the common archive writer.
 pub(crate) enum SyncFilterWriter<W: Write> {
     Plain(SharedOutput<W>),
@@ -1026,7 +966,7 @@ pub(crate) enum SyncFilterWriter<W: Write> {
     },
     #[cfg(feature = "lz4")]
     Lz4 {
-        writer: Box<lz4_flex::frame::FrameEncoder<SharedOutput<W>>>,
+        writer: Box<Lz4FrameWrite<SharedOutput<W>>>,
         output: SharedOutput<W>,
     },
 }
@@ -1078,7 +1018,7 @@ impl<W: Write> SyncFilterWriter<W> {
             },
             #[cfg(feature = "lz4")]
             Some(FilterId::Lz4) => Ok(Self::Lz4 {
-                writer: Box::new(lz4_flex::frame::FrameEncoder::new(shared.clone())),
+                writer: Box::new(Lz4FrameWrite::new(shared.clone())),
                 output: shared,
             }),
             Some(_) => Err(ArchiveError::new(ErrorKind::Capability)
@@ -1113,7 +1053,7 @@ impl<W: Write> SyncFilterWriter<W> {
             },
             #[cfg(feature = "lz4")]
             Self::Lz4 { writer, output } => {
-                drop((*writer).finish().map_err(io::Error::from)?);
+                (*writer).finish_output()?;
                 output.take()
             },
         }

@@ -328,6 +328,12 @@ fn check_codec_policy(root: &Path) -> Result {
             "ruzstd",
             &["zstd", "zstd-safe", "zstd-sys"][..],
         ),
+        (
+            "lz4",
+            ["lz4", "lz4,async,tokio"],
+            "lz4_flex",
+            &["lz4", "lz4-sys"][..],
+        ),
     ] {
         for features in profiles {
             let output = Command::new(cargo())
@@ -375,7 +381,7 @@ fn check_codec_policy(root: &Path) -> Result {
         }
     }
     println!(
-        "sync and async bzip2/zstd dependency graphs select their Rust backends and exclude native codec packages"
+        "sync and async bzip2/zstd/LZ4 dependency graphs select their Rust backends and exclude native codec packages"
     );
     Ok(())
 }

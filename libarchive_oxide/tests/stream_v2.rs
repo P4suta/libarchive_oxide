@@ -5,7 +5,7 @@
 //! End-to-end v0.2 synchronous streaming contracts.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 
 use libarchive_oxide::filter::gzip::GzipEncoder;
 use libarchive_oxide::{ArchiveReader, ArchiveWriter, Pipeline, PipelineEvent, ReaderEvent};
@@ -339,6 +339,31 @@ fn caller_driven_pipeline_rejects_truncated_zstd() {
 }
 
 #[test]
+fn caller_driven_pipeline_reports_malformed_zstd_fuzz_regression() {
+    const MALFORMED: &[u8] =
+        include_bytes!("fixtures/zstd/crash-142bc61adb972f47b2d1ef33ae89832307ea82d5.zst");
+    assert_eq!(
+        collect_pipeline(MALFORMED, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+}
+
+#[test]
+fn caller_driven_pipeline_rejects_truncated_lz4() {
+    let tar = tar_bytes();
+    let mut truncated = filter_bytes(&tar, FilterId::Lz4);
+    truncated.truncate(truncated.len() - 3);
+    assert_eq!(
+        collect_pipeline(&truncated, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+}
+
+#[test]
 fn pure_rust_zstd_writer_is_deterministic_and_independently_decodable() {
     let payload: Vec<u8> = (0_u8..=251).cycle().take(200_000).collect();
     let metadata = EntryMetadata::builder(
@@ -373,6 +398,68 @@ fn pure_rust_zstd_writer_is_deterministic_and_independently_decodable() {
     *corrupt.last_mut().unwrap() ^= 0x80;
     assert_eq!(
         collect_pipeline(&corrupt, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+}
+
+#[test]
+fn pure_rust_lz4_writer_is_deterministic_and_independently_decodable() {
+    let payload: Vec<u8> = (0_u8..=251).cycle().take(20_000).collect();
+    let metadata = EntryMetadata::builder(
+        EntryKind::File,
+        ArchivePath::from_bytes(b"portable-lz4.bin".to_vec()),
+    )
+    .size(Some(payload.len() as u64))
+    .build();
+
+    let build = |filter, chunk: usize| {
+        let mut writer =
+            ArchiveWriter::with_filter(Vec::new(), FormatId::Tar, filter, Limits::default())
+                .unwrap();
+        writer.start_entry(&metadata).unwrap();
+        for bytes in payload.chunks(chunk) {
+            writer.write_data(bytes).unwrap();
+        }
+        writer.end_entry().unwrap();
+        writer.finish().unwrap()
+    };
+
+    let plain = build(None, payload.len());
+    let one_write = build(Some(FilterId::Lz4), payload.len());
+    let one_byte_writes = build(Some(FilterId::Lz4), 1);
+    assert_eq!(one_write, one_byte_writes);
+
+    let mut decoder = lz4_codec::Decoder::new(one_write.as_slice()).unwrap();
+    let mut native_plain = Vec::new();
+    decoder.read_to_end(&mut native_plain).unwrap();
+    assert_eq!(native_plain, plain);
+
+    let mut corrupt_header = one_write.clone();
+    corrupt_header[14] ^= 0x80;
+    assert_eq!(
+        collect_pipeline(&corrupt_header, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+
+    let mut corrupt_block = one_write.clone();
+    let block_length =
+        (u32::from_le_bytes(corrupt_block[15..19].try_into().unwrap()) & 0x7fff_ffff) as usize;
+    corrupt_block[19 + block_length] ^= 0x80;
+    assert_eq!(
+        collect_pipeline(&corrupt_block, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+
+    let mut corrupt_content = one_write;
+    *corrupt_content.last_mut().unwrap() ^= 0x80;
+    assert_eq!(
+        collect_pipeline(&corrupt_content, Limits::default())
             .unwrap_err()
             .kind(),
         libarchive_oxide_core::ErrorKind::Malformed
