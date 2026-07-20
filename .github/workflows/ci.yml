@@ -307,7 +307,11 @@ jobs:
     # Promoted to a required gate after three consecutive green runs on main. Stable/native replay
     # and nightly libFuzzer already cover the full corpus; skip those CPU-heavy invariant batches
     # under QEMU and use optimized code so this gate remains focused on byte-order behavior.
+    # Opt level 1 keeps release semantics and fast QEMU execution without paying opt-level 3's
+    # disproportionate first-build codegen cost for platform-specific filesystem code.
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
