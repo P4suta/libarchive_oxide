@@ -78,7 +78,7 @@ enum FilteredOutput<W: Write> {
     #[cfg(feature = "zstd")]
     Zstd(Box<crate::filtered_io::ZstdFrameWrite<W>>),
     #[cfg(feature = "xz")]
-    Xz(Box<lzma_rust2::XzWriter<W>>),
+    Xz(Box<crate::filtered_io::XzFrameWrite<W>>),
     #[cfg(feature = "lz4")]
     Lz4(Box<crate::filtered_io::Lz4FrameWrite<W>>),
 }
@@ -98,12 +98,9 @@ impl<W: Write> FilteredOutput<W> {
                 crate::filtered_io::ZstdFrameWrite::new(output),
             ))),
             #[cfg(feature = "xz")]
-            Some(FilterId::Xz) => {
-                lzma_rust2::XzWriter::new(output, lzma_rust2::XzOptions::with_preset(6))
-                    .map(Box::new)
-                    .map(Self::Xz)
-                    .map_err(CreateStreamError::Io)
-            },
+            Some(FilterId::Xz) => Ok(Self::Xz(Box::new(crate::filtered_io::XzFrameWrite::new(
+                output,
+            )))),
             #[cfg(feature = "lz4")]
             Some(FilterId::Lz4) => Ok(Self::Lz4(Box::new(crate::filtered_io::Lz4FrameWrite::new(
                 output,

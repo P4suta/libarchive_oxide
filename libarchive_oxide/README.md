@@ -10,8 +10,8 @@ Safe-Rust archive detection, compression, extraction, and creation over
 
 The crate supports tar, cpio, ar, ZIP/ZIP64, optional single-folder 7z, and
 ISO 9660 with format-specific limits. Outer filters are gzip, bzip2, zstd, xz,
-and LZ4 frame. The crate forbids unsafe code, but the async xz dependency
-currently selects a native C backend. See the repository's
+and LZ4 frame. The crate forbids unsafe code; bzip2, zstd, xz/LZMA2, and LZ4
+are dependency-gated to Rust backends across sync and async adapters. See the repository's
 [support matrix](https://github.com/P4suta/libarchive_oxide/blob/main/docs/support-matrix.md)
 for method- and metadata-level details.
 
@@ -78,11 +78,10 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 
 `--no-default-features` retains uncompressed formats and zip store mode.
 
-The sync-only and async/Tokio bzip2, zstd, and LZ4 dependency graphs are
-CI-checked to require their Rust backends and exclude native codec packages.
-The complete default feature graph is not yet guaranteed C/FFI-free because
-the async xz path still selects a native backend. A dependency-verified
-portable profile is roadmap work.
+The sync-only and async/Tokio bzip2, zstd, xz/LZMA2, and LZ4 dependency graphs
+are CI-checked to require their Rust backends and exclude native codec packages.
+The complete default feature graph is not advertised as C/FFI-free until the
+dependency-verified portable profile lands.
 
 Sequential, seek, futures-io, and Tokio adapters all drive the same archive
 state machines. Seek variants are named `SeekArchive*`, `AsyncSeekArchive*`,

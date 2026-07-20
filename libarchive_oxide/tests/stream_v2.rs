@@ -235,7 +235,8 @@ fn nested_filter_depth_is_bounded_and_composes_statically() {
                     error
                         .archive_error()
                         .map(libarchive_oxide_core::ArchiveError::kind),
-                    Some(libarchive_oxide_core::ErrorKind::Limit)
+                    Some(libarchive_oxide_core::ErrorKind::Limit),
+                    "{error:?}"
                 );
                 break;
             },
@@ -401,6 +402,100 @@ fn pure_rust_zstd_writer_is_deterministic_and_independently_decodable() {
             .unwrap_err()
             .kind(),
         libarchive_oxide_core::ErrorKind::Malformed
+    );
+}
+
+#[test]
+fn pure_rust_xz_writer_is_deterministic_and_interoperable() {
+    let payload: Vec<u8> = (0_u8..=251).cycle().take(200_000).collect();
+    let metadata = EntryMetadata::builder(
+        EntryKind::File,
+        ArchivePath::from_bytes(b"portable-xz.bin".to_vec()),
+    )
+    .size(Some(payload.len() as u64))
+    .build();
+
+    let build = |filter, chunk: usize| {
+        let mut writer =
+            ArchiveWriter::with_filter(Vec::new(), FormatId::Tar, filter, Limits::default())
+                .unwrap();
+        writer.start_entry(&metadata).unwrap();
+        for bytes in payload.chunks(chunk) {
+            writer.write_data(bytes).unwrap();
+        }
+        writer.end_entry().unwrap();
+        writer.finish().unwrap()
+    };
+
+    let plain = build(None, payload.len());
+    let expected = collect(plain.clone());
+    let one_write = build(Some(FilterId::Xz), payload.len());
+    let one_byte_writes = build(Some(FilterId::Xz), 1);
+    assert_eq!(one_write, one_byte_writes);
+
+    let mut native_decoder = xz_codec::read::XzDecoder::new_multi_decoder(one_write.as_slice());
+    let mut native_plain = Vec::new();
+    native_decoder.read_to_end(&mut native_plain).unwrap();
+    assert_eq!(native_plain, plain);
+
+    let mut native_encoder = xz_codec::write::XzEncoder::new(Vec::new(), 6);
+    native_encoder.write_all(&native_plain).unwrap();
+    let native_stream = native_encoder.finish().unwrap();
+    assert_eq!(
+        collect_pipeline(&native_stream, Limits::default()).unwrap(),
+        expected
+    );
+
+    let mut corrupt_header = native_stream.clone();
+    corrupt_header[8] ^= 0x80;
+    assert_eq!(
+        collect_pipeline(&corrupt_header, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+
+    let footer = native_stream.len() - 12;
+    let backward_size =
+        u32::from_le_bytes(native_stream[footer + 4..footer + 8].try_into().unwrap());
+    let index_size = (backward_size as usize + 1) * 4;
+    let mut corrupt_block_checksum = native_stream.clone();
+    corrupt_block_checksum[footer - index_size - 1] ^= 0x80;
+    assert_eq!(
+        collect_pipeline(&corrupt_block_checksum, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+
+    let mut truncated = native_stream.clone();
+    truncated.pop();
+    assert_eq!(
+        collect_pipeline(&truncated, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+
+    let mut invalid_padding = native_stream;
+    invalid_padding.push(0);
+    assert_eq!(
+        collect_pipeline(&invalid_padding, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+}
+
+#[test]
+fn caller_driven_xz_rejects_unbounded_index_before_allocation() {
+    let input =
+        include_bytes!("../../fuzz/corpus/codec_xz/b16afad38be9f4c8a35cf2a4dba55890278d5b5f");
+    assert_eq!(
+        collect_pipeline(input, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Limit
     );
 }
 

@@ -7,6 +7,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::io::{Cursor, Write};
+use std::panic::RefUnwindSafe;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -14,12 +15,25 @@ use futures_io::AsyncRead;
 use futures_lite::future::block_on;
 use libarchive_oxide::filter::gzip::GzipEncoder;
 use libarchive_oxide::{
-    ArchiveReader, ArchiveWriter, AsyncArchiveReader, AsyncArchiveWriter, ReaderEvent,
+    ArchiveReader, ArchiveWriter, AsyncArchiveReader, AsyncArchiveWriter, FilterReader, Pipeline,
+    ReaderEvent,
 };
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
     ArchivePath, Codec, CodecStatus, EndOfInput, EntryKind, EntryMetadata, FormatId, Limits,
 };
+
+fn assert_reader_auto_traits<T: Sync + RefUnwindSafe>() {}
+
+#[test]
+fn xz_backend_preserves_public_reader_auto_traits() {
+    assert_reader_auto_traits::<FilterReader<Cursor<Vec<u8>>>>();
+    assert_reader_auto_traits::<Pipeline>();
+    assert_reader_auto_traits::<ArchiveReader<Cursor<Vec<u8>>>>();
+    assert_reader_auto_traits::<AsyncArchiveReader<Cursor<Vec<u8>>>>();
+    #[cfg(feature = "tokio")]
+    assert_reader_auto_traits::<libarchive_oxide::TokioArchiveReader<Cursor<Vec<u8>>>>();
+}
 
 fn compress(plain: &[u8], filter: FilterId) -> std::io::Result<Vec<u8>> {
     match filter {
@@ -285,7 +299,8 @@ fn async_reader_composes_four_nested_filters() {
                         error
                             .archive_error()
                             .map(libarchive_oxide_core::ArchiveError::kind),
-                        Some(libarchive_oxide_core::ErrorKind::Limit)
+                        Some(libarchive_oxide_core::ErrorKind::Limit),
+                        "{error:?}"
                     );
                     break;
                 },
@@ -314,7 +329,7 @@ fn async_xz_dictionary_limit_prevents_oversized_allocation() {
         };
         assert_eq!(
             error.io_error().map(std::io::Error::kind),
-            Some(std::io::ErrorKind::InvalidData)
+            Some(std::io::ErrorKind::OutOfMemory)
         );
     });
 }
