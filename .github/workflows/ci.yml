@@ -307,8 +307,11 @@ jobs:
     # Promoted to a required gate after three consecutive green runs on main. Stable/native replay
     # and nightly libFuzzer already cover the full corpus; skip those CPU-heavy invariant batches
     # under QEMU so this debug-profile gate remains focused on byte-order behavior without paying
-    # release-profile codegen cost for platform-specific filesystem code.
+    # release-profile codegen cost for platform-specific filesystem code. The one-byte XZ writer
+    # case remains in every native OS job; under QEMU it measures encoder throughput rather than
+    # byte-order behavior and takes over 20 minutes.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -316,6 +319,15 @@ jobs:
       - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
         with:
           tool: cross
+      - name: compile big-endian s390x test binaries
+        run: >-
+          cross test
+          -p libarchive_oxide-core
+          -p libarchive_oxide
+          --no-default-features
+          --features libarchive_oxide/portable-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio
+          --target s390x-unknown-linux-gnu
+          --no-run
       - name: test suite on big-endian s390x under qemu
         run: >-
           cross test
@@ -325,8 +337,11 @@ jobs:
           --features libarchive_oxide/portable-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio
           --target s390x-unknown-linux-gnu
           --
+          --test-threads=1
+          --nocapture
           --skip generated_256_mib_archive_streams_in_bounded_chunks
           --skip linux_reference_adapter_restores_mode_time_xattr_acl_and_sparse_layout
+          --skip selected_xz_writer_is_deterministic_and_interoperable
           --skip corpus_files_replay_without_panic
           --skip arbitrary_seeds_uphold_invariants
           --skip seed_mutants_uphold_invariants
