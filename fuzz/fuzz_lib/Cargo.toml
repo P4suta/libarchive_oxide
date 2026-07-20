@@ -15,6 +15,11 @@ description = "Portable fuzz invariant bodies for libarchive_oxide, shared by th
 # A plain library: no libFuzzer, no proc-macro. Builds on stable Windows/MSVC.
 doctest = false
 
+[features]
+default = ["portable-codecs"]
+portable-codecs = ["libarchive_oxide/portable-codecs"]
+native-codecs = ["libarchive_oxide/native-codecs"]
+
 [dependencies]
 # All formats and codecs are needed, so every relevant feature is switched on unconditionally.
 # The former arca-filter crate is now `libarchive_oxide::filter`, gated by the same codec features.

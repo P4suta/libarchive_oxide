@@ -5,11 +5,11 @@
 //! Compression filter implementations and runtime dispatch.
 
 pub mod gzip;
-#[cfg(feature = "lz4")]
+#[cfg(all(feature = "lz4", not(feature = "native-codecs")))]
 pub(crate) mod lz4;
-#[cfg(feature = "xz")]
+#[cfg(all(feature = "xz", not(feature = "native-codecs")))]
 pub(crate) mod xz;
-#[cfg(feature = "zstd")]
+#[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
 pub(crate) mod zstd;
 
 /// IEEE CRC-32 primitives.

@@ -21,11 +21,30 @@ categories = ["compression", "filesystem", "parsing"]
 exclude = ["tests/"]
 
 [package.metadata.docs.rs]
-all-features = true
+no-default-features = true
+features = ["portable-codecs", "aes", "sevenz", "async", "tokio"]
 rustdoc-args = ["--generate-link-to-definition"]
 
 [features]
-default = ["gzip", "bzip2", "zstd", "xz", "lz4"]
+default = ["portable-codecs"]
+# Mutually exclusive codec backend profiles. Individual codec features remain
+# compatible and select their portable backend when neither profile is named.
+portable-codecs = ["gzip", "bzip2", "zstd", "xz", "lz4"]
+native-codecs = [
+    "gzip",
+    "bzip2",
+    "zstd",
+    "xz",
+    "lz4",
+    "dep:compression-codecs",
+    "compression-codecs/gzip",
+    "compression-codecs/bzip2",
+    "compression-codecs/zstd",
+    "compression-codecs/lz4",
+    "dep:xz-codec",
+    "bzip2/bzip2-sys",
+    "dep:flate2",
+]
 # Compression codecs.
 gzip = []
 bzip2 = [
@@ -60,6 +79,8 @@ lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"],
 twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash32"], optional = true }
 compression-codecs = { version = "0.4.38", default-features = false, optional = true }
 bzip2 = { version = "0.6.1", optional = true }
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib"], optional = true }
+xz-codec = { package = "xz2", version = "0.1.7", optional = true }
 # Shared by xz and 7z.
 lzma-rust2 = { version = "0.16.5", default-features = false, features = ["std", "encoder", "xz"], optional = true }
 # WinZip AE-2 requires SHA-1.
@@ -84,7 +105,7 @@ rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 # Shared portable fuzz cases.
-libarchive_oxide-fuzz-cases = { path = "../fuzz/fuzz_lib" }
+libarchive_oxide-fuzz-cases = { path = "../fuzz/fuzz_lib", default-features = false }
 # Deterministic structured inputs.
 arbitrary = { version = "1", features = ["derive"] }
 # Test fixture generation.

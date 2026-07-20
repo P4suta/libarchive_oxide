@@ -179,14 +179,19 @@ fn check_package_licenses(root: &Path) -> Result {
 
 fn check_package_smoke(root: &Path) -> Result {
     let version = workspace_version(root)?;
-    for crate_name in CRATES {
-        let status = Command::new(cargo())
-            .current_dir(root)
-            .args(["package", "-p", crate_name, "--allow-dirty", "--no-verify"])
-            .status()?;
-        if !status.success() {
-            return Err(format!("cargo package failed for {crate_name}").into());
-        }
+    let status = Command::new(cargo())
+        .current_dir(root)
+        .args([
+            "package",
+            "--workspace",
+            "--exclude",
+            "xtask",
+            "--allow-dirty",
+            "--no-verify",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err("cargo package failed for the publishable workspace".into());
     }
 
     let target = root.join("target");
@@ -233,8 +238,13 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+[features]
+default = ["portable-codecs"]
+portable-codecs = ["libarchive_oxide/portable-codecs"]
+native-codecs = ["libarchive_oxide/native-codecs"]
+
 [dependencies]
-libarchive_oxide = {{ path = "{consumer_flagship}" }}
+libarchive_oxide = {{ path = "{consumer_flagship}", default-features = false }}
 libarchive_oxide-core = {{ path = "{consumer_core}" }}
 "#
         ),
@@ -255,17 +265,61 @@ fn main() {
 ",
     )?;
 
-    let status = Command::new(cargo())
-        .current_dir(&smoke)
-        .args(["check", "--workspace", "--all-targets", "--all-features"])
-        .status()?;
-    if !status.success() {
-        return Err("external consumer failed to compile packaged crates".into());
-    }
-    println!("packaged crates compile together in an external consumer workspace");
+    check_packaged_profiles(&smoke)?;
     Ok(())
 }
 
+fn check_packaged_profiles(smoke: &Path) -> Result {
+    for (profile, features) in [
+        (
+            "portable",
+            "libarchive_oxide-package-consumer/portable-codecs,\
+             libarchive_oxide-cli/portable-codecs,libarchive_oxide/async,libarchive_oxide/tokio",
+        ),
+        (
+            "native",
+            "libarchive_oxide-package-consumer/native-codecs,\
+             libarchive_oxide-cli/native-codecs,libarchive_oxide/async,libarchive_oxide/tokio",
+        ),
+    ] {
+        let status = Command::new(cargo())
+            .current_dir(smoke)
+            .args([
+                "check",
+                "--workspace",
+                "--all-targets",
+                "--no-default-features",
+                "--features",
+                features,
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(format!(
+                "external consumer failed to compile packaged crates with the {profile} profile"
+            )
+            .into());
+        }
+    }
+    let conflict = Command::new(cargo())
+        .current_dir(smoke)
+        .args([
+            "check",
+            "-p",
+            "libarchive_oxide",
+            "--features",
+            "native-codecs",
+        ])
+        .output()?;
+    if conflict.status.success()
+        || !String::from_utf8_lossy(&conflict.stderr).contains("mutually exclusive")
+    {
+        return Err("packaged codec profiles did not fail with the documented conflict".into());
+    }
+    println!(
+        "packaged crates compile in portable and native profiles; their combination fails closed"
+    );
+    Ok(())
+}
 fn unpack_package(root: &Path, destination: &Path, crate_name: &str, version: &str) -> Result {
     let package_root = root.join("target").join("package");
     let target = root.join("target");
@@ -315,83 +369,108 @@ fn workspace_version(root: &Path) -> Result<String> {
 }
 
 fn check_codec_policy(root: &Path) -> Result {
-    for (codec, profiles, required, forbidden) in [
-        (
-            "bzip2",
-            ["bzip2", "bzip2,async,tokio"],
-            "libbz2-rs-sys",
-            &["bzip2-sys"][..],
-        ),
-        (
-            "zstd",
-            ["zstd", "zstd,async,tokio"],
-            "ruzstd",
-            &["zstd", "zstd-safe", "zstd-sys"][..],
-        ),
-        (
-            "xz",
-            ["xz", "xz,async,tokio"],
-            "lzma-rust2",
-            &["xz2", "lzma-sys"][..],
-        ),
-        (
-            "lz4",
-            ["lz4", "lz4,async,tokio"],
-            "lz4_flex",
-            &["lz4", "lz4-sys"][..],
-        ),
+    const PORTABLE_FORBIDDEN: &[&str] = &[
+        "libz-sys",
+        "libz-ng-sys",
+        "bzip2-sys",
+        "zstd",
+        "zstd-safe",
+        "zstd-sys",
+        "xz2",
+        "lzma-sys",
+        "lz4",
+        "lz4-sys",
+    ];
+    for (codec, profiles, required) in [
+        ("gzip", ["gzip", "gzip,async,tokio"], "miniz_oxide"),
+        ("bzip2", ["bzip2", "bzip2,async,tokio"], "libbz2-rs-sys"),
+        ("zstd", ["zstd", "zstd,async,tokio"], "ruzstd"),
+        ("xz", ["xz", "xz,async,tokio"], "lzma-rust2"),
+        ("lz4", ["lz4", "lz4,async,tokio"], "lz4_flex"),
     ] {
         for features in profiles {
-            let output = Command::new(cargo())
-                .current_dir(root)
-                .args([
-                    "tree",
-                    "-p",
-                    "libarchive_oxide",
-                    "--no-default-features",
-                    "--features",
-                    features,
-                    "--edges",
-                    "normal,build",
-                    "--prefix",
-                    "none",
-                ])
-                .output()?;
-            if !output.status.success() {
-                return Err(format!(
-                    "cargo tree failed for {codec} profile {features:?}:\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                )
-                .into());
-            }
-            let tree = String::from_utf8(output.stdout)?;
-            let package_names: Vec<&str> = tree
-                .lines()
-                .filter_map(|line| line.split_whitespace().next())
-                .collect();
-            if !package_names.contains(&required) {
-                return Err(format!(
-                    "{codec} profile {features:?} does not select the Rust backend {required}"
-                )
-                .into());
-            }
-            if let Some(native) = forbidden
-                .iter()
-                .find(|package| package_names.contains(package))
-            {
-                return Err(format!(
-                    "{codec} profile {features:?} selected forbidden native package {native}"
-                )
-                .into());
-            }
+            require_dependency_profile(
+                root,
+                &format!("compatible portable {codec} ({features})"),
+                features,
+                &[required],
+                PORTABLE_FORBIDDEN,
+            )?;
         }
     }
+    require_dependency_profile(
+        root,
+        "maximal portable-codecs",
+        "portable-codecs,aes,sevenz,async,tokio",
+        &[
+            "miniz_oxide",
+            "libbz2-rs-sys",
+            "ruzstd",
+            "lzma-rust2",
+            "lz4_flex",
+        ],
+        PORTABLE_FORBIDDEN,
+    )?;
+    require_dependency_profile(
+        root,
+        "maximal native-codecs",
+        "native-codecs,aes,sevenz,async,tokio",
+        &["libz-sys", "bzip2-sys", "zstd-sys", "lzma-sys", "lz4-sys"],
+        &[],
+    )?;
     println!(
-        "sync and async bzip2/zstd/xz/LZ4 dependency graphs select their Rust backends and exclude native codec packages"
+        "portable codec graphs exclude C/FFI packages; the explicit native graph selects all five native backends"
     );
     Ok(())
 }
 
+fn require_dependency_profile(
+    root: &Path,
+    label: &str,
+    features: &str,
+    required: &[&str],
+    forbidden: &[&str],
+) -> Result {
+    let output = Command::new(cargo())
+        .current_dir(root)
+        .args([
+            "tree",
+            "-p",
+            "libarchive_oxide",
+            "--no-default-features",
+            "--features",
+            features,
+            "--edges",
+            "normal,build",
+            "--prefix",
+            "none",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo tree failed for {label}:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let tree = String::from_utf8(output.stdout)?;
+    let package_names: Vec<&str> = tree
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    for package in required {
+        if !package_names.contains(package) {
+            return Err(format!("{label} does not select required package {package}").into());
+        }
+    }
+    if let Some(package) = forbidden
+        .iter()
+        .find(|package| package_names.contains(package))
+    {
+        return Err(format!("{label} selected forbidden package {package}").into());
+    }
+    Ok(())
+}
 fn check_release_policy(root: &Path) -> Result {
     let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
     let assets = fs::read_to_string(root.join(".github/workflows/release-assets.yml"))?;

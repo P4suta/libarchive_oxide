@@ -9,10 +9,19 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "portable-codecs", feature = "native-codecs"))]
+compile_error!(
+    "`portable-codecs` and `native-codecs` are mutually exclusive; use \
+     `--no-default-features --features native-codecs` for the native profile"
+);
+
 // Filter modules use `alloc` paths and also compile under std.
 extern crate alloc;
 
 use libarchive_oxide_core::filter::FilterId;
+
+#[cfg(any(feature = "bzip2", feature = "native-codecs"))]
+mod backend_codec;
 
 #[cfg(feature = "async")]
 mod async_filter;

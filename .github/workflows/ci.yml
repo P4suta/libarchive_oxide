@@ -90,9 +90,8 @@ jobs:
         with:
           tool: just@1.50.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # This also runs libarchive_oxide/tests/fuzz_replay.rs — the portable adversarial gate that
-      # mutates every committed seed through the reader/round-trip/codec invariants (catches
-      # reintroduced panics on malformed input without nightly/libFuzzer), on all three OSes.
+      # This runs the same conformance and committed fuzz-replay corpus through the maximal
+      # portable and native profiles on all three OSes. The profiles are deliberately exclusive.
       - run: just test
 
   no_std:
@@ -190,7 +189,7 @@ jobs:
         run: just package-licenses
       - name: compile packaged crates from an external consumer
         run: just package-smoke
-      - name: verify bzip2, zstd, xz and LZ4 use Rust backends
+      - name: verify portable exclusion and explicit native codec backends
         run: just codec-policy
       - name: verify manual draft-first release policy
         run: just release-policy
@@ -232,7 +231,13 @@ jobs:
       # major bump. `release-plz` re-runs the same tool at publish time (release.yml); this is the
       # early PR-time signal.
       - if: vars.V02_BASELINE_PUBLISHED == 'true'
-        run: cargo semver-checks check-release -p libarchive_oxide-core -p libarchive_oxide
+        # cargo-semver-checks otherwise heuristically enables almost every feature, which would
+        # intentionally trip the portable/native mutual-exclusion guard.
+        run: >-
+          cargo semver-checks check-release
+          -p libarchive_oxide-core
+          -p libarchive_oxide
+          --default-features
 
   fuzz:
     name: fuzz (nightly, build + short run)
@@ -242,6 +247,8 @@ jobs:
       # runner's GNU target so cargo-fuzz does not mistake its own build target for the fuzz target;
       # ASan is incompatible with a statically linked musl libc.
       FUZZ_TARGET: x86_64-unknown-linux-gnu
+      # Keep malformed length arithmetic fail-closed in panic-abort tests and libFuzzer builds.
+      RUSTFLAGS: -C overflow-checks=yes
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -254,26 +261,40 @@ jobs:
         run: rustup toolchain install nightly --profile minimal --no-self-update
       # A panic in a dependency must fail as a process abort here as it does under libFuzzer.
       # Overflow checks keep malformed length arithmetic on the same fail-closed path.
-      - name: malformed-codec regression (panic abort, overflow checks)
-        env:
-          RUSTFLAGS: -C overflow-checks=yes
-        run: >-
-          cargo +nightly test -Z panic-abort-tests
-          -p libarchive_oxide --all-features
-          --test filtered_io_v2 malformed_zstd_block_does_not_panic
-      # First gate: every target must compile against libFuzzer on Linux/nightly.
+      - name: malformed-codec regression (both profiles, panic abort, overflow checks)
+        run: |
+          cargo +nightly test -Z panic-abort-tests \
+            -p libarchive_oxide --no-default-features \
+            --features portable-codecs,aes,sevenz,async,tokio \
+            --test filtered_io_v2 malformed_zstd_block_does_not_panic
+          cargo +nightly test -Z panic-abort-tests \
+            -p libarchive_oxide --no-default-features \
+            --features native-codecs,aes,sevenz,async,tokio \
+            --test filtered_io_v2 malformed_zstd_block_does_not_panic
+      # Every target must compile against libFuzzer with each mutually exclusive profile.
       - run: cargo +nightly fuzz build --target "$FUZZ_TARGET"
-      # Second gate: actually *run* libFuzzer as a bug-finder. Each target fuzzes for a bounded wall
-      # time, seeded from its committed corpus (fuzz/corpus/<target>), so a panic on malformed input
-      # in a reader/round-trip/codec path fails CI here — not just at compile time. Kept short so the
-      # job stays lean; the coverage-guided mutator explores far past the seeds within the budget.
-      - name: short coverage-guided fuzz run per target
+      - run: >-
+          cargo +nightly fuzz build --no-default-features --features native-codecs
+          --target "$FUZZ_TARGET"
+      # Both profiles run the same target list and committed corpus. The portable budget remains the
+      # deeper default campaign; native gets a shorter differential run on the identical seeds.
+      - name: portable coverage-guided fuzz run per target
         run: |
           set -euo pipefail
           targets=$(cargo +nightly fuzz list)
           for t in $targets; do
-            echo "::group::fuzz $t"
+            echo "::group::portable fuzz $t"
             cargo +nightly fuzz run "$t" --target "$FUZZ_TARGET" -- -max_total_time=30 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+      - name: native coverage-guided fuzz run per target
+        run: |
+          set -euo pipefail
+          targets=$(cargo +nightly fuzz list)
+          for t in $targets; do
+            echo "::group::native fuzz $t"
+            cargo +nightly fuzz run "$t" --no-default-features --features native-codecs \
+              --target "$FUZZ_TARGET" -- -max_total_time=10 -rss_limit_mb=4096
             echo "::endgroup::"
           done
 
@@ -297,7 +318,8 @@ jobs:
           cross test
           -p libarchive_oxide-core
           -p libarchive_oxide
-          --all-features
+          --no-default-features
+          --features libarchive_oxide/portable-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio
           --target s390x-unknown-linux-gnu
 
   actionlint:

@@ -19,10 +19,15 @@ rust-version = "1.85"
 [package.metadata]
 cargo-fuzz = true
 
+[features]
+default = ["portable-codecs"]
+portable-codecs = ["libarchive_oxide-fuzz-cases/portable-codecs"]
+native-codecs = ["libarchive_oxide-fuzz-cases/native-codecs"]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-libarchive_oxide-fuzz-cases = { path = "fuzz_lib" }
+libarchive_oxide-fuzz-cases = { path = "fuzz_lib", default-features = false }
 
 # Keep the targets fast to link and free of unrelated harness cruft.
 [profile.release]
@@ -111,6 +116,12 @@ bench = false
 
 # ── Codec targets: decode-no-panic + decode∘encode = id. ──
 
+[[bin]]
+name = "codec_bzip2"
+path = "fuzz_targets/codec_bzip2.rs"
+test = false
+doc = false
+bench = false
 [[bin]]
 name = "codec_gzip"
 path = "fuzz_targets/codec_gzip.rs"

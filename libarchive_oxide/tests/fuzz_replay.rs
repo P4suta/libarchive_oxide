@@ -154,7 +154,7 @@ fn arbitrary_seeds_uphold_invariants() {
         }
     }
 
-    assert_eq!(TARGETS.len(), 16, "all Phase-7 targets are wired");
+    assert_eq!(TARGETS.len(), 17, "all fuzz targets are wired");
     assert_eq!(runs, TARGETS.len() * LENGTHS.len() * STREAMS);
 }
 

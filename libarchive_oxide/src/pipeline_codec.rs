@@ -4,34 +4,61 @@
 
 //! Private static dispatch for caller-driven outer codecs.
 
-#[cfg(feature = "bzip2")]
-use libarchive_oxide_core::CodecStatus;
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, Codec, CodecStep, EndOfInput, ErrorKind, Limits};
 
+#[cfg(any(feature = "bzip2", feature = "native-codecs"))]
+use crate::backend_codec::ExternalDecoder;
+#[cfg(feature = "native-codecs")]
+use crate::backend_codec::NativeXzDecoder;
+#[cfg(not(feature = "native-codecs"))]
 use crate::filter::gzip::GzipDecoder;
 
 #[derive(Debug)]
 pub(crate) enum PipelineCodec {
+    #[cfg(feature = "native-codecs")]
+    Gzip(ExternalDecoder<compression_codecs::GzipDecoder>),
+    #[cfg(not(feature = "native-codecs"))]
     Gzip(Box<GzipDecoder>),
     #[cfg(feature = "bzip2")]
-    Bzip2(compression_codecs::BzDecoder),
-    #[cfg(feature = "zstd")]
+    Bzip2(ExternalDecoder<compression_codecs::BzDecoder>),
+    #[cfg(all(feature = "zstd", feature = "native-codecs"))]
+    Zstd(ExternalDecoder<compression_codecs::ZstdDecoder>),
+    #[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
     Zstd(Box<crate::filter::zstd::ZstdDecoder>),
-    #[cfg(feature = "xz")]
+    #[cfg(all(feature = "xz", feature = "native-codecs"))]
+    Xz(NativeXzDecoder),
+    #[cfg(all(feature = "xz", not(feature = "native-codecs")))]
     Xz(Box<crate::filter::xz::XzDecoder>),
-    #[cfg(feature = "lz4")]
+    #[cfg(all(feature = "lz4", feature = "native-codecs"))]
+    Lz4(ExternalDecoder<compression_codecs::Lz4Decoder>),
+    #[cfg(all(feature = "lz4", not(feature = "native-codecs")))]
     Lz4(Box<crate::filter::lz4::Lz4Decoder>),
 }
 
 impl PipelineCodec {
     pub(crate) fn new(filter: FilterId, limits: Limits) -> Result<Self, ArchiveError> {
         match filter {
-            FilterId::Gzip => Ok(Self::Gzip(Box::new(GzipDecoder::new(limits)))),
+            FilterId::Gzip => {
+                #[cfg(feature = "native-codecs")]
+                {
+                    Ok(Self::Gzip(ExternalDecoder::new(
+                        compression_codecs::GzipDecoder::new(),
+                        filter,
+                    )))
+                }
+                #[cfg(not(feature = "native-codecs"))]
+                {
+                    Ok(Self::Gzip(Box::new(GzipDecoder::new(limits))))
+                }
+            },
             FilterId::Bzip2 => {
                 #[cfg(feature = "bzip2")]
                 {
-                    Ok(Self::Bzip2(compression_codecs::BzDecoder::new()))
+                    Ok(Self::Bzip2(ExternalDecoder::new(
+                        compression_codecs::BzDecoder::new(),
+                        filter,
+                    )))
                 }
                 #[cfg(not(feature = "bzip2"))]
                 {
@@ -39,7 +66,12 @@ impl PipelineCodec {
                 }
             },
             FilterId::Zstd => {
-                #[cfg(feature = "zstd")]
+                #[cfg(all(feature = "zstd", feature = "native-codecs"))]
+                {
+                    let decoder = native_zstd_decoder(limits)?;
+                    Ok(Self::Zstd(ExternalDecoder::new(decoder, filter)))
+                }
+                #[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
                 {
                     Ok(Self::Zstd(Box::default()))
                 }
@@ -49,7 +81,11 @@ impl PipelineCodec {
                 }
             },
             FilterId::Xz => {
-                #[cfg(feature = "xz")]
+                #[cfg(all(feature = "xz", feature = "native-codecs"))]
+                {
+                    NativeXzDecoder::new(limits.codec_memory()).map(Self::Xz)
+                }
+                #[cfg(all(feature = "xz", not(feature = "native-codecs")))]
                 {
                     crate::filter::xz::XzDecoder::new(limits)
                         .map(Box::new)
@@ -61,7 +97,14 @@ impl PipelineCodec {
                 }
             },
             FilterId::Lz4 => {
-                #[cfg(feature = "lz4")]
+                #[cfg(all(feature = "lz4", feature = "native-codecs"))]
+                {
+                    Ok(Self::Lz4(ExternalDecoder::new(
+                        compression_codecs::Lz4Decoder::new(),
+                        filter,
+                    )))
+                }
+                #[cfg(all(feature = "lz4", not(feature = "native-codecs")))]
                 {
                     Ok(Self::Lz4(Box::default()))
                 }
@@ -83,9 +126,12 @@ impl PipelineCodec {
         end: EndOfInput,
     ) -> Result<CodecStep, ArchiveError> {
         match self {
+            #[cfg(feature = "native-codecs")]
+            Self::Gzip(codec) => codec.process(input, output, end),
+            #[cfg(not(feature = "native-codecs"))]
             Self::Gzip(codec) => codec.process(input, output, end),
             #[cfg(feature = "bzip2")]
-            Self::Bzip2(codec) => external_process(codec, FilterId::Bzip2, input, output, end),
+            Self::Bzip2(codec) => codec.process(input, output, end),
             #[cfg(feature = "zstd")]
             Self::Zstd(codec) => codec.process(input, output, end),
             #[cfg(feature = "xz")]
@@ -96,55 +142,20 @@ impl PipelineCodec {
     }
 }
 
-#[cfg(feature = "bzip2")]
-fn external_process(
-    decoder: &mut impl compression_codecs::Decode,
-    filter: FilterId,
-    input: &[u8],
-    output: &mut [u8],
-    end: EndOfInput,
-) -> Result<CodecStep, ArchiveError> {
-    use compression_codecs::core::util::PartialBuffer;
-
-    let mut source = PartialBuffer::new(input);
-    let mut destination = PartialBuffer::new(output);
-    let mut done = decoder
-        .decode(&mut source, &mut destination)
-        .map_err(|error| codec_error(filter, &error))?;
-    if !done && source.unwritten().is_empty() && matches!(end, EndOfInput::End) {
-        done = decoder
-            .finish(&mut destination)
-            .map_err(|error| codec_error(filter, &error))?;
-        if !done && destination.written_len() == 0 {
-            return Err(ArchiveError::new(ErrorKind::Malformed)
-                .with_format(filter_name(filter))
-                .with_context("codec ended before its terminal record"));
-        }
+#[cfg(all(feature = "zstd", feature = "native-codecs"))]
+fn native_zstd_decoder(limits: Limits) -> Result<compression_codecs::ZstdDecoder, ArchiveError> {
+    let Some(memory_limit) = limits.codec_memory() else {
+        return Ok(compression_codecs::ZstdDecoder::new());
+    };
+    if memory_limit < 1024 {
+        return Err(ArchiveError::new(ErrorKind::Limit)
+            .with_format("zstd")
+            .with_context("Zstandard codec memory limit is below the minimum 1 KiB window"));
     }
-    let status = if done {
-        CodecStatus::Done
-    } else if destination.unwritten().is_empty() {
-        CodecStatus::NeedOutput
-    } else {
-        CodecStatus::NeedInput
-    };
-    Ok(CodecStep {
-        consumed: source.written_len(),
-        produced: destination.written_len(),
-        status,
-    })
-}
-
-#[cfg(feature = "bzip2")]
-fn codec_error(filter: FilterId, error: &std::io::Error) -> ArchiveError {
-    let kind = if error.kind() == std::io::ErrorKind::OutOfMemory {
-        ErrorKind::Limit
-    } else {
-        ErrorKind::Malformed
-    };
-    ArchiveError::new(kind)
-        .with_format(filter_name(filter))
-        .with_context(error.to_string())
+    let window_log = (usize::BITS - 1 - memory_limit.leading_zeros()).min(31);
+    Ok(compression_codecs::ZstdDecoder::new_with_params(&[
+        compression_codecs::zstd::params::DParameter::window_log_max(window_log),
+    ]))
 }
 
 #[allow(dead_code)]

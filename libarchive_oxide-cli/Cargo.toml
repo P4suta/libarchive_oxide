@@ -19,7 +19,13 @@ keywords = ["archive", "tar", "zip", "cpio", "cli"]
 categories = ["command-line-utilities"]
 
 [package.metadata.docs.rs]
-all-features = true
+no-default-features = true
+features = ["portable-codecs"]
+
+[features]
+default = ["portable-codecs"]
+portable-codecs = ["libarchive_oxide/portable-codecs"]
+native-codecs = ["libarchive_oxide/native-codecs"]
 
 # Command-line entry points.
 [[bin]]
@@ -44,7 +50,7 @@ path = "src/bin/oxunzip.rs"
 
 [dependencies]
 # Enable CLI-supported formats.
-libarchive_oxide = { path = "../libarchive_oxide", version = "0.2.0", features = ["aes", "sevenz"] }
+libarchive_oxide = { path = "../libarchive_oxide", version = "0.2.0", default-features = false, features = ["aes", "sevenz"] }
 libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
 cap-std = "4.0.2"
 serde_json = "1.0.149"

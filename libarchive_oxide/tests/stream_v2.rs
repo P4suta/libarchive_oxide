@@ -182,7 +182,13 @@ fn gzip_trailer_is_authenticated() {
             Ok(ReaderEvent::Done) => panic!("corrupt trailer was accepted"),
             Ok(_) => {},
             Err(error) => {
-                assert!(error.to_string().contains("CRC32"));
+                assert!(
+                    error.archive_error().is_some_and(|archive| {
+                        archive.kind() == libarchive_oxide_core::ErrorKind::Malformed
+                    }) || error
+                        .io_error()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidData)
+                );
                 break;
             },
         }
@@ -200,7 +206,13 @@ fn truncated_gzip_trailer_is_rejected() {
             Ok(ReaderEvent::Done) => panic!("truncated trailer was accepted"),
             Ok(_) => {},
             Err(error) => {
-                assert!(error.to_string().contains("truncated trailer"));
+                assert!(
+                    error.archive_error().is_some_and(|archive| {
+                        archive.kind() == libarchive_oxide_core::ErrorKind::Malformed
+                    }) || error
+                        .io_error()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidData)
+                );
                 break;
             },
         }
@@ -365,7 +377,7 @@ fn caller_driven_pipeline_rejects_truncated_lz4() {
 }
 
 #[test]
-fn pure_rust_zstd_writer_is_deterministic_and_independently_decodable() {
+fn selected_zstd_writer_is_deterministic_and_independently_decodable() {
     let payload: Vec<u8> = (0_u8..=251).cycle().take(200_000).collect();
     let metadata = EntryMetadata::builder(
         EntryKind::File,
@@ -406,7 +418,7 @@ fn pure_rust_zstd_writer_is_deterministic_and_independently_decodable() {
 }
 
 #[test]
-fn pure_rust_xz_writer_is_deterministic_and_interoperable() {
+fn selected_xz_writer_is_deterministic_and_interoperable() {
     let payload: Vec<u8> = (0_u8..=251).cycle().take(200_000).collect();
     let metadata = EntryMetadata::builder(
         EntryKind::File,
@@ -500,7 +512,7 @@ fn caller_driven_xz_rejects_unbounded_index_before_allocation() {
 }
 
 #[test]
-fn pure_rust_lz4_writer_is_deterministic_and_independently_decodable() {
+fn selected_lz4_writer_is_deterministic_and_independently_decodable() {
     let payload: Vec<u8> = (0_u8..=251).cycle().take(20_000).collect();
     let metadata = EntryMetadata::builder(
         EntryKind::File,
@@ -531,8 +543,11 @@ fn pure_rust_lz4_writer_is_deterministic_and_independently_decodable() {
     decoder.read_to_end(&mut native_plain).unwrap();
     assert_eq!(native_plain, plain);
 
+    let flg = one_write[4];
+    let header_length =
+        4 + 2 + if flg & 0x08 != 0 { 8 } else { 0 } + if flg & 0x01 != 0 { 4 } else { 0 } + 1;
     let mut corrupt_header = one_write.clone();
-    corrupt_header[14] ^= 0x80;
+    corrupt_header[header_length - 1] ^= 0x80;
     assert_eq!(
         collect_pipeline(&corrupt_header, Limits::default())
             .unwrap_err()
@@ -541,9 +556,12 @@ fn pure_rust_lz4_writer_is_deterministic_and_independently_decodable() {
     );
 
     let mut corrupt_block = one_write.clone();
-    let block_length =
-        (u32::from_le_bytes(corrupt_block[15..19].try_into().unwrap()) & 0x7fff_ffff) as usize;
-    corrupt_block[19 + block_length] ^= 0x80;
+    let block_length = (u32::from_le_bytes(
+        corrupt_block[header_length..header_length + 4]
+            .try_into()
+            .unwrap(),
+    ) & 0x7fff_ffff) as usize;
+    corrupt_block[header_length + 4 + block_length] ^= 0x80;
     assert_eq!(
         collect_pipeline(&corrupt_block, Limits::default())
             .unwrap_err()
