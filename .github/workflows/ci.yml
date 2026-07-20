@@ -304,7 +304,9 @@ jobs:
     # mix endian): a byte-order bug hides on the little-endian CI matrix. `cross` runs both library
     # suites under qemu on a big-endian target to surface it. The CLI contract suite is excluded
     # because it spawns target binaries as child processes, bypassing cross's top-level qemu runner.
-    # Promoted to a required gate after three consecutive green runs on main.
+    # Promoted to a required gate after three consecutive green runs on main. Stable/native replay
+    # and nightly libFuzzer already cover the full corpus; skip those CPU-heavy invariant batches
+    # under QEMU and use optimized code so this gate remains focused on byte-order behavior.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -320,7 +322,12 @@ jobs:
           -p libarchive_oxide
           --no-default-features
           --features libarchive_oxide/portable-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio
+          --release
           --target s390x-unknown-linux-gnu
+          --
+          --skip corpus_files_replay_without_panic
+          --skip arbitrary_seeds_uphold_invariants
+          --skip seed_mutants_uphold_invariants
 
   actionlint:
     name: actionlint (workflow self-check)

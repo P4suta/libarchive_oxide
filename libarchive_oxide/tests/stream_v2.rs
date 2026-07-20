@@ -419,7 +419,10 @@ fn selected_zstd_writer_is_deterministic_and_independently_decodable() {
 
 #[test]
 fn selected_xz_writer_is_deterministic_and_interoperable() {
-    let payload: Vec<u8> = (0_u8..=251).cycle().take(200_000).collect();
+    // One-byte adapter boundaries do not need a compression-benchmark-sized payload. Keeping this
+    // above 16 KiB still crosses parser/output chunks while bounding preset-6 debug builds on every
+    // required OS runner and under emulation.
+    let payload: Vec<u8> = (0_u8..=251).cycle().take(16 * 1024 + 17).collect();
     let metadata = EntryMetadata::builder(
         EntryKind::File,
         ArchivePath::from_bytes(b"portable-xz.bin".to_vec()),
