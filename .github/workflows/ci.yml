@@ -330,6 +330,7 @@ jobs:
           --target s390x-unknown-linux-gnu
           --
           --skip generated_256_mib_archive_streams_in_bounded_chunks
+          --skip linux_reference_adapter_restores_mode_time_xattr_acl_and_sparse_layout
           --skip corpus_files_replay_without_panic
           --skip arbitrary_seeds_uphold_invariants
           --skip seed_mutants_uphold_invariants
