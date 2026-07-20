@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 
@@ -452,8 +453,9 @@ impl XzValidator {
 /// their requested memory has passed `Limits::codec_memory`.
 pub(crate) struct XzDecoder {
     sender: Option<SyncSender<InputMessage>>,
-    events: Receiver<WorkerEvent>,
-    worker: Option<thread::JoinHandle<io::Result<()>>>,
+    // Preserve the public readers' historical Sync and RefUnwindSafe auto traits.
+    events: Mutex<Receiver<WorkerEvent>>,
+    worker: Mutex<Option<thread::JoinHandle<io::Result<()>>>>,
     validator: XzValidator,
     pending_input: Vec<u8>,
     pending_output: Vec<u8>,
@@ -477,8 +479,8 @@ impl XzDecoder {
             })?;
         Ok(Self {
             sender: Some(sender),
-            events,
-            worker: Some(worker),
+            events: Mutex::new(events),
+            worker: Mutex::new(Some(worker)),
             validator: XzValidator::new(limits),
             pending_input: Vec::with_capacity(MAX_STAGED),
             pending_output: Vec::new(),
@@ -497,7 +499,11 @@ impl XzDecoder {
 
     fn finish_worker(&mut self) -> Result<(), ArchiveError> {
         self.sender.take();
-        match self.worker.take().map(thread::JoinHandle::join) {
+        let worker = match self.worker.get_mut() {
+            Ok(worker) => worker.take(),
+            Err(_) => return Err(self.fail(malformed("XZ worker handle was poisoned"))),
+        };
+        match worker.map(thread::JoinHandle::join) {
             Some(Ok(Ok(()))) => {
                 self.done = true;
                 Ok(())
@@ -585,7 +591,11 @@ impl XzDecoder {
     }
 
     fn poll_event(&mut self, output: &mut [u8]) -> Result<Option<usize>, ArchiveError> {
-        match self.events.try_recv() {
+        let event = match self.events.get_mut() {
+            Ok(events) => events.try_recv(),
+            Err(_) => return Err(self.fail(malformed("XZ event receiver was poisoned"))),
+        };
+        match event {
             Ok(event) => Ok(Some(self.handle_event(event, output))),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
@@ -596,7 +606,11 @@ impl XzDecoder {
     }
 
     fn wait_event(&mut self, output: &mut [u8]) -> Result<usize, ArchiveError> {
-        if let Ok(event) = self.events.recv() {
+        let event = match self.events.get_mut() {
+            Ok(events) => events.recv(),
+            Err(_) => return Err(self.fail(malformed("XZ event receiver was poisoned"))),
+        };
+        if let Ok(event) = event {
             Ok(self.handle_event(event, output))
         } else {
             self.finish_worker()?;
@@ -715,7 +729,6 @@ impl Codec for XzDecoder {
                 });
             }
             if effective_end
-                && self.end_sent
                 && produced == 0
                 && self.pending_output.is_empty()
                 && !output.is_empty()
@@ -740,7 +753,14 @@ impl Codec for XzDecoder {
                     status,
                 });
             }
-            if effective_end && self.end_sent {
+            if effective_end {
+                if output.is_empty() && !self.pending_output.is_empty() {
+                    return Ok(CodecStep {
+                        consumed,
+                        produced,
+                        status: CodecStatus::NeedOutput,
+                    });
+                }
                 produced += self.wait_event(&mut output[produced..])?;
                 continue;
             }
