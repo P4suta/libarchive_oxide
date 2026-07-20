@@ -80,10 +80,19 @@ jobs:
     timeout-minutes: 15
     env:
       RUSTFLAGS: -D warnings
+      RUST_TEST_THREADS: ${{ matrix.test_threads }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            test_threads: 4
+          - os: windows-latest
+            test_threads: 4
+          # Pure-Rust preset-6 XZ cases contend heavily on the macOS runner when libtest schedules
+          # them together. Serial execution is faster and makes the last printed test causal.
+          - os: macos-latest
+            test_threads: 1
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
