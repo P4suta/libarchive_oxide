@@ -57,14 +57,30 @@ errors. External seek-native providers are not currently supported. See the
 
 ## Filesystem restoration
 
-Extraction is rooted in a `cap-std` directory capability. The default policy
-rejects path traversal, pre-existing destinations, links, and special files,
-and regular files are committed from a `create_new` temporary sibling.
+`ArchiveSession::apply_with_adapter` drives a compile-time `FilesystemAdapter`
+after session identity, path normalization, policy, resource-limit, and
+hardlink-order checks. Existing `apply(plan, cap_std::fs::Dir)` creates the
+standard adapter. Every requested entry/metadata operation has an applied,
+unsupported, refused, partial, or OS-error finding in `ApplyReport`; omitted
+evidence is converted to `Partial`.
 
-Restoration fidelity varies by platform. Unix mode, ownership, timestamps,
-xattrs, ACLs, sparse extents, symlinks, and hardlinks must be evaluated through
-the extraction policy and report; unsupported restoration is reported rather
-than counted as full format support. Linux is the planned reference adapter.
+| Operation | Standard portable path | Linux reference path |
+|---|---|---|
+| regular file | temporary-sibling atomic publish | same, metadata applied by open descriptor |
+| directory | no-follow creation/finalization | same |
+| mode | Unix targets | yes |
+| access/modification time | yes | yes, descriptor-based |
+| numeric uid/gid | reported unsupported | yes; permission errors remain typed |
+| xattr | reported unsupported | yes |
+| POSIX ACL | reported unsupported | numeric access/default ACL text |
+| sparse extents | logical holes preserved | logical and allocated-block evidence tested |
+| symlink/hardlink | explicit policy only | explicit policy only |
+| FIFO/socket/device | reported unsupported | explicit policy only |
+| change/birth time, filesystem flags | reported unsupported | reported unsupported |
+
+The default policy still rejects traversal, pre-existing destinations, links,
+and special files. Commit failure removes the sibling without publishing an
+invalid destination. See [the filesystem adapter contract](filesystem-adapters.md).
 
 ## Profiles
 

@@ -84,6 +84,30 @@ impl ExtractionPolicy {
         self.special_files = allow;
         self
     }
+
+    /// Whether existing regular files may be atomically replaced.
+    #[must_use]
+    pub const fn overwrites(self) -> bool {
+        self.overwrite
+    }
+
+    /// Whether symbolic links may be restored.
+    #[must_use]
+    pub const fn symlinks(self) -> bool {
+        self.symlinks
+    }
+
+    /// Whether session-local hard links may be restored.
+    #[must_use]
+    pub const fn hardlinks(self) -> bool {
+        self.hardlinks
+    }
+
+    /// Whether platform-supported special files may be restored.
+    #[must_use]
+    pub const fn special_files(self) -> bool {
+        self.special_files
+    }
 }
 
 impl Default for ExtractionPolicy {
@@ -108,6 +132,8 @@ pub enum RejectionReason {
     ExternalReference,
     /// The requested restore capability is not implemented on this platform.
     UnsupportedRestore,
+    /// The filesystem adapter reported an entry-level operating-system failure.
+    FilesystemError,
 }
 
 /// Materialization result for one archive entry.
@@ -149,6 +175,10 @@ impl EntryOutcome {
     pub const fn outcome(&self) -> &EntryOutcomeKind {
         &self.outcome
     }
+
+    pub(crate) const fn new(path: ArchivePath, outcome: EntryOutcomeKind) -> Self {
+        Self { path, outcome }
+    }
 }
 
 /// Complete extraction report. Rejections are never silently converted to success.
@@ -170,6 +200,10 @@ impl ExtractionReport {
         self.outcomes
             .iter()
             .any(|item| matches!(item.outcome, EntryOutcomeKind::Rejected(_)))
+    }
+
+    pub(crate) fn push(&mut self, outcome: EntryOutcome) {
+        self.outcomes.push(outcome);
     }
 }
 

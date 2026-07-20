@@ -39,10 +39,15 @@ compatibility.
   bounded conformance, malformed, and fuzz corpus;
 - every decoder, encoder, filter pipeline, spool, and extractor receives
   finite-by-default resource limits;
-- extraction is rooted in a `cap-std` directory capability and commits regular
-  files atomically from a `create_new` temporary sibling;
+- session apply keeps path normalization, limits, link order, and policy in a
+  shared driver, then passes only relative normalized operations to a
+  compile-time filesystem adapter;
+- the built-in `cap-std` adapter commits regular files atomically from a
+  `create_new` sibling, reopens parents/directories without following links,
+  and leaves the destination unpublished on commit failure;
 - safe extraction rejects traversal, pre-existing destinations, links, and
-  special files, and reports every rejection;
+  special files; applied, unsupported, refused, partial, and OS-error
+  filesystem outcomes remain typed in `ApplyReport`;
 - decoded output and CLI processing are capped at 4 GiB by default;
 - header-derived offsets and sizes use checked conversions and arithmetic;
 - fuzz targets run in CI;

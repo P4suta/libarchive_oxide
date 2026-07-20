@@ -58,7 +58,10 @@ The [support matrix](support-matrix.md) is authoritative for what works now.
 
 Provider registration in this campaign is implemented as associated-type static
 chains shared by Pipeline, reader, engine/session, and create; see
-[ADR-0006](adr/0006-compile-time-providers.md).
+[ADR-0006](adr/0006-compile-time-providers.md).Filesystem application is implemented as a shared policy/limit driver plus a
+compile-time capability-reporting adapter. The Linux reference adapter and
+atomicity/finding contract are specified by
+[ADR-0007](adr/0007-capability-filesystem.md).
 
 ### Campaign 2: OCI and packages
 

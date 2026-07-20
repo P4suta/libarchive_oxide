@@ -143,6 +143,19 @@ ABI is introduced. Providers serve stable `FormatId` / `FilterId` values, and
 prepend order selects an alternative implementation. See the
 [provider contract](docs/providers.md).
 
+## Filesystem adapters
+
+`ArchiveSession::apply_with_adapter` keeps session identity, path policy,
+resource limits, hardlink ordering, and archive events in the engine while a
+compile-time `FilesystemAdapter` performs normalized relative operations.
+`ApplyReport::filesystem_findings` records applied, unsupported, refused,
+partial, and OS-error outcomes for every requested entry or metadata operation;
+an adapter cannot silently omit an advertised attribute. Existing
+`apply(plan, cap_std::fs::Dir)` remains a shortcut to the built-in atomic
+`CapStdFilesystemAdapter`. Linux additionally restores descriptor-based
+mode/time, numeric ownership, xattrs, POSIX ACLs, and sparse layout. See the
+[filesystem adapter contract](docs/filesystem-adapters.md).
+
 ## Codec backends
 
 `libarchive_oxide-core` is zero-dependency `no_std + alloc` safe Rust, and all
@@ -172,6 +185,7 @@ All published crates use `#![forbid(unsafe_code)]`.
 - [Contributing](CONTRIBUTING.md)
 - [Architecture decisions](docs/adr/)
 - [Compile-time provider contract](docs/providers.md)
+- [Filesystem adapter contract](docs/filesystem-adapters.md)
 - [Detailed support matrix](docs/support-matrix.md)
 - [Modern Replacement roadmap](docs/modern-replacement.md)
 - [Modern Replacement issue tracker](https://github.com/P4suta/libarchive_oxide/issues/28)

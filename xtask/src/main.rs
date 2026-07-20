@@ -29,8 +29,10 @@ const SOURCE_TREES: &[&str] = &[
 const PACKAGE_CONSUMER_MAIN: &str = r#"use std::io::Cursor;
 
 use libarchive_oxide::{
-    ArchiveEngine, ArchiveReader, CodecCapabilities, CodecProvider, FormatCapabilities,
-    FormatProvider, ProviderArchiveEncoder, ProviderSet, ReaderEvent,
+    ArchiveEngine, ArchiveReader, CodecCapabilities, CodecProvider, FilesystemAdapter,
+    FilesystemAdapterError, FilesystemCapabilities, FilesystemEntry, FilesystemEntryReport,
+    FilesystemFinding, FilesystemMaterialization, FormatCapabilities, FormatProvider,
+    ProviderArchiveEncoder, ProviderSet, ReaderEvent,
 };
 use libarchive_oxide_core::{
     ArchiveDecoder, ArchiveEncoder, ArchiveError, Codec, CodecStep, DecodeStep, EncodeCommand,
@@ -106,7 +108,27 @@ impl CodecProvider for ExternalCodec {
     }
 }
 
+struct ExternalFilesystem;
+impl FilesystemAdapter for ExternalFilesystem {
+    fn capabilities(&self) -> FilesystemCapabilities {
+        FilesystemCapabilities::none().with_atomic_commit(true)
+    }
+    fn begin_session(&mut self) -> Result<(), FilesystemAdapterError> { Ok(()) }
+    fn begin_entry(&mut self, _entry: FilesystemEntry<'_>) -> Result<(), FilesystemAdapterError> {
+        Ok(())
+    }
+    fn write_data(&mut self, _data: &[u8]) -> Result<(), FilesystemAdapterError> { Ok(()) }
+    fn finish_entry(&mut self) -> Result<FilesystemEntryReport, FilesystemAdapterError> {
+        Ok(FilesystemEntryReport::new(FilesystemMaterialization::Failed, Vec::new()))
+    }
+    fn abort_entry(&mut self) {}
+    fn finish_session(&mut self) -> Result<Vec<FilesystemFinding>, FilesystemAdapterError> {
+        Ok(Vec::new())
+    }
+}
+
 fn main() {
+    let _filesystem = ExternalFilesystem;
     let _engine = ArchiveEngine::new()
         .with_format_provider(ExternalFormat)
         .with_codec_provider(ExternalCodec);
