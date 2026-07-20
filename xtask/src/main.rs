@@ -329,6 +329,12 @@ fn check_codec_policy(root: &Path) -> Result {
             &["zstd", "zstd-safe", "zstd-sys"][..],
         ),
         (
+            "xz",
+            ["xz", "xz,async,tokio"],
+            "lzma-rust2",
+            &["xz2", "lzma-sys"][..],
+        ),
+        (
             "lz4",
             ["lz4", "lz4,async,tokio"],
             "lz4_flex",
@@ -381,7 +387,7 @@ fn check_codec_policy(root: &Path) -> Result {
         }
     }
     println!(
-        "sync and async bzip2/zstd/LZ4 dependency graphs select their Rust backends and exclude native codec packages"
+        "sync and async bzip2/zstd/xz/LZ4 dependency graphs select their Rust backends and exclude native codec packages"
     );
     Ok(())
 }

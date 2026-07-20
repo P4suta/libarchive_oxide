@@ -285,7 +285,8 @@ fn async_reader_composes_four_nested_filters() {
                         error
                             .archive_error()
                             .map(libarchive_oxide_core::ArchiveError::kind),
-                        Some(libarchive_oxide_core::ErrorKind::Limit)
+                        Some(libarchive_oxide_core::ErrorKind::Limit),
+                        "{error:?}"
                     );
                     break;
                 },
@@ -314,7 +315,7 @@ fn async_xz_dictionary_limit_prevents_oversized_allocation() {
         };
         assert_eq!(
             error.io_error().map(std::io::Error::kind),
-            Some(std::io::ErrorKind::InvalidData)
+            Some(std::io::ErrorKind::OutOfMemory)
         );
     });
 }

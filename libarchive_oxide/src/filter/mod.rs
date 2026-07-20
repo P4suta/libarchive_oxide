@@ -7,6 +7,8 @@
 pub mod gzip;
 #[cfg(feature = "lz4")]
 pub(crate) mod lz4;
+#[cfg(feature = "xz")]
+pub(crate) mod xz;
 #[cfg(feature = "zstd")]
 pub(crate) mod zstd;
 

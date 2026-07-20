@@ -30,14 +30,14 @@ targets for the Modern Archive Profile.
 | gzip/DEFLATE | yes | yes | Rust |
 | bzip2 | yes | yes | Rust `libbz2-rs-sys`; native `bzip2-sys` rejected by CI |
 | zstd | yes | yes | Pure-Rust `ruzstd`; native zstd packages rejected by CI |
-| xz/LZMA2 | yes | yes | Rust sync path; async all-features may use native code |
+| xz/LZMA2 | yes | yes | Pure-Rust `lzma-rust2`; native liblzma packages rejected by CI |
 | LZ4 frame | yes | yes | Pure-Rust `lz4_flex`; native LZ4 packages rejected by CI |
 
-The sync and async/Tokio bzip2, zstd, and LZ4 profiles have dependency-graph
-gates. The future complete `portable-codecs` profile must extend those gates
-to xz and reject all C and FFI backends. Until that complete gate exists and
-passes, neither the default profile nor `--all-features` is described as pure
-Rust.
+The sync and async/Tokio bzip2, zstd, xz/LZMA2, and LZ4 profiles have
+dependency-graph gates. The future complete `portable-codecs` profile must
+unify those individual gates and reject all C and FFI backends. Until that
+complete gate exists and passes, neither the default profile nor
+`--all-features` is described as pure Rust.
 
 ## Filesystem restoration
 

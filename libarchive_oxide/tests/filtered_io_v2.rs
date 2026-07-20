@@ -209,6 +209,7 @@ fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
         compress(b"12345", FilterId::Gzip).unwrap(),
         compress(b"12345", FilterId::Bzip2).unwrap(),
         compress(b"12345", FilterId::Zstd).unwrap(),
+        compress(b"12345", FilterId::Xz).unwrap(),
         compress(b"12345", FilterId::Lz4).unwrap(),
     ] {
         let mut reader = FilterReader::with_limits(OneByte::new(bytes), limits).unwrap();
@@ -238,6 +239,10 @@ fn xz_dictionary_limit_prevents_oversized_allocation() {
     ];
     let mut reader = FilterReader::with_limits(Cursor::new(encoded), Limits::default()).unwrap();
     let mut output = [0_u8; 1];
+    assert_eq!(
+        reader.read(&mut output).unwrap_err().kind(),
+        io::ErrorKind::OutOfMemory
+    );
     assert_eq!(
         reader.read(&mut output).unwrap_err().kind(),
         io::ErrorKind::InvalidData

@@ -28,7 +28,7 @@ dependencies use native C backends; see [Codec backends](#codec-backends).
 | gzip/DEFLATE | yes | yes | Rust |
 | bzip2 | yes | yes | Rust `libbz2-rs-sys`; CI rejects native `bzip2-sys` |
 | zstd | yes | yes | Pure-Rust `ruzstd`; native zstd packages rejected by CI |
-| xz/LZMA2 | yes | yes | Rust in sync paths; async all-features may select a native backend |
+| xz/LZMA2 | yes | yes | Pure-Rust `lzma-rust2`; native liblzma packages rejected by CI |
 | LZ4 frame | yes | yes | Pure-Rust `lz4_flex`; native LZ4 packages rejected by CI |
 
 The [detailed support matrix](docs/support-matrix.md) distinguishes archive
@@ -133,10 +133,10 @@ configured number of gzip, bzip2, zstd, xz, and lz4 layers.
 ## Codec backends
 
 `libarchive_oxide-core` is zero-dependency `no_std + alloc` safe Rust, and all
-project-owned crates use `#![forbid(unsafe_code)]`. The current default codec
-feature set is not yet a C/FFI-free dependency graph: the async xz path still
-selects a native backend. The `zstd` and `lz4` features are C/FFI-free in sync,
-Pipeline, futures-io, and Tokio configurations.
+project-owned crates use `#![forbid(unsafe_code)]`. The bzip2, zstd, xz/LZMA2,
+and LZ4 features are dependency-gated to Rust backends in sync, Pipeline,
+futures-io, and Tokio configurations. The complete default graph is not yet
+advertised as C/FFI-free until the `portable-codecs` profile gate lands.
 The roadmap separates a dependency-verified `portable-codecs` profile from an
 explicit `native-codecs` performance profile. Until that work lands, do not
 interpret “safe Rust” as “no native transitive dependencies.”

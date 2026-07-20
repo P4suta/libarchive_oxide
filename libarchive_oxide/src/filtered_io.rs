@@ -876,6 +876,72 @@ impl<W: Write> Write for ZstdFrameWrite<W> {
     }
 }
 
+#[cfg(feature = "xz")]
+pub(crate) struct XzFrameWrite<W: Write> {
+    output: W,
+    input: Vec<u8>,
+    wrote_frame: bool,
+}
+
+#[cfg(feature = "xz")]
+impl<W: Write> XzFrameWrite<W> {
+    pub(crate) fn new(output: W) -> Self {
+        Self {
+            output,
+            input: Vec::with_capacity(BUFFER),
+            wrote_frame: false,
+        }
+    }
+
+    fn emit_frame(&mut self) -> io::Result<()> {
+        let encoded = crate::filter::xz::encode_frame(&self.input)?;
+        self.output.write_all(&encoded)?;
+        self.input.clear();
+        self.wrote_frame = true;
+        Ok(())
+    }
+
+    fn finish_output(mut self) -> io::Result<()> {
+        if !self.input.is_empty() || !self.wrote_frame {
+            self.emit_frame()?;
+        }
+        self.output.flush()
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        if !self.input.is_empty() || !self.wrote_frame {
+            self.emit_frame()?;
+        }
+        self.output.flush()?;
+        Ok(self.output)
+    }
+}
+
+#[cfg(feature = "xz")]
+impl<W: Write> Write for XzFrameWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.input.len() == BUFFER {
+            self.emit_frame()?;
+        }
+        let consumed = (BUFFER - self.input.len()).min(bytes.len());
+        self.input.extend_from_slice(&bytes[..consumed]);
+        if self.input.len() == BUFFER {
+            self.emit_frame()?;
+        }
+        Ok(consumed)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.input.is_empty() {
+            self.emit_frame()?;
+        }
+        self.output.flush()
+    }
+}
+
 #[cfg(feature = "lz4")]
 pub(crate) struct Lz4FrameWrite<W: Write> {
     output: W,
@@ -961,7 +1027,7 @@ pub(crate) enum SyncFilterWriter<W: Write> {
     },
     #[cfg(feature = "xz")]
     Xz {
-        writer: Box<lzma_rust2::XzWriter<SharedOutput<W>>>,
+        writer: Box<XzFrameWrite<SharedOutput<W>>>,
         output: SharedOutput<W>,
     },
     #[cfg(feature = "lz4")]
@@ -1002,20 +1068,10 @@ impl<W: Write> SyncFilterWriter<W> {
                 output: shared,
             }),
             #[cfg(feature = "xz")]
-            Some(FilterId::Xz) => {
-                let writer = lzma_rust2::XzWriter::new(
-                    shared.clone(),
-                    lzma_rust2::XzOptions::with_preset(6),
-                )
-                .map_err(|_| {
-                    ArchiveError::new(ErrorKind::Capability)
-                        .with_context("failed to initialize incremental XZ encoder")
-                })?;
-                Ok(Self::Xz {
-                    writer: Box::new(writer),
-                    output: shared,
-                })
-            },
+            Some(FilterId::Xz) => Ok(Self::Xz {
+                writer: Box::new(XzFrameWrite::new(shared.clone())),
+                output: shared,
+            }),
             #[cfg(feature = "lz4")]
             Some(FilterId::Lz4) => Ok(Self::Lz4 {
                 writer: Box::new(Lz4FrameWrite::new(shared.clone())),
@@ -1048,7 +1104,7 @@ impl<W: Write> SyncFilterWriter<W> {
             },
             #[cfg(feature = "xz")]
             Self::Xz { writer, output } => {
-                drop((*writer).finish()?);
+                (*writer).finish_output()?;
                 output.take()
             },
             #[cfg(feature = "lz4")]

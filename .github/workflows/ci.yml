@@ -190,7 +190,7 @@ jobs:
         run: just package-licenses
       - name: compile packaged crates from an external consumer
         run: just package-smoke
-      - name: verify bzip2, zstd and LZ4 use Rust backends
+      - name: verify bzip2, zstd, xz and LZ4 use Rust backends
         run: just codec-policy
       - name: verify manual draft-first release policy
         run: just release-policy

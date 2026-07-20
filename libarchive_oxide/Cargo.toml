@@ -35,12 +35,7 @@ bzip2 = [
     "async-compression?/bzip2",
 ]
 zstd = ["dep:ruzstd"]
-xz = [
-    "dep:lzma-rust2",
-    "dep:compression-codecs",
-    "compression-codecs/xz",
-    "async-compression?/xz",
-]
+xz = ["dep:lzma-rust2"]
 lz4 = ["dep:lz4_flex", "dep:twox-hash"]
 # WinZip AES-256 AE-2.
 aes = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1", "dep:pbkdf2", "dep:subtle", "dep:getrandom"]
@@ -66,7 +61,7 @@ twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash32
 compression-codecs = { version = "0.4.38", default-features = false, optional = true }
 bzip2 = { version = "0.6.1", optional = true }
 # Shared by xz and 7z.
-lzma-rust2 = { version = "0.16.5", optional = true }
+lzma-rust2 = { version = "0.16.5", default-features = false, features = ["std", "encoder", "xz"], optional = true }
 # WinZip AE-2 requires SHA-1.
 aes = { version = "0.9", optional = true }
 ctr = { version = "0.10", optional = true }
@@ -98,6 +93,8 @@ lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] 
 # Independent liblz4 consumer used only to validate our Pure-Rust writer output.
 lz4-codec = { package = "lz4", version = "1.28.1" }
 lzma-rust2 = "0.16.5"
+# Independent liblzma producer/consumer used only for XZ interoperability tests.
+xz-codec = { package = "xz2", version = "0.1.7" }
 ruzstd = "0.8.2"
 zstd-codec = { package = "zstd", version = "0.13.3" }
 sevenz-rust2 = "0.21.3"
