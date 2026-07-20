@@ -10,8 +10,8 @@ Safe-Rust archive detection, compression, extraction, and creation over
 
 The crate supports tar, cpio, ar, ZIP/ZIP64, optional single-folder 7z, and
 ISO 9660 with format-specific limits. Outer filters are gzip, bzip2, zstd, xz,
-and LZ4 frame. The crate forbids unsafe code; bzip2, zstd, xz/LZMA2, and LZ4
-are dependency-gated to Rust backends across sync and async adapters. See the repository's
+and LZ4 frame. The crate forbids unsafe code; its default `portable-codecs`
+profile is dependency-gated to C/FFI-free backends across sync and async adapters. See the repository's
 [support matrix](https://github.com/P4suta/libarchive_oxide/blob/main/docs/support-matrix.md)
 for method- and metadata-level details.
 
@@ -66,11 +66,13 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 
 | Feature | Default | Effect |
 |---|:---:|---|
-| `gzip` | yes | gzip |
-| `bzip2` | yes | bzip2 through the Rust `libbz2-rs-sys` backend |
-| `zstd` | yes | zstd through the Pure-Rust `ruzstd` backend |
-| `xz` | yes | xz / LZMA2 |
-| `lz4` | yes | LZ4 frame through the Pure-Rust `lz4_flex` backend |
+| `portable-codecs` | yes | all five outer codecs through C/FFI-free backends |
+| `native-codecs` | no | all five through native libraries; use with `--no-default-features` |
+| `gzip` | via profile | gzip; portable when selected alone |
+| `bzip2` | via profile | bzip2; portable when selected alone |
+| `zstd` | via profile | zstd; portable when selected alone |
+| `xz` | via profile | xz / LZMA2; portable when selected alone |
+| `lz4` | via profile | LZ4 frame; portable when selected alone |
 | `aes` | no | WinZip AES-256 AE-2 |
 | `sevenz` | no | 7z read/write |
 | `async` | no | runtime-neutral `futures-io` adapters |
@@ -78,10 +80,10 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 
 `--no-default-features` retains uncompressed formats and zip store mode.
 
-The sync-only and async/Tokio bzip2, zstd, xz/LZMA2, and LZ4 dependency graphs
-are CI-checked to require their Rust backends and exclude native codec packages.
-The complete default feature graph is not advertised as C/FFI-free until the
-dependency-verified portable profile lands.
+The default portable graph is CI-checked to require Rust backends and exclude
+codec C/FFI packages. The native profile is separately checked to select libz,
+libbz2, libzstd, liblzma, and liblz4. Both markers together intentionally fail
+compilation; maximal CI runs them as separate profiles.
 
 Sequential, seek, futures-io, and Tokio adapters all drive the same archive
 state machines. Seek variants are named `SeekArchive*`, `AsyncSeekArchive*`,

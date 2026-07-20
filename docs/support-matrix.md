@@ -27,17 +27,17 @@ targets for the Modern Archive Profile.
 
 | Filter | Decode | Encode | Dependency profile today |
 |---|:---:|:---:|---|
-| gzip/DEFLATE | yes | yes | Rust |
-| bzip2 | yes | yes | Rust `libbz2-rs-sys`; native `bzip2-sys` rejected by CI |
-| zstd | yes | yes | Pure-Rust `ruzstd`; native zstd packages rejected by CI |
-| xz/LZMA2 | yes | yes | Pure-Rust `lzma-rust2`; native liblzma packages rejected by CI |
-| LZ4 frame | yes | yes | Pure-Rust `lz4_flex`; native LZ4 packages rejected by CI |
+| gzip/DEFLATE | yes | yes | portable `miniz_oxide`; native libz |
+| bzip2 | yes | yes | portable `libbz2-rs-sys`; native libbz2 |
+| zstd | yes | yes | portable `ruzstd`; native libzstd |
+| xz/LZMA2 | yes | yes | portable `lzma-rust2`; native liblzma |
+| LZ4 frame | yes | yes | portable `lz4_flex`; native liblz4 |
 
-The sync and async/Tokio bzip2, zstd, xz/LZMA2, and LZ4 profiles have
-dependency-graph gates. The future complete `portable-codecs` profile must
-unify those individual gates and reject all C and FFI backends. Until that
-complete gate exists and passes, neither the default profile nor
-`--all-features` is described as pure Rust.
+`portable-codecs` is the dependency-verified default. `native-codecs` is an
+explicit `--no-default-features` profile, and selecting both fails compilation.
+Profile-less individual codec features remain portable. Sync, Pipeline,
+futures-io, Tokio, create, and CLI paths share the same conformance and
+malformed corpus; see [codec profile evidence](codec-profiles.md).
 
 ## Filesystem restoration
 

@@ -9,11 +9,13 @@ use std::fmt;
 use std::io::{self, BufReader, Read, Write};
 use std::rc::Rc;
 
+#[cfg(not(feature = "native-codecs"))]
+use libarchive_oxide_core::Codec;
 use libarchive_oxide_core::filter::FilterId;
-use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, EndOfInput, ErrorKind, Limits};
+use libarchive_oxide_core::{ArchiveError, CodecStatus, EndOfInput, ErrorKind, Limits};
 
-use crate::filter::gzip::{GzipDecoder, GzipEncoder};
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+#[cfg(not(feature = "native-codecs"))]
+use crate::filter::gzip::GzipEncoder;
 use crate::pipeline_codec::PipelineCodec;
 
 const BUFFER: usize = 64 * 1024;
@@ -73,7 +75,7 @@ impl<R: Read> FilterReader<R> {
         let available = &prefix[..prefix_len];
         if available.starts_with(&[0x1f, 0x8b]) {
             return Ok(Self {
-                inner: FilterReaderInner::Gzip(Box::new(GzipRead::new(input, limits))),
+                inner: FilterReaderInner::Gzip(Box::new(GzipRead::new(input, limits)?)),
                 decoded: 0,
                 decoded_limit: limits.decoded_total(),
             });
@@ -575,7 +577,7 @@ impl<R: Read> fmt::Debug for FilterReader<R> {
 
 struct GzipRead<R> {
     input: R,
-    decoder: GzipDecoder,
+    decoder: PipelineCodec,
     buffer: Vec<u8>,
     start: usize,
     end: usize,
@@ -586,10 +588,10 @@ struct GzipRead<R> {
 }
 
 impl<R: Read> GzipRead<R> {
-    fn new(input: R, limits: Limits) -> Self {
-        Self {
+    fn new(input: R, limits: Limits) -> io::Result<Self> {
+        Ok(Self {
             input,
-            decoder: GzipDecoder::new(limits),
+            decoder: PipelineCodec::new(FilterId::Gzip, limits).map_err(codec_archive_io)?,
             buffer: vec![0; BUFFER],
             start: 0,
             end: 0,
@@ -597,7 +599,7 @@ impl<R: Read> GzipRead<R> {
             between_members: false,
             done: false,
             limits,
-        }
+        })
     }
 
     fn fill(&mut self) -> io::Result<()> {
@@ -650,7 +652,8 @@ impl<R: Read> Read for GzipRead<R> {
                         "trailing data after gzip member",
                     ));
                 }
-                self.decoder = GzipDecoder::new(self.limits);
+                self.decoder =
+                    PipelineCodec::new(FilterId::Gzip, self.limits).map_err(codec_archive_io)?;
                 self.between_members = false;
             }
             if self.start == self.end && !self.eof {
@@ -697,7 +700,6 @@ fn archive_io(error: ArchiveError) -> io::Error {
     io::Error::new(kind, error)
 }
 
-#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 fn codec_archive_io(error: ArchiveError) -> io::Error {
     let kind = match error.kind() {
         ErrorKind::Limit => io::ErrorKind::OutOfMemory,
@@ -746,14 +748,20 @@ impl<W: Write> Write for SharedOutput<W> {
     }
 }
 
-pub(crate) struct GzipFilterWrite<W> {
+pub(crate) struct GzipFilterWrite<W: Write> {
+    #[cfg(not(feature = "native-codecs"))]
     output: W,
+    #[cfg(not(feature = "native-codecs"))]
     encoder: GzipEncoder,
+    #[cfg(not(feature = "native-codecs"))]
     buffer: Vec<u8>,
+    #[cfg(feature = "native-codecs")]
+    encoder: flate2::write::GzEncoder<W>,
 }
 
+#[cfg(not(feature = "native-codecs"))]
 impl<W: Write> GzipFilterWrite<W> {
-    fn new(output: W, limits: Limits) -> Self {
+    pub(crate) fn new(output: W, limits: Limits) -> Self {
         Self {
             output,
             encoder: GzipEncoder::new(limits),
@@ -761,7 +769,7 @@ impl<W: Write> GzipFilterWrite<W> {
         }
     }
 
-    fn finish(mut self) -> io::Result<W> {
+    pub(crate) fn finish(mut self) -> io::Result<W> {
         loop {
             let step = self
                 .encoder
@@ -782,6 +790,20 @@ impl<W: Write> GzipFilterWrite<W> {
     }
 }
 
+#[cfg(feature = "native-codecs")]
+impl<W: Write> GzipFilterWrite<W> {
+    pub(crate) fn new(output: W, _limits: Limits) -> Self {
+        Self {
+            encoder: flate2::write::GzEncoder::new(output, flate2::Compression::default()),
+        }
+    }
+
+    pub(crate) fn finish(self) -> io::Result<W> {
+        self.encoder.finish()
+    }
+}
+
+#[cfg(not(feature = "native-codecs"))]
 impl<W: Write> Write for GzipFilterWrite<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.is_empty() {
@@ -810,6 +832,38 @@ impl<W: Write> Write for GzipFilterWrite<W> {
     }
 }
 
+#[cfg(feature = "native-codecs")]
+impl<W: Write> Write for GzipFilterWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.encoder.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.encoder.flush()
+    }
+}
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
+pub(crate) fn encode_profile_frame(filter: FilterId, input: &[u8]) -> io::Result<Vec<u8>> {
+    #[cfg(feature = "native-codecs")]
+    {
+        crate::backend_codec::encode_frame(filter, input)
+    }
+    #[cfg(not(feature = "native-codecs"))]
+    {
+        match filter {
+            #[cfg(feature = "zstd")]
+            FilterId::Zstd => Ok(crate::filter::zstd::encode_frame(input)),
+            #[cfg(feature = "xz")]
+            FilterId::Xz => crate::filter::xz::encode_frame(input),
+            #[cfg(feature = "lz4")]
+            FilterId::Lz4 => crate::filter::lz4::encode_frame(input),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filter has no frame encoder in the selected codec profile",
+            )),
+        }
+    }
+}
 #[cfg(feature = "zstd")]
 pub(crate) struct ZstdFrameWrite<W: Write> {
     output: W,
@@ -828,7 +882,7 @@ impl<W: Write> ZstdFrameWrite<W> {
     }
 
     fn emit_frame(&mut self) -> io::Result<()> {
-        let encoded = crate::filter::zstd::encode_frame(&self.input);
+        let encoded = encode_profile_frame(FilterId::Zstd, &self.input)?;
         self.output.write_all(&encoded)?;
         self.input.clear();
         self.wrote_frame = true;
@@ -894,7 +948,7 @@ impl<W: Write> XzFrameWrite<W> {
     }
 
     fn emit_frame(&mut self) -> io::Result<()> {
-        let encoded = crate::filter::xz::encode_frame(&self.input)?;
+        let encoded = encode_profile_frame(FilterId::Xz, &self.input)?;
         self.output.write_all(&encoded)?;
         self.input.clear();
         self.wrote_frame = true;
@@ -960,7 +1014,7 @@ impl<W: Write> Lz4FrameWrite<W> {
     }
 
     fn emit_frame(&mut self) -> io::Result<()> {
-        let encoded = crate::filter::lz4::encode_frame(&self.input)?;
+        let encoded = encode_profile_frame(FilterId::Lz4, &self.input)?;
         self.output.write_all(&encoded)?;
         self.input.clear();
         self.wrote_frame = true;

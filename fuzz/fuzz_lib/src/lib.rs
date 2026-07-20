@@ -355,6 +355,7 @@ fn gzip_decode(data: &[u8]) -> Option<Vec<u8>> {
 
 /// gzip codec protocol and round-trip target.
 pub fn codec_gzip(data: &[u8]) {
+    filtered_decode_no_panic(data);
     codec_decode_no_panic(GzipDecoder::new(fuzz_limits()), data);
     let plain: Vec<u8> = data.iter().copied().take(CODEC_ROUNDTRIP_MAX).collect();
     if let Some(encoded) = gzip_encode(&plain) {
@@ -367,6 +368,11 @@ fn filtered_decode_no_panic(data: &[u8]) {
         return;
     };
     let _ = read_capped(reader, CODEC_CAP);
+}
+
+/// bzip2 incremental filter target.
+pub fn codec_bzip2(data: &[u8]) {
+    filtered_decode_no_panic(data);
 }
 
 /// zstd incremental filter target.
@@ -433,6 +439,7 @@ pub const TARGETS: &[&str] = &[
     "roundtrip_7z",
     "roundtrip_iso",
     "codec_gzip",
+    "codec_bzip2",
     "codec_zstd",
     "codec_xz",
     "codec_lz4",
@@ -454,6 +461,7 @@ pub fn run_target(name: &str, data: &[u8]) {
         "roundtrip_7z" => roundtrip_7z(&entries_from_bytes(data)),
         "roundtrip_iso" => roundtrip_iso(&entries_from_bytes(data)),
         "codec_gzip" => codec_gzip(data),
+        "codec_bzip2" => codec_bzip2(data),
         "codec_zstd" => codec_zstd(data),
         "codec_xz" => codec_xz(data),
         "codec_lz4" => codec_lz4(data),

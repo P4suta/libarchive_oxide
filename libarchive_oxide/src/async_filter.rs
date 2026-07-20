@@ -634,20 +634,7 @@ impl<W> AsyncFrameEncoder<W> {
 
     fn encode_frame(&mut self) -> io::Result<()> {
         debug_assert_eq!(self.pending_position, self.pending.len());
-        self.pending = match self.filter {
-            #[cfg(feature = "zstd")]
-            FilterId::Zstd => crate::filter::zstd::encode_frame(&self.input),
-            #[cfg(feature = "xz")]
-            FilterId::Xz => crate::filter::xz::encode_frame(&self.input)?,
-            #[cfg(feature = "lz4")]
-            FilterId::Lz4 => crate::filter::lz4::encode_frame(&self.input)?,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "filter has no portable async frame encoder",
-                ));
-            },
-        };
+        self.pending = crate::filtered_io::encode_profile_frame(self.filter, &self.input)?;
         self.pending_position = 0;
         self.input.clear();
         self.wrote_frame = true;

@@ -7,6 +7,9 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
 export RUSTDOCFLAGS := "-D warnings"
 
+portable_features := "libarchive_oxide/portable-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio,libarchive_oxide-cli/portable-codecs"
+native_features := "libarchive_oxide/native-codecs,libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,libarchive_oxide/tokio,libarchive_oxide-cli/native-codecs"
+
 # List the available development commands.
 default:
     @just --list
@@ -19,17 +22,19 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-# Run Clippy over every target and feature.
+# Run Clippy over both mutually exclusive maximal codec profiles.
 lint:
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --no-default-features --features {{portable_features}} -- -D warnings
+    cargo clippy --workspace --all-targets --no-default-features --features {{native_features}} -- -D warnings
 
-# Run the portable workspace test suite.
+# Run the same workspace suite and committed fuzz corpus through both profiles.
 test:
-    cargo test --workspace --all-features
+    cargo test --workspace --no-default-features --features {{portable_features}}
+    cargo test --workspace --no-default-features --features {{native_features}}
 
-# Build public documentation with warnings denied.
+# Build public documentation for the default portable profile with warnings denied.
 doc:
-    cargo doc --workspace --all-features --no-deps
+    cargo doc --workspace --no-default-features --features {{portable_features}} --no-deps
 
 # Spell-check the repository.
 typos:
@@ -63,7 +68,7 @@ package-licenses:
 package-smoke:
     cargo run --quiet -p xtask -- package-smoke
 
-# Keep the bzip2, zstd, xz, and LZ4 Tier 1 paths on their Rust implementations.
+# Verify portable C/FFI exclusion and explicit native backend selection.
 codec-policy:
     cargo run --quiet -p xtask -- codec-policy
 
@@ -78,7 +83,8 @@ actionlint:
 # Verify the declared core and std MSRVs.
 msrv:
     cargo msrv verify --path libarchive_oxide-core
-    cargo msrv verify --path libarchive_oxide --all-features
+    cargo msrv verify --path libarchive_oxide --no-default-features --features portable-codecs,aes,sevenz,async,tokio
+    cargo msrv verify --path libarchive_oxide --no-default-features --features native-codecs,aes,sevenz,async,tokio
 
 # Fast deterministic checks used during the edit/commit loop.
 check: fmt-check typos lint no-dyn reuse license-sync codec-policy release-policy

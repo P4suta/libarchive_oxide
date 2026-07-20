@@ -9,8 +9,8 @@ Safe-Rust archive reading, writing, compression, and extraction.
 
 This project is independent of the upstream
 [libarchive](https://www.libarchive.org/) project. It is not a binding.
-Project-owned crates forbid unsafe code. Some currently enabled codec
-dependencies use native C backends; see [Codec backends](#codec-backends).
+Project-owned crates forbid unsafe code. The default codec profile is C/FFI-free;
+an explicit native performance profile is also available. See [Codec backends](#codec-backends).
 
 ## Support
 
@@ -25,11 +25,11 @@ dependencies use native C backends; see [Codec backends](#codec-backends).
 
 | Outer compression | Decode | Encode | Current backend note |
 |---|:---:|:---:|---|
-| gzip/DEFLATE | yes | yes | Rust |
-| bzip2 | yes | yes | Rust `libbz2-rs-sys`; CI rejects native `bzip2-sys` |
-| zstd | yes | yes | Pure-Rust `ruzstd`; native zstd packages rejected by CI |
-| xz/LZMA2 | yes | yes | Pure-Rust `lzma-rust2`; native liblzma packages rejected by CI |
-| LZ4 frame | yes | yes | Pure-Rust `lz4_flex`; native LZ4 packages rejected by CI |
+| gzip/DEFLATE | yes | yes | portable `miniz_oxide`; native libz |
+| bzip2 | yes | yes | portable `libbz2-rs-sys`; native libbz2 |
+| zstd | yes | yes | portable `ruzstd`; native libzstd |
+| xz/LZMA2 | yes | yes | portable `lzma-rust2`; native liblzma |
+| LZ4 frame | yes | yes | portable `lz4_flex`; native liblz4 |
 
 The [detailed support matrix](docs/support-matrix.md) distinguishes archive
 dialects, compression methods, encryption, metadata, and unsupported cases.
@@ -113,11 +113,13 @@ fn list(input: impl Read) -> Result<(), Box<dyn std::error::Error>> {
 
 | Feature | Default | Enables |
 |---|:---:|---|
-| `gzip` | yes | gzip |
-| `bzip2` | yes | bzip2 through the Rust backend |
-| `zstd` | yes | zstd through the Pure-Rust `ruzstd` backend |
-| `xz` | yes | xz |
-| `lz4` | yes | lz4 frame |
+| `portable-codecs` | yes | all five outer codecs through C/FFI-free backends |
+| `native-codecs` | no | all five outer codecs through native libraries; requires `--no-default-features` |
+| `gzip` | via profile | gzip; portable when selected alone |
+| `bzip2` | via profile | bzip2; portable when selected alone |
+| `zstd` | via profile | zstd; portable when selected alone |
+| `xz` | via profile | xz; portable when selected alone |
+| `lz4` | via profile | LZ4 frame; portable when selected alone |
 | `aes` | no | WinZip AES-256 AE-2 |
 | `sevenz` | no | 7z |
 | `async` | no | runtime-neutral futures-io adapters |
@@ -133,13 +135,13 @@ configured number of gzip, bzip2, zstd, xz, and lz4 layers.
 ## Codec backends
 
 `libarchive_oxide-core` is zero-dependency `no_std + alloc` safe Rust, and all
-project-owned crates use `#![forbid(unsafe_code)]`. The bzip2, zstd, xz/LZMA2,
-and LZ4 features are dependency-gated to Rust backends in sync, Pipeline,
-futures-io, and Tokio configurations. The complete default graph is not yet
-advertised as C/FFI-free until the `portable-codecs` profile gate lands.
-The roadmap separates a dependency-verified `portable-codecs` profile from an
-explicit `native-codecs` performance profile. Until that work lands, do not
-interpret “safe Rust” as “no native transitive dependencies.”
+project-owned crates use `#![forbid(unsafe_code)]`. `portable-codecs` is the
+default and its normal/build graph rejects codec C/FFI packages. Select the
+native performance profile explicitly with
+`--no-default-features --features native-codecs`. The two profile markers are
+mutually exclusive; individual codec features without a marker remain portable
+for compatibility. Both profiles drive the same bounded state-machine contract
+and corpus. See the [profile evidence](docs/codec-profiles.md).
 
 ## Requirements
 

@@ -7,6 +7,9 @@ Command-line tools for `libarchive_oxide`.
 
 ```sh
 cargo install libarchive_oxide-cli --locked
+
+# Explicit native codec profile
+cargo install libarchive_oxide-cli --locked --no-default-features --features native-codecs
 ```
 
 | Tool | Compatible interface | Function |

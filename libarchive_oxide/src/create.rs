@@ -12,11 +12,10 @@ use std::path::Path;
 
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
-    ArchiveError, ArchivePath, Codec, CodecStatus, EndOfInput, EntryKind, EntryMetadata,
-    EntryTimes, ErrorKind, FormatId, Limits, Owner, PathEncoding, Timestamp,
+    ArchiveError, ArchivePath, EntryKind, EntryMetadata, EntryTimes, ErrorKind, FormatId, Limits,
+    Owner, PathEncoding, Timestamp,
 };
 
-use crate::filter::gzip::GzipEncoder;
 use crate::{ArchiveWriter, StreamError};
 
 const COPY_BUFFER: usize = 64 * 1024;
@@ -72,7 +71,7 @@ impl From<ArchiveError> for CreateStreamError {
 
 enum FilteredOutput<W: Write> {
     Plain(W),
-    Gzip(Box<GzipWrite<W>>),
+    Gzip(Box<crate::filtered_io::GzipFilterWrite<W>>),
     #[cfg(feature = "bzip2")]
     Bzip2(Box<bzip2::write::BzEncoder<W>>),
     #[cfg(feature = "zstd")]
@@ -87,7 +86,9 @@ impl<W: Write> FilteredOutput<W> {
     fn new(output: W, filter: Option<FilterId>, limits: Limits) -> Result<Self, CreateStreamError> {
         match filter {
             None => Ok(Self::Plain(output)),
-            Some(FilterId::Gzip) => Ok(Self::Gzip(Box::new(GzipWrite::new(output, limits)))),
+            Some(FilterId::Gzip) => Ok(Self::Gzip(Box::new(
+                crate::filtered_io::GzipFilterWrite::new(output, limits),
+            ))),
             #[cfg(feature = "bzip2")]
             Some(FilterId::Bzip2) => Ok(Self::Bzip2(Box::new(bzip2::write::BzEncoder::new(
                 output,
@@ -157,67 +158,6 @@ impl<W: Write> Write for FilteredOutput<W> {
             #[cfg(feature = "lz4")]
             Self::Lz4(output) => output.flush(),
         }
-    }
-}
-
-struct GzipWrite<W> {
-    output: W,
-    codec: GzipEncoder,
-    buffer: Vec<u8>,
-}
-
-impl<W: Write> GzipWrite<W> {
-    fn new(output: W, limits: Limits) -> Self {
-        Self {
-            output,
-            codec: GzipEncoder::new(limits),
-            buffer: vec![0; COPY_BUFFER],
-        }
-    }
-
-    fn finish(mut self) -> io::Result<W> {
-        loop {
-            let step = self
-                .codec
-                .process(&[], &mut self.buffer, EndOfInput::End)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            self.output.write_all(&self.buffer[..step.produced])?;
-            if matches!(step.status, CodecStatus::Done) {
-                self.output.flush()?;
-                return Ok(self.output);
-            }
-            if step.produced == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "gzip encoder made no finish progress",
-                ));
-            }
-        }
-    }
-}
-
-impl<W: Write> Write for GzipWrite<W> {
-    fn write(&mut self, mut input: &[u8]) -> io::Result<usize> {
-        let original = input.len();
-        while !input.is_empty() {
-            let step = self
-                .codec
-                .process(input, &mut self.buffer, EndOfInput::More)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            self.output.write_all(&self.buffer[..step.produced])?;
-            input = &input[step.consumed..];
-            if step.consumed == 0 && step.produced == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "gzip encoder made no write progress",
-                ));
-            }
-        }
-        Ok(original)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.output.flush()
     }
 }
 
