@@ -90,8 +90,9 @@ release-policy:
 fuzz-ci:
     cargo run --quiet -p xtask -- fuzz-ci
 
-# Run the optimized s390x test selection through cross/qemu.
+# Compile and run the bounded s390x test selection through cross/qemu.
 big-endian-ci:
+    cargo run --quiet -p xtask -- big-endian-ci-compile
     cargo run --quiet -p xtask -- big-endian-ci
 
 # Validate GitHub Actions workflows.

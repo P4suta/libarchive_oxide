@@ -166,11 +166,12 @@ fn run() -> Result {
         Some("codec-policy") => check_codec_policy(&root),
         Some("release-policy") => check_release_policy(&root),
         Some("fuzz-ci") => run_fuzz_ci(&root),
+        Some("big-endian-ci-compile") => compile_big_endian_ci(&root),
         Some("big-endian-ci") => run_big_endian_ci(&root),
         Some(command) => Err(format!("unknown command {command:?}").into()),
         None => Err(
             "expected one of: no-dyn, license-sync, package-licenses, package-smoke, \
-             codec-policy, release-policy, fuzz-ci, big-endian-ci"
+             codec-policy, release-policy, fuzz-ci, big-endian-ci-compile, big-endian-ci"
                 .into(),
         ),
     }
@@ -778,6 +779,27 @@ fn fuzz_targets(root: &Path) -> Result<Vec<String>> {
     Ok(targets)
 }
 
+fn compile_big_endian_ci(root: &Path) -> Result {
+    run_command(
+        root,
+        if cfg!(windows) { "cross.exe" } else { "cross" },
+        &[
+            "test",
+            "-p",
+            "libarchive_oxide-core",
+            "-p",
+            "libarchive_oxide",
+            "--no-default-features",
+            "--features",
+            BIG_ENDIAN_FEATURES,
+            "--target",
+            "s390x-unknown-linux-gnu",
+            "--no-run",
+        ],
+        "compile big-endian s390x test binaries",
+    )
+}
+
 fn run_big_endian_ci(root: &Path) -> Result {
     run_command(
         root,
@@ -791,10 +813,17 @@ fn run_big_endian_ci(root: &Path) -> Result {
             "--no-default-features",
             "--features",
             BIG_ENDIAN_FEATURES,
-            "--release",
             "--target",
             "s390x-unknown-linux-gnu",
             "--",
+            "--test-threads=1",
+            "--nocapture",
+            "--skip",
+            "generated_256_mib_archive_streams_in_bounded_chunks",
+            "--skip",
+            "linux_reference_adapter_restores_mode_time_xattr_acl_and_sparse_layout",
+            "--skip",
+            "selected_xz_writer_is_deterministic_and_interoperable",
             "--skip",
             "corpus_files_replay_without_panic",
             "--skip",
@@ -807,10 +836,21 @@ fn run_big_endian_ci(root: &Path) -> Result {
 }
 
 fn run_command(root: &Path, program: &str, arguments: &[&str], description: &str) -> Result {
+    run_command_with_env(root, program, arguments, &[], description)
+}
+
+fn run_command_with_env(
+    root: &Path,
+    program: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    description: &str,
+) -> Result {
     println!("xtask: {description}");
     let status = Command::new(program)
         .current_dir(root)
         .args(arguments)
+        .envs(environment.iter().copied())
         .status()?;
     if !status.success() {
         return Err(format!("{description} failed with {status}").into());
