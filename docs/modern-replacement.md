@@ -56,6 +56,10 @@ The [support matrix](support-matrix.md) is authoritative for what works now.
   a unified `oxarchive` CLI, portable/native codec profiles, bzip2, and
   comparable benchmarks.
 
+Provider registration in this campaign is implemented as associated-type static
+chains shared by Pipeline, reader, engine/session, and create; see
+[ADR-0006](adr/0006-compile-time-providers.md).
+
 ### Campaign 2: OCI and packages
 
 - Build an OCI layer engine for tar, tar+gzip, and tar+zstd without registry

@@ -24,10 +24,15 @@ use sha2::{Digest, Sha256};
 
 use crate::extractor::{ExtractionPolicy, ExtractionReport, RejectionReason};
 use crate::path::sanitize_archive_path;
+use crate::provider::{
+    BuiltinCodecProviders, BuiltinFormatProviders, CodecProvider, CodecProviderNode,
+    FormatProvider, FormatProviderNode, ProviderCapability, ProviderSet, StaticCodecProviders,
+    StaticFormatProviders,
+};
 use crate::spool::{DEFAULT_MAX_BYTES, DEFAULT_MEMORY_THRESHOLD};
 use crate::{
-    ArchiveReader, ArchiveWriter, Extractor, ReaderEvent, SeekArchiveReader, SeekArchiveWriter,
-    SpoolReader, StreamError,
+    ArchiveReader, ArchiveWriter, Extractor, ProviderArchiveWriter, ReaderEvent, SeekArchiveReader,
+    SeekArchiveWriter, SpoolReader, StreamError,
 };
 
 const FORMAT_PROBE_BYTES: usize = 16 * 2048 + 6;
@@ -61,76 +66,20 @@ impl fmt::Display for InputDigest {
     }
 }
 
-/// Built-in provider availability for the engine's current feature set.
-///
-/// External provider registration is intentionally separate from this first
-/// high-level engine slice. This type gives callers one capability query
-/// surface without exposing the private built-in dispatch enums.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProviderSet {
-    builtins: bool,
-}
-
-impl ProviderSet {
-    /// Built-in providers compiled into this crate.
-    #[must_use]
-    pub const fn builtins() -> Self {
-        Self { builtins: true }
-    }
-
-    /// Whether a built-in format provider is compiled in.
-    #[must_use]
-    pub const fn supports_format(self, format: FormatId) -> bool {
-        if !self.builtins {
-            return false;
-        }
-        if matches!(
-            format,
-            FormatId::Tar | FormatId::Cpio | FormatId::Ar | FormatId::Zip | FormatId::Iso9660
-        ) {
-            return true;
-        }
-        matches!(format, FormatId::SevenZip) && cfg!(feature = "sevenz")
-    }
-
-    /// Whether a built-in outer-filter provider is compiled in.
-    #[must_use]
-    pub const fn supports_filter(self, filter: FilterId) -> bool {
-        if !self.builtins {
-            return false;
-        }
-        if matches!(filter, FilterId::Gzip) {
-            return true;
-        }
-        if matches!(filter, FilterId::Bzip2) {
-            return cfg!(feature = "bzip2");
-        }
-        if matches!(filter, FilterId::Zstd) {
-            return cfg!(feature = "zstd");
-        }
-        if matches!(filter, FilterId::Xz) {
-            return cfg!(feature = "xz");
-        }
-        matches!(filter, FilterId::Lz4) && cfg!(feature = "lz4")
-    }
-}
-
-impl Default for ProviderSet {
-    fn default() -> Self {
-        Self::builtins()
-    }
-}
-
 /// High-level archive engine configuration.
 #[derive(Debug, Clone, Copy)]
-pub struct ArchiveEngine {
+pub struct ArchiveEngine<F = BuiltinFormatProviders, C = BuiltinCodecProviders>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
     limits: Limits,
     spool_memory_threshold: usize,
     spool_maximum: u64,
-    providers: ProviderSet,
+    providers: ProviderSet<F, C>,
 }
 
-impl ArchiveEngine {
+impl ArchiveEngine<BuiltinFormatProviders, BuiltinCodecProviders> {
     /// Safe finite defaults with the built-in providers.
     #[must_use]
     pub const fn new() -> Self {
@@ -140,55 +89,6 @@ impl ArchiveEngine {
             spool_maximum: DEFAULT_MAX_BYTES,
             providers: ProviderSet::builtins(),
         }
-    }
-
-    /// Replaces parser, codec, inspection, and extraction budgets.
-    #[must_use]
-    pub const fn with_limits(mut self, limits: Limits) -> Self {
-        self.limits = limits;
-        self
-    }
-
-    /// Replaces the immutable snapshot's memory threshold and total byte cap.
-    #[must_use]
-    pub const fn with_spool_limits(mut self, memory_threshold: usize, maximum: u64) -> Self {
-        self.spool_memory_threshold = memory_threshold;
-        self.spool_maximum = maximum;
-        self
-    }
-
-    /// Resource budgets used for new sessions.
-    #[must_use]
-    pub const fn limits(self) -> Limits {
-        self.limits
-    }
-
-    /// Providers available to new sessions.
-    #[must_use]
-    pub const fn providers(self) -> ProviderSet {
-        self.providers
-    }
-
-    /// Opens an immutable, bounded snapshot session.
-    ///
-    /// The snapshot remains in memory through the configured threshold and
-    /// then moves to an automatically deleted temporary file.
-    pub fn open(self, input: impl Read) -> Result<ArchiveSession, StreamError> {
-        let mut snapshot = SpoolReader::from_reader_with_limits(
-            input,
-            self.spool_memory_threshold,
-            self.spool_maximum,
-        )?;
-        let digest = digest_snapshot(&mut snapshot)?;
-        let reader = SessionReader::open(snapshot, self.limits)?;
-        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-        Ok(ArchiveSession {
-            id,
-            digest,
-            limits: self.limits,
-            reader: Some(reader),
-            applied: false,
-        })
     }
 
     /// Creates a sequential writer from high-level options.
@@ -222,12 +122,111 @@ impl ArchiveEngine {
     }
 }
 
-impl Default for ArchiveEngine {
+impl<F, C> ArchiveEngine<F, C>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    /// Replaces parser, codec, inspection, and extraction budgets.
+    #[must_use]
+    pub const fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Replaces the immutable snapshot's memory threshold and total byte cap.
+    #[must_use]
+    pub const fn with_spool_limits(mut self, memory_threshold: usize, maximum: u64) -> Self {
+        self.spool_memory_threshold = memory_threshold;
+        self.spool_maximum = maximum;
+        self
+    }
+
+    /// Prepends one compile-time format provider to this engine.
+    #[must_use]
+    pub fn with_format_provider<P>(self, provider: P) -> ArchiveEngine<FormatProviderNode<P, F>, C>
+    where
+        P: FormatProvider,
+    {
+        ArchiveEngine {
+            limits: self.limits,
+            spool_memory_threshold: self.spool_memory_threshold,
+            spool_maximum: self.spool_maximum,
+            providers: self.providers.with_format_provider(provider),
+        }
+    }
+
+    /// Prepends one compile-time outer-codec provider to this engine.
+    #[must_use]
+    pub fn with_codec_provider<P>(self, provider: P) -> ArchiveEngine<F, CodecProviderNode<P, C>>
+    where
+        P: CodecProvider,
+    {
+        ArchiveEngine {
+            limits: self.limits,
+            spool_memory_threshold: self.spool_memory_threshold,
+            spool_maximum: self.spool_maximum,
+            providers: self.providers.with_codec_provider(provider),
+        }
+    }
+
+    /// Resource budgets used for new sessions.
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Providers available to new sessions.
+    #[must_use]
+    pub fn providers(self) -> ProviderSet<F, C> {
+        self.providers
+    }
+
+    /// Creates a sequential writer through this engine's registered provider chains.
+    pub fn create_registered<W: Write>(
+        self,
+        output: W,
+        options: CreateOptions,
+    ) -> Result<ProviderArchiveWriter<W, F, C>, StreamError> {
+        let limits = options.limits.unwrap_or(self.limits);
+        ProviderArchiveWriter::with_providers(
+            output,
+            options.format,
+            options.filter,
+            limits,
+            self.providers,
+        )
+        .map_err(StreamError::archive)
+    }
+
+    /// Opens an immutable, bounded snapshot session.
+    ///
+    /// The snapshot remains in memory through the configured threshold and
+    /// then moves to an automatically deleted temporary file.
+    pub fn open(self, input: impl Read) -> Result<ArchiveSession<F, C>, StreamError> {
+        let mut snapshot = SpoolReader::from_reader_with_limits(
+            input,
+            self.spool_memory_threshold,
+            self.spool_maximum,
+        )?;
+        let digest = digest_snapshot(&mut snapshot)?;
+        let reader = SessionReader::open(snapshot, self.limits, self.providers)?;
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(ArchiveSession {
+            id,
+            digest,
+            limits: self.limits,
+            reader: Some(reader),
+            applied: false,
+        })
+    }
+}
+
+impl Default for ArchiveEngine<BuiltinFormatProviders, BuiltinCodecProviders> {
     fn default() -> Self {
         Self::new()
     }
 }
-
 /// High-level archive creation choices.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateOptions {
@@ -498,14 +497,41 @@ impl ApplyReport {
     }
 }
 
-#[derive(Debug)]
-enum SessionReader {
-    Sequential(Box<ArchiveReader<SpoolReader>>),
-    Seek(Box<SeekArchiveReader<SpoolReader>>),
+enum SessionReader<F, C>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    Sequential(Box<ArchiveReader<SpoolReader, F, C>>),
+    Seek {
+        reader: Box<SeekArchiveReader<SpoolReader>>,
+        providers: ProviderSet<F, C>,
+    },
 }
 
-impl SessionReader {
-    fn open(mut snapshot: SpoolReader, limits: Limits) -> Result<Self, StreamError> {
+impl<F, C> fmt::Debug for SessionReader<F, C>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Sequential(_) => "SessionReader::Sequential(..)",
+            Self::Seek { .. } => "SessionReader::Seek(..)",
+        })
+    }
+}
+
+impl<F, C> SessionReader<F, C>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    fn open(
+        mut snapshot: SpoolReader,
+        limits: Limits,
+        providers: ProviderSet<F, C>,
+    ) -> Result<Self, StreamError> {
         let mut prefix = vec![0; FORMAT_PROBE_BYTES];
         let mut read = 0;
         while read < prefix.len() {
@@ -518,17 +544,21 @@ impl SessionReader {
             read += count;
         }
         snapshot.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
-        let seek_native = matches!(
-            FormatId::probe(&prefix[..read]),
-            ProbeResult::Match(FormatId::Zip | FormatId::SevenZip | FormatId::Iso9660)
-        );
+        let seek_native = match FormatId::probe(&prefix[..read]) {
+            ProbeResult::Match(format) => matches!(
+                providers.format_capability(format),
+                ProviderCapability::Available(capability) if capability.requires_seek()
+            ),
+            _ => false,
+        };
         if seek_native {
-            Ok(Self::Seek(Box::new(SeekArchiveReader::with_limits(
-                snapshot, limits,
-            )?)))
+            Ok(Self::Seek {
+                reader: Box::new(SeekArchiveReader::with_limits(snapshot, limits)?),
+                providers,
+            })
         } else {
-            Ok(Self::Sequential(Box::new(ArchiveReader::with_limits(
-                snapshot, limits,
+            Ok(Self::Sequential(Box::new(ArchiveReader::with_providers(
+                snapshot, limits, providers,
             ))))
         }
     }
@@ -536,36 +566,59 @@ impl SessionReader {
     fn next_event(&mut self) -> Result<ReaderEvent<'_>, StreamError> {
         match self {
             Self::Sequential(reader) => reader.next_event(),
-            Self::Seek(reader) => reader.next_event(),
+            Self::Seek { reader, .. } => reader.next_event(),
         }
     }
 
     fn format(&self) -> Option<FormatId> {
         match self {
             Self::Sequential(reader) => reader.format(),
-            Self::Seek(reader) => Some(reader.format()),
+            Self::Seek { reader, .. } => Some(reader.format()),
         }
     }
 
-    fn into_inner(self) -> SpoolReader {
+    fn into_parts(self) -> (SpoolReader, ProviderSet<F, C>) {
         match self {
-            Self::Sequential(reader) => (*reader).into_inner(),
-            Self::Seek(reader) => (*reader).into_inner(),
+            Self::Sequential(reader) => (*reader).into_parts(),
+            Self::Seek { reader, providers } => ((*reader).into_inner(), providers),
         }
     }
 }
-
 /// Open session over an immutable encoded input snapshot.
-#[derive(Debug)]
-pub struct ArchiveSession {
+pub struct ArchiveSession<F = BuiltinFormatProviders, C = BuiltinCodecProviders>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
     id: u64,
     digest: InputDigest,
     limits: Limits,
-    reader: Option<SessionReader>,
+    reader: Option<SessionReader<F, C>>,
     applied: bool,
 }
 
-impl ArchiveSession {
+impl<F, C> fmt::Debug for ArchiveSession<F, C>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArchiveSession")
+            .field("id", &self.id)
+            .field("digest", &self.digest)
+            .field("limits", &self.limits)
+            .field("reader", &self.reader)
+            .field("applied", &self.applied)
+            .finish()
+    }
+}
+
+impl<F, C> ArchiveSession<F, C>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
     /// Encoded input identity.
     #[must_use]
     pub const fn digest(&self) -> InputDigest {
@@ -592,9 +645,9 @@ impl ArchiveSession {
                     .with_context("archive session reader is unavailable"),
             )
         })?;
-        let mut snapshot = reader.into_inner();
+        let (mut snapshot, providers) = reader.into_parts();
         snapshot.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
-        self.reader = Some(SessionReader::open(snapshot, self.limits)?);
+        self.reader = Some(SessionReader::open(snapshot, self.limits, providers)?);
         Ok(())
     }
 
@@ -710,8 +763,10 @@ impl ArchiveSession {
                     .with_context("archive session reader is unavailable"),
             )
         })? {
-            SessionReader::Sequential(reader) => extractor.extract(reader)?,
-            SessionReader::Seek(reader) => extractor.extract_seek_matching(reader, |_| true)?,
+            SessionReader::Sequential(reader) => extractor.extract_registered(reader)?,
+            SessionReader::Seek { reader, .. } => {
+                extractor.extract_seek_matching(reader, |_| true)?
+            },
         };
         Ok(ApplyReport {
             digest: self.digest,

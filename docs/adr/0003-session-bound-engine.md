@@ -46,5 +46,6 @@ time-of-check/time-of-use boundary.
   can guarantee stable object identity (for example version ID plus digest).
 - The Rust plan is explicitly not the CLI JSON schema and is not a durable
   interchange format.
-- Built-in provider capability queries are exposed now; compile-time external
-  provider protocols and range sources remain separate follow-up work.
+- Compile-time external provider chains are specified by
+  [ADR-0006](0006-compile-time-providers.md); immutable range-source identity is
+  specified separately by [ADR-0004](0004-immutable-range-sources.md).
