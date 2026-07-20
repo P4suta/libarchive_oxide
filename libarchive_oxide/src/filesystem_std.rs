@@ -444,10 +444,20 @@ fn apply_linux_metadata<Fd: std::os::fd::AsFd>(
     metadata: &EntryMetadata,
     findings: &mut Vec<FilesystemFinding>,
 ) {
-    use rustix::fs::{Gid, Uid};
-    use rustix::fs::{
-        Mode, Timespec, Timestamps, UTIME_OMIT, XattrFlags, fchmod, fchown, fsetxattr, futimens,
-    };
+    apply_linux_xattrs(fd, metadata, findings);
+    apply_linux_acls(fd, metadata, findings);
+    apply_linux_ownership(fd, metadata, findings);
+    apply_linux_times(fd, metadata, findings);
+    apply_linux_mode(fd, metadata, findings);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn apply_linux_xattrs<Fd: std::os::fd::AsFd>(
+    fd: &Fd,
+    metadata: &EntryMetadata,
+    findings: &mut Vec<FilesystemFinding>,
+) {
+    use rustix::fs::{XattrFlags, fsetxattr};
 
     let path = metadata.path();
     for (name, value) in metadata.xattrs() {
@@ -473,7 +483,17 @@ fn apply_linux_metadata<Fd: std::os::fd::AsFd>(
             },
         }
     }
+}
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn apply_linux_acls<Fd: std::os::fd::AsFd>(
+    fd: &Fd,
+    metadata: &EntryMetadata,
+    findings: &mut Vec<FilesystemFinding>,
+) {
+    use rustix::fs::{XattrFlags, fsetxattr};
+
+    let path = metadata.path();
     let acl_keys: Vec<&[u8]> = metadata
         .extensions()
         .iter()
@@ -482,7 +502,7 @@ fn apply_linux_metadata<Fd: std::os::fd::AsFd>(
                 && (extension.key().starts_with(b"SCHILY.acl.")
                     || extension.key().starts_with(b"LIBARCHIVE.acl."))
         })
-        .map(|extension| extension.key())
+        .map(libarchive_oxide_core::Extension::key)
         .collect();
     for (index, acl) in metadata.acl().iter().enumerate() {
         let operation = FilesystemOperation::Acl(index);
@@ -516,146 +536,177 @@ fn apply_linux_metadata<Fd: std::os::fd::AsFd>(
             )),
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn apply_linux_ownership<Fd: std::os::fd::AsFd>(
+    fd: &Fd,
+    metadata: &EntryMetadata,
+    findings: &mut Vec<FilesystemFinding>,
+) {
+    use rustix::fs::{Gid, Uid, fchown};
 
     let owner = metadata.owner();
-    if owner.uid.is_some() || owner.gid.is_some() || owner.user.is_some() || owner.group.is_some() {
-        let uid = owner
-            .uid
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value != u32::MAX)
-            .map(Uid::from_raw);
-        let gid = owner
-            .gid
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value != u32::MAX)
-            .map(Gid::from_raw);
-        if (owner.uid.is_some() && uid.is_none())
-            || (owner.gid.is_some() && gid.is_none())
-            || (owner.uid.is_none() && owner.user.is_some())
-            || (owner.gid.is_none() && owner.group.is_some())
-        {
-            findings.push(FilesystemFinding::unsupported(
+    if owner.uid.is_none() && owner.gid.is_none() && owner.user.is_none() && owner.group.is_none() {
+        return;
+    }
+    let uid = owner
+        .uid
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != u32::MAX)
+        .map(Uid::from_raw);
+    let gid = owner
+        .gid
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != u32::MAX)
+        .map(Gid::from_raw);
+    let path = metadata.path();
+    if (owner.uid.is_some() && uid.is_none())
+        || (owner.gid.is_some() && gid.is_none())
+        || (owner.uid.is_none() && owner.user.is_some())
+        || (owner.gid.is_none() && owner.group.is_some())
+    {
+        findings.push(FilesystemFinding::unsupported(
+            path.clone(),
+            FilesystemOperation::Ownership,
+            "ownership requires representable numeric uid/gid; names are not resolved",
+        ));
+        return;
+    }
+    match fchown(fd, uid, gid) {
+        Ok(()) => findings.push(FilesystemFinding::applied(
+            path.clone(),
+            FilesystemOperation::Ownership,
+        )),
+        Err(error) => {
+            let error = io::Error::from_raw_os_error(error.raw_os_error());
+            findings.push(FilesystemFinding::os_error(
                 path.clone(),
                 FilesystemOperation::Ownership,
-                "ownership requires representable numeric uid/gid; names are not resolved",
+                "failed to restore numeric ownership",
+                &error,
             ));
-        } else {
-            match fchown(fd, uid, gid) {
-                Ok(()) => findings.push(FilesystemFinding::applied(
-                    path.clone(),
-                    FilesystemOperation::Ownership,
-                )),
-                Err(error) => {
-                    let error = io::Error::from_raw_os_error(error.raw_os_error());
-                    findings.push(FilesystemFinding::os_error(
-                        path.clone(),
-                        FilesystemOperation::Ownership,
-                        "failed to restore numeric ownership",
-                        &error,
-                    ));
-                },
-            }
-        }
+        },
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn apply_linux_times<Fd: std::os::fd::AsFd>(
+    fd: &Fd,
+    metadata: &EntryMetadata,
+    findings: &mut Vec<FilesystemFinding>,
+) {
+    use rustix::fs::{Timespec, Timestamps, UTIME_OMIT, futimens};
 
     let times = metadata.times();
-    if times.accessed.is_some() || times.modified.is_some() {
-        let converted = times
-            .accessed
-            .map(linux_timespec)
-            .transpose()
-            .and_then(|accessed| {
-                times
-                    .modified
-                    .map(linux_timespec)
-                    .transpose()
-                    .map(|modified| (accessed, modified))
-            });
-        match converted {
-            Ok((accessed, modified)) => {
-                let timestamps = Timestamps {
-                    last_access: accessed.unwrap_or(Timespec {
-                        tv_sec: 0,
-                        tv_nsec: UTIME_OMIT,
-                    }),
-                    last_modification: modified.unwrap_or(Timespec {
-                        tv_sec: 0,
-                        tv_nsec: UTIME_OMIT,
-                    }),
-                };
-                match futimens(fd, &timestamps) {
-                    Ok(()) => {
-                        if times.accessed.is_some() {
-                            findings.push(FilesystemFinding::applied(
-                                path.clone(),
-                                FilesystemOperation::AccessTime,
-                            ));
-                        }
-                        if times.modified.is_some() {
-                            findings.push(FilesystemFinding::applied(
-                                path.clone(),
-                                FilesystemOperation::ModificationTime,
-                            ));
-                        }
-                    },
-                    Err(error) => {
-                        let error = io::Error::from_raw_os_error(error.raw_os_error());
-                        if times.accessed.is_some() {
-                            findings.push(FilesystemFinding::os_error(
-                                path.clone(),
-                                FilesystemOperation::AccessTime,
-                                "failed to restore access time",
-                                &error,
-                            ));
-                        }
-                        if times.modified.is_some() {
-                            findings.push(FilesystemFinding::os_error(
-                                path.clone(),
-                                FilesystemOperation::ModificationTime,
-                                "failed to restore modification time",
-                                &error,
-                            ));
-                        }
-                    },
-                }
-            },
-            Err(error) => {
-                if times.accessed.is_some() {
-                    findings.push(FilesystemFinding::os_error(
-                        path.clone(),
-                        FilesystemOperation::AccessTime,
-                        "archive access time is not representable",
-                        &error,
-                    ));
-                }
-                if times.modified.is_some() {
-                    findings.push(FilesystemFinding::os_error(
-                        path.clone(),
-                        FilesystemOperation::ModificationTime,
-                        "archive modification time is not representable",
-                        &error,
-                    ));
-                }
-            },
+    if times.accessed.is_none() && times.modified.is_none() {
+        return;
+    }
+    let converted = times
+        .accessed
+        .map(linux_timespec)
+        .transpose()
+        .and_then(|accessed| {
+            times
+                .modified
+                .map(linux_timespec)
+                .transpose()
+                .map(|modified| (accessed, modified))
+        });
+    let path = metadata.path();
+    match converted {
+        Ok((accessed, modified)) => {
+            let timestamps = Timestamps {
+                last_access: accessed.unwrap_or(Timespec {
+                    tv_sec: 0,
+                    tv_nsec: UTIME_OMIT,
+                }),
+                last_modification: modified.unwrap_or(Timespec {
+                    tv_sec: 0,
+                    tv_nsec: UTIME_OMIT,
+                }),
+            };
+            match futimens(fd, &timestamps) {
+                Ok(()) => record_linux_time_findings(metadata, findings, None, false),
+                Err(error) => {
+                    let error = io::Error::from_raw_os_error(error.raw_os_error());
+                    record_linux_time_findings(metadata, findings, Some(&error), false);
+                },
+            }
+        },
+        Err(error) => record_linux_time_findings(metadata, findings, Some(&error), true),
+    }
+    let _ = path;
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn record_linux_time_findings(
+    metadata: &EntryMetadata,
+    findings: &mut Vec<FilesystemFinding>,
+    error: Option<&io::Error>,
+    conversion_failed: bool,
+) {
+    let path = metadata.path();
+    for (present, operation, restore_failure, conversion_failure) in [
+        (
+            metadata.times().accessed.is_some(),
+            FilesystemOperation::AccessTime,
+            "failed to restore access time",
+            "archive access time is not representable",
+        ),
+        (
+            metadata.times().modified.is_some(),
+            FilesystemOperation::ModificationTime,
+            "failed to restore modification time",
+            "archive modification time is not representable",
+        ),
+    ] {
+        if !present {
+            continue;
+        }
+        if let Some(error) = error {
+            findings.push(FilesystemFinding::os_error(
+                path.clone(),
+                operation,
+                if conversion_failed {
+                    conversion_failure
+                } else {
+                    restore_failure
+                },
+                error,
+            ));
+        } else {
+            findings.push(FilesystemFinding::applied(path.clone(), operation));
         }
     }
+}
 
-    if let Some(mode) = metadata.mode() {
-        match fchmod(fd, Mode::from_bits_truncate(mode & 0o7777)) {
-            Ok(()) => findings.push(FilesystemFinding::applied(
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn apply_linux_mode<Fd: std::os::fd::AsFd>(
+    fd: &Fd,
+    metadata: &EntryMetadata,
+    findings: &mut Vec<FilesystemFinding>,
+) {
+    use rustix::fs::{Mode, fchmod};
+
+    let Some(mode) = metadata.mode() else {
+        return;
+    };
+    let path = metadata.path();
+    match fchmod(fd, Mode::from_bits_truncate(mode & 0o7777)) {
+        Ok(()) => findings.push(FilesystemFinding::applied(
+            path.clone(),
+            FilesystemOperation::Mode,
+        )),
+        Err(error) => {
+            let error = io::Error::from_raw_os_error(error.raw_os_error());
+            findings.push(FilesystemFinding::os_error(
                 path.clone(),
                 FilesystemOperation::Mode,
-            )),
-            Err(error) => {
-                let error = io::Error::from_raw_os_error(error.raw_os_error());
-                findings.push(FilesystemFinding::os_error(
-                    path.clone(),
-                    FilesystemOperation::Mode,
-                    "failed to restore mode",
-                    &error,
-                ));
-            },
-        }
+                "failed to restore mode",
+                &error,
+            ));
+        },
     }
 }
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -736,8 +787,8 @@ fn acl_permissions(value: &str) -> Result<u16, String> {
     {
         return Err("ACL permissions are not rwx text".to_owned());
     }
-    Ok(u16::from(bytes[0] == b'r') * 4
-        | u16::from(bytes[1] == b'w') * 2
+    Ok((u16::from(bytes[0] == b'r') * 4)
+        | (u16::from(bytes[1] == b'w') * 2)
         | u16::from(bytes[2] == b'x'))
 }
 
@@ -950,11 +1001,19 @@ impl FilesystemAdapter for CapStdFilesystemAdapter {
         let mut findings = Vec::new();
         for (filesystem_path, (_, metadata)) in directories {
             match self.root.open_dir_nofollow(filesystem_path) {
-                Ok(_directory) => {
+                Ok(directory) => {
                     #[cfg(any(target_os = "linux", target_os = "android"))]
-                    apply_linux_metadata(&_directory, metadata, &mut findings);
+                    apply_linux_metadata(&directory, metadata, &mut findings);
                     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    apply_directory_metadata(&self.root, filesystem_path, metadata, &mut findings);
+                    {
+                        drop(directory);
+                        apply_directory_metadata(
+                            &self.root,
+                            filesystem_path,
+                            metadata,
+                            &mut findings,
+                        );
+                    }
                 },
                 Err(error) => metadata_error_findings(
                     metadata,

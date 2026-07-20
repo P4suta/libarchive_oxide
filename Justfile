@@ -27,6 +27,11 @@ lint:
     cargo clippy --workspace --all-targets --no-default-features --features {{portable_features}} -- -D warnings
     cargo clippy --workspace --all-targets --no-default-features --features {{native_features}} -- -D warnings
 
+# Compile Linux-only library code even when the developer host is Windows or macOS.
+lint-linux:
+    rustup target add x86_64-unknown-linux-gnu
+    cargo clippy -p libarchive_oxide --lib --no-default-features --features portable-codecs,async,tokio --target x86_64-unknown-linux-gnu -- -D warnings
+
 # Run the same workspace suite and committed fuzz corpus through both profiles.
 test:
     cargo test --workspace --no-default-features --features {{portable_features}}
@@ -87,9 +92,9 @@ msrv:
     cargo msrv verify --path libarchive_oxide --no-default-features --features native-codecs,aes,sevenz,async,tokio
 
 # Fast deterministic checks used during the edit/commit loop.
-check: fmt-check typos lint no-dyn reuse license-sync codec-policy release-policy
+check: fmt-check typos lint lint-linux no-dyn reuse license-sync codec-policy release-policy
     @echo "fast local checks passed"
 
 # Every practical CI gate available on a developer machine.
-ci: fmt-check typos lint test doc no-dyn no-std deny reuse license-sync package-licenses package-smoke codec-policy release-policy actionlint msrv
+ci: fmt-check typos lint lint-linux test doc no-dyn no-std deny reuse license-sync package-licenses package-smoke codec-policy release-policy actionlint msrv
     @echo "local CI passed"
