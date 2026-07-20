@@ -15,6 +15,13 @@ const BLOCK_HEADER: usize = 3;
 const CHECKSUM: usize = 4;
 const MAX_PENDING: usize = MAX_BLOCK + MAX_FRAME_HEADER + BLOCK_HEADER + CHECKSUM;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalState {
+    Running,
+    Done,
+    Failed,
+}
+
 /// Incremental Zstandard decoder backed by `ruzstd`.
 ///
 /// `ruzstd` consumes complete blocks, so this adapter retains at most one
@@ -25,7 +32,7 @@ pub(crate) struct ZstdDecoder {
     pending: Vec<u8>,
     frame_active: bool,
     saw_frame: bool,
-    done: bool,
+    terminal: TerminalState,
 }
 
 impl ZstdDecoder {
@@ -35,7 +42,7 @@ impl ZstdDecoder {
             pending: Vec::with_capacity(MAX_PENDING),
             frame_active: false,
             saw_frame: false,
-            done: false,
+            terminal: TerminalState::Running,
         }
     }
 
@@ -43,6 +50,16 @@ impl ZstdDecoder {
         ArchiveError::new(ErrorKind::Malformed)
             .with_format("zstd")
             .with_context(context)
+    }
+
+    fn frame_header_len(prefix: &[u8]) -> Option<usize> {
+        let descriptor = *prefix.get(MAGIC.len())?;
+        let single_segment = descriptor & 0x20 != 0;
+        let dictionary = [0, 1, 2, 4].get(usize::from(descriptor & 0x03)).copied()?;
+        let content_size = [usize::from(single_segment), 2, 4, 8]
+            .get(usize::from(descriptor >> 6))
+            .copied()?;
+        Some(MAGIC.len() + 1 + usize::from(!single_segment) + dictionary + content_size)
     }
 
     fn discard_pending(&mut self, consumed: usize) {
@@ -76,7 +93,7 @@ impl ZstdDecoder {
         if !self.frame_active {
             if self.pending.is_empty() {
                 if matches!(end, EndOfInput::End) {
-                    self.done = true;
+                    self.terminal = TerminalState::Done;
                     return Ok(CodecStatus::Done);
                 }
                 return Ok(CodecStatus::NeedInput);
@@ -122,7 +139,7 @@ impl fmt::Debug for ZstdDecoder {
             .field("pending", &self.pending.len())
             .field("frame_active", &self.frame_active)
             .field("saw_frame", &self.saw_frame)
-            .field("done", &self.done)
+            .field("terminal", &self.terminal)
             .finish_non_exhaustive()
     }
 }
@@ -134,7 +151,12 @@ impl Codec for ZstdDecoder {
         output: &mut [u8],
         end: EndOfInput,
     ) -> Result<CodecStep, ArchiveError> {
-        if self.done {
+        if self.terminal == TerminalState::Failed {
+            return Err(Self::malformed(
+                "Zstandard decoder cannot continue after malformed input",
+            ));
+        }
+        if self.terminal == TerminalState::Done {
             if input.is_empty() {
                 return Ok(CodecStep {
                     consumed: 0,
@@ -155,7 +177,7 @@ impl Codec for ZstdDecoder {
             if self.pending.len() < MAGIC.len() {
                 if matches!(end, EndOfInput::End) {
                     let context = if self.saw_frame && self.pending.is_empty() {
-                        self.done = true;
+                        self.terminal = TerminalState::Done;
                         return Ok(CodecStep {
                             consumed,
                             produced: 0,
@@ -175,24 +197,40 @@ impl Codec for ZstdDecoder {
             if !self.pending.starts_with(MAGIC) {
                 return Err(Self::malformed("invalid Zstandard frame magic"));
             }
-            self.frame_active = true;
-        }
-
-        let result = self.decoder.decode_from_to(&self.pending, output);
-        let (decoded_input, produced) = match result {
-            Ok(progress) => progress,
-            Err(_)
-                if matches!(end, EndOfInput::More)
-                    && self.pending.len() < MAX_PENDING
-                    && consumed != 0 =>
-            {
+            let Some(header_len) = Self::frame_header_len(&self.pending) else {
+                if matches!(end, EndOfInput::End) {
+                    return Err(Self::malformed("truncated Zstandard frame header"));
+                }
                 return Ok(CodecStep {
                     consumed,
                     produced: 0,
                     status: CodecStatus::NeedInput,
                 });
+            };
+            if self.pending.len() < header_len {
+                if matches!(end, EndOfInput::End) {
+                    return Err(Self::malformed("truncated Zstandard frame header"));
+                }
+                return Ok(CodecStep {
+                    consumed,
+                    produced: 0,
+                    status: CodecStatus::NeedInput,
+                });
+            }
+            self.frame_active = true;
+        }
+
+        // The variable frame header is preflighted above. `ruzstd` reports a
+        // partial block as successful zero progress. Every actual error is
+        // terminal: retrying after an error can reuse mutated decoder state and
+        // turn malformed input into a process-aborting panic.
+        let (decoded_input, produced) = match self.decoder.decode_from_to(&self.pending, output) {
+            Ok(progress) => progress,
+            Err(error) => {
+                self.terminal = TerminalState::Failed;
+                self.decoder = ruzstd::decoding::FrameDecoder::new();
+                return Err(Self::malformed(error.to_string()));
             },
-            Err(error) => return Err(Self::malformed(error.to_string())),
         };
         if decoded_input > self.pending.len() {
             if matches!(end, EndOfInput::End) {

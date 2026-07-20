@@ -179,6 +179,29 @@ fn bzip2_accepts_an_independent_python_fixture_and_rejects_corruption() {
 }
 
 #[test]
+fn malformed_zstd_block_does_not_panic() {
+    // Minimized by the codec_zstd fuzz target after mutating a valid frame.
+    const MALFORMED: &[u8] =
+        include_bytes!("fixtures/zstd/crash-142bc61adb972f47b2d1ef33ae89832307ea82d5.zst");
+    const CORPUS: &[u8] =
+        include_bytes!("../../fuzz/corpus/codec_zstd/142bc61adb972f47b2d1ef33ae89832307ea82d5");
+    assert_eq!(MALFORMED, CORPUS);
+
+    let mut reader = FilterReader::new(Cursor::new(MALFORMED)).unwrap();
+    let mut output = Vec::new();
+    assert_eq!(
+        reader.read_to_end(&mut output).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    let mut retry = [0_u8; 1];
+    assert_eq!(
+        reader.read(&mut retry).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
 fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
     let limits = Limits::default().with_decoded_total(Some(4));
     for bytes in [

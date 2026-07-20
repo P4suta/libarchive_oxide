@@ -19,7 +19,7 @@ SPDX-FileCopyrightText = "2026 libarchive_oxide contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
 
 [[annotations]]
-path = ["fuzz/corpus/**"]
+path = ["fuzz/corpus/**", "**/tests/fixtures/**"]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 libarchive_oxide contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"

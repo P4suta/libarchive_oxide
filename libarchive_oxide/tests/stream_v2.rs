@@ -339,6 +339,18 @@ fn caller_driven_pipeline_rejects_truncated_zstd() {
 }
 
 #[test]
+fn caller_driven_pipeline_reports_malformed_zstd_fuzz_regression() {
+    const MALFORMED: &[u8] =
+        include_bytes!("fixtures/zstd/crash-142bc61adb972f47b2d1ef33ae89832307ea82d5.zst");
+    assert_eq!(
+        collect_pipeline(MALFORMED, Limits::default())
+            .unwrap_err()
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Malformed
+    );
+}
+
+#[test]
 fn caller_driven_pipeline_rejects_truncated_lz4() {
     let tar = tar_bytes();
     let mut truncated = filter_bytes(&tar, FilterId::Lz4);
