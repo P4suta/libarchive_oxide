@@ -796,15 +796,17 @@ fn acl_permissions(value: &str) -> Result<u16, String> {
 fn apply_file_metadata(
     root: &Dir,
     filesystem_path: &Path,
-    _file: &File,
+    file: &File,
     metadata: &EntryMetadata,
     findings: &mut Vec<FilesystemFinding>,
 ) {
     apply_portable_times(root, filesystem_path, metadata, findings);
+    #[cfg(not(unix))]
+    let _ = file;
     #[cfg(unix)]
     if let Some(mode) = metadata.mode() {
         use cap_std::fs::{Permissions, PermissionsExt};
-        match _file.set_permissions(Permissions::from_mode(mode & 0o7777)) {
+        match file.set_permissions(Permissions::from_mode(mode & 0o7777)) {
             Ok(()) => findings.push(FilesystemFinding::applied(
                 metadata.path().clone(),
                 FilesystemOperation::Mode,
@@ -813,7 +815,7 @@ fn apply_file_metadata(
                 metadata.path().clone(),
                 FilesystemOperation::Mode,
                 "failed to restore mode",
-                error,
+                &error,
             )),
         }
     }
@@ -839,7 +841,7 @@ fn apply_directory_metadata(
                 metadata.path().clone(),
                 FilesystemOperation::Mode,
                 "failed to restore directory mode",
-                error,
+                &error,
             )),
         }
     }
