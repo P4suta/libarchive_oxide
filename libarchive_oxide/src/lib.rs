@@ -39,6 +39,7 @@ pub mod filtered_io;
 mod iso_stream;
 pub mod path;
 mod pipeline_codec;
+pub mod provider;
 pub mod range_source;
 pub mod secret;
 pub mod seek_stream;
@@ -60,7 +61,7 @@ pub use async_stream::{AsyncArchiveReader, AsyncArchiveWriter};
 pub use create::{CreateStreamError, StreamingArchiveBuilder};
 pub use engine::{
     ApplyReport, ArchiveEngine, ArchiveInspection, ArchiveSession, CreateOptions, EntryDescriptor,
-    ExtractionPlan, InputDigest, PlanDisposition, PlannedEntry, Policy, ProviderSet,
+    ExtractionPlan, InputDigest, PlanDisposition, PlannedEntry, Policy,
 };
 pub use extractor::{
     EntryOutcome, EntryOutcomeKind, ExtractionPolicy, ExtractionReport, Extractor, RejectionReason,
@@ -69,13 +70,21 @@ pub use filtered_io::FilterReader;
 pub use libarchive_oxide_core;
 pub use libarchive_oxide_core::CpioDialect;
 pub use path::{sanitize, sanitize_archive_path};
+pub use provider::{
+    BuiltinCodecProviders, BuiltinFormatProviders, CodecCapabilities, CodecProvider,
+    CodecProviderNode, FormatCapabilities, FormatProvider, FormatProviderNode, NoCodecProviders,
+    NoFormatProviders, ProviderArchiveEncoder, ProviderCapability, ProviderSet,
+};
 pub use range_source::{
     RangeArchiveReader, RangeMetrics, RangeReadError, RangeReader, RangeSource, SourceIdentity,
 };
 pub use secret::SecretBytes;
 pub use seek_stream::{SeekArchiveReader, SeekArchiveWriter};
 pub use spool::{SpoolReader, SpoolWriter};
-pub use stream::{ArchiveReader, ArchiveWriter, Pipeline, PipelineEvent, ReaderEvent, StreamError};
+pub use stream::{
+    ArchiveReader, ArchiveWriter, Pipeline, PipelineEvent, ProviderArchiveWriter, ReaderEvent,
+    StreamError,
+};
 #[cfg(feature = "tokio")]
 pub use tokio_stream::{
     TokioArchiveReader, TokioArchiveWriter, TokioExtractor, TokioIo, TokioSeekArchiveReader,

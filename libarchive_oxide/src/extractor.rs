@@ -17,6 +17,7 @@ use libarchive_oxide_core::{
 };
 
 use crate::path::sanitize_archive_path;
+use crate::provider::{StaticCodecProviders, StaticFormatProviders};
 use crate::{ArchiveReader, ReaderEvent, SeekArchiveReader, StreamError};
 
 #[cfg(feature = "tokio")]
@@ -296,13 +297,39 @@ impl Extractor {
         self.extract_matching(reader, |_| true)
     }
 
-    /// Extracts entries accepted by `select`, consuming skipped payload without
-    /// treating selection as a security-policy rejection.
+    /// Extracts built-in entries accepted by `select`.
     pub fn extract_matching<R: Read>(
         &mut self,
         reader: &mut ArchiveReader<R>,
-        mut select: impl FnMut(&EntryMetadata) -> bool,
+        select: impl FnMut(&EntryMetadata) -> bool,
     ) -> Result<ExtractionReport, StreamError> {
+        self.extract_registered_matching(reader, select)
+    }
+
+    /// Extracts an archive using statically registered format and codec providers.
+    pub fn extract_registered<R, F, C>(
+        &mut self,
+        reader: &mut ArchiveReader<R, F, C>,
+    ) -> Result<ExtractionReport, StreamError>
+    where
+        R: Read,
+        F: StaticFormatProviders,
+        C: StaticCodecProviders,
+    {
+        self.extract_registered_matching(reader, |_| true)
+    }
+
+    /// Extracts registered-provider entries accepted by `select`.
+    pub fn extract_registered_matching<R, F, C>(
+        &mut self,
+        reader: &mut ArchiveReader<R, F, C>,
+        mut select: impl FnMut(&EntryMetadata) -> bool,
+    ) -> Result<ExtractionReport, StreamError>
+    where
+        R: Read,
+        F: StaticFormatProviders,
+        C: StaticCodecProviders,
+    {
         self.begin_session();
         let mut report = ExtractionReport::default();
         let mut pending: Option<PendingEntry> = None;

@@ -9,18 +9,20 @@ use std::io::{self, Read, Write};
 
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
-    ArDecoder, ArEncoder, ArchiveDecoder, ArchiveEncoder, ArchiveError, ArchiveMetadata,
-    CodecStatus, CpioDecoder, CpioDialect, CpioEncoder, DecodeEvent, DecodeStep, EncodeCommand,
-    EncodeStatus, EndOfInput, EntryMetadata, ErrorKind, FormatId, Limits, ProbeResult, TarDecoder,
-    TarEncoder,
+    ArchiveDecoder, ArchiveEncoder, ArchiveError, ArchiveMetadata, Codec, CodecStatus, CpioDialect,
+    DecodeEvent, EncodeCommand, EncodeStatus, EndOfInput, EntryMetadata, ErrorKind, FormatId,
+    Limits, ProbeResult,
 };
 
 #[cfg(feature = "aes")]
 use crate::SecretBytes;
 use crate::filtered_io::SyncFilterWriter;
-use crate::pipeline_codec::PipelineCodec;
+pub(crate) use crate::provider::BuiltinFormatEncoder as RuntimeEncoder;
+use crate::provider::{
+    BuiltinCodecProviders, BuiltinFormatProviders, ProviderArchiveEncoder, ProviderSet,
+    StaticCodecProviders, StaticFormatProviders, filter_name,
+};
 use crate::zip::ZipMethod;
-use crate::zip_stream::{StreamZipMethod, ZipStreamEncoder};
 
 const BUFFER: usize = 64 * 1024;
 const DETECTION_MINIMUM: usize = 16 * 2048 + 6;
@@ -137,9 +139,10 @@ enum LayerState {
 }
 
 #[derive(Debug)]
-struct CodecLayer {
+struct CodecLayer<S, D> {
     filter: FilterId,
-    codec: PipelineCodec,
+    selection: S,
+    codec: D,
     state: LayerState,
     output: Vec<u8>,
     output_start: usize,
@@ -184,131 +187,28 @@ enum OwnedReaderEvent {
     Done,
 }
 
-#[derive(Debug)]
-enum RuntimeDecoder {
-    Tar(Box<TarDecoder>),
-    Cpio(Box<CpioDecoder>),
-    Ar(Box<ArDecoder>),
-}
-
-impl RuntimeDecoder {
-    fn step<'a>(
-        &'a mut self,
-        input: &'a [u8],
-        output: &'a mut [u8],
-        end: EndOfInput,
-    ) -> Result<DecodeStep<'a>, ArchiveError> {
-        let input_len = input.len();
-        let output_len = output.len();
-        match self {
-            Self::Tar(decoder) => decoder.step(input, output, end),
-            Self::Cpio(decoder) => decoder.step(input, output, end),
-            Self::Ar(decoder) => decoder.step(input, output, end),
-        }
-        .and_then(|step| step.validate(input_len, output_len))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum RuntimeEncoder {
-    Tar(TarEncoder),
-    Cpio(CpioEncoder),
-    Ar(ArEncoder),
-    Zip(Box<ZipStreamEncoder>),
-}
-
-impl RuntimeEncoder {
-    pub(crate) fn sequential(format: FormatId, limits: Limits) -> Result<Self, ArchiveError> {
-        match format {
-            FormatId::Tar => Ok(Self::Tar(TarEncoder::new(limits))),
-            FormatId::Cpio => Ok(Self::Cpio(CpioEncoder::new(limits))),
-            FormatId::Ar => Ok(Self::Ar(ArEncoder::new(limits))),
-            FormatId::Zip => Ok(Self::Zip(Box::new(ZipStreamEncoder::new(limits)))),
-            _ => Err(ArchiveError::new(ErrorKind::Capability)
-                .with_context("format is not available through the sequential writer")),
-        }
-    }
-
-    pub(crate) fn zip(limits: Limits, method: ZipMethod) -> Self {
-        let method = match method {
-            ZipMethod::Store => StreamZipMethod::Store,
-            ZipMethod::Deflate => StreamZipMethod::Deflate,
-        };
-        Self::Zip(Box::new(ZipStreamEncoder::with_method(limits, method)))
-    }
-
-    pub(crate) const fn cpio(limits: Limits, dialect: CpioDialect) -> Self {
-        Self::Cpio(CpioEncoder::with_dialect(limits, dialect))
-    }
-
-    #[cfg(feature = "aes")]
-    pub(crate) fn encrypted_zip(limits: Limits, method: ZipMethod, password: SecretBytes) -> Self {
-        let method = match method {
-            ZipMethod::Store => StreamZipMethod::Store,
-            ZipMethod::Deflate => StreamZipMethod::Deflate,
-        };
-        Self::Zip(Box::new(ZipStreamEncoder::with_password(
-            limits, method, password,
-        )))
-    }
-
-    pub(crate) fn step(
-        &mut self,
-        command: EncodeCommand<'_>,
-        output: &mut [u8],
-    ) -> Result<libarchive_oxide_core::EncodeStep, ArchiveError> {
-        let data_len = match &command {
-            EncodeCommand::Data(data) => Some(data.len()),
-            _ => None,
-        };
-        let output_len = output.len();
-        match self {
-            Self::Tar(encoder) => encoder.step(command, output),
-            Self::Cpio(encoder) => encoder.step(command, output),
-            Self::Ar(encoder) => encoder.step(command, output),
-            Self::Zip(encoder) => encoder.step(command, output),
-        }
-        .and_then(|step| step.validate(data_len, output_len))
-    }
-
-    pub(crate) fn set_archive_metadata(
-        &mut self,
-        metadata: &ArchiveMetadata,
-    ) -> Result<(), ArchiveError> {
-        match self {
-            Self::Tar(encoder) => encoder.set_archive_metadata(metadata),
-            Self::Zip(encoder) => encoder.set_archive_metadata(metadata),
-            Self::Cpio(_) | Self::Ar(_) => {
-                if metadata.volume_name().is_none()
-                    && metadata.comment().is_none()
-                    && metadata.extensions().is_empty()
-                {
-                    Ok(())
-                } else {
-                    Err(ArchiveError::new(ErrorKind::Unsupported)
-                        .with_context("format has no archive-level metadata representation"))
-                }
-            },
-        }
-    }
-}
-
 /// Caller-driven, bounded filter-to-format pipeline.
 ///
 /// Sync and async adapters differ only in how they respond to
 /// [`PipelineEvent::NeedInput`].
 #[derive(Debug)]
-pub struct Pipeline {
+pub struct Pipeline<F = BuiltinFormatProviders, C = BuiltinCodecProviders>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    formats: F,
+    codecs: C,
     limits: Limits,
     initial_error: Option<ArchiveError>,
     input: Vec<u8>,
     input_start: usize,
     input_end: usize,
     input_finished: bool,
-    layers: Vec<CodecLayer>,
+    layers: Vec<CodecLayer<C::Selection, C::Decoder>>,
     layer_capacity: usize,
     filter_depth: usize,
-    decoder: Option<RuntimeDecoder>,
+    decoder: Option<F::Decoder>,
     format: Option<FormatId>,
     event_data: Vec<u8>,
     decoder_scratch: Vec<u8>,
@@ -317,16 +217,17 @@ pub struct Pipeline {
     filter_input: FilterInputMode,
 }
 
-impl CodecLayer {
-    fn new(filter: FilterId, limits: Limits, capacity: usize) -> Result<Self, ArchiveError> {
-        Ok(Self {
+impl<S, D> CodecLayer<S, D> {
+    fn new(filter: FilterId, selection: S, codec: D, capacity: usize) -> Self {
+        Self {
             filter,
-            codec: PipelineCodec::new(filter, limits)?,
+            selection,
+            codec,
             state: LayerState::Running,
             output: vec![0; capacity],
             output_start: 0,
             output_end: 0,
-        })
+        }
     }
 
     fn available(&self) -> &[u8] {
@@ -344,18 +245,46 @@ impl CodecLayer {
     }
 }
 
-impl Pipeline {
+impl Pipeline<BuiltinFormatProviders, BuiltinCodecProviders> {
     /// Creates a pipeline with explicit resource limits.
     #[must_use]
     pub fn new(limits: Limits) -> Self {
-        Self::with_filter_mode(limits, FilterInputMode::Detect)
+        Self::with_filter_mode(
+            limits,
+            FilterInputMode::Detect,
+            BuiltinFormatProviders,
+            BuiltinCodecProviders,
+        )
     }
 
     pub(crate) fn after_filter_adapters(limits: Limits) -> Self {
-        Self::with_filter_mode(limits, FilterInputMode::Predecoded)
+        Self::with_filter_mode(
+            limits,
+            FilterInputMode::Predecoded,
+            BuiltinFormatProviders,
+            BuiltinCodecProviders,
+        )
+    }
+}
+
+impl<F, C> Pipeline<F, C>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    /// Creates a bounded pipeline from an explicitly registered provider set.
+    #[must_use]
+    pub fn with_providers(limits: Limits, providers: ProviderSet<F, C>) -> Self {
+        let (formats, codecs) = providers.into_chains();
+        Self::with_filter_mode(limits, FilterInputMode::Detect, formats, codecs)
     }
 
-    fn with_filter_mode(limits: Limits, filter_input: FilterInputMode) -> Self {
+    fn with_filter_mode(
+        limits: Limits,
+        filter_input: FilterInputMode,
+        formats: F,
+        codecs: C,
+    ) -> Self {
         let filter_depth = if filter_input == FilterInputMode::Detect {
             limits.filter_depth().unwrap_or(64)
         } else {
@@ -375,6 +304,8 @@ impl Pipeline {
         });
         let capacity = capacity.max(1);
         Self {
+            formats,
+            codecs,
             limits,
             initial_error,
             input: vec![0; capacity],
@@ -517,9 +448,11 @@ impl Pipeline {
                     .with_format("xz")
                     .with_context("XZ stream padding is not a multiple of four"));
             }
-            match FilterId::probe(self.source(layer)) {
-                ProbeResult::Match(next) if next == filter => {
-                    self.layers[layer].codec = PipelineCodec::new(filter, self.limits)?;
+            match self.codecs.probe_codec(self.source(layer))? {
+                ProbeResult::Match((next, selection)) if next == filter => {
+                    let codec = self.codecs.codec_decoder(selection.clone(), self.limits)?;
+                    self.layers[layer].selection = selection;
+                    self.layers[layer].codec = codec;
                     self.layers[layer].state = LayerState::Running;
                     return Ok(Drive::Ready);
                 },
@@ -641,21 +574,12 @@ impl Pipeline {
         self.drive_layer(last, minimum)
     }
 
-    fn install_decoder(&mut self, format: FormatId) -> Result<(), ArchiveError> {
-        self.decoder = Some(match format {
-            FormatId::Tar => RuntimeDecoder::Tar(Box::new(TarDecoder::new(self.limits))),
-            FormatId::Cpio => RuntimeDecoder::Cpio(Box::new(CpioDecoder::new(self.limits))),
-            FormatId::Ar => RuntimeDecoder::Ar(Box::new(ArDecoder::new(self.limits))),
-            FormatId::Zip | FormatId::SevenZip | FormatId::Iso9660 => {
-                return Err(ArchiveError::new(ErrorKind::Capability)
-                    .with_format(format_name(format))
-                    .with_context("archive format requires Read + Seek"));
-            },
-            _ => {
-                return Err(ArchiveError::new(ErrorKind::Unsupported)
-                    .with_context("matched archive format has no sequential decoder"));
-            },
-        });
+    fn install_decoder(
+        &mut self,
+        format: FormatId,
+        selection: F::Selection,
+    ) -> Result<(), ArchiveError> {
+        self.decoder = Some(self.formats.format_decoder(selection, self.limits)?);
         self.format = Some(format);
         Ok(())
     }
@@ -669,8 +593,8 @@ impl Pipeline {
                 continue;
             }
 
-            let filter_probe = FilterId::probe(self.plain());
-            if let ProbeResult::Match(filter) = filter_probe {
+            let filter_probe = self.codecs.probe_codec(self.plain())?;
+            if let ProbeResult::Match((filter, selection)) = filter_probe {
                 if self.filter_input == FilterInputMode::Predecoded {
                     return Err(ArchiveError::new(ErrorKind::Limit)
                         .with_context("outer filter nesting exceeds configured depth"));
@@ -679,8 +603,13 @@ impl Pipeline {
                     return Err(ArchiveError::new(ErrorKind::Limit)
                         .with_context("outer filter nesting exceeds configured depth"));
                 }
-                self.layers
-                    .push(CodecLayer::new(filter, self.limits, self.layer_capacity)?);
+                let codec = self.codecs.codec_decoder(selection.clone(), self.limits)?;
+                self.layers.push(CodecLayer::new(
+                    filter,
+                    selection,
+                    codec,
+                    self.layer_capacity,
+                ));
                 continue;
             }
             if !self.plain_exhausted() {
@@ -692,9 +621,9 @@ impl Pipeline {
                 }
             }
 
-            match FormatId::probe(self.plain()) {
-                ProbeResult::Match(format) => {
-                    self.install_decoder(format)?;
+            match self.formats.probe_format(self.plain())? {
+                ProbeResult::Match((format, selection)) => {
+                    self.install_decoder(format, selection)?;
                     return Ok(Drive::Ready);
                 },
                 ProbeResult::NeedMore { minimum } if !self.plain_exhausted() => {
@@ -707,16 +636,16 @@ impl Pipeline {
                         && self.plain().len() >= 2 * 512
                         && self.plain()[..2 * 512].iter().all(|byte| *byte == 0)
                     {
-                        self.install_decoder(FormatId::Tar)?;
+                        let selection = self.formats.select_format(FormatId::Tar)?;
+                        self.install_decoder(FormatId::Tar, selection)?;
                         return Ok(Drive::Ready);
                     }
                     return Err(ArchiveError::new(ErrorKind::Unsupported)
-                        .with_context("no built-in sequential archive format matched"));
+                        .with_context("no registered sequential archive format matched"));
                 },
             }
         }
     }
-
     fn poll_after_archive(&mut self) -> Result<PipelineEvent<'_>, ArchiveError> {
         loop {
             if !self.plain().is_empty() {
@@ -767,6 +696,7 @@ impl Pipeline {
             }
 
             let input_len = self.plain().len();
+            let output_len = self.decoder_scratch.len();
             let end = if self.plain_finished() {
                 EndOfInput::End
             } else {
@@ -783,7 +713,7 @@ impl Pipeline {
                         &layer.output[layer.output_start..layer.output_end],
                         &mut self.decoder_scratch,
                         end,
-                    )?
+                    )
             } else {
                 self.decoder
                     .as_mut()
@@ -795,8 +725,9 @@ impl Pipeline {
                         &self.input[self.input_start..self.input_end],
                         &mut self.decoder_scratch,
                         end,
-                    )?
-            };
+                    )
+            }?
+            .validate(input_len, output_len)?;
             let consumed = step.consumed;
             let event = match step.event {
                 DecodeEvent::NeedInput => OwnedPipelineEvent::NeedInput,
@@ -866,6 +797,10 @@ impl Pipeline {
         }
     }
 
+    pub(crate) fn into_providers(self) -> ProviderSet<F, C> {
+        ProviderSet::from_chains(self.formats, self.codecs)
+    }
+
     /// Resource limits used by this pipeline.
     #[must_use]
     pub const fn limits(&self) -> Limits {
@@ -879,36 +814,31 @@ impl Pipeline {
     }
 }
 
-const fn filter_name(filter: FilterId) -> &'static str {
-    match filter {
-        FilterId::Gzip => "gzip",
-        FilterId::Bzip2 => "bzip2",
-        FilterId::Zstd => "zstd",
-        FilterId::Xz => "xz",
-        FilterId::Lz4 => "lz4",
-        _ => "unknown",
-    }
-}
-
-const fn format_name(format: FormatId) -> &'static str {
-    match format {
-        FormatId::Tar => "tar",
-        FormatId::Cpio => "cpio",
-        FormatId::Ar => "ar",
-        FormatId::Zip => "zip",
-        FormatId::SevenZip => "7z",
-        FormatId::Iso9660 => "iso9660",
-        _ => "unknown",
-    }
-}
-
 /// Incremental archive reader over [`Read`].
-#[derive(Debug)]
-pub struct ArchiveReader<R: Read> {
+pub struct ArchiveReader<R: Read, F = BuiltinFormatProviders, C = BuiltinCodecProviders>
+where
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
     reader: ReaderInput<R>,
-    pipeline: Pipeline,
+    pipeline: Pipeline<F, C>,
     read_buffer: Vec<u8>,
     event_data: Vec<u8>,
+}
+
+impl<R, F, C> fmt::Debug for ArchiveReader<R, F, C>
+where
+    R: Read,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArchiveReader")
+            .field("limits", &self.pipeline.limits())
+            .field("format", &self.pipeline.format())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -991,7 +921,7 @@ impl<R: Read> ReaderInput<R> {
     }
 }
 
-impl<R: Read> ArchiveReader<R> {
+impl<R: Read> ArchiveReader<R, BuiltinFormatProviders, BuiltinCodecProviders> {
     /// Builds a bounded reader with the safe default limits.
     #[must_use]
     pub fn new(reader: R) -> Self {
@@ -1008,7 +938,24 @@ impl<R: Read> ArchiveReader<R> {
             event_data: Vec::with_capacity(BUFFER),
         }
     }
+}
 
+impl<R, F, C> ArchiveReader<R, F, C>
+where
+    R: Read,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    /// Builds a bounded reader that uses one statically registered provider set.
+    #[must_use]
+    pub fn with_providers(reader: R, limits: Limits, providers: ProviderSet<F, C>) -> Self {
+        Self {
+            reader: ReaderInput::Plain(reader),
+            pipeline: Pipeline::with_providers(limits, providers),
+            read_buffer: vec![0; BUFFER],
+            event_data: Vec::with_capacity(BUFFER),
+        }
+    }
     /// Produces the next structural event.
     pub fn next_event(&mut self) -> Result<ReaderEvent<'_>, StreamError> {
         loop {
@@ -1063,6 +1010,10 @@ impl<R: Read> ArchiveReader<R> {
         }
     }
 
+    pub(crate) fn into_parts(self) -> (R, ProviderSet<F, C>) {
+        (self.reader.into_inner(), self.pipeline.into_providers())
+    }
+
     /// Returns the wrapped input.
     #[must_use]
     pub fn into_inner(self) -> R {
@@ -1098,7 +1049,7 @@ impl<W: Write> ArchiveWriter<W> {
     pub fn new(output: W) -> Self {
         Self {
             output: SyncFilterWriter::plain(output),
-            encoder: RuntimeEncoder::Tar(TarEncoder::new(Limits::default())),
+            encoder: RuntimeEncoder::tar(Limits::default()),
             format: FormatId::Tar,
             buffer: vec![0; BUFFER],
             failed: false,
@@ -1296,6 +1247,352 @@ impl<W: Write> ArchiveWriter<W> {
     /// Abandons the archive without adding a trailer.
     pub fn abort(self) -> Result<W, StreamError> {
         self.output.abort().map_err(StreamError::io)
+    }
+
+    /// Output archive format.
+    #[must_use]
+    pub const fn format(&self) -> FormatId {
+        self.format
+    }
+}
+
+enum ProviderFilterOutput<W, C>
+where
+    W: Write,
+    C: StaticCodecProviders,
+{
+    Plain {
+        output: W,
+        _codecs: C,
+    },
+    Framed {
+        output: W,
+        codecs: C,
+        selection: C::Selection,
+        input: Vec<u8>,
+        frame_capacity: usize,
+        reserved_bytes: usize,
+        maximum_bytes: Option<usize>,
+        limits: Box<Limits>,
+        wrote_frame: bool,
+    },
+}
+
+impl<W, C> ProviderFilterOutput<W, C>
+where
+    W: Write,
+    C: StaticCodecProviders,
+{
+    fn write_bytes(&mut self, mut bytes: &[u8]) -> Result<(), StreamError> {
+        if let Self::Plain { output, .. } = self {
+            return output.write_all(bytes).map_err(StreamError::io);
+        }
+        while !bytes.is_empty() {
+            let full = match self {
+                Self::Framed {
+                    input,
+                    frame_capacity,
+                    ..
+                } => input.len() == *frame_capacity,
+                Self::Plain { .. } => false,
+            };
+            if full {
+                self.emit_frame()?;
+                continue;
+            }
+            let consumed = match self {
+                Self::Framed {
+                    input,
+                    frame_capacity,
+                    ..
+                } => {
+                    let consumed = (*frame_capacity - input.len()).min(bytes.len());
+                    input.extend_from_slice(&bytes[..consumed]);
+                    consumed
+                },
+                Self::Plain { .. } => 0,
+            };
+            bytes = &bytes[consumed..];
+        }
+        Ok(())
+    }
+    fn emit_frame(&mut self) -> Result<(), StreamError> {
+        let Self::Framed {
+            output,
+            codecs,
+            selection,
+            input,
+            reserved_bytes,
+            maximum_bytes,
+            limits,
+            wrote_frame,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let encoded = codecs
+            .encode_codec_frame(selection.clone(), input, **limits)
+            .map_err(StreamError::archive)?;
+        if maximum_bytes.is_some_and(|maximum| {
+            reserved_bytes
+                .checked_add(input.len())
+                .and_then(|used| used.checked_add(encoded.len()))
+                .is_none_or(|used| used > maximum)
+        }) {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_context("registered codec frame exceeds the writer in-flight budget"),
+            ));
+        }
+        output.write_all(&encoded).map_err(StreamError::io)?;
+        input.clear();
+        *wrote_frame = true;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<W, StreamError> {
+        match &mut self {
+            Self::Plain { output, .. } => output.flush().map_err(StreamError::io)?,
+            Self::Framed {
+                input, wrote_frame, ..
+            } => {
+                if !input.is_empty() || !*wrote_frame {
+                    self.emit_frame()?;
+                }
+                if let Self::Framed { output, .. } = &mut self {
+                    output.flush().map_err(StreamError::io)?;
+                }
+            },
+        }
+        Ok(match self {
+            Self::Plain { output, .. } | Self::Framed { output, .. } => output,
+        })
+    }
+
+    fn abort(self) -> W {
+        match self {
+            Self::Plain { output, .. } | Self::Framed { output, .. } => output,
+        }
+    }
+}
+
+/// Sequential writer backed by one statically registered provider set.
+pub struct ProviderArchiveWriter<W, F, C>
+where
+    W: Write,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    output: ProviderFilterOutput<W, C>,
+    encoder: F::Encoder,
+    format: FormatId,
+    buffer: Vec<u8>,
+    failed: bool,
+}
+
+impl<W, F, C> fmt::Debug for ProviderArchiveWriter<W, F, C>
+where
+    W: Write,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderArchiveWriter")
+            .field("format", &self.format)
+            .field("buffer_capacity", &self.buffer.len())
+            .field("failed", &self.failed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W, F, C> ProviderArchiveWriter<W, F, C>
+where
+    W: Write,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    /// Builds a bounded writer from an explicitly registered provider set.
+    pub fn with_providers(
+        output: W,
+        format: FormatId,
+        filter: Option<FilterId>,
+        limits: Limits,
+        providers: ProviderSet<F, C>,
+    ) -> Result<Self, ArchiveError> {
+        let (formats, codecs) = providers.into_chains();
+        let format_selection = formats.select_format(format)?;
+        let encoder = formats.format_encoder(format_selection, limits)?;
+        let maximum_bytes = limits.in_flight_bytes();
+        let configured = maximum_bytes.unwrap_or(BUFFER.saturating_mul(4));
+        let capacity = (configured / 4).clamp(1, BUFFER);
+        let output = if let Some(filter) = filter {
+            let selection = codecs.select_codec(filter)?;
+            // Construct once here so a decode-only/disabled provider fails before any output.
+            if !matches!(
+                codecs.codec_capability(filter),
+                crate::provider::ProviderCapability::Available(capability)
+                    if capability.can_encode()
+            ) {
+                return Err(ArchiveError::new(ErrorKind::Capability)
+                    .with_format(filter_name(filter))
+                    .with_context("registered codec provider cannot encode this filter"));
+            }
+            ProviderFilterOutput::Framed {
+                output,
+                codecs,
+                selection,
+                input: Vec::with_capacity(capacity),
+                frame_capacity: capacity,
+                reserved_bytes: capacity,
+                maximum_bytes,
+                limits: Box::new(limits),
+                wrote_frame: false,
+            }
+        } else {
+            ProviderFilterOutput::Plain {
+                output,
+                _codecs: codecs,
+            }
+        };
+        Ok(Self {
+            output,
+            encoder,
+            format,
+            buffer: vec![0; capacity],
+            failed: false,
+        })
+    }
+
+    fn encoder_step(
+        &mut self,
+        command: EncodeCommand<'_>,
+    ) -> Result<libarchive_oxide_core::EncodeStep, StreamError> {
+        let data_len = match &command {
+            EncodeCommand::Data(data) => Some(data.len()),
+            _ => None,
+        };
+        let output_len = self.buffer.len();
+        self.encoder
+            .step(command, &mut self.buffer)
+            .and_then(|step| step.validate(data_len, output_len))
+            .map_err(StreamError::archive)
+    }
+
+    fn emit(&mut self, produced: usize) -> Result<(), StreamError> {
+        if produced == 0 {
+            return Ok(());
+        }
+        if let Err(error) = self.output.write_bytes(&self.buffer[..produced]) {
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn ensure_live(&self) -> Result<(), StreamError> {
+        if self.failed {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_context("archive writer is poisoned by an earlier output error"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sets archive-level metadata before the first entry.
+    pub fn set_archive_metadata(&mut self, metadata: &ArchiveMetadata) -> Result<(), StreamError> {
+        self.ensure_live()?;
+        self.encoder
+            .set_archive_metadata(metadata)
+            .map_err(StreamError::archive)
+    }
+
+    /// Begins one entry.
+    pub fn start_entry(&mut self, metadata: &EntryMetadata) -> Result<(), StreamError> {
+        self.ensure_live()?;
+        loop {
+            let step = self.encoder_step(EncodeCommand::BeginEntry(metadata))?;
+            self.emit(step.produced)?;
+            if step.consumed == 1 {
+                return Ok(());
+            }
+            if step.produced == 0 {
+                let (kind, context) = if matches!(step.status, EncodeStatus::NeedOutput) {
+                    (
+                        ErrorKind::Limit,
+                        "format provider requires more output than the in-flight budget",
+                    )
+                } else {
+                    (
+                        ErrorKind::Protocol,
+                        "format provider did not accept begin-entry",
+                    )
+                };
+                return Err(StreamError::archive(
+                    ArchiveError::new(kind).with_context(context),
+                ));
+            }
+        }
+    }
+
+    /// Streams entry body bytes.
+    pub fn write_data(&mut self, mut data: &[u8]) -> Result<(), StreamError> {
+        self.ensure_live()?;
+        while !data.is_empty() {
+            let step = self.encoder_step(EncodeCommand::Data(data))?;
+            self.emit(step.produced)?;
+            data = &data[step.consumed..];
+            if step.consumed == 0 && step.produced == 0 {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Protocol)
+                        .with_context("format provider made no write progress"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the current entry.
+    pub fn end_entry(&mut self) -> Result<(), StreamError> {
+        self.ensure_live()?;
+        loop {
+            let step = self.encoder_step(EncodeCommand::EndEntry)?;
+            self.emit(step.produced)?;
+            if step.consumed == 1 {
+                return Ok(());
+            }
+            if step.produced == 0 {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Protocol)
+                        .with_context("format provider did not accept end-entry"),
+                ));
+            }
+        }
+    }
+
+    /// Finalizes the archive and returns the underlying destination.
+    pub fn finish(mut self) -> Result<W, StreamError> {
+        self.ensure_live()?;
+        loop {
+            let step = self.encoder_step(EncodeCommand::Finish)?;
+            self.emit(step.produced)?;
+            if matches!(step.status, EncodeStatus::Done) {
+                return self.output.finish();
+            }
+            if step.consumed == 0 && step.produced == 0 {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Protocol)
+                        .with_context("format provider made no finish progress"),
+                ));
+            }
+        }
+    }
+
+    /// Abandons the archive without adding a trailer or codec frame.
+    pub fn abort(self) -> W {
+        self.output.abort()
     }
 
     /// Output archive format.

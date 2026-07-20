@@ -26,6 +26,99 @@ const SOURCE_TREES: &[&str] = &[
     "libarchive_oxide-cli/src",
 ];
 
+const PACKAGE_CONSUMER_MAIN: &str = r#"use std::io::Cursor;
+
+use libarchive_oxide::{
+    ArchiveEngine, ArchiveReader, CodecCapabilities, CodecProvider, FormatCapabilities,
+    FormatProvider, ProviderArchiveEncoder, ProviderSet, ReaderEvent,
+};
+use libarchive_oxide_core::{
+    ArchiveDecoder, ArchiveEncoder, ArchiveError, Codec, CodecStep, DecodeStep, EncodeCommand,
+    EncodeStep, EndOfInput, FilterId, FormatId, Limits, ProbeResult,
+};
+
+struct ExternalDecoder;
+impl ArchiveDecoder for ExternalDecoder {
+    fn step<'a>(
+        &'a mut self,
+        _input: &'a [u8],
+        _output: &'a mut [u8],
+        _end: EndOfInput,
+    ) -> Result<DecodeStep<'a>, ArchiveError> {
+        Err(ArchiveError::new(libarchive_oxide_core::ErrorKind::Protocol))
+    }
+}
+
+struct ExternalEncoder;
+impl ArchiveEncoder for ExternalEncoder {
+    fn step(
+        &mut self,
+        _command: EncodeCommand<'_>,
+        _output: &mut [u8],
+    ) -> Result<EncodeStep, ArchiveError> {
+        Err(ArchiveError::new(libarchive_oxide_core::ErrorKind::Protocol))
+    }
+}
+impl ProviderArchiveEncoder for ExternalEncoder {}
+
+struct ExternalFormat;
+impl FormatProvider for ExternalFormat {
+    type Decoder = ExternalDecoder;
+    type Encoder = ExternalEncoder;
+
+    fn format(&self) -> FormatId { FormatId::Tar }
+    fn name(&self) -> &'static str { "package-smoke-format" }
+    fn probe(&self, _prefix: &[u8]) -> ProbeResult<()> { ProbeResult::NoMatch }
+    fn capabilities(&self) -> FormatCapabilities {
+        FormatCapabilities::new(true, true, false)
+    }
+    fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
+        Ok(ExternalDecoder)
+    }
+    fn encoder(&self, _limits: Limits) -> Result<Self::Encoder, ArchiveError> {
+        Ok(ExternalEncoder)
+    }
+}
+
+struct ExternalCodec;
+impl Codec for ExternalCodec {
+    fn process(
+        &mut self,
+        _input: &[u8],
+        _output: &mut [u8],
+        _end: EndOfInput,
+    ) -> Result<CodecStep, ArchiveError> {
+        Err(ArchiveError::new(libarchive_oxide_core::ErrorKind::Protocol))
+    }
+}
+impl CodecProvider for ExternalCodec {
+    type Decoder = Self;
+
+    fn filter(&self) -> FilterId { FilterId::Gzip }
+    fn name(&self) -> &'static str { "package-smoke-codec" }
+    fn probe(&self, _prefix: &[u8]) -> ProbeResult<()> { ProbeResult::NoMatch }
+    fn capabilities(&self) -> CodecCapabilities { CodecCapabilities::new(true, true) }
+    fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
+        Ok(ExternalCodec)
+    }
+    fn encode_frame(&self, input: &[u8], _limits: Limits) -> Result<Vec<u8>, ArchiveError> {
+        Ok(input.to_vec())
+    }
+}
+
+fn main() {
+    let _engine = ArchiveEngine::new()
+        .with_format_provider(ExternalFormat)
+        .with_codec_provider(ExternalCodec);
+    let _closed = ProviderSet::empty()
+        .with_format_provider(ExternalFormat)
+        .with_codec_provider(ExternalCodec);
+    let limits = Limits::safe();
+    let mut reader = ArchiveReader::with_limits(Cursor::new(Vec::<u8>::new()), limits);
+    let _event: Result<ReaderEvent<'_>, _> = reader.next_event();
+}
+"#;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -251,18 +344,7 @@ libarchive_oxide-core = {{ path = "{consumer_core}" }}
     )?;
     fs::write(
         smoke.join("consumer").join("src").join("main.rs"),
-        r"use std::io::Cursor;
-
-use libarchive_oxide::{ArchiveEngine, ArchiveReader, ReaderEvent};
-use libarchive_oxide_core::Limits;
-
-fn main() {
-    let _engine = ArchiveEngine::new();
-    let limits = Limits::safe();
-    let mut reader = ArchiveReader::with_limits(Cursor::new(Vec::<u8>::new()), limits);
-    let _event: Result<ReaderEvent<'_>, _> = reader.next_event();
-}
-",
+        PACKAGE_CONSUMER_MAIN,
     )?;
 
     check_packaged_profiles(&smoke)?;

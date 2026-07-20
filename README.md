@@ -132,6 +132,17 @@ use `SeekArchiveReader` / `SeekArchiveWriter`. The `async` feature adds both
 `Pipeline` is the direct caller-driven API and incrementally composes up to the
 configured number of gzip, bzip2, zstd, xz, and lz4 layers.
 
+## Compile-time providers
+
+Downstream crates can prepend statically dispatched `FormatProvider` and
+`CodecProvider` implementations to `ProviderSet::builtins()`, or start from a
+closed `ProviderSet::empty()`. `Pipeline`, `ArchiveReader`, and `ArchiveEngine`
+then use that same concrete chain for events, inspection, rewind, planning,
+apply, and `create_registered`; no global registry, `dyn` dispatch, or plugin
+ABI is introduced. Providers serve stable `FormatId` / `FilterId` values, and
+prepend order selects an alternative implementation. See the
+[provider contract](docs/providers.md).
+
 ## Codec backends
 
 `libarchive_oxide-core` is zero-dependency `no_std + alloc` safe Rust, and all
@@ -160,6 +171,7 @@ All published crates use `#![forbid(unsafe_code)]`.
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 - [Architecture decisions](docs/adr/)
+- [Compile-time provider contract](docs/providers.md)
 - [Detailed support matrix](docs/support-matrix.md)
 - [Modern Replacement roadmap](docs/modern-replacement.md)
 - [Modern Replacement issue tracker](https://github.com/P4suta/libarchive_oxide/issues/28)

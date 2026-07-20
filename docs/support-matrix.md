@@ -39,6 +39,22 @@ Profile-less individual codec features remain portable. Sync, Pipeline,
 futures-io, Tokio, create, and CLI paths share the same conformance and
 malformed corpus; see [codec profile evidence](codec-profiles.md).
 
+## Compile-time providers
+
+| Surface | Built-in compatibility | Downstream registration |
+|---|---|---|
+| format read | unchanged | sequential alternative `FormatProvider` |
+| format write | unchanged | `ProviderArchiveWriter` / `create_registered` |
+| outer codec read/write | unchanged | bounded alternative `CodecProvider` frames |
+| engine events/inspect/plan/apply | unchanged | same concrete chain survives rewind |
+| capability query | available/disabled/unknown | available/disabled/unknown |
+
+Registration is static generic composition: there is no trait-object registry,
+global mutable registration, dynamic library loading, or plugin ABI. Invalid
+probe/progress contracts and ambiguous different-ID matches fail with typed
+errors. External seek-native providers are not currently supported. See the
+[provider contract and evidence](providers.md).
+
 ## Filesystem restoration
 
 Extraction is rooted in a `cap-std` directory capability. The default policy

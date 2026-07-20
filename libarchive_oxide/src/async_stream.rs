@@ -11,13 +11,14 @@ use std::task::{Context, Poll};
 use futures_io::{AsyncRead, AsyncWrite};
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
-    ArchiveError, ArchiveMetadata, CpioDialect, EncodeCommand, EncodeStatus, EntryMetadata,
-    ErrorKind, FormatId, Limits, TarEncoder,
+    ArchiveEncoder, ArchiveError, ArchiveMetadata, CpioDialect, EncodeCommand, EncodeStatus,
+    EntryMetadata, ErrorKind, FormatId, Limits,
 };
 
 #[cfg(feature = "aes")]
 use crate::SecretBytes;
 use crate::async_filter::{AsyncFilterReader, AsyncFilterWriter};
+use crate::provider::ProviderArchiveEncoder;
 use crate::stream::{Pipeline, PipelineEvent, ReaderEvent, RuntimeEncoder, StreamError};
 use crate::zip::ZipMethod;
 
@@ -205,7 +206,7 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveWriter<W> {
     pub fn new(output: W) -> Self {
         Self {
             output: AsyncFilterWriter::Plain(output),
-            encoder: RuntimeEncoder::Tar(TarEncoder::new(Limits::default())),
+            encoder: RuntimeEncoder::tar(Limits::default()),
             format: FormatId::Tar,
             buffer: vec![0; BUFFER],
             failed: false,
