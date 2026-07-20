@@ -54,6 +54,11 @@ v0.2 intentionally has no source-compatible v0.1 shim.
   destination objects, links, and special files.
 - Inspect every `EntryOutcome` in the returned `ExtractionReport`; policy
   rejection is not reported as silent success.
+- High-level session apply can use `apply_with_adapter` for a downstream
+  `FilesystemAdapter`. Existing `apply(plan, cap_std::fs::Dir)` remains valid.
+  Inspect `ApplyReport::filesystem_findings` when restoration fidelity matters;
+  unsupported, refused, partial, and OS-error attributes are never implicit
+  success.
 
 ## Resource and capability changes
 

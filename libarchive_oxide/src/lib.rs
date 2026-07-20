@@ -36,6 +36,10 @@ pub mod engine;
 pub mod extractor;
 pub mod filter;
 pub mod filtered_io;
+
+pub mod filesystem;
+mod filesystem_driver;
+mod filesystem_std;
 mod iso_stream;
 pub mod path;
 mod pipeline_codec;
@@ -66,6 +70,12 @@ pub use engine::{
 pub use extractor::{
     EntryOutcome, EntryOutcomeKind, ExtractionPolicy, ExtractionReport, Extractor, RejectionReason,
 };
+pub use filesystem::{
+    FilesystemAdapter, FilesystemAdapterError, FilesystemCapabilities, FilesystemEntry,
+    FilesystemEntryReport, FilesystemFinding, FilesystemFindingKind, FilesystemMaterialization,
+    FilesystemOperation,
+};
+pub use filesystem_std::CapStdFilesystemAdapter;
 pub use filtered_io::FilterReader;
 pub use libarchive_oxide_core;
 pub use libarchive_oxide_core::CpioDialect;

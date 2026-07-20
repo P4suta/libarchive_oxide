@@ -23,6 +23,7 @@ use libarchive_oxide_core::{
 use sha2::{Digest, Sha256};
 
 use crate::extractor::{ExtractionPolicy, ExtractionReport, RejectionReason};
+use crate::filesystem_driver::{extract_registered_with_adapter, extract_seek_with_adapter};
 use crate::path::sanitize_archive_path;
 use crate::provider::{
     BuiltinCodecProviders, BuiltinFormatProviders, CodecProvider, CodecProviderNode,
@@ -31,8 +32,9 @@ use crate::provider::{
 };
 use crate::spool::{DEFAULT_MAX_BYTES, DEFAULT_MEMORY_THRESHOLD};
 use crate::{
-    ArchiveReader, ArchiveWriter, Extractor, ProviderArchiveWriter, ReaderEvent, SeekArchiveReader,
-    SeekArchiveWriter, SpoolReader, StreamError,
+    ArchiveReader, ArchiveWriter, CapStdFilesystemAdapter, FilesystemAdapter, FilesystemFinding,
+    ProviderArchiveWriter, ReaderEvent, SeekArchiveReader, SeekArchiveWriter, SpoolReader,
+    StreamError,
 };
 
 const FORMAT_PROBE_BYTES: usize = 16 * 2048 + 6;
@@ -469,6 +471,7 @@ pub struct ApplyReport {
     digest: InputDigest,
     format: FormatId,
     extraction: ExtractionReport,
+    findings: Vec<FilesystemFinding>,
 }
 
 impl ApplyReport {
@@ -490,10 +493,32 @@ impl ApplyReport {
         &self.extraction
     }
 
+    /// Typed filesystem capability, refusal, partial-application, and OS-error findings.
+    #[must_use]
+    pub fn filesystem_findings(&self) -> &[FilesystemFinding] {
+        &self.findings
+    }
+
+    /// Whether any requested filesystem operation was not completely applied.
+    #[must_use]
+    pub fn has_filesystem_findings(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| finding.kind() != crate::filesystem::FilesystemFindingKind::Applied)
+    }
+
     /// Consumes this report and returns the low-level extraction report.
+    ///
+    /// Use [`Self::into_parts`] when filesystem fidelity evidence is also needed.
     #[must_use]
     pub fn into_extraction(self) -> ExtractionReport {
         self.extraction
+    }
+
+    /// Consumes the report into materialization outcomes and filesystem findings.
+    #[must_use]
+    pub fn into_parts(self) -> (ExtractionReport, Vec<FilesystemFinding>) {
+        (self.extraction, self.findings)
     }
 }
 
@@ -731,9 +756,27 @@ where
         })
     }
 
-    /// Applies a plan exactly once through a directory capability.
+    /// Applies a plan exactly once through the built-in `cap-std` adapter.
+    ///
+    /// This source-compatible shortcut delegates to [`Self::apply_with_adapter`].
     #[allow(clippy::needless_pass_by_value)] // Ownership is the single-use plan contract.
     pub fn apply(&mut self, plan: ExtractionPlan, root: Dir) -> Result<ApplyReport, StreamError> {
+        let mut adapter = CapStdFilesystemAdapter::new(root);
+        self.apply_with_adapter(plan, &mut adapter)
+    }
+
+    /// Applies a plan exactly once through a capability-reporting adapter.
+    ///
+    /// Session identity and replay checks run before the adapter is touched.
+    /// The shared driver retains path policy, resource limits, hardlink order,
+    /// and archive parser state; the adapter only receives normalized relative
+    /// operations.
+    #[allow(clippy::needless_pass_by_value)] // Ownership is the single-use plan contract.
+    pub fn apply_with_adapter<A: FilesystemAdapter>(
+        &mut self,
+        plan: ExtractionPlan,
+        adapter: &mut A,
+    ) -> Result<ApplyReport, StreamError> {
         let ExtractionPlan {
             session_id,
             digest,
@@ -755,23 +798,27 @@ where
         }
         self.applied = true;
         self.rewind()?;
-        let mut extractor =
-            Extractor::with_policy_and_limits(root, policy.extraction_policy(), self.limits);
-        let extraction = match self.reader.as_mut().ok_or_else(|| {
+        let applied = match self.reader.as_mut().ok_or_else(|| {
             StreamError::archive(
                 ArchiveError::new(ErrorKind::Protocol)
                     .with_context("archive session reader is unavailable"),
             )
         })? {
-            SessionReader::Sequential(reader) => extractor.extract_registered(reader)?,
+            SessionReader::Sequential(reader) => extract_registered_with_adapter(
+                reader,
+                adapter,
+                policy.extraction_policy(),
+                self.limits,
+            )?,
             SessionReader::Seek { reader, .. } => {
-                extractor.extract_seek_matching(reader, |_| true)?
+                extract_seek_with_adapter(reader, adapter, policy.extraction_policy(), self.limits)?
             },
         };
         Ok(ApplyReport {
             digest: self.digest,
             format,
-            extraction,
+            extraction: applied.extraction,
+            findings: applied.findings,
         })
     }
 }

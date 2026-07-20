@@ -33,6 +33,19 @@ pre-commit:
       tags: lint
       glob: "*.rs"
       run: mise exec -- just lint
+      fail_text: "Host Clippy failed; fix every warning before committing."
+
+    clippy-linux:
+      tags: lint
+      glob: "*.rs"
+      run: mise exec -- just lint-linux
+      fail_text: "Linux-target Clippy failed; fix cfg-gated warnings before committing."
+
+    clippy-macos:
+      tags: lint
+      glob: "*.rs"
+      run: mise exec -- just lint-macos
+      fail_text: "macOS-target Clippy failed; fix cfg-gated errors before committing."
 
     check-no-dyn:
       tags: lint

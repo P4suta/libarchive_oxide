@@ -14,8 +14,9 @@ Do not bypass hooks with `--no-verify`.
 
 The hooks use two layers:
 
-- `pre-commit` formats and spell-checks staged files, then runs the fast lint,
-  static-dispatch, and license checks;
+- `pre-commit` formats and spell-checks staged files, then runs both codec-profile
+  host Clippy plus Linux- and macOS-target Clippy before static-dispatch and
+  license checks;
 - `pre-push` runs `just ci`, which mirrors every practical CI gate
   available on a developer machine, including all-feature tests, rustdoc,
   bare-metal `no_std`, dependency policy, packaged-crate consumer validation,

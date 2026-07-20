@@ -31,9 +31,11 @@ time-of-check/time-of-use boundary.
 - Seek-native ZIP, 7z, and ISO inputs use `SeekArchiveReader`; sequential and
   outer-filtered inputs reuse `ArchiveReader`. Both continue to drive the same
   format and codec state machines.
-- `Policy` is translated to the existing capability-rooted `Extractor`.
-  Planning is advisory and typed; the apply report remains authoritative for
-  destination-state and platform-dependent rejection.
+- `Policy` is enforced by the shared filesystem driver before dispatch to a
+  compile-time `FilesystemAdapter`. `apply(cap_std::fs::Dir)` remains a
+  compatibility shortcut to the standard adapter. Planning is advisory and
+  typed; entry outcomes plus filesystem findings remain authoritative for
+  destination state and platform fidelity.
 - `CreateOptions` selects existing sequential or seek writers. It does not
   introduce a second creation implementation.
 
@@ -47,5 +49,6 @@ time-of-check/time-of-use boundary.
 - The Rust plan is explicitly not the CLI JSON schema and is not a durable
   interchange format.
 - Compile-time external provider chains are specified by
-  [ADR-0006](0006-compile-time-providers.md); immutable range-source identity is
-  specified separately by [ADR-0004](0004-immutable-range-sources.md).
+  [ADR-0006](0006-compile-time-providers.md); capability-reporting application
+  by [ADR-0007](0007-capability-filesystem.md); immutable range-source identity
+  by [ADR-0004](0004-immutable-range-sources.md).
