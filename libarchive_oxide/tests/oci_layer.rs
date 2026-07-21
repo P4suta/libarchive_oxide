@@ -419,10 +419,17 @@ fn apply_maps_ownership_into_the_plan() {
     let report = result.expect("apply mapped layer");
     assert_eq!(report.materialized(), 1);
     assert_eq!(fs::read(dir.path().join("srv/app")).unwrap(), b"payload");
+    // On Linux the adapter attempts and reports ownership rather than silently
+    // dropping it. Mapping to uid 0 lands as `Applied` only when the process is
+    // privileged; an unprivileged runner reports the refused chown as `OsError`.
+    // Either way the ownership operation is surfaced, never discarded.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     assert!(report.findings().iter().any(|finding| {
         finding.operation() == &FilesystemOperation::Ownership
-            && finding.kind() == FilesystemFindingKind::Applied
+            && matches!(
+                finding.kind(),
+                FilesystemFindingKind::Applied | FilesystemFindingKind::OsError
+            )
     }));
 }
 
