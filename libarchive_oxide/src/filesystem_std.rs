@@ -20,6 +20,7 @@ use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Timestamp};
 use crate::filesystem::{
     FilesystemAdapter, FilesystemAdapterError, FilesystemCapabilities, FilesystemEntry,
     FilesystemEntryReport, FilesystemFinding, FilesystemMaterialization, FilesystemOperation,
+    FilesystemRemoval,
 };
 
 #[derive(Debug)]
@@ -336,6 +337,60 @@ impl CapStdFilesystemAdapter {
         {
             let _ = self.root.remove_file(&file.temporary);
         }
+    }
+
+    /// Opens the directory named by `path` by resolving each component with a
+    /// `nofollow` step, so no intermediate symbolic link is traversed. An empty
+    /// or `.` path yields a fresh handle to the extraction root.
+    fn open_dir_chain(&self, path: &Path) -> io::Result<Dir> {
+        let mut current = self.root.open_dir_nofollow(".")?;
+        for component in path.components() {
+            let component = component.as_os_str();
+            if component.is_empty() || component == std::ffi::OsStr::new(".") {
+                continue;
+            }
+            current = current.open_dir_nofollow(component)?;
+        }
+        Ok(current)
+    }
+
+    /// Removes `destination` and any subtree it roots without following a
+    /// terminal or intermediate symbolic link.
+    fn remove_target(&self, destination: &Path) -> io::Result<()> {
+        let parent = destination.parent().unwrap_or_else(|| Path::new(""));
+        let Some(name) = destination.file_name() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "whiteout target has no final component",
+            ));
+        };
+        let directory = self.open_dir_chain(parent)?;
+        match directory.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_dir() => directory.remove_dir_all(name),
+            Ok(_) => directory.remove_file_or_symlink(name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Removes every child of `destination` while leaving the directory itself
+    /// in place. Symbolic-link children are unlinked, never followed.
+    fn clear_directory_contents(&self, destination: &Path) -> io::Result<()> {
+        let directory = self.open_dir_chain(destination)?;
+        let mut children: Vec<(std::ffi::OsString, bool)> = Vec::new();
+        for entry in directory.entries()? {
+            let entry = entry?;
+            let is_dir = entry.file_type()?.is_dir();
+            children.push((entry.file_name(), is_dir));
+        }
+        for (name, is_dir) in children {
+            if is_dir {
+                directory.remove_dir_all(&name)?;
+            } else {
+                directory.remove_file_or_symlink(&name)?;
+            }
+        }
+        Ok(())
     }
 }
 impl PendingFile {
@@ -1027,6 +1082,38 @@ impl FilesystemAdapter for CapStdFilesystemAdapter {
         }
         self.directory_metadata.clear();
         Ok(findings)
+    }
+
+    fn remove_path(
+        &mut self,
+        request: FilesystemRemoval<'_>,
+    ) -> Result<FilesystemFinding, FilesystemAdapterError> {
+        let path = request.path().clone();
+        Ok(match self.remove_target(request.destination()) {
+            Ok(()) => FilesystemFinding::applied(path, FilesystemOperation::RemovePath),
+            Err(error) => FilesystemFinding::os_error(
+                path,
+                FilesystemOperation::RemovePath,
+                "failed to remove whiteout target",
+                &error,
+            ),
+        })
+    }
+
+    fn clear_directory(
+        &mut self,
+        request: FilesystemRemoval<'_>,
+    ) -> Result<FilesystemFinding, FilesystemAdapterError> {
+        let path = request.path().clone();
+        Ok(match self.clear_directory_contents(request.destination()) {
+            Ok(()) => FilesystemFinding::applied(path, FilesystemOperation::ClearDirectory),
+            Err(error) => FilesystemFinding::os_error(
+                path,
+                FilesystemOperation::ClearDirectory,
+                "failed to clear opaque directory",
+                &error,
+            ),
+        })
     }
 }
 

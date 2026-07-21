@@ -50,10 +50,13 @@ Detailed bodies used for initial issue creation live in
 | [RM-115](https://github.com/P4suta/libarchive_oxide/issues/44) | RM-110 | completed by [#45](https://github.com/P4suta/libarchive_oxide/pull/45) | Default portable and explicit native codec profiles |
 | [RM-121](https://github.com/P4suta/libarchive_oxide/issues/32) | RM-120 | completed by [#33](https://github.com/P4suta/libarchive_oxide/pull/33) | `oxarchive` inspect, plan, apply, and verify |
 | [RM-122](https://github.com/P4suta/libarchive_oxide/issues/48) | RM-120 | implementation [#51](https://github.com/P4suta/libarchive_oxide/pull/51) | Bounded create, streamed inspection, and unified CLI contracts |
+| RM-201 | RM-200 | implementation (DEV-74) | Bounded layer read with one-pass compressed digest and diffID |
+| RM-202 | RM-200 | implementation (DEV-74) | Digest-verified layer apply with whiteout, opaque, ownership, link, and conflict handling |
 
 The cross-epic acceptance mapping, local reproductions, performance/RSS data,
 and remote-only gates are collected in the
-[Campaign 1 completion evidence](campaign-1-evidence.md).
+[Campaign 1 completion evidence](campaign-1-evidence.md) and the
+[Campaign 2 completion evidence](campaign-2-evidence.md).
 
 ## Labels
 

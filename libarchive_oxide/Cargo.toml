@@ -118,6 +118,8 @@ lzma-rust2 = "0.16.5"
 xz-codec = { package = "xz2", version = "0.1.7" }
 ruzstd = "0.8.2"
 zstd-codec = { package = "zstd", version = "0.13.3" }
+# Independent SHA-256 reference for OCI layer digest/diffID tests.
+sha2 = "0.11"
 sevenz-rust2 = "0.21.3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }
 futures-lite = "2.6.1"
