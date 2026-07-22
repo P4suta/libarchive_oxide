@@ -6,14 +6,14 @@ scheme, metadata field, or producer quirk is accepted.
 
 ## Archive containers
 
-| Container | Access | Read | Write | Metadata and method notes |
-|---|---|---|---|---|
-| tar | sequential | v7, ustar, pax, GNU | yes | pax extensions and GNU sparse; known-size entry creation |
-| cpio | sequential | binary little/big endian, odc, newc, crc | yes | known-size entry creation |
-| ar | sequential | GNU and BSD | yes | thin members are reported as external references and are never materialized automatically |
-| ZIP/ZIP64 | seek or streaming | Store and Deflate | yes | descriptors, ZIP64, Unicode/timestamp extras, optional WinZip AES-256 AE-2; unknown extras are preserved |
-| 7z | seek | LZMA/LZMA2, encoded headers, solid single-folder archives | yes | optional `sevenz`; multiple folders and general coder graphs are unsupported |
-| ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | UDF and continuation-area coverage are not complete |
+| Container | Access | Read | Write | Encryption | Metadata/method notes |
+|---|---|---|---|---|---|
+| tar | sequential | v7, ustar, pax, GNU | yes | none | pax extensions and GNU sparse; known-size entry creation |
+| cpio | sequential | binary little/big endian, odc, newc, crc | yes | none | known-size entry creation |
+| ar | sequential | GNU and BSD | yes | none | thin members are reported as external references and are never materialized automatically |
+| ZIP/ZIP64 | seek or streaming | Store and Deflate | yes | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode/timestamp extras; unknown extras are preserved |
+| 7z | seek | LZMA/LZMA2, encoded headers, solid single-folder archives | yes | none (AES unsupported) | optional `sevenz`; multiple folders and general coder graphs are unsupported |
+| ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | UDF and continuation-area coverage are not complete |
 
 ZIP compression methods Deflate64, BZip2, LZMA, and Zstandard are not yet
 implemented. Traditional ZipCrypto is not enabled by default. 7z BCJ/Delta,

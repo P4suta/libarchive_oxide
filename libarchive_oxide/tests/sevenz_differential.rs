@@ -24,13 +24,16 @@
 
 use std::io::Cursor;
 
-use libarchive_oxide::{ReaderEvent, SeekArchiveReader, SeekArchiveWriter};
+use libarchive_oxide::SeekArchiveWriter;
 use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Limits};
 
 use sevenz_rust2::{
     ArchiveEntry, ArchiveReader as SevenReader, ArchiveWriter as SevenWriter, EncoderConfiguration,
     EncoderMethod, Password, SourceReader,
 };
+
+mod common;
+use common::{EntryShape, read_with_arca};
 
 /// Writes an arca 7z with a directory, two content files, and an empty file.
 fn arca_archive() -> Vec<u8> {
@@ -114,33 +117,14 @@ fn arca_reads_sevenz_rust2_output() {
     let cursor = w.finish().unwrap();
     let bytes = cursor.into_inner();
 
-    let got = drive_arca(&bytes);
-
-    assert_eq!(got.len(), 2);
-    assert_eq!(got[0].0, b"pkg/a.txt");
-    assert_eq!(got[0].1, EntryKind::File);
-    assert_eq!(got[0].2, a);
-    assert_eq!(got[1].0, b"pkg/b.txt");
-    assert_eq!(got[1].2, b);
-}
-
-/// Reads every content file through arca's seek adapter.
-fn drive_arca(bytes: &[u8]) -> Vec<(Vec<u8>, EntryKind, Vec<u8>)> {
-    let mut reader = SeekArchiveReader::new(Cursor::new(bytes.to_vec())).unwrap();
-    let mut entries: Vec<(Vec<u8>, EntryKind, Vec<u8>)> = Vec::new();
-    loop {
-        match reader.next_event().unwrap() {
-            ReaderEvent::Entry(metadata) => entries.push((
-                metadata.path().as_bytes().to_vec(),
-                metadata.kind(),
-                Vec::new(),
-            )),
-            ReaderEvent::Data(data) => entries.last_mut().unwrap().2.extend_from_slice(data),
-            ReaderEvent::ArchiveMetadata(_) | ReaderEvent::EndEntry => {},
-            ReaderEvent::Done => return entries,
-            _ => panic!("unexpected future 7z event"),
-        }
-    }
+    // Route the read/compare through the shared interop harness: byte-level content equality
+    // against canonical shapes (path + kind + content), not a count-only check.
+    let got = read_with_arca(&bytes);
+    let expected = vec![
+        EntryShape::new(b"pkg/a.txt".to_vec(), EntryKind::File, a.clone()),
+        EntryShape::new(b"pkg/b.txt".to_vec(), EntryKind::File, b.clone()),
+    ];
+    assert_eq!(got, expected);
 }
 
 /// The plain-**LZMA** (method `03 01 01`) folder coder — what 7-Zip and `sevenz-rust2` use — must be
@@ -163,12 +147,12 @@ fn arca_reads_sevenz_rust2_lzma_folder() {
     w.push_archive_entries(entries, sources).unwrap();
     let bytes = w.finish().unwrap().into_inner();
 
-    let got = drive_arca(&bytes);
-    assert_eq!(got.len(), 2);
-    assert_eq!(got[0].0, b"pkg/a.txt");
-    assert_eq!(got[0].2, a);
-    assert_eq!(got[1].0, b"pkg/b.txt");
-    assert_eq!(got[1].2, b);
+    let got = read_with_arca(&bytes);
+    let expected = vec![
+        EntryShape::new(b"pkg/a.txt".to_vec(), EntryKind::File, a.clone()),
+        EntryShape::new(b"pkg/b.txt".to_vec(), EntryKind::File, b.clone()),
+    ];
+    assert_eq!(got, expected);
 }
 
 /// A compressed (`kEncodedHeader`) next header is what mainstream 7-Zip / `sevenz-rust2` emit once an
@@ -209,10 +193,10 @@ fn arca_reads_sevenz_rust2_compressed_header() {
         "sevenz-rust2 should emit a compressed header here"
     );
 
-    let got = drive_arca(&bytes);
+    let got = read_with_arca(&bytes);
     assert_eq!(got.len(), count);
     for (g, e) in got.iter().zip(expected.iter()) {
-        assert_eq!(g.0, e.0);
-        assert_eq!(g.2, e.1);
+        assert_eq!(g.path(), e.0.as_slice());
+        assert_eq!(g.content(), e.1.as_slice());
     }
 }

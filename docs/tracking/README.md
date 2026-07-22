@@ -60,6 +60,12 @@ Detailed bodies used for initial issue creation live in
 | RM-213 | RM-210 | implementation (DEV-101) | Bounded ZIP-container profile validators (JAR, NuGet, Wheel, EPUB) reading only the central directory with no payload decompression |
 | RM-214 | RM-210 | implementation (DEV-102) | Bounded OS/app package validators (Android APK, iOS IPA, Windows MSIX) with required-member checks and informational APK v1/v2/v3 and MSIX signing-scheme detection |
 | RM-215 | RM-210 | implementation (DEV-103) | `oxarchive package validate` CLI over the shared package validators, rendering their typed findings and stable severity as one `package_validation` JSON record without re-implementing validation |
+| RM-301 | RM-300 | implementation (DEV-107) | Reusable interoperability-evidence harness (≥3 producers read, ≥2 consumers accept) and producer-corpus provenance policy, proven on ZIP Store/Deflate and 7z LZMA2 |
+| RM-302 | RM-300 | implementation (DEV-108) | ZIP method-depth interop corpora spanning Store and Deflate across three independent producers and two consumers |
+| RM-303 | RM-300 | implementation (DEV-109) | 7z coder-graph depth interop corpora over LZMA2/LZMA folders and plain/encoded headers |
+| RM-304 | RM-300 | implementation (DEV-110) | tar/cpio/ar/ISO producer corpora with metadata-fidelity comparison through the shared harness |
+| RM-305 | RM-300 | implementation (DEV-111) | CAB/XAR read-only interop corpora read back through arca against independent producers |
+| RM-306 | RM-300 | implementation (DEV-112) | RAR5/UDF feasibility ADR recording scope, licensing, and go/no-go for read support |
 
 The cross-epic acceptance mapping, local reproductions, performance/RSS data,
 and remote-only gates are collected in the
