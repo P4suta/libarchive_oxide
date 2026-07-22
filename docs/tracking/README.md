@@ -55,6 +55,7 @@ Detailed bodies used for initial issue creation live in
 | RM-203 | RM-200 | implementation (DEV-94) | Deterministic OCI layer creation reproducing identical bytes and digests across order, timestamps, ownership, PAX emission, and padding |
 | RM-204 | RM-200 | implementation (DEV-95) | Byte/range source adapters feeding the OCI layer engine with no networking, auth, or cloud SDK dependency |
 | RM-205 | RM-200 | implementation (DEV-96) | `oxarchive oci` inspect, verify, and apply subcommands over the shared layer engine |
+| RM-211 | RM-210 | implementation (DEV-99) | Bounded package-validation framework and Debian `.deb` validator |
 
 The cross-epic acceptance mapping, local reproductions, performance/RSS data,
 and remote-only gates are collected in the
