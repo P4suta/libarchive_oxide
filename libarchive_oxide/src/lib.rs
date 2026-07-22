@@ -41,6 +41,7 @@ pub mod filesystem;
 mod filesystem_driver;
 mod filesystem_std;
 mod iso_stream;
+pub mod oci;
 pub mod path;
 mod pipeline_codec;
 pub mod provider;
@@ -73,12 +74,17 @@ pub use extractor::{
 pub use filesystem::{
     FilesystemAdapter, FilesystemAdapterError, FilesystemCapabilities, FilesystemEntry,
     FilesystemEntryReport, FilesystemFinding, FilesystemFindingKind, FilesystemMaterialization,
-    FilesystemOperation,
+    FilesystemOperation, FilesystemRemoval,
 };
 pub use filesystem_std::CapStdFilesystemAdapter;
 pub use filtered_io::FilterReader;
 pub use libarchive_oxide_core;
 pub use libarchive_oxide_core::CpioDialect;
+pub use oci::{
+    DigestKind, DigestMismatch, IdentityOwnership, LayerDigests, OciApplyReport, OciLayerApplier,
+    OciLayerEngine, OciLayerEntry, OciLayerError, OciLayerPlan, OciLayerSession, OciMaterialize,
+    OciPlanOperation, OciReject, OciRejection, OciRemoval, OwnershipMapper, OwnershipTable,
+};
 pub use path::{sanitize, sanitize_archive_path};
 pub use provider::{
     BuiltinCodecProviders, BuiltinFormatProviders, CodecCapabilities, CodecProvider,

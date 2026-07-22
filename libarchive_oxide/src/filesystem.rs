@@ -39,6 +39,10 @@ pub enum FilesystemOperation {
     Acl(usize),
     /// Restore filesystem flags.
     FileFlags,
+    /// Remove a whiteout target path, including any subtree it roots.
+    RemovePath,
+    /// Clear the contents of an opaque directory in place.
+    ClearDirectory,
 }
 
 /// Outcome of one requested filesystem operation.
@@ -200,6 +204,7 @@ pub struct FilesystemCapabilities {
     sparse: bool,
     special_files: bool,
     file_flags: bool,
+    removals: bool,
 }
 
 impl FilesystemCapabilities {
@@ -222,6 +227,7 @@ impl FilesystemCapabilities {
             sparse: false,
             special_files: false,
             file_flags: false,
+            removals: false,
         }
     }
 
@@ -240,6 +246,7 @@ impl FilesystemCapabilities {
             .with_acls(cfg!(any(target_os = "linux", target_os = "android")))
             .with_sparse(cfg!(unix))
             .with_special_files(cfg!(any(target_os = "linux", target_os = "android")))
+            .with_removals(true)
     }
 
     /// Enables or disables atomic regular-file publication.
@@ -326,6 +333,12 @@ impl FilesystemCapabilities {
         self.file_flags = enabled;
         self
     }
+    /// Enables or disables whiteout removal and opaque-directory clearing.
+    #[must_use]
+    pub const fn with_removals(mut self, enabled: bool) -> Self {
+        self.removals = enabled;
+        self
+    }
 
     /// Whether regular files are published atomically.
     #[must_use]
@@ -397,6 +410,11 @@ impl FilesystemCapabilities {
     pub const fn file_flags(self) -> bool {
         self.file_flags
     }
+    /// Whether whiteout removal and opaque-directory clearing are supported.
+    #[must_use]
+    pub const fn removals(self) -> bool {
+        self.removals
+    }
 
     /// Whether this capability covers an operation.
     #[must_use]
@@ -414,6 +432,7 @@ impl FilesystemCapabilities {
             FilesystemOperation::ExtendedAttribute(_) => self.xattrs,
             FilesystemOperation::Acl(_) => self.acls,
             FilesystemOperation::FileFlags => self.file_flags,
+            FilesystemOperation::RemovePath | FilesystemOperation::ClearDirectory => self.removals,
         }
     }
 
@@ -479,6 +498,36 @@ impl<'a> FilesystemEntry<'a> {
     #[must_use]
     pub const fn overwrite(self) -> bool {
         self.overwrite
+    }
+}
+
+/// A policy-validated whiteout or opaque-directory request.
+///
+/// `destination` is a normalized relative path; the engine has already rejected
+/// absolute paths, traversal, drive prefixes, and unrepresentable bytes. An
+/// empty destination denotes the extraction root itself. Adapters must still
+/// resolve the path without following untrusted intermediate links.
+#[derive(Debug, Clone, Copy)]
+pub struct FilesystemRemoval<'a> {
+    path: &'a ArchivePath,
+    destination: &'a Path,
+}
+
+impl<'a> FilesystemRemoval<'a> {
+    pub(crate) const fn new(path: &'a ArchivePath, destination: &'a Path) -> Self {
+        Self { path, destination }
+    }
+
+    /// Archive-native path of the whiteout or opaque marker entry.
+    #[must_use]
+    pub const fn path(self) -> &'a ArchivePath {
+        self.path
+    }
+
+    /// Normalized relative destination the request targets.
+    #[must_use]
+    pub const fn destination(self) -> &'a Path {
+        self.destination
     }
 }
 
@@ -620,4 +669,44 @@ pub trait FilesystemAdapter {
     fn abort_entry(&mut self);
     /// Finalizes deferred directory metadata and returns additional findings.
     fn finish_session(&mut self) -> Result<Vec<FilesystemFinding>, FilesystemAdapterError>;
+
+    /// Removes a whiteout target path, including any subtree it roots.
+    ///
+    /// The default implementation reports the operation as unsupported, so
+    /// existing adapters and test doubles keep compiling and refusing removals
+    /// until they opt in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for broken adapter state or infrastructure
+    /// failures; expected refusals and OS errors are returned as findings.
+    fn remove_path(
+        &mut self,
+        request: FilesystemRemoval<'_>,
+    ) -> Result<FilesystemFinding, FilesystemAdapterError> {
+        Ok(FilesystemFinding::unsupported(
+            request.path().clone(),
+            FilesystemOperation::RemovePath,
+            "filesystem adapter does not support whiteout removal",
+        ))
+    }
+
+    /// Clears the contents of an opaque directory in place.
+    ///
+    /// The default implementation reports the operation as unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for broken adapter state or infrastructure
+    /// failures; expected refusals and OS errors are returned as findings.
+    fn clear_directory(
+        &mut self,
+        request: FilesystemRemoval<'_>,
+    ) -> Result<FilesystemFinding, FilesystemAdapterError> {
+        Ok(FilesystemFinding::unsupported(
+            request.path().clone(),
+            FilesystemOperation::ClearDirectory,
+            "filesystem adapter does not support opaque-directory clearing",
+        ))
+    }
 }

@@ -344,6 +344,30 @@ impl Policy {
         self
     }
 
+    /// Whether existing regular files may be atomically replaced.
+    #[must_use]
+    pub const fn overwrite(self) -> bool {
+        self.overwrite
+    }
+
+    /// Whether symbolic-link restoration is enabled.
+    #[must_use]
+    pub const fn symlinks(self) -> bool {
+        self.symlinks
+    }
+
+    /// Whether hard-link restoration is enabled.
+    #[must_use]
+    pub const fn hardlinks(self) -> bool {
+        self.hardlinks
+    }
+
+    /// Whether special-file restoration is enabled.
+    #[must_use]
+    pub const fn special_files(self) -> bool {
+        self.special_files
+    }
+
     const fn extraction_policy(self) -> ExtractionPolicy {
         ExtractionPolicy::safe()
             .allow_overwrite(self.overwrite)
