@@ -11,29 +11,53 @@ scheme, metadata field, or producer quirk is accepted.
 | tar | sequential | v7, ustar, pax, GNU | yes | none | pax extensions and GNU sparse; known-size entry creation |
 | cpio | sequential | binary little/big endian, odc, newc, crc | yes | none | known-size entry creation |
 | ar | sequential | GNU and BSD | yes | none | thin members are reported as external references and are never materialized automatically |
-| ZIP/ZIP64 | seek or streaming | Store, Deflate, BZip2 (method 12), Zstandard (method 93), and LZMA (method 14) | Store, Deflate, BZip2, LZMA; Zstandard (native-codecs only) | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode/timestamp extras; unknown extras are preserved |
+| ZIP/ZIP64 | seek or streaming | see [ZIP compression methods](#zip-compression-methods) grid | see grid | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode/timestamp extras; unknown extras are preserved |
 | 7z | seek | LZMA/LZMA2, encoded headers, solid single-folder archives | yes | none (AES unsupported) | optional `sevenz`; multiple folders and general coder graphs are unsupported |
 | ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | UDF and continuation-area coverage are not complete |
 
-ZIP BZip2 (method 12) read and write are available under the `bzip2` feature
-(on by default via `portable-codecs`); when that feature is off, a method-12
-member reports a structured unsupported error and still enumerates. ZIP
-Zstandard (method 93) read is available under the `zstd` feature on BOTH codec
-profiles (portable via `ruzstd`, native via `compression-codecs`); Zstandard
-write is available ONLY under the `native-codecs` profile, because the portable
-`ruzstd` path is decode-only — selecting Zstandard for write on the portable
-profile returns a structured `Unsupported` error rather than panicking, and with
-the `zstd` feature off entirely a method-93 member reports a structured
-unsupported error and still enumerates. ZIP LZMA (method 14) read and write are
-available under the `xz` feature (on by default via `portable-codecs`, and also
-under `native-codecs`); both directions drive `lzma-rust2` — arca emits raw
-LZMA1 with the 9-byte ZIP-LZMA header and an end-of-stream marker (general-purpose
-bit 1), and reads both the end-marker and known-size conventions. When the `xz`
-feature is off, a method-14 member reports a structured unsupported error and
-still enumerates. ZIP compression method Deflate64 is not yet implemented.
-Traditional ZipCrypto is not enabled by default.
+### ZIP compression methods
+
+Capability is a grid: each method is reported per direction (read/write) and per
+codec profile (portable/native). A `—` cell is not a silent gap — a member using
+that method returns a structured `Unsupported` error and still enumerates. Cells
+that are a *tracked deficit* rather than a permanent limit are listed under
+[Codec capability deficits](#codec-capability-deficits).
+
+| Method | Code | Read (portable) | Read (native) | Write (portable) | Write (native) | Feature |
+|---|---|:---:|:---:|:---:|:---:|---|
+| Store | 0 | ✓ | ✓ | ✓ | ✓ | — |
+| Deflate | 8 | ✓ | ✓ | ✓ | ✓ | — |
+| Deflate64 | 9 | — | — | — | — | — |
+| BZip2 | 12 | ✓ | ✓ | ✓ | ✓ | `bzip2` |
+| LZMA | 14 | ✓ | ✓ | ✓ | ✓ | `xz` |
+| Zstandard | 93 | ✓ | ✓ | — | ✓ | `zstd` (read) / `native-codecs` (write) |
+
+Notes: BZip2 and LZMA are complete read+write on both profiles (`libbz2-rs-sys` /
+`lzma-rust2`, both pure-Rust on portable). LZMA emits raw LZMA1 with the 9-byte
+ZIP-LZMA header and an end-of-stream marker (general-purpose bit 1) and reads both
+the end-marker and known-size conventions. Zstandard read is pure-Rust on both
+profiles (`ruzstd` / `compression-codecs`); Zstandard *write* is `native-codecs`
+only — see the deficit table for why, and note this is a tracked debt, not a
+resting state. Deflate64 has no implementation in either direction. Traditional
+ZipCrypto is not enabled by default.
+
 7z BCJ/Delta, Deflate, BZip2, Zstandard, PPMd, AES, multi-folder, and arbitrary
 coder-graph coverage remain roadmap work.
+
+### Codec capability deficits
+
+Per [ADR-0012](adr/0012-codec-capability-contract.md), a codec gap never bends a
+core guarantee (`#![forbid(unsafe_code)]`, static dispatch, C-free portable
+profile, bounded streaming, stable API) and is never a silent fallback: it is a
+typed capability plus a *tracked deficit* with a declared resolution path.
+Documenting a gap opens a debt; it does not discharge it. This is the complete
+ledger — every other mainstream codec (deflate, bzip2, xz/LZMA, lz4) is complete
+read+write on portable.
+
+| Deficit | Surfaces as | Why | Resolution path | Tracking |
+|---|---|---|---|---|
+| Portable **streaming** zstd encode | ZIP write method 93 on `portable-codecs` → structured `Unsupported`; `native-codecs` write works | `ruzstd` ships only a one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, used for outer-filter frames and `create --zstd`). It cannot emit a single ZIP member as a bounded stream without buffering the whole member, which would break the core bounded-memory guarantee. The engine refuses the path rather than weaken the guarantee. | A streaming, single-stream pure-Rust zstd encoder — upstream to `ruzstd` or a dedicated crate the engine consumes. | RM-307 → follow-on codec initiative |
+| Deflate64 (read + write) | ZIP method 9 → structured `Unsupported` | No pure-Rust Deflate64 encoder exists; decoders are scarce and write has effectively no consumer demand. | Feasibility decision (own read-only decoder, external decoder, or leave unsupported); no encoder planned. | RM-306 feasibility ADR |
 
 RAR5, CAB, XAR, and UDF are not currently implemented. They are read-only
 targets for the Modern Archive Profile.
@@ -53,6 +77,13 @@ explicit `--no-default-features` profile, and selecting both fails compilation.
 Profile-less individual codec features remain portable. Sync, Pipeline,
 futures-io, Tokio, create, and CLI paths share the same conformance and
 malformed corpus; see [codec profile evidence](codec-profiles.md).
+
+The portable zstd *encode* above is `ruzstd`'s one-shot frame encoder, which
+serves outer-filter frames and `create --zstd`. It is deliberately not reused
+for bounded-streaming ZIP-member writing (a single member must stream within the
+memory budget), which is why ZIP method 93 write is `native-codecs` only; see
+[Codec capability deficits](#codec-capability-deficits) and
+[ADR-0012](adr/0012-codec-capability-contract.md).
 
 ## Compile-time providers
 

@@ -253,6 +253,40 @@ change, or versioned release candidate is part of this snapshot.
   file is created, no new runtime dependency is added (`lzma-rust2` was already
   present via `xz`/`sevenz`), and the crate keeps `#![forbid(unsafe_code)]`.
 
+## RM-307
+
+- ADR-0012 (`docs/adr/0012-codec-capability-contract.md`) codifies the
+  codec-capability contract: the engine commits to a codec *contract* and an
+  honest capability model, and the core guarantees (`#![forbid(unsafe_code)]`,
+  static `no-dyn` dispatch, the C-free `portable-codecs` profile, bounded
+  streaming, a stable API) never bend to a codec's absence or limitation. A codec
+  that cannot meet a path's contract is refused for that path and surfaced as a
+  typed capability (`ProviderCapability` + `ErrorKind::Unsupported`), never a
+  panic, a silent fallback, or an API-shape change.
+- The ADR fixes that capability honesty is necessary but *not sufficient*: every
+  read/write asymmetry or missing method is a **tracked deficit** with a declared
+  resolution path (an upstream contribution, a dedicated pure-Rust crate the
+  engine consumes, or the native profile), and the portable/native split is a
+  pressure valve toward completeness rather than a resting state — the RM-400
+  claim is not satisfied while a Tier-1 deficit is merely documented.
+- The canonical worked example is portable zstd *encode*: `ruzstd` ships only a
+  one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, already used
+  for outer-filter frames and `create --zstd`), which cannot emit a ZIP member as
+  a bounded stream without buffering the whole member and breaking the memory
+  guarantee, so ZIP method-93 write is `native-codecs` only — the engine refuses
+  the path rather than weaken the guarantee. This and Deflate64 (method 9) are the
+  entire current deficit ledger; every other mainstream codec is complete
+  read+write on portable.
+- `docs/support-matrix.md` is refactored to the accountability grid: the ZIP row
+  points to a `method × {read,write} × {portable,native}` table where every `—` is
+  a data point (a structured `Unsupported`, enumeration continues), plus a
+  "Codec capability deficits" ledger linking each gap to its resolution path and
+  tracking item, with the outer-filter zstd-encode note reconciled against the
+  ZIP-member write deficit.
+- RM-307 adds no runtime code and no dependency; it is an
+  architecture-and-documentation slice establishing the contract that RM-302..306
+  and future codec work inherit.
+
 ## Reproduced gates
 
 - Working tree, Windows x86_64, portable codec profile with `--features sevenz,aes`:
