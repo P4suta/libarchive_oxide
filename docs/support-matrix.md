@@ -106,3 +106,28 @@ validation profiles built from the primitives above. A profile is only marked
 supported when its container, codec, metadata, security, and interoperability
 tests all pass. Registry communication and authentication are outside the OCI
 layer-engine scope.
+
+Package validation is bounded and never extracts or whole-buffers an untrusted
+package. Two verdicts are reported separately and must not be conflated: a
+*container-readable* result means the outer container structure could be parsed
+at all, and a *profile-valid* result means the package additionally satisfied
+its profile with no blocking findings. A readable container can still fail its
+profile, and "planned" means neither verdict is produced yet.
+
+| Profile | Package container | Container-readable check | Profile-valid verdict | Notes |
+|---|---|---|:---:|---|
+| Debian `.deb` | `ar` with leading `debian-binary`, then `control.tar.*` and `data.tar.*` | yes | yes | bounded no-extract; inner tarballs stored plain or under one gzip/xz/zstd/bzip2 filter; member order, duplicates, unsafe names/paths, truncation, and decompression bombs are typed findings; a method this build cannot decode is a capability finding, not a hard failure |
+| RPM | lead + signature/header + cpio payload | planned | planned | payload cpio under xz/zstd; header and signature verification are follow-on work |
+| Alpine `apk` | signed control/data `tar.gz` segments | planned | planned | |
+| Java `JAR` | ZIP with `META-INF/MANIFEST.MF` | planned | planned | shares the ZIP-based package family |
+| Apple `IPA` | ZIP with `Payload/*.app` | planned | planned | ZIP-based |
+| `MSIX`/APPX | ZIP with `OPC`/`AppxManifest.xml` | planned | planned | ZIP-based |
+| NuGet `.nupkg` | ZIP with `OPC` and `.nuspec` | planned | planned | ZIP-based |
+| Python `Wheel` | ZIP with `*.dist-info/` | planned | planned | ZIP-based |
+| `EPUB` | ZIP with `mimetype` and `META-INF/container.xml` | planned | planned | ZIP-based |
+
+The Debian profile is exercised by twelve bounded validation tests
+(`tests/package_deb.rs`) and is described in
+[ADR-0010](adr/0010-package-profiles.md). RPM, the ZIP-based package families,
+and a package-validation CLI surface are later Campaign 2 units and remain
+planned.

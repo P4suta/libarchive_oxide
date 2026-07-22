@@ -8,9 +8,11 @@ bytes and digests across order, timestamps, ownership, PAX emission, and
 padding), RM-204 (byte/range source adapters that feed the engine with no
 networking, authentication, or cloud SDK dependency), and RM-205 (the
 `oxarchive oci` inspect/verify/apply CLI over the same engine, plan, and report
-types). RM-201/202 (#52) and RM-205 (#53) have reached `main`; RM-203 is based on
-the `feat/rm-203-deterministic-layer` working tree and RM-204 on the
-`feat/rm-204-oci-range-adapters` working tree. The parent epic closes only after
+types). It also records the first slice of the package-validator epic RM-210:
+RM-211 (the bounded package-validation framework and the Debian `.deb`
+validator). RM-201/202 (#52), RM-205 (#53), RM-204 (#54), and RM-203 (#55) have
+reached `main`; RM-211 is based on the `feat/rm-211-deb-validator` working tree.
+The parent epics close only after
 every slice has passed its required remote checks and reached `main`.
 
 No tag, package publication, GitHub Release, release-workflow execution,
@@ -34,6 +36,10 @@ version change, or versioned release candidate is part of this snapshot.
 | `oci` CLI subcommands | RM-205 | `libarchive_oxide-cli/src/oci.rs` | `run_oci`, `run_oci_inspect`, `run_oci_verify`, `run_oci_apply` over the shared engine |
 | `oci` command dispatch | RM-205 | `libarchive_oxide-cli/src/oxarchive.rs` | `run_oxarchive` routes `oci` to `crate::oci::run_oci` |
 | `oci` CLI contract tests | RM-205 | `libarchive_oxide-cli/tests/oci_cli.rs` | 8 tests: inspect, verify, apply, usage |
+| Shared package finding vocabulary | RM-211 | `libarchive_oxide/src/package/finding.rs` | `PackageFinding`, `PackageFindingCode`, `Severity`, `SupportStatus` |
+| Bounded Debian `.deb` validator | RM-211 | `libarchive_oxide/src/package/deb.rs` | `DebValidator`, `DebValidation`, `ar` `ReaderEvent` + per-member `Pipeline` |
+| Package module surface and re-exports | RM-211 | `libarchive_oxide/src/package/mod.rs`, `src/lib.rs` | public `package` types re-exported from the crate root |
+| Debian validation tests | RM-211 | `libarchive_oxide/tests/package_deb.rs` | 12 tests, happy path and adversarial no-extract refusals |
 
 ## RM-201
 
@@ -176,6 +182,41 @@ version change, or versioned release candidate is part of this snapshot.
   2), and `unknown_oci_subcommand_is_usage_error` covers an unknown and a missing
   `oci` subcommand.
 
+## RM-211
+
+- ADR-0010 specifies bounded no-extract package validation: the outer `ar`
+  container is read with the push/event `ArchiveReader` (`ReaderEvent`) and each
+  `control.tar.*` / `data.tar.*` member is streamed through a per-member
+  `Pipeline` that decodes only enough to check the outer filter and the nested
+  tar structure. `DebValidator::validate` never materializes the package and
+  buffers no whole member; only a 64-byte `debian-binary` prefix and a six-byte
+  filter-probe prefix are retained, and nested decode is bounded by the
+  configured `Limits`.
+- `well_formed_deb_is_valid_across_data_filters` builds a conforming `.deb` for a
+  plain `data.tar` and for gzip, xz, zstd, and bzip2 data tarballs, and confirms
+  each reads, validates with no findings, and reports the detected `data.tar` and
+  `control.tar` outer filters through `data_compression`/`control_compression`.
+- The container-structure refusals are covered by
+  `missing_debian_binary_is_rejected`, `out_of_order_members_are_rejected`,
+  `invalid_version_stamp_is_rejected`, `duplicate_member_is_rejected`, and
+  `traversal_member_name_is_rejected`, each asserting the container still reads,
+  the profile is not valid, and the specific `PackageFindingCode` is present —
+  demonstrating that `container_readable` and `profile_valid` are separate
+  verdicts.
+- The nested-tar refusals are covered by
+  `non_archive_member_reports_malformed_nesting` (a member that is not the
+  archive it claims), `truncated_member_is_rejected`,
+  `traversal_entry_path_is_rejected`, `duplicate_entry_path_is_rejected`, and
+  `decompression_bomb_is_bounded`, the last bounding each nested decode to 8 KiB
+  against a 200 KB hostile expansion so the bomb is refused as a
+  `DecompressionBomb` finding rather than expanded.
+- `unsupported_compression_reports_capability_finding` swaps in a codec provider
+  that recognizes zstd frames but advertises no capability (mirroring a build
+  without the `zstd` feature); the container reads and the filter is detected as
+  zstd, but the member is reported as an `UnsupportedCompression` capability
+  finding derived from the `ProviderCapability` query rather than as corruption,
+  and the profile is not confirmed valid.
+
 ## Reproduced gates
 
 - Working tree, Windows x86_64, default portable codec profile:
@@ -191,16 +232,23 @@ version change, or versioned release candidate is part of this snapshot.
 - `cargo test -p libarchive_oxide-cli --test oci_cli` passed 8/8 (RM-205), and
   the full `cargo test -p libarchive_oxide` and `-p libarchive_oxide-cli` suites
   passed, including the existing engine, codec, zip, and CLI contract suites.
-- `cargo fmt --check`, `cargo clippy -p libarchive_oxide --all-targets -- -D
-  warnings`, the `no-dyn` gate (static dispatch; `OciLayerBuilder` and
-  `OciLayerFilter` add no trait objects), and `RUSTDOCFLAGS="-D warnings" cargo
-  doc -p libarchive_oxide --no-deps` all pass; every public `oci` item, including
-  the RM-203 create surface, carries rustdoc and the crate keeps
+- `cargo test -p libarchive_oxide --test package_deb` passed 12/12 (RM-211) on
+  the working tree, Windows x86_64, default portable codec profile.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  the `no-dyn` gate (static dispatch; the OCI builder and the package validator
+  add no trait objects), and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` all
+  pass; every public `oci` and `package` item carries rustdoc and the crate keeps
   `#![forbid(unsafe_code)]` with no new runtime dependency.
 
 ## Out of scope for this slice
 
 Deterministic layer creation landed as RM-203, the `oxarchive oci` CLI subcommand
 as RM-205, and the SDK-free range adapter example as RM-204. Only a full 10 GiB
-soak remains out of scope for these slices. The remote matrix, nightly fuzz,
+soak remains out of scope for the RM-200 slices. The remote matrix, nightly fuzz,
 big-endian, and CodeQL gates remain required before the RM-200 epic can close.
+
+For the RM-210 package-validator epic, RM-211 lands only the framework and the
+Debian `.deb` profile. The RPM profile, the ZIP-based package families (JAR,
+IPA, MSIX, NuGet, Wheel, EPUB), and a package-validation CLI surface (RM-215)
+are later slices and are not part of this snapshot. Remote checks and reaching
+`main` remain required before the RM-210 epic can close.

@@ -42,6 +42,7 @@ mod filesystem_driver;
 mod filesystem_std;
 mod iso_stream;
 pub mod oci;
+pub mod package;
 pub mod path;
 mod pipeline_codec;
 pub mod provider;
@@ -85,6 +86,9 @@ pub use oci::{
     OciLayerBlob, OciLayerBuilder, OciLayerEngine, OciLayerEntry, OciLayerError, OciLayerFilter,
     OciLayerPlan, OciLayerSession, OciMaterialize, OciPlanOperation, OciReject, OciRejection,
     OciRemoval, OwnershipMapper, OwnershipTable,
+};
+pub use package::{
+    DebValidation, DebValidator, PackageFinding, PackageFindingCode, Severity, SupportStatus,
 };
 pub use path::{sanitize, sanitize_archive_path};
 pub use provider::{
