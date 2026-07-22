@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-22
-- Tracks: RM-211 / DEV-75, RM-212 / DEV-100, RM-213 / DEV-101
+- Tracks: RM-211 / DEV-75, RM-212 / DEV-100, RM-213 / DEV-101, RM-214
 
 ## Context
 
@@ -28,7 +28,8 @@ adapter's per-operation findings.
 
 ## Decision
 
-- A new `package` module (`finding`, `deb`, `rpm`) builds on the existing
+- A new `package` module (`finding`, `deb`, `rpm`, `zip_profile`, `app_profile`,
+  and the shared internal `zip_reader`) builds on the existing
   bounded primitives rather than adding a general new parser: the outer `ar`
   container, the `Pipeline` sans-io nested decoder, the compile-time provider
   capability query, the archive-path sanitizer, and the core `Limits`. The RPM
@@ -179,11 +180,63 @@ adapter's per-operation findings.
   decompression, signature and digest verification, and the remaining ZIP
   families (IPA, MSIX/APPX) are out of scope for this unit.
 
-The remaining ZIP families (IPA, MSIX/APPX) and a package-validation CLI surface
-are deferred to later Campaign 2 units (RM-215 for the CLI). This decision owns no rendering
+### OS/app package profiles (RM-214)
+
+- **APK, IPA, and MSIX reuse the ZIP central-directory reader, extracted to a
+  shared module.** The RM-213 reader (end-of-central-directory location with a
+  ZIP64 fallback, bounded member collection, and the shared ZIP-structure
+  defenses) was moved verbatim into a crate-internal `zip_reader` module so both
+  the `ZipPackageValidator` (JAR/NuGet/Wheel/EPUB) and the new
+  `AppPackageValidator` (APK/IPA/MSIX) parse the container in exactly one place.
+  The app validator adds no new container parser; it selects an
+  `AppPackageProfile` and reuses the whole `finding` vocabulary, the path
+  sanitizer, and the core `Limits`, and — like the ZIP-container validator — it
+  requires `Read + Seek`.
+- **Per-profile required members.** APK requires a root `AndroidManifest.xml`
+  (a `classes.dex` is typical but not mandated); IPA requires a
+  `Payload/<name>.app/Info.plist` bundle, checked structurally only because the
+  iOS code signature lives inside the `.app`; MSIX requires `AppxManifest.xml`,
+  `[Content_Types].xml`, and `AppxBlockMap.xml`. A missing required member is a
+  `MissingRequiredMember` finding.
+- **APK signing schemes are detected, bounded, and informational.** The v1
+  scheme is detected from a `META-INF/*.SF` paired with a
+  `META-INF/*.(RSA|DSA|EC)` signature file in the central directory. The v2/v3
+  schemes live in the *APK Signing Block*, which sits between the last local
+  entry and the central directory: the 24 bytes immediately before the
+  central-directory start offset (which the reader now returns) are read and the
+  trailing 16-byte `APK Sig Block 42` magic confirms the block's presence, then
+  its id-value pairs are walked under a cap (`Limits::metadata_bytes`, with a
+  fixed fallback) for the v2 id `0x7109871a` and v3 id `0xf05368c0`. The block is
+  never read in full; an oversized block is scanned only up to the cap and the
+  truncation is reported. Every signature observation is an informational
+  `Severity::Info` finding — `SigningSchemeDetected` when a scheme is found or
+  `UnsignedPackage` when none is — so signature state never on its own
+  invalidates the profile. MSIX detects its `AppxSignature.p7x` member the same
+  way. The detected schemes are also surfaced structurally on the result as an
+  `AppSignatureReport`.
+- **Same separated verdict, same shared defenses, additive codes.** Every app
+  profile refuses an unsafe (`UnsafeEntryPath`) or duplicate
+  (`DuplicateEntryPath`) member name, an encrypted member
+  (`UnexpectedEncryption`), a compression method this build cannot decode
+  (`UnsupportedCompression`), and a summed-declared-size decompression bomb
+  (`DecompressionBomb`) — the identical `check_common_structure` shared with the
+  ZIP-container profiles. `AppPackageValidation` exposes the same
+  `SupportStatus { container_readable, profile_valid }`. The two informational
+  codes `UnsignedPackage` and `SigningSchemeDetected` are additions to the shared
+  `PackageFindingCode` enum; every other code is reused unchanged.
+- **Supported inputs, OS/app unit (RM-214).** The APK, IPA, and MSIX profiles:
+  required-member presence, APK v1/v2/v3 signing-scheme detection (with a bounded
+  signing-block scan), MSIX `AppxSignature.p7x` detection, unsafe/duplicate
+  member paths, encryption, an undecodable method, and decompression-bomb
+  refusal. Cryptographic signature *verification* (validating the certificates
+  and digests, as opposed to detecting the scheme) and a package-validation CLI
+  surface are out of scope for this unit.
+
+A package-validation CLI surface is deferred to a later Campaign 2 unit
+(RM-215). This decision owns no rendering
 or transport policy: any front end consumes the same `DebValidation`,
-`RpmValidation`, `ZipPackageValidation`, `PackageFinding`, and `SupportStatus`
-types unchanged and re-implements no package policy of its own.
+`RpmValidation`, `ZipPackageValidation`, `AppPackageValidation`, `PackageFinding`,
+and `SupportStatus` types unchanged and re-implements no package policy of its own.
 
 ## Consequences
 
@@ -203,7 +256,10 @@ reduced build cannot decode without the validator conflating that with
 corruption. The shared `finding` vocabulary is profile-agnostic: the RPM profile
 reuses it directly and only adds a small bounded lead/header parser and five
 RPM-specific codes, and the ZIP-container profiles (RM-213) do the same with only
-a bounded central-directory reader and four additive codes. Signature and
-cryptographic-integrity verification, digest checking, the remaining ZIP families
-(IPA, MSIX/APPX), and any package-validation CLI are outside these units and
-remain later Campaign 2 work.
+a bounded central-directory reader and four additive codes. The OS/app profiles
+(RM-214) extend that same reader — extracted to a shared `zip_reader` module — to
+APK, IPA, and MSIX, adding APK signing-scheme detection and MSIX signature
+detection as informational findings under two more additive codes. Cryptographic
+signature *verification* and digest checking (as opposed to scheme detection) and
+any package-validation CLI are outside these units and remain later Campaign 2
+work.

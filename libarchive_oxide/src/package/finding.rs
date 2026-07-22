@@ -96,6 +96,10 @@ pub enum PackageFindingCode {
     MimetypeInvalidContent,
     /// A member was encrypted in a profile that forbids encryption.
     UnexpectedEncryption,
+    /// A package carried no detectable signature (informational).
+    UnsignedPackage,
+    /// A signing scheme was detected in the package (informational).
+    SigningSchemeDetected,
 }
 
 impl PackageFindingCode {
@@ -126,6 +130,8 @@ impl PackageFindingCode {
             Self::MimetypeNotStored => "mimetype-not-stored",
             Self::MimetypeInvalidContent => "mimetype-invalid-content",
             Self::UnexpectedEncryption => "unexpected-encryption",
+            Self::UnsignedPackage => "unsigned-package",
+            Self::SigningSchemeDetected => "signing-scheme-detected",
         }
     }
 
@@ -136,6 +142,7 @@ impl PackageFindingCode {
             Self::UnknownMember | Self::UnsupportedCompression | Self::CompressorMismatch => {
                 Severity::Warning
             },
+            Self::UnsignedPackage | Self::SigningSchemeDetected => Severity::Info,
             _ => Severity::Error,
         }
     }

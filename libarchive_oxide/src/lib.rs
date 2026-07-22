@@ -88,6 +88,7 @@ pub use oci::{
     OciRemoval, OwnershipMapper, OwnershipTable,
 };
 pub use package::{
+    AppPackageProfile, AppPackageValidation, AppPackageValidator, AppSignatureReport,
     DebValidation, DebValidator, PackageFinding, PackageFindingCode, RpmValidation, RpmValidator,
     Severity, SupportStatus, ZipPackageProfile, ZipPackageValidation, ZipPackageValidator,
 };

@@ -8,14 +8,15 @@ bytes and digests across order, timestamps, ownership, PAX emission, and
 padding), RM-204 (byte/range source adapters that feed the engine with no
 networking, authentication, or cloud SDK dependency), and RM-205 (the
 `oxarchive oci` inspect/verify/apply CLI over the same engine, plan, and report
-types). It also records the first three slices of the package-validator epic RM-210:
+types). It also records the first four slices of the package-validator epic RM-210:
 RM-211 (the bounded package-validation framework and the Debian `.deb`
-validator), RM-212 (the bounded RPM profile validator), and RM-213 (the bounded
-ZIP-container profiles: JAR, NuGet, Wheel, and EPUB). RM-201/202 (#52),
-RM-205 (#53), RM-204 (#54), RM-203 (#55), and RM-211 (#56) have reached `main`;
-RM-212 and RM-213 are based on their respective working trees. The parent
-epics close only after every slice has passed its required remote checks and
-reached `main`.
+validator), RM-212 (the bounded RPM profile validator), RM-213 (the bounded
+ZIP-container profiles: JAR, NuGet, Wheel, and EPUB), and RM-214 (the bounded
+OS/app profiles: Android APK, iOS IPA, and Windows MSIX, with informational
+signing-scheme detection). RM-201/202 (#52), RM-205 (#53), RM-204 (#54),
+RM-203 (#55), RM-211 (#56), RM-212 (#57), and RM-213 (#58) have reached `main`;
+RM-214 is based on its working tree. The parent epics close only after every
+slice has passed its required remote checks and reached `main`.
 
 No tag, package publication, GitHub Release, release-workflow execution,
 version change, or versioned release candidate is part of this snapshot.
@@ -50,6 +51,11 @@ version change, or versioned release candidate is part of this snapshot.
 | ZIP-container finding codes | RM-213 | `libarchive_oxide/src/package/finding.rs` | `MimetypeNotFirst`, `MimetypeNotStored`, `MimetypeInvalidContent`, `UnexpectedEncryption` |
 | ZIP profile re-exports on the package surface | RM-213 | `libarchive_oxide/src/package/mod.rs`, `src/lib.rs` | public `ZipPackageValidator`/`ZipPackageValidation`/`ZipPackageProfile` re-exported from the crate root |
 | ZIP-container validation tests | RM-213 | `libarchive_oxide/tests/package_zip.rs` | 19 tests, happy path and adversarial no-extract refusals |
+| Shared ZIP central-directory reader | RM-214 | `libarchive_oxide/src/package/zip_reader.rs` | `read_central_directory_with_offset`, `check_common_structure`, `ZipEntry` extracted from RM-213 and reused by both ZIP validators |
+| Bounded OS/app package validator | RM-214 | `libarchive_oxide/src/package/app_profile.rs` | `AppPackageValidator`, `AppPackageValidation`, `AppPackageProfile`, `AppSignatureReport`, bounded APK Signing Block scan |
+| OS/app signing finding codes | RM-214 | `libarchive_oxide/src/package/finding.rs` | `UnsignedPackage`, `SigningSchemeDetected` (both `Severity::Info`) |
+| OS/app re-exports on the package surface | RM-214 | `libarchive_oxide/src/package/mod.rs`, `src/lib.rs` | public `AppPackageValidator`/`AppPackageValidation`/`AppPackageProfile`/`AppSignatureReport` re-exported from the crate root |
+| OS/app validation tests | RM-214 | `libarchive_oxide/tests/package_app.rs` | 22 tests, happy path, signing-scheme detection, and adversarial no-extract refusals |
 
 ## RM-201
 
@@ -302,6 +308,56 @@ version change, or versioned release candidate is part of this snapshot.
   with no decompression), and `garbage_container_is_unreadable`
   (`ContainerUnreadable` with `container_readable` cleared).
 
+## RM-214
+
+- ADR-0010 extends bounded no-extract package validation to the OS/app families.
+  `AppPackageValidator` takes an `AppPackageProfile` (APK, IPA, or MSIX) and adds
+  no new container parser: the RM-213 central-directory reader (EOCD location with
+  a ZIP64 fallback, bounded member collection, and the shared ZIP-structure
+  defenses) was extracted verbatim into a crate-internal `zip_reader` module and is
+  reused unchanged by both the ZIP-container validator and the app validator.
+  Because the ZIP index lives at the end of the file, the validator requires
+  `Read + Seek`, and nothing is ever decompressed.
+- `apk_v1_signed_reports_scheme_and_is_valid`, `ipa_with_app_bundle_is_valid`, and
+  `msix_signed_is_valid_and_reports_signature` confirm a conforming archive for
+  each profile reads and validates with no blocking findings, and that the
+  required members — root `AndroidManifest.xml`; a `Payload/<name>.app/Info.plist`
+  bundle; `AppxManifest.xml` + `[Content_Types].xml` + `AppxBlockMap.xml` — are
+  each enforced. `apk_from_real_deflate_writer_is_valid` proves the shared
+  central-directory reader interoperates with the crate's own sequential deflate
+  ZIP writer.
+- APK signing-scheme detection is exercised end to end: `apk_v2_signing_block_is_detected`
+  and `apk_v3_signing_block_is_detected` build a hand-assembled APK Signing Block
+  (spliced between the last local entry and the central directory) and confirm the
+  `APK Sig Block 42` magic is found before the central-directory offset and the v2
+  id `0x7109871a` / v3 id `0xf05368c0` are recovered from its id-value pairs;
+  `apk_v2_and_v3_both_detected` shows both schemes plus an unrelated pair;
+  `apk_v1_signed_reports_scheme_and_is_valid` and
+  `apk_v1_requires_both_sf_and_signature_file` cover the v1 `META-INF/*.SF` +
+  `*.(RSA|DSA|EC)` pair (a lone `.SF` is not a signature). Every signature
+  observation is informational: `apk_unsigned_reports_unsigned_but_stays_valid`
+  and `msix_unsigned_is_valid_but_reports_unsigned` show an unsigned package still
+  reads as `profile_valid` while carrying an `UnsignedPackage` finding.
+- `apk_signing_block_scan_is_bounded_by_metadata_budget` places a v2 id behind a
+  4 KiB filler pair and caps the scan at a 256-byte `metadata_bytes` budget: the
+  block is still detected via its magic and a `SigningSchemeDetected` finding is
+  emitted, but the v2 id sitting past the cap is deliberately not reached — proving
+  the id-value scan is bounded rather than read in full.
+- The missing-member refusals — `apk_without_manifest_is_rejected`,
+  `ipa_without_app_bundle_is_rejected`, `ipa_info_plist_outside_app_is_rejected`,
+  `msix_without_manifest_is_rejected`, and `msix_without_block_map_is_rejected` —
+  each assert the container still reads while the profile is not valid,
+  demonstrating the separated verdict.
+- The shared ZIP-structure defenses (identical `check_common_structure` reused
+  from RM-213) are covered by `traversing_member_name_is_rejected`
+  (`UnsafeEntryPath`), `duplicate_member_path_is_rejected` (`DuplicateEntryPath`),
+  `unsupported_method_is_reported` (an LZMA method yields the
+  `UnsupportedCompression` capability finding), `encrypted_member_is_reported`
+  (`UnexpectedEncryption`), `decompression_bomb_is_refused_by_budget` (a summed
+  declared size over a 64-byte `decoded_total` budget yields `DecompressionBomb`
+  with no decompression), and `garbage_container_is_unreadable`
+  (`ContainerUnreadable` with `container_readable` cleared).
+
 ## Reproduced gates
 
 - Working tree, Windows x86_64, default portable codec profile:
@@ -323,6 +379,10 @@ version change, or versioned release candidate is part of this snapshot.
   the working tree, Windows x86_64, default portable codec profile.
 - `cargo test -p libarchive_oxide --test package_zip` passed 19/19 (RM-213) on
   the working tree, Windows x86_64, default portable codec profile.
+- `cargo test -p libarchive_oxide --test package_app` passed 22/22 (RM-214) on
+  the working tree, Windows x86_64, default portable codec profile; the RM-213
+  central-directory reader was extracted to a shared internal `zip_reader` module
+  reused unchanged by the ZIP-container profiles.
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   the `no-dyn` gate (static dispatch; the OCI builder and the package validator
   add no trait objects), and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` all
@@ -337,9 +397,11 @@ soak remains out of scope for the RM-200 slices. The remote matrix, nightly fuzz
 big-endian, and CodeQL gates remain required before the RM-200 epic can close.
 
 For the RM-210 package-validator epic, RM-211 lands the framework and the Debian
-`.deb` profile, RM-212 adds the RPM profile, and RM-213 adds the ZIP-container
-profiles (JAR, NuGet, Wheel, EPUB). The remaining ZIP-based families (IPA, MSIX)
-and a package-validation CLI surface (RM-215) are later slices and are not part
-of this snapshot. Signature and digest verification are out of scope for the
-Debian, RPM, and ZIP-container profiles alike. Remote checks and reaching `main`
-remain required before the RM-210 epic can close.
+`.deb` profile, RM-212 adds the RPM profile, RM-213 adds the ZIP-container
+profiles (JAR, NuGet, Wheel, EPUB), and RM-214 adds the OS/app profiles
+(Android APK, iOS IPA, Windows MSIX) with bounded APK signing-scheme detection.
+A package-validation CLI surface (RM-215) is a later slice and is not part of
+this snapshot. Cryptographic signature *verification* and digest checking (as
+opposed to APK/MSIX signature-scheme *detection*, which RM-214 adds as
+informational findings) are out of scope for every package profile. Remote
+checks and reaching `main` remain required before the RM-210 epic can close.
