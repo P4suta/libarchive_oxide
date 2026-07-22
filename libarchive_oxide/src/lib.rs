@@ -82,8 +82,9 @@ pub use libarchive_oxide_core;
 pub use libarchive_oxide_core::CpioDialect;
 pub use oci::{
     DigestKind, DigestMismatch, IdentityOwnership, LayerDigests, OciApplyReport, OciLayerApplier,
-    OciLayerEngine, OciLayerEntry, OciLayerError, OciLayerPlan, OciLayerSession, OciMaterialize,
-    OciPlanOperation, OciReject, OciRejection, OciRemoval, OwnershipMapper, OwnershipTable,
+    OciLayerBlob, OciLayerBuilder, OciLayerEngine, OciLayerEntry, OciLayerError, OciLayerFilter,
+    OciLayerPlan, OciLayerSession, OciMaterialize, OciPlanOperation, OciReject, OciRejection,
+    OciRemoval, OwnershipMapper, OwnershipTable,
 };
 pub use path::{sanitize, sanitize_archive_path};
 pub use provider::{

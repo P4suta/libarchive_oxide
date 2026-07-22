@@ -3,12 +3,15 @@
 This snapshot records the technical evidence for the OCI layer engine slices of
 RM-200: RM-201 (bounded layer read with one-pass compressed digest and diffID),
 RM-202 (digest-verified layer application with overlay, ownership, link, and
-conflict handling), RM-204 (byte/range source adapters that feed the engine with
-no networking, authentication, or cloud SDK dependency), and RM-205 (the
+conflict handling), RM-203 (deterministic layer creation reproducing identical
+bytes and digests across order, timestamps, ownership, PAX emission, and
+padding), RM-204 (byte/range source adapters that feed the engine with no
+networking, authentication, or cloud SDK dependency), and RM-205 (the
 `oxarchive oci` inspect/verify/apply CLI over the same engine, plan, and report
-types). RM-201/202 (#52) and RM-205 (#53) have reached `main`; RM-204 is based on
-the `feat/rm-204-oci-range-adapters` working tree. The parent epic closes only
-after every slice has passed its required remote checks and reached `main`.
+types). RM-201/202 (#52) and RM-205 (#53) have reached `main`; RM-203 is based on
+the `feat/rm-203-deterministic-layer` working tree and RM-204 on the
+`feat/rm-204-oci-range-adapters` working tree. The parent epic closes only after
+every slice has passed its required remote checks and reached `main`.
 
 No tag, package publication, GitHub Release, release-workflow execution,
 version change, or versioned release candidate is part of this snapshot.
@@ -24,6 +27,8 @@ version change, or versioned release candidate is part of this snapshot.
 | Module surface and re-exports | RM-201/202 | `libarchive_oxide/src/oci/mod.rs`, `src/lib.rs` | public `oci` types re-exported from the crate root |
 | Adapter removal/clear operations | RM-202 | `libarchive_oxide/src/filesystem.rs`, `src/filesystem_std.rs` | `FilesystemRemoval`, `remove_path`, `clear_directory` |
 | Integration tests | RM-201/202 | `libarchive_oxide/tests/oci_layer.rs` | 20 tests, read and apply |
+| Deterministic layer builder | RM-203 | `libarchive_oxide/src/oci/create.rs` | `OciLayerBuilder`, `OciLayerFilter`, `OciLayerBlob` over the tar encoder and outer filter |
+| Determinism/round-trip tests | RM-203 | `libarchive_oxide/tests/oci_create.rs` | 8 tests, byte-identical rebuilds and digest round-trips |
 | SDK-free range adapters example | RM-204 | `libarchive_oxide/examples/oci_range_adapter.rs` | `FetchRange`, HTTP/S3/GCS/Azure adapters over one injected fetch seam |
 | Range-backed layer read tests | RM-204 | `libarchive_oxide/tests/oci_range.rs` | 4 tests, `RangeReader` → `OciLayerEngine` parity and offset exactness |
 | `oci` CLI subcommands | RM-205 | `libarchive_oxide-cli/src/oci.rs` | `run_oci`, `run_oci_inspect`, `run_oci_verify`, `run_oci_apply` over the shared engine |
@@ -71,6 +76,40 @@ version change, or versioned release candidate is part of this snapshot.
   `applier_applies_at_most_one_plan`, and `plan_binds_to_its_originating_applier`
   cover path traversal, duplicate paths, symlink escape, single-apply, and
   cross-applier plan binding.
+
+## RM-203
+
+- ADR-0009 records deterministic layer creation as part of the OCI decision:
+  `OciLayerBuilder` reuses the sequential tar encoder and outer-filter writer,
+  reads the wall clock nowhere, and preserves the caller's entry order, so the
+  same ordered entries and outer filter always produce byte-identical blobs and
+  identical `LayerDigests`. The builder computes the diffID by decoding its own
+  blob through the bounded `FilterReader`, matching what a reader observes.
+- `uncompressed_build_is_byte_identical_and_digests_round_trip`,
+  `gzip_build_is_byte_identical_and_matches_reference`, and
+  `zstd_build_is_byte_identical_and_matches_reference` build the same fixture
+  twice on each of the three paths (tar, tar+gzip, tar+zstd) and assert the blobs
+  are byte-identical and the digests equal, cross-checked against an independent
+  `sha2` reference; the uncompressed path's two digests coincide while the
+  compressed paths differ.
+- `build_digests_round_trip_through_the_reader` re-reads each produced blob with
+  `OciLayerEngine`, confirms the entry paths come back in insertion order, that
+  the session recomputes exactly the builder's digests, and that
+  `OciLayerSession::verify` accepts the builder's pair — closing the create →
+  read round trip on all three filters.
+- `metadata_is_emitted_as_specified` sets mode `0o640`, uid 4242, gid 2424, an
+  mtime, and a `user.oxide` xattr, then asserts the reader recovers mode, uid,
+  gid, and size and that a `SCHILY.xattr.user.oxide=present` PAX record appears in
+  the decoded tar stream, exercising PAX emission end to end.
+- `unset_timestamps_never_inject_wall_clock` builds a fixture with no modification
+  time twice across a real `sleep` and asserts the blobs and digests are still
+  identical, proving an unset mtime serializes as the epoch (`0`) rather than the
+  current time.
+- `entry_order_and_padding_are_reproducible_across_filters` shows that identical
+  order yields identical bytes while reversing two entries changes the bytes on
+  every filter, pinning both the ordering contract and the fixed tar block
+  padding; `reference_reader_agrees_with_builder_for_gzip` independently decodes
+  the gzip blob and confirms the reported compressed digest and diffID.
 
 ## RM-204
 
@@ -140,22 +179,28 @@ version change, or versioned release candidate is part of this snapshot.
 ## Reproduced gates
 
 - Working tree, Windows x86_64, default portable codec profile:
-  `cargo test -p libarchive_oxide --test oci_layer` passed 20/20, and
+  `cargo test -p libarchive_oxide --test oci_layer` passed 20/20,
+  `cargo test -p libarchive_oxide --test oci_create` passed 8/8 (RM-203), and
   `cargo test -p libarchive_oxide --test oci_range` passed 4/4 (RM-204).
+- The full `cargo test -p libarchive_oxide` suite passed, including the RM-203
+  determinism and round-trip tests alongside the existing engine, codec, and OCI
+  read/apply suites.
 - `cargo build -p libarchive_oxide --example oci_range_adapter` builds and
   `cargo run` on it prints matching digests across all four adapters and a
   3-operation plan (RM-204).
 - `cargo test -p libarchive_oxide-cli --test oci_cli` passed 8/8 (RM-205), and
   the full `cargo test -p libarchive_oxide` and `-p libarchive_oxide-cli` suites
   passed, including the existing engine, codec, zip, and CLI contract suites.
-- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  the `no-dyn` gate, and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` all
-  pass; every public `oci` item carries rustdoc and the crate keeps
+- `cargo fmt --check`, `cargo clippy -p libarchive_oxide --all-targets -- -D
+  warnings`, the `no-dyn` gate (static dispatch; `OciLayerBuilder` and
+  `OciLayerFilter` add no trait objects), and `RUSTDOCFLAGS="-D warnings" cargo
+  doc -p libarchive_oxide --no-deps` all pass; every public `oci` item, including
+  the RM-203 create surface, carries rustdoc and the crate keeps
   `#![forbid(unsafe_code)]` with no new runtime dependency.
 
 ## Out of scope for this slice
 
-Deterministic layer creation and a full 10 GiB soak are deferred to RM-203. The
-`oxarchive oci` CLI subcommand landed as RM-205 and the SDK-free range adapter
-example as RM-204. Remote matrix, nightly fuzz, big-endian, and CodeQL gates
-remain required before the RM-200 epic can close.
+Deterministic layer creation landed as RM-203, the `oxarchive oci` CLI subcommand
+as RM-205, and the SDK-free range adapter example as RM-204. Only a full 10 GiB
+soak remains out of scope for these slices. The remote matrix, nightly fuzz,
+big-endian, and CodeQL gates remain required before the RM-200 epic can close.

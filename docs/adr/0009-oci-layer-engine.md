@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-22
-- Tracks: RM-201, RM-202 / DEV-74
+- Tracks: RM-201, RM-202, RM-203 / DEV-74
 
 ## Context
 
@@ -52,10 +52,23 @@ the overlay markers.
   engine's single-apply guard.
 - **Supported inputs this unit.** tar, tar+gzip, and tar+zstd, with hardlink,
   symlink, xattr, uid/gid mapping, path-conflict, and symlink-escape handling.
+- **Deterministic layer creation.** `OciLayerBuilder` (RM-203) turns an ordered
+  list of explicit entry descriptions and one outer filter (uncompressed, gzip,
+  or zstd) into a single tar layer blob and its `LayerDigests` (compressed digest
+  and diffID). It reuses the sequential tar encoder and outer-filter writer rather
+  than a second serializer, and reads the wall clock nowhere: entry order is the
+  caller's order, and every mode, owner id, timestamp, and `SCHILY.xattr.*` PAX
+  record is emitted solely from the supplied metadata (an unset modification time
+  serializes as `0`). Because the gzip encoder writes a fixed header (`mtime = 0`,
+  unknown OS) and the zstd encoder is deterministic, the same ordered entries and
+  filter always yield byte-identical blobs and identical digests, and a built
+  layer reads back through `OciLayerSession` with matching digests.
 
-Deterministic layer creation, a range-source adapter example, and a full 10 GiB
-soak are deliberately out of scope and are deferred to later units (RM-203,
-RM-204). The `oxarchive oci` CLI (RM-205) does not extend this decision: it
+A range-source adapter example and a full 10 GiB soak are deliberately out of
+scope for the read/apply units above and are deferred separately (RM-204).
+Deterministic layer creation is no longer out of scope: it is provided by RM-203
+per the decision above. The `oxarchive oci` CLI (RM-205) does not extend this
+decision: it
 consumes the same `OciLayerEngine`, `OciLayerApplier`, `OciLayerPlan`, and
 `OciApplyReport` types unchanged and re-implements no OCI policy of its own, so
 whiteout, opaque-directory, digest, ownership, and path decisions stay owned by
@@ -80,5 +93,12 @@ The applier requires a seekable blob so it can rewind between the verify and
 apply passes; a purely streaming apply is not offered here. Ownership landing is
 still platform-gated by the filesystem adapter, so `MapOwnership` records the
 intended mapping on every platform but only realizes it where the adapter
-supports ownership. Multi-layer stacking, image manifests, and layer creation
-remain the responsibility of later Campaign 2 units.
+supports ownership. Multi-layer stacking and image manifests remain the
+responsibility of later Campaign 2 units.
+
+Layer creation is reproducible by construction. Byte-for-byte identical rebuilds
+and stable digests follow from the fixed gzip header and the total absence of any
+wall-clock or environmental input, so the same ordered entries and outer filter
+produce the same content-addressed layer on any host or run. `OciLayerBuilder`
+computes the diffID by decoding its own blob through the bounded `FilterReader`,
+so the digests it returns are exactly the ones a subsequent reader observes.
