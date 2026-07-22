@@ -14,6 +14,11 @@ use libarchive_oxide_core::{
 use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
+#[cfg(feature = "zstd")]
+use libarchive_oxide_core::filter::FilterId;
+#[cfg(feature = "zstd")]
+use libarchive_oxide_core::{CodecStatus, EndOfInput};
+
 use crate::filter::gzip::Crc32;
 use crate::{ArchiveWriter, ReaderEvent, SecretBytes, StreamError};
 
@@ -167,6 +172,18 @@ enum ZipBody {
         expected_size: u64,
         end_offset: u64,
     },
+    #[cfg(feature = "zstd")]
+    Zstd {
+        compressed_unread: u64,
+        compressed: Vec<u8>,
+        compressed_start: usize,
+        decoder: Box<crate::pipeline_codec::PipelineCodec>,
+        expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
     #[cfg(feature = "aes")]
     AesStored {
         encrypted_remaining: u64,
@@ -206,6 +223,8 @@ impl std::fmt::Debug for ZipBody {
             Self::Deflate { .. } => "Deflate",
             #[cfg(feature = "bzip2")]
             Self::Bzip2 { .. } => "Bzip2",
+            #[cfg(feature = "zstd")]
+            Self::Zstd { .. } => "Zstd",
             #[cfg(feature = "aes")]
             Self::AesStored { .. } => "AesStored",
             #[cfg(feature = "aes")]
@@ -840,6 +859,95 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                         return Ok(ReaderEvent::Data(&self.event_data));
                     }
                 },
+                #[cfg(feature = "zstd")]
+                ZipBody::Zstd {
+                    compressed_unread,
+                    compressed,
+                    compressed_start,
+                    decoder,
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    if *compressed_start == compressed.len() && *compressed_unread != 0 {
+                        let count = usize::try_from((*compressed_unread).min(BUFFER as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context("compressed read size exceeds address space"),
+                                )
+                            })?;
+                        let mut next = vec![0; count];
+                        self.input.read_exact(&mut next).map_err(StreamError::io)?;
+                        *compressed = next;
+                        *compressed_unread -= count as u64;
+                        *compressed_start = 0;
+                    }
+                    self.event_data.resize(BUFFER, 0);
+                    let end = if *compressed_unread == 0 {
+                        EndOfInput::End
+                    } else {
+                        EndOfInput::More
+                    };
+                    let step = decoder
+                        .process(&compressed[*compressed_start..], &mut self.event_data, end)
+                        .map_err(StreamError::archive)?;
+                    *compressed_start += step.consumed;
+                    self.event_data.truncate(step.produced);
+                    crc.update(&self.event_data);
+                    *produced = produced.checked_add(step.produced as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("zstd output count overflow"),
+                        )
+                    })?;
+                    let next_total = self
+                        .decoded_total
+                        .checked_add(step.produced as u64)
+                        .ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("decoded total overflow"),
+                            )
+                        })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    if matches!(step.status, CodecStatus::Done) {
+                        if *produced != *expected_size {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("zstd size does not match central directory"),
+                            ));
+                        }
+                        if crc.finalize() != *expected_crc {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("zstd entry CRC32 mismatch"),
+                            ));
+                        }
+                        self.body = ZipBody::EndEntry;
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
                 #[cfg(feature = "aes")]
                 ZipBody::AesStored {
                     encrypted_remaining,
@@ -1068,6 +1176,8 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
             | ZipBody::Raw { end_offset, .. } => end_offset,
             #[cfg(feature = "bzip2")]
             ZipBody::Bzip2 { end_offset, .. } => end_offset,
+            #[cfg(feature = "zstd")]
+            ZipBody::Zstd { end_offset, .. } => end_offset,
             #[cfg(feature = "aes")]
             ZipBody::AesStored { end_offset, .. } | ZipBody::AesDeflate { end_offset, .. } => {
                 end_offset
@@ -1205,6 +1315,21 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                     compressed: Vec::with_capacity(BUFFER),
                     compressed_start: 0,
                     decompress: Box::new(bzip2::Decompress::new(false)),
+                    expected_crc: entry.crc32,
+                    crc: Crc32::new(),
+                    produced: 0,
+                    expected_size: entry.uncompressed_size,
+                    end_offset,
+                },
+                #[cfg(feature = "zstd")]
+                93 => ZipBody::Zstd {
+                    compressed_unread: entry.compressed_size,
+                    compressed: Vec::with_capacity(BUFFER),
+                    compressed_start: 0,
+                    decoder: Box::new(crate::pipeline_codec::PipelineCodec::new(
+                        FilterId::Zstd,
+                        self.limits,
+                    )?),
                     expected_crc: entry.crc32,
                     crc: Crc32::new(),
                     produced: 0,

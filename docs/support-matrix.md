@@ -11,17 +11,23 @@ scheme, metadata field, or producer quirk is accepted.
 | tar | sequential | v7, ustar, pax, GNU | yes | none | pax extensions and GNU sparse; known-size entry creation |
 | cpio | sequential | binary little/big endian, odc, newc, crc | yes | none | known-size entry creation |
 | ar | sequential | GNU and BSD | yes | none | thin members are reported as external references and are never materialized automatically |
-| ZIP/ZIP64 | seek or streaming | Store, Deflate, and BZip2 (method 12) | yes | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode/timestamp extras; unknown extras are preserved |
+| ZIP/ZIP64 | seek or streaming | Store, Deflate, BZip2 (method 12), and Zstandard (method 93) | Store, Deflate, BZip2; Zstandard (native-codecs only) | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode/timestamp extras; unknown extras are preserved |
 | 7z | seek | LZMA/LZMA2, encoded headers, solid single-folder archives | yes | none (AES unsupported) | optional `sevenz`; multiple folders and general coder graphs are unsupported |
 | ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | UDF and continuation-area coverage are not complete |
 
 ZIP BZip2 (method 12) read and write are available under the `bzip2` feature
 (on by default via `portable-codecs`); when that feature is off, a method-12
 member reports a structured unsupported error and still enumerates. ZIP
-compression methods Deflate64, LZMA, and Zstandard are not yet implemented.
-Traditional ZipCrypto is not enabled by default. 7z BCJ/Delta,
-Deflate, BZip2, Zstandard, PPMd, AES, multi-folder, and arbitrary coder-graph
-coverage remain roadmap work.
+Zstandard (method 93) read is available under the `zstd` feature on BOTH codec
+profiles (portable via `ruzstd`, native via `compression-codecs`); Zstandard
+write is available ONLY under the `native-codecs` profile, because the portable
+`ruzstd` path is decode-only — selecting Zstandard for write on the portable
+profile returns a structured `Unsupported` error rather than panicking, and with
+the `zstd` feature off entirely a method-93 member reports a structured
+unsupported error and still enumerates. ZIP compression methods Deflate64 and
+LZMA are not yet implemented. Traditional ZipCrypto is not enabled by default.
+7z BCJ/Delta, Deflate, BZip2, Zstandard, PPMd, AES, multi-folder, and arbitrary
+coder-graph coverage remain roadmap work.
 
 RAR5, CAB, XAR, and UDF are not currently implemented. They are read-only
 targets for the Modern Archive Profile.

@@ -15,4 +15,10 @@ pub enum ZipMethod {
     /// Encode bytes as `bzip2` (method 12).
     #[cfg(feature = "bzip2")]
     Bzip2,
+    /// Encode bytes as Zstandard (method 93).
+    ///
+    /// Reading is available on both codec profiles; writing requires the
+    /// `native-codecs` profile (the portable `ruzstd` path is decode-only).
+    #[cfg(feature = "zstd")]
+    Zstd,
 }

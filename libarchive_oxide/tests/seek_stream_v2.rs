@@ -392,6 +392,10 @@ fn zip_store_and_deflate_payloads_stream_without_whole_entry_vecs() {
     );
     #[cfg(feature = "bzip2")]
     assert_eq!(collect(zip_fixture(ZipMethod::Bzip2)), vec![b'a'; 200_000]);
+    // Zstd round-trip needs an encoder: native-codecs only. Portable read
+    // coverage is provided by the raw-zstd fixture tests below.
+    #[cfg(feature = "native-codecs")]
+    assert_eq!(collect(zip_fixture(ZipMethod::Zstd)), vec![b'a'; 200_000]);
 }
 
 #[test]
@@ -401,6 +405,8 @@ fn common_writer_streams_unknown_size_zip_with_data_descriptors() {
         let mut v = vec![ZipMethod::Store, ZipMethod::Deflate];
         #[cfg(feature = "bzip2")]
         v.push(ZipMethod::Bzip2);
+        #[cfg(feature = "native-codecs")]
+        v.push(ZipMethod::Zstd);
         v
     };
     for method in methods {
@@ -1096,6 +1102,200 @@ fn zip_method_12_is_unsupported_without_bzip2_feature() {
         .unwrap();
     bytes[8..10].copy_from_slice(&12_u16.to_le_bytes());
     bytes[central + 10..central + 12].copy_from_slice(&12_u16.to_le_bytes());
+
+    let mut reader = SeekArchiveReader::new(Cursor::new(bytes)).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::Entry(_)
+    ));
+    let error = reader.next_event().unwrap_err();
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Unsupported)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ZIP Zstandard (method 93) contracts.
+//
+// READ is exercised on BOTH profiles via a first-party raw-ZIP builder whose
+// body is a raw zstd frame from the independent-C `zstd` crate (dev-dep
+// `zstd-codec`). WRITE-without-encoder (portable) and feature-off degradation
+// are asserted to produce structured errors, never panics.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "zstd")]
+fn raw_zstd_zip(content: &[u8], body_override: Option<Vec<u8>>) -> Vec<u8> {
+    let full = zstd_codec::stream::encode_all(Cursor::new(content), 3).unwrap();
+    let body = body_override.unwrap_or(full);
+    let crc = {
+        let mut c = flate2::Crc::new();
+        c.update(content);
+        c.sum()
+    };
+    let name = b"member.bin";
+    let mut out = Vec::new();
+    let put16 = |o: &mut Vec<u8>, v: u16| o.extend_from_slice(&v.to_le_bytes());
+    let put32 = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_le_bytes());
+    let local_offset = out.len() as u32;
+    out.extend_from_slice(b"PK\x03\x04");
+    put16(&mut out, 63);
+    put16(&mut out, 0);
+    put16(&mut out, 93);
+    put16(&mut out, 0);
+    put16(&mut out, 0x21);
+    put32(&mut out, crc);
+    put32(&mut out, body.len() as u32);
+    put32(&mut out, content.len() as u32);
+    put16(&mut out, name.len() as u16);
+    put16(&mut out, 0);
+    out.extend_from_slice(name);
+    out.extend_from_slice(&body);
+    let central_offset = out.len() as u32;
+    let mut central = Vec::new();
+    central.extend_from_slice(b"PK\x01\x02");
+    put16(&mut central, 0x031e);
+    put16(&mut central, 63);
+    put16(&mut central, 0);
+    put16(&mut central, 93);
+    put16(&mut central, 0);
+    put16(&mut central, 0x21);
+    put32(&mut central, crc);
+    put32(&mut central, body.len() as u32);
+    put32(&mut central, content.len() as u32);
+    put16(&mut central, name.len() as u16);
+    put16(&mut central, 0);
+    put16(&mut central, 0);
+    put16(&mut central, 0);
+    put16(&mut central, 0);
+    put32(&mut central, 0);
+    put32(&mut central, local_offset);
+    central.extend_from_slice(name);
+    let central_size = central.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    put16(&mut out, 0);
+    put16(&mut out, 0);
+    put16(&mut out, 1);
+    put16(&mut out, 1);
+    put32(&mut out, central_size);
+    put32(&mut out, central_offset);
+    put16(&mut out, 0);
+    out
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zip_zstd_roundtrips_through_seek_reader() {
+    let content = b"zstd payload for the seek reader\n".repeat(50);
+    let bytes = raw_zstd_zip(&content, None);
+    let mut reader = SeekArchiveReader::new(Cursor::new(bytes)).unwrap();
+    let mut body = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(chunk) => body.extend_from_slice(chunk),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(body, content);
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zip_zstd_truncated_payload_is_structured_error() {
+    let content = b"zstd payload that will be truncated\n".repeat(50);
+    let full = zstd_codec::stream::encode_all(Cursor::new(&content), 3).unwrap();
+    // Cut the frame in half so the declared compressed_size matches the
+    // truncated body and the decoder runs out of input before its terminal block.
+    let truncated = full[..full.len() / 2].to_vec();
+    let bytes = raw_zstd_zip(&content, Some(truncated));
+    let mut reader = SeekArchiveReader::new(Cursor::new(bytes)).unwrap();
+    let mut error = None;
+    loop {
+        match reader.next_event() {
+            Ok(ReaderEvent::Done) => break,
+            Ok(_) => {},
+            Err(e) => {
+                error = Some(e);
+                break;
+            },
+        }
+    }
+    let error = error.expect("truncated zstd stream must fail");
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Malformed)
+    );
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zip_zstd_bomb_is_bounded_by_limits() {
+    let content = vec![0_u8; 1 << 20];
+    let bytes = raw_zstd_zip(&content, None);
+    let limits = Limits::default().with_decoded_total(Some(4096));
+    let mut reader = SeekArchiveReader::with_limits(Cursor::new(bytes), limits).unwrap();
+    let mut error = None;
+    loop {
+        match reader.next_event() {
+            Ok(ReaderEvent::Done) => break,
+            Ok(_) => {},
+            Err(e) => {
+                error = Some(e);
+                break;
+            },
+        }
+    }
+    let error = error.expect("zstd bomb must be bounded by limits");
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Limit)
+    );
+}
+
+// Portable (zstd read, no native encoder): selecting ZipMethod::Zstd for WRITE
+// must degrade to a structured Unsupported error at entry-open, never a panic.
+#[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
+#[test]
+fn zip_zstd_write_without_encoder_is_structured_unsupported() {
+    let mut writer = ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Zstd, Limits::default());
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("payload.bin"))
+        .size(Some(4))
+        .build();
+    let error = writer
+        .start_entry(&metadata)
+        .expect_err("portable zstd write must be rejected");
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Unsupported)
+    );
+}
+
+// Feature-off: method 93 falls through to the structured Unsupported error and
+// still enumerates via end_offset (identical to the bzip2-off behavior).
+#[cfg(not(feature = "zstd"))]
+#[test]
+fn zip_method_93_is_unsupported_without_zstd_feature() {
+    let mut bytes = zip_fixture(ZipMethod::Store);
+    let central = bytes
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .unwrap();
+    bytes[8..10].copy_from_slice(&93_u16.to_le_bytes());
+    bytes[central + 10..central + 12].copy_from_slice(&93_u16.to_le_bytes());
 
     let mut reader = SeekArchiveReader::new(Cursor::new(bytes)).unwrap();
     assert!(matches!(

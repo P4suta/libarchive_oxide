@@ -887,16 +887,13 @@ impl BuiltinFormatEncoder {
     }
 
     pub(crate) fn zip(limits: Limits, method: crate::ZipMethod) -> Self {
-        let method = match method {
-            crate::ZipMethod::Store => StreamZipMethod::Store,
-            crate::ZipMethod::Deflate => StreamZipMethod::Deflate,
-            #[cfg(feature = "bzip2")]
-            crate::ZipMethod::Bzip2 => StreamZipMethod::Bzip2,
-        };
+        let (method, deferred) = map_zip_method(method);
+        let mut encoder = ZipStreamEncoder::with_method(limits, method);
+        if let Some(message) = deferred {
+            encoder.set_deferred_unsupported(message);
+        }
         Self {
-            inner: BuiltinFormatEncoderInner::Zip(Box::new(ZipStreamEncoder::with_method(
-                limits, method,
-            ))),
+            inner: BuiltinFormatEncoderInner::Zip(Box::new(encoder)),
         }
     }
 
@@ -912,17 +909,36 @@ impl BuiltinFormatEncoder {
         method: crate::ZipMethod,
         password: crate::SecretBytes,
     ) -> Self {
-        let method = match method {
-            crate::ZipMethod::Store => StreamZipMethod::Store,
-            crate::ZipMethod::Deflate => StreamZipMethod::Deflate,
-            #[cfg(feature = "bzip2")]
-            crate::ZipMethod::Bzip2 => StreamZipMethod::Bzip2,
-        };
-        Self {
-            inner: BuiltinFormatEncoderInner::Zip(Box::new(ZipStreamEncoder::with_password(
-                limits, method, password,
-            ))),
+        let (method, deferred) = map_zip_method(method);
+        let mut encoder = ZipStreamEncoder::with_password(limits, method, password);
+        if let Some(message) = deferred {
+            encoder.set_deferred_unsupported(message);
         }
+        Self {
+            inner: BuiltinFormatEncoderInner::Zip(Box::new(encoder)),
+        }
+    }
+}
+
+/// Maps the public [`crate::ZipMethod`] to the writer's internal method,
+/// returning a deferred structured-Unsupported message when the requested
+/// method has no encoder in the current build profile (ZIP Zstandard write
+/// requires `native-codecs`; the portable `ruzstd` path is decode-only).
+fn map_zip_method(method: crate::ZipMethod) -> (StreamZipMethod, Option<&'static str>) {
+    match method {
+        crate::ZipMethod::Store => (StreamZipMethod::Store, None),
+        crate::ZipMethod::Deflate => (StreamZipMethod::Deflate, None),
+        #[cfg(feature = "bzip2")]
+        crate::ZipMethod::Bzip2 => (StreamZipMethod::Bzip2, None),
+        #[cfg(all(feature = "zstd", feature = "native-codecs"))]
+        crate::ZipMethod::Zstd => (StreamZipMethod::Zstd, None),
+        #[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
+        crate::ZipMethod::Zstd => (
+            StreamZipMethod::Deflate,
+            Some(
+                "ZIP Zstandard write requires the native-codecs profile (no portable zstd encoder)",
+            ),
+        ),
     }
 }
 
