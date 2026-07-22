@@ -91,6 +91,8 @@ invalid destination. See [the filesystem adapter contract](filesystem-adapters.m
 | `oxarchive apply` | human or JSON outcomes plus filesystem findings | same immutable session; per-file atomic commit |
 | `oxarchive create` | tar/cpio/ar/zip; optional gzip/bzip2/xz/zstd/lz4 | common `CreateOptions`; 64 KiB copy buffer; file output staged and no-replace published |
 | `oxarchive verify` | human or JSON digest/count result | streams payload events with checked counters |
+| `oxarchive oci` | inspect/verify/apply over the shared layer engine; machine JSON only | bounded JSON-Lines inspection; digest verified before apply; `apply` needs a seekable layer |
+| `oxarchive package validate` | `--type`-selected profile over the shared validators; one machine JSON record | bounded no-extract; shared typed findings and stable severity; deb/rpm accept `-`, ZIP-container profiles need a seekable file |
 | `oxtar`, `oxcpio`, `oxcat`, `oxunzip` | documented compatibility subsets | shared exit 0/1/2, stdout/stderr, limits, and safe extraction contracts |
 
 `create ARCHIVE=-` reserves stdout for archive bytes and can leave a partial
@@ -132,5 +134,16 @@ The Debian profile is exercised by twelve bounded validation tests
 four ZIP-container profiles (JAR, NuGet, Wheel, EPUB) by nineteen
 (`tests/package_zip.rs`), and the three OS/app profiles (APK, IPA, MSIX) by
 twenty-two (`tests/package_app.rs`); all are described in
-[ADR-0010](adr/0010-package-profiles.md). A package-validation CLI surface
-(RM-215) is a later Campaign 2 unit and remains planned.
+[ADR-0010](adr/0010-package-profiles.md).
+
+The `oxarchive package validate PACKAGE --type <profile>` CLI surface (RM-215)
+drives these same validators and renders their shared typed findings and stable
+severity as one `package_validation` JSON record, re-implementing no
+package-structure interpretation. The record reports `container_readable` and
+`profile_valid` as the two separate verdicts named above, so the CLI never
+conflates them; exit is 0 when the profile is valid, 1 when the container was
+read but the profile was not satisfied, and 2 on a usage error. The `deb` and
+`rpm` profiles accept `-` for standard input; the ZIP-container profiles require
+a seekable file. It is exercised by nine CLI contract tests
+(`libarchive_oxide-cli/tests/package_cli.rs`); see the
+[CLI and streaming-output contract](cli-contract.md).

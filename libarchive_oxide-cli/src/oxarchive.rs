@@ -39,12 +39,15 @@ Usage:
   oxarchive oci inspect LAYER
   oxarchive oci verify LAYER --digest sha256:... --diff-id sha256:...
   oxarchive oci apply [POLICY FLAGS] LAYER DEST --digest sha256:... --diff-id sha256:...
+  oxarchive package validate PACKAGE --type <deb|rpm|jar|nuget|wheel|epub|apk|ipa|msix>
 
 ARCHIVE may be '-' to read standard input, or for create to write standard output.
 Create formats: tar, cpio, ar, zip. Filters: none, gzip, bzip2, xz, zstd, lz4.
 `--json create -` is refused so machine records never mix with archive bytes.
 The `oci` subcommands read OCI image layers (tar, tar+gzip, tar+zstd) and emit
 machine JSON only. `oci apply` requires a seekable LAYER file (not '-').
+The `package validate` subcommand runs the shared package validators and emits
+one machine JSON record; deb/rpm accept '-', the ZIP-container profiles do not.
 
 Policy flags:
   --overwrite
@@ -84,6 +87,7 @@ pub fn run_oxarchive(mut args: Vec<String>) -> CliResult {
         "create" => run_create(operands, json_output),
         "verify" => run_verify(operands, json_output),
         "oci" => crate::oci::run_oci(operands),
+        "package" => crate::package::run_package(operands),
         flag if flag.starts_with('-') => Err(CliError::unsupported(flag)),
         _ => Err(CliError::usage(format!(
             "unknown command: {command}\n\n{HELP}"

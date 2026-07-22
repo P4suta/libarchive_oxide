@@ -8,15 +8,17 @@ bytes and digests across order, timestamps, ownership, PAX emission, and
 padding), RM-204 (byte/range source adapters that feed the engine with no
 networking, authentication, or cloud SDK dependency), and RM-205 (the
 `oxarchive oci` inspect/verify/apply CLI over the same engine, plan, and report
-types). It also records the first four slices of the package-validator epic RM-210:
+types). It also records the first five slices of the package-validator epic RM-210:
 RM-211 (the bounded package-validation framework and the Debian `.deb`
 validator), RM-212 (the bounded RPM profile validator), RM-213 (the bounded
-ZIP-container profiles: JAR, NuGet, Wheel, and EPUB), and RM-214 (the bounded
+ZIP-container profiles: JAR, NuGet, Wheel, and EPUB), RM-214 (the bounded
 OS/app profiles: Android APK, iOS IPA, and Windows MSIX, with informational
-signing-scheme detection). RM-201/202 (#52), RM-205 (#53), RM-204 (#54),
+signing-scheme detection), and RM-215 (the `oxarchive package validate` CLI over
+those same validators and their shared typed findings and stable severity).
+RM-201/202 (#52), RM-205 (#53), RM-204 (#54),
 RM-203 (#55), RM-211 (#56), RM-212 (#57), and RM-213 (#58) have reached `main`;
-RM-214 is based on its working tree. The parent epics close only after every
-slice has passed its required remote checks and reached `main`.
+RM-214 and RM-215 are based on their working tree. The parent epics close only
+after every slice has passed its required remote checks and reached `main`.
 
 No tag, package publication, GitHub Release, release-workflow execution,
 version change, or versioned release candidate is part of this snapshot.
@@ -56,6 +58,9 @@ version change, or versioned release candidate is part of this snapshot.
 | OS/app signing finding codes | RM-214 | `libarchive_oxide/src/package/finding.rs` | `UnsignedPackage`, `SigningSchemeDetected` (both `Severity::Info`) |
 | OS/app re-exports on the package surface | RM-214 | `libarchive_oxide/src/package/mod.rs`, `src/lib.rs` | public `AppPackageValidator`/`AppPackageValidation`/`AppPackageProfile`/`AppSignatureReport` re-exported from the crate root |
 | OS/app validation tests | RM-214 | `libarchive_oxide/tests/package_app.rs` | 22 tests, happy path, signing-scheme detection, and adversarial no-extract refusals |
+| `package` CLI subcommand | RM-215 | `libarchive_oxide-cli/src/package.rs` | `run_package`, `run_validate`, `PackageProfile` static dispatch over `DebValidator`/`RpmValidator`/`ZipPackageValidator`/`AppPackageValidator`, `emit`/`finding_json` rendering the shared typed findings |
+| `package` command dispatch | RM-215 | `libarchive_oxide-cli/src/oxarchive.rs`, `src/lib.rs` | `run_oxarchive` routes `package` to `crate::package::run_package`; `pub mod package` registered |
+| `package` CLI contract tests | RM-215 | `libarchive_oxide-cli/tests/package_cli.rs` | 9 tests: valid deb/rpm/jar/epub, `--type=` form, deb stdin, invalid deb/jar typed findings, usage errors, ZIP-stdin rejection |
 
 ## RM-201
 
@@ -358,6 +363,44 @@ version change, or versioned release candidate is part of this snapshot.
   with no decompression), and `garbage_container_is_unreadable`
   (`ContainerUnreadable` with `container_readable` cleared).
 
+## RM-215
+
+- The unified `oxarchive` binary gains a `package validate` subcommand that
+  shares the RM-211/212/213/214 validators and their shared `SupportStatus`,
+  `PackageFinding`, `PackageFindingCode`, and `Severity` types directly. The CLI
+  re-implements no package-structure interpretation or finding classification:
+  `run_validate` selects a profile, opens a bounded input, calls the matching
+  validator, and `finding_json` renders each finding from its stable accessors
+  (`severity().label()`, `code().as_str()`, `path()`, `detail()`) so severity
+  and code are never re-derived. A `PackageProfile` enum unifies the four
+  validators without a trait object, keeping the `no-dyn` gate green, and every
+  invocation emits one `package_validation` JSON record carrying
+  `schema_version`, `profile`, `container_readable`, `profile_valid`, and the
+  `findings` array.
+- `valid_packages_report_exit_zero_and_profile_valid` builds a conforming
+  `.deb`, RPM, JAR, and EPUB with the library fixture builders (`ar`/`cpio`/`tar`
+  through `ArchiveEngine`, stored ZIP through `ArchiveWriter`), validates each,
+  and asserts exit 0 with `container_readable: true`, `profile_valid: true`, and
+  an empty `findings` array. `type_flag_accepts_equals_form` covers the
+  `--type=jar` spelling.
+- `deb_validates_from_standard_input` confirms the `deb` profile reads `-` from
+  standard input at exit 0, while `zip_profile_rejects_standard_input_as_usage`
+  confirms a ZIP-container profile (`jar`) rejects `-` as a usage error (exit 2,
+  empty stdout, non-empty stderr) because a central directory is not seekable
+  from a stream.
+- `missing_debian_binary_reports_exit_one_with_typed_finding` and
+  `jar_without_manifest_reports_exit_one_with_typed_finding` build packages that
+  read as containers but fail their profile, and assert exit 1 with
+  `container_readable: true`, `profile_valid: false`, and the specific shared
+  code (`missing-debian-binary`, rendered with its stable `error` severity;
+  `missing-required-member`) present in the JSON — demonstrating the CLI carries
+  the library's separated verdict and typed classification unchanged.
+- `unknown_type_is_usage_error`, `missing_type_is_usage_error`, and
+  `unknown_subcommand_is_usage_error` (covering both an unknown subcommand and a
+  missing subcommand) confirm argument and type faults exit 2 with empty stdout
+  and a usage diagnostic on standard error, reusing the shared `CliError` usage
+  path.
+
 ## Reproduced gates
 
 - Working tree, Windows x86_64, default portable codec profile:
@@ -383,6 +426,11 @@ version change, or versioned release candidate is part of this snapshot.
   the working tree, Windows x86_64, default portable codec profile; the RM-213
   central-directory reader was extracted to a shared internal `zip_reader` module
   reused unchanged by the ZIP-container profiles.
+- `cargo test -p libarchive_oxide-cli --test package_cli` passed 9/9 (RM-215) on
+  the working tree, Windows x86_64, default portable codec profile, and the full
+  `cargo test -p libarchive_oxide-cli` suite passed alongside the existing OCI
+  and archive CLI contract suites; the `package validate` CLI adds no trait
+  object and drives the shared validators without re-deriving any finding.
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   the `no-dyn` gate (static dispatch; the OCI builder and the package validator
   add no trait objects), and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` all
@@ -398,10 +446,11 @@ big-endian, and CodeQL gates remain required before the RM-200 epic can close.
 
 For the RM-210 package-validator epic, RM-211 lands the framework and the Debian
 `.deb` profile, RM-212 adds the RPM profile, RM-213 adds the ZIP-container
-profiles (JAR, NuGet, Wheel, EPUB), and RM-214 adds the OS/app profiles
-(Android APK, iOS IPA, Windows MSIX) with bounded APK signing-scheme detection.
-A package-validation CLI surface (RM-215) is a later slice and is not part of
-this snapshot. Cryptographic signature *verification* and digest checking (as
+profiles (JAR, NuGet, Wheel, EPUB), RM-214 adds the OS/app profiles
+(Android APK, iOS IPA, Windows MSIX) with bounded APK signing-scheme detection,
+and RM-215 adds the `oxarchive package validate` CLI surface over those same
+validators with no re-implemented validation logic. Cryptographic signature
+*verification* and digest checking (as
 opposed to APK/MSIX signature-scheme *detection*, which RM-214 adds as
 informational findings) are out of scope for every package profile. Remote
 checks and reaching `main` remain required before the RM-210 epic can close.
