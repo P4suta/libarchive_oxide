@@ -70,6 +70,12 @@ a caller can inspect exactly which deletions and clears a layer requests before
 committing. Because verification precedes any adapter call, a tampered or
 truncated layer can never partially mutate the destination.
 
+Because the engine and applier are generic over `Read` (and `Read + Seek`), a
+`RangeReader` over any `RangeSource` feeds them directly, so a remote layer blob
+served through ranged fetches (HTTP `Range`, S3/GCS/Azure object reads) can be
+read, digested, and planned with no registry, authentication, or cloud SDK
+dependency — the transport is injected at the `RangeSource` seam (see RM-204).
+
 The applier requires a seekable blob so it can rewind between the verify and
 apply passes; a purely streaming apply is not offered here. Ownership landing is
 still platform-gated by the filesystem adapter, so `MapOwnership` records the

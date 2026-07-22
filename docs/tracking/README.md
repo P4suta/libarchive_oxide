@@ -52,6 +52,7 @@ Detailed bodies used for initial issue creation live in
 | [RM-122](https://github.com/P4suta/libarchive_oxide/issues/48) | RM-120 | implementation [#51](https://github.com/P4suta/libarchive_oxide/pull/51) | Bounded create, streamed inspection, and unified CLI contracts |
 | RM-201 | RM-200 | implementation (DEV-74) | Bounded layer read with one-pass compressed digest and diffID |
 | RM-202 | RM-200 | implementation (DEV-74) | Digest-verified layer apply with whiteout, opaque, ownership, link, and conflict handling |
+| RM-204 | RM-200 | implementation (DEV-95) | Byte/range source adapters feeding the OCI layer engine with no networking, auth, or cloud SDK dependency |
 | RM-205 | RM-200 | implementation (DEV-96) | `oxarchive oci` inspect, verify, and apply subcommands over the shared layer engine |
 
 The cross-epic acceptance mapping, local reproductions, performance/RSS data,

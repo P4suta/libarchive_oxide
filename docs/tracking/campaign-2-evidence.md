@@ -1,12 +1,14 @@
 # Campaign 2 completion evidence
 
-This snapshot records the technical evidence for RM-200, the OCI layer engine:
-RM-201 (bounded layer read with one-pass compressed digest and diffID), RM-202
-(digest-verified layer application with overlay, ownership, link, and conflict
-handling), and RM-205 (the `oxarchive oci` inspect/verify/apply CLI over the
-same engine, plan, and report types). It is based on the
-`feat/rm-205-oxarchive-oci-cli` working tree. The parent epic closes only after
-every slice has passed its required remote checks and reached `main`.
+This snapshot records the technical evidence for the OCI layer engine slices of
+RM-200: RM-201 (bounded layer read with one-pass compressed digest and diffID),
+RM-202 (digest-verified layer application with overlay, ownership, link, and
+conflict handling), RM-204 (byte/range source adapters that feed the engine with
+no networking, authentication, or cloud SDK dependency), and RM-205 (the
+`oxarchive oci` inspect/verify/apply CLI over the same engine, plan, and report
+types). RM-201/202 (#52) and RM-205 (#53) have reached `main`; RM-204 is based on
+the `feat/rm-204-oci-range-adapters` working tree. The parent epic closes only
+after every slice has passed its required remote checks and reached `main`.
 
 No tag, package publication, GitHub Release, release-workflow execution,
 version change, or versioned release candidate is part of this snapshot.
@@ -22,6 +24,8 @@ version change, or versioned release candidate is part of this snapshot.
 | Module surface and re-exports | RM-201/202 | `libarchive_oxide/src/oci/mod.rs`, `src/lib.rs` | public `oci` types re-exported from the crate root |
 | Adapter removal/clear operations | RM-202 | `libarchive_oxide/src/filesystem.rs`, `src/filesystem_std.rs` | `FilesystemRemoval`, `remove_path`, `clear_directory` |
 | Integration tests | RM-201/202 | `libarchive_oxide/tests/oci_layer.rs` | 20 tests, read and apply |
+| SDK-free range adapters example | RM-204 | `libarchive_oxide/examples/oci_range_adapter.rs` | `FetchRange`, HTTP/S3/GCS/Azure adapters over one injected fetch seam |
+| Range-backed layer read tests | RM-204 | `libarchive_oxide/tests/oci_range.rs` | 4 tests, `RangeReader` → `OciLayerEngine` parity and offset exactness |
 | `oci` CLI subcommands | RM-205 | `libarchive_oxide-cli/src/oci.rs` | `run_oci`, `run_oci_inspect`, `run_oci_verify`, `run_oci_apply` over the shared engine |
 | `oci` command dispatch | RM-205 | `libarchive_oxide-cli/src/oxarchive.rs` | `run_oxarchive` routes `oci` to `crate::oci::run_oci` |
 | `oci` CLI contract tests | RM-205 | `libarchive_oxide-cli/tests/oci_cli.rs` | 8 tests: inspect, verify, apply, usage |
@@ -68,6 +72,38 @@ version change, or versioned release candidate is part of this snapshot.
   cover path traversal, duplicate paths, symlink escape, single-apply, and
   cross-applier plan binding.
 
+## RM-204
+
+- ADR-0009 records that the layer engine and applier are generic over `Read`
+  (and `Read + Seek`), so a `RangeReader` over any `RangeSource` feeds them with
+  no new parser. RM-204 exercises exactly that path: a remote layer blob served
+  through ranged fetches is read, digested, and planned with no registry
+  networking, authentication, or cloud SDK dependency.
+- `examples/oci_range_adapter.rs` defines one generic bridge, `FetchRange<F>`,
+  parameterized over a `FnMut(offset, len) -> io::Result<Vec<u8>>` fetch closure
+  (static dispatch, no trait objects). The transport is injected at that single
+  seam, never depended upon: the HTTP/HTTPS, Amazon S3 `GetObject`, Google Cloud
+  Storage media, and Azure Blob Storage adapters differ only in the identity
+  source (`ETag`, `VersionId`, `generation`) and in which header carries the
+  shared `bytes=<a>-<b>` value, which is documented rather than implemented.
+- Running the example drives all four adapters against one in-memory blob through
+  the same range interface a remote store exposes; the four report identical
+  compressed/diffID digests, and the same S3-flavored source — being `Read +
+  Seek` via `RangeReader` — also feeds `OciLayerApplier::plan`, which produces a
+  3-operation plan without touching any filesystem.
+- `tests/oci_range.rs` proves parity and boundary exactness with a recording
+  `MemoryRange` source: `range_backed_digests_match_direct_read` and
+  `range_backed_session_verifies_against_direct_digests` show a `RangeReader`-fed
+  `OciLayerEngine` yields byte-identical paths and digests to a direct `Cursor`
+  read; `range_reader_reproduces_bytes_across_chunk_boundaries` confirms the
+  reader reassembles the blob across fetch boundaries with every fetch strictly
+  inside the source; and `read_range_returns_exact_bytes_at_each_offset` checks
+  start, mid-window, final-byte, and at-length (zero bytes) reads.
+- No crate dependency is added: the adapters reuse the existing `RangeSource`,
+  `RangeReader`, `SourceIdentity`, and `oci` surface only. The absence of any
+  HTTP or cloud SDK is the point of the unit — the transport lives entirely in
+  the caller-supplied closure.
+
 ## RM-205
 
 - The unified `oxarchive` binary gains an `oci` subcommand group that shares the
@@ -104,17 +140,22 @@ version change, or versioned release candidate is part of this snapshot.
 ## Reproduced gates
 
 - Working tree, Windows x86_64, default portable codec profile:
-  `cargo test -p libarchive_oxide --test oci_layer` passed 20/20.
-- The full `cargo test -p libarchive_oxide` suite passed, including the existing
-  engine, codec, and zip suites.
-- `cargo fmt --check`, `cargo clippy -p libarchive_oxide --all-targets
-  -- -D warnings`, and `RUSTDOCFLAGS="-D warnings" cargo doc -p libarchive_oxide
-  --no-deps` all pass; every public `oci` item carries rustdoc and the crate
-  keeps `#![forbid(unsafe_code)]` with no new runtime dependency.
+  `cargo test -p libarchive_oxide --test oci_layer` passed 20/20, and
+  `cargo test -p libarchive_oxide --test oci_range` passed 4/4 (RM-204).
+- `cargo build -p libarchive_oxide --example oci_range_adapter` builds and
+  `cargo run` on it prints matching digests across all four adapters and a
+  3-operation plan (RM-204).
+- `cargo test -p libarchive_oxide-cli --test oci_cli` passed 8/8 (RM-205), and
+  the full `cargo test -p libarchive_oxide` and `-p libarchive_oxide-cli` suites
+  passed, including the existing engine, codec, zip, and CLI contract suites.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  the `no-dyn` gate, and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` all
+  pass; every public `oci` item carries rustdoc and the crate keeps
+  `#![forbid(unsafe_code)]` with no new runtime dependency.
 
 ## Out of scope for this slice
 
-Deterministic layer creation, a range-source adapter example, and a full 10 GiB
-soak are deferred to RM-203 and RM-204. The `oxarchive oci` CLI subcommand
-lands here as RM-205. Remote matrix, nightly fuzz, big-endian, and CodeQL gates
+Deterministic layer creation and a full 10 GiB soak are deferred to RM-203. The
+`oxarchive oci` CLI subcommand landed as RM-205 and the SDK-free range adapter
+example as RM-204. Remote matrix, nightly fuzz, big-endian, and CodeQL gates
 remain required before the RM-200 epic can close.
