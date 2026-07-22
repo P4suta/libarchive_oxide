@@ -1,8 +1,8 @@
-# ADR-0010: Bounded package-validation profiles, the Debian `.deb` and RPM validators
+# ADR-0010: Bounded package-validation profiles, the Debian `.deb`, RPM, and ZIP-container validators
 
 - Status: accepted
 - Date: 2026-07-22
-- Tracks: RM-211 / DEV-75, RM-212 / DEV-100
+- Tracks: RM-211 / DEV-75, RM-212 / DEV-100, RM-213 / DEV-101
 
 ## Context
 
@@ -125,11 +125,65 @@ adapter's per-operation findings.
   gzip/xz/zstd/bzip2 (plus a plain `none` cpio). Signature and digest
   verification are explicitly out of scope for this unit.
 
-The ZIP-based package families and a package-validation CLI surface are deferred
-to later Campaign 2 units (RM-215 for the CLI). This decision owns no rendering
+### ZIP-container profiles (RM-213)
+
+- **JAR, NuGet, Wheel, and EPUB are one ZIP validator with per-profile members.**
+  All four are ordinary ZIP archives; they differ only in the members they must
+  carry and, for EPUB, in a structural constraint on the first member.
+  `ZipPackageValidator` takes a `ZipPackageProfile` and reuses the whole
+  `finding` vocabulary, the path sanitizer, and the core `Limits`. Because ZIP
+  stores its index (the central directory) at the end of the file, the validator
+  requires `Read + Seek` rather than the streaming `Read` the `ar` and RPM
+  profiles use.
+- **Bounded, no-extract validation reads only the central directory.** A small
+  bounded hand-written parser locates the end-of-central-directory record (with a
+  ZIP64 fallback), then walks the central directory to collect each member's
+  name, order, compression method, encryption flag, and declared uncompressed
+  size. No entry payload is ever decompressed. Central-directory size,
+  entry count, and per-entry path length are bounded by `Limits::metadata_bytes`,
+  `Limits::entries`, and `Limits::path_bytes`, matching the seekable ZIP reader.
+  The single exception is the EPUB `mimetype` body: only for that member, and
+  only the exact media-type length, is a stored body read to confirm it is
+  `application/epub+zip`.
+- **The decompression-bomb budget is the summed declared size.** Because nothing
+  is decompressed, the bomb defense compares the summed declared uncompressed
+  size of every member against `Limits::decoded_total` and reports a
+  `DecompressionBomb` finding when it is exceeded, rather than expanding output.
+- **Per-profile required members.** JAR requires `META-INF/MANIFEST.MF`; NuGet
+  requires `[Content_Types].xml` and exactly one root `*.nuspec` (a second root
+  manifest is a `DuplicateMember` finding); Wheel requires `*.dist-info/METADATA`,
+  `*.dist-info/RECORD`, and `*.dist-info/WHEEL`; EPUB requires a first, stored
+  `mimetype` member with the exact `application/epub+zip` body plus
+  `META-INF/container.xml`. A missing required member is a `MissingRequiredMember`
+  finding.
+- **Shared ZIP-structure defenses and additive codes.** Every profile refuses an
+  unsafe (`UnsafeEntryPath`) or duplicate (`DuplicateEntryPath`) member name, an
+  encrypted member (`UnexpectedEncryption`), and a compression method this build
+  cannot decode (the same `UnsupportedCompression` capability finding used by the
+  Debian and RPM profiles, classified from the central-directory method rather
+  than a provider query because no decode is attempted). The EPUB-specific
+  constraints add `MimetypeNotFirst`, `MimetypeNotStored`, and
+  `MimetypeInvalidContent`; these three codes plus `UnexpectedEncryption` are
+  additions to the shared `PackageFindingCode` enum and every other code is
+  reused unchanged.
+- **Same separated verdict.** `ZipPackageValidation` exposes the same
+  `SupportStatus { container_readable, profile_valid }`: a ZIP whose central
+  directory cannot be parsed clears `container_readable`, while a readable
+  archive that is missing a required member, carries an encrypted or
+  undecodable member, or violates the EPUB `mimetype` contract reads but is not
+  `profile_valid`.
+- **Supported inputs, ZIP-container unit (RM-213).** The JAR, NuGet, Wheel, and
+  EPUB profiles: required-member presence, the single-root-`.nuspec` and
+  first-stored-`mimetype` structural rules, unsafe/duplicate member paths,
+  encryption, an undecodable method, and decompression-bomb refusal. Payload
+  decompression, signature and digest verification, and the remaining ZIP
+  families (IPA, MSIX/APPX) are out of scope for this unit.
+
+The remaining ZIP families (IPA, MSIX/APPX) and a package-validation CLI surface
+are deferred to later Campaign 2 units (RM-215 for the CLI). This decision owns no rendering
 or transport policy: any front end consumes the same `DebValidation`,
-`RpmValidation`, `PackageFinding`, and `SupportStatus` types unchanged and
-re-implements no package policy of its own.
+`RpmValidation`, `ZipPackageValidation`, `PackageFinding`, and `SupportStatus`
+types unchanged and re-implements no package policy of its own.
 
 ## Consequences
 
@@ -147,8 +201,9 @@ the same call path serves an in-memory buffer, a file, or a range-backed source,
 and swapping the provider set lets a caller detect exactly which members a
 reduced build cannot decode without the validator conflating that with
 corruption. The shared `finding` vocabulary is profile-agnostic: the RPM profile
-already reuses it directly and only adds a small bounded lead/header parser and
-five RPM-specific codes, and the ZIP-based families will do the same with only
-their own container-reading front end. Signature and cryptographic-integrity
-verification, digest checking, and any package-validation CLI are outside these
-units and remain later Campaign 2 work.
+reuses it directly and only adds a small bounded lead/header parser and five
+RPM-specific codes, and the ZIP-container profiles (RM-213) do the same with only
+a bounded central-directory reader and four additive codes. Signature and
+cryptographic-integrity verification, digest checking, the remaining ZIP families
+(IPA, MSIX/APPX), and any package-validation CLI are outside these units and
+remain later Campaign 2 work.

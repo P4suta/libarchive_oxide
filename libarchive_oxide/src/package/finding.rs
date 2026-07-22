@@ -88,6 +88,14 @@ pub enum PackageFindingCode {
     PayloadFormatMismatch,
     /// The detected payload filter disagreed with the declared compressor tag.
     CompressorMismatch,
+    /// An EPUB `mimetype` member was present but not the first archive member.
+    MimetypeNotFirst,
+    /// An EPUB `mimetype` member was compressed rather than stored.
+    MimetypeNotStored,
+    /// An EPUB `mimetype` member did not carry the `application/epub+zip` body.
+    MimetypeInvalidContent,
+    /// A member was encrypted in a profile that forbids encryption.
+    UnexpectedEncryption,
 }
 
 impl PackageFindingCode {
@@ -114,6 +122,10 @@ impl PackageFindingCode {
             Self::HeaderTooLarge => "header-too-large",
             Self::PayloadFormatMismatch => "payload-format-mismatch",
             Self::CompressorMismatch => "compressor-mismatch",
+            Self::MimetypeNotFirst => "mimetype-not-first",
+            Self::MimetypeNotStored => "mimetype-not-stored",
+            Self::MimetypeInvalidContent => "mimetype-invalid-content",
+            Self::UnexpectedEncryption => "unexpected-encryption",
         }
     }
 

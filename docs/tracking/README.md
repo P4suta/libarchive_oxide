@@ -57,6 +57,7 @@ Detailed bodies used for initial issue creation live in
 | RM-205 | RM-200 | implementation (DEV-96) | `oxarchive oci` inspect, verify, and apply subcommands over the shared layer engine |
 | RM-211 | RM-210 | implementation (DEV-99) | Bounded package-validation framework and Debian `.deb` validator |
 | RM-212 | RM-210 | implementation (DEV-100) | Bounded RPM profile validator with no-extract lead/header parsing and compressed cpio payload checks |
+| RM-213 | RM-210 | implementation (DEV-101) | Bounded ZIP-container profile validators (JAR, NuGet, Wheel, EPUB) reading only the central directory with no payload decompression |
 
 The cross-epic acceptance mapping, local reproductions, performance/RSS data,
 and remote-only gates are collected in the
