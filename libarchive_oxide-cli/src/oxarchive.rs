@@ -36,10 +36,15 @@ Usage:
   oxarchive [--json] apply [POLICY FLAGS] ARCHIVE DEST
   oxarchive [--json] create --format FORMAT [--filter FILTER] ARCHIVE INPUT...
   oxarchive [--json] verify ARCHIVE
+  oxarchive oci inspect LAYER
+  oxarchive oci verify LAYER --digest sha256:... --diff-id sha256:...
+  oxarchive oci apply [POLICY FLAGS] LAYER DEST --digest sha256:... --diff-id sha256:...
 
 ARCHIVE may be '-' to read standard input, or for create to write standard output.
 Create formats: tar, cpio, ar, zip. Filters: none, gzip, bzip2, xz, zstd, lz4.
 `--json create -` is refused so machine records never mix with archive bytes.
+The `oci` subcommands read OCI image layers (tar, tar+gzip, tar+zstd) and emit
+machine JSON only. `oci apply` requires a seekable LAYER file (not '-').
 
 Policy flags:
   --overwrite
@@ -78,6 +83,7 @@ pub fn run_oxarchive(mut args: Vec<String>) -> CliResult {
         "apply" => run_apply(operands, json_output),
         "create" => run_create(operands, json_output),
         "verify" => run_verify(operands, json_output),
+        "oci" => crate::oci::run_oci(operands),
         flag if flag.starts_with('-') => Err(CliError::unsupported(flag)),
         _ => Err(CliError::usage(format!(
             "unknown command: {command}\n\n{HELP}"
@@ -769,7 +775,7 @@ fn metadata_json(metadata: &EntryMetadata) -> Value {
     })
 }
 
-fn print_json(value: &Value) -> CliResult {
+pub(crate) fn print_json(value: &Value) -> CliResult {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     serde_json::to_writer_pretty(&mut output, value)
@@ -780,7 +786,7 @@ fn print_json(value: &Value) -> CliResult {
         .map_err(|error| CliError::runtime(format!("cannot flush stdout: {error}")))
 }
 
-fn write_json_record<W: Write>(output: &mut W, value: &Value) -> CliResult {
+pub(crate) fn write_json_record<W: Write>(output: &mut W, value: &Value) -> CliResult {
     serde_json::to_writer(&mut *output, value)
         .map_err(|error| CliError::runtime(format!("cannot write JSON record: {error}")))?;
     output
@@ -844,7 +850,7 @@ fn outcome_name(outcome: &EntryOutcomeKind) -> String {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {

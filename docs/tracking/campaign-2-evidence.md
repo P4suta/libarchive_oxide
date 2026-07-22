@@ -1,11 +1,12 @@
 # Campaign 2 completion evidence
 
-This snapshot records the technical evidence for the first slice of RM-200,
-the OCI layer engine: RM-201 (bounded layer read with one-pass compressed
-digest and diffID) and RM-202 (digest-verified layer application with overlay,
-ownership, link, and conflict handling). It is based on the
-`feat/rm-200-oci-layer` working tree. The parent epic closes only after every
-slice has passed its required remote checks and reached `main`.
+This snapshot records the technical evidence for RM-200, the OCI layer engine:
+RM-201 (bounded layer read with one-pass compressed digest and diffID), RM-202
+(digest-verified layer application with overlay, ownership, link, and conflict
+handling), and RM-205 (the `oxarchive oci` inspect/verify/apply CLI over the
+same engine, plan, and report types). It is based on the
+`feat/rm-205-oxarchive-oci-cli` working tree. The parent epic closes only after
+every slice has passed its required remote checks and reached `main`.
 
 No tag, package publication, GitHub Release, release-workflow execution,
 version change, or versioned release candidate is part of this snapshot.
@@ -21,6 +22,9 @@ version change, or versioned release candidate is part of this snapshot.
 | Module surface and re-exports | RM-201/202 | `libarchive_oxide/src/oci/mod.rs`, `src/lib.rs` | public `oci` types re-exported from the crate root |
 | Adapter removal/clear operations | RM-202 | `libarchive_oxide/src/filesystem.rs`, `src/filesystem_std.rs` | `FilesystemRemoval`, `remove_path`, `clear_directory` |
 | Integration tests | RM-201/202 | `libarchive_oxide/tests/oci_layer.rs` | 20 tests, read and apply |
+| `oci` CLI subcommands | RM-205 | `libarchive_oxide-cli/src/oci.rs` | `run_oci`, `run_oci_inspect`, `run_oci_verify`, `run_oci_apply` over the shared engine |
+| `oci` command dispatch | RM-205 | `libarchive_oxide-cli/src/oxarchive.rs` | `run_oxarchive` routes `oci` to `crate::oci::run_oci` |
+| `oci` CLI contract tests | RM-205 | `libarchive_oxide-cli/tests/oci_cli.rs` | 8 tests: inspect, verify, apply, usage |
 
 ## RM-201
 
@@ -64,6 +68,39 @@ version change, or versioned release candidate is part of this snapshot.
   cover path traversal, duplicate paths, symlink escape, single-apply, and
   cross-applier plan binding.
 
+## RM-205
+
+- The unified `oxarchive` binary gains an `oci` subcommand group that shares the
+  RM-201/202 `OciLayerEngine`, `OciLayerApplier`, `LayerDigests`, and
+  `OciApplyReport` types directly; the CLI re-implements no whiteout,
+  opaque-directory, digest, ownership, or path policy and only renders the shared
+  plan/report values as machine JSON. `run_oxarchive` routes `oci` to
+  `crate::oci::run_oci`, which statically dispatches to `inspect`, `verify`, and
+  `apply` without a trait object (a `LayerSource` enum unifies stdin and a file),
+  keeping the `no-dyn` gate green.
+- `inspect_streams_bounded_json_lines_across_filters` confirms `oci inspect`
+  emits JSON Lines — `oci_inspect_start`, one `oci_inspect_entry` per member with
+  `path`/`kind`/`size`, then `oci_inspect_complete` carrying `entry_count`, the
+  compressed `digest`, and the `diff_id` — for plain, gzip, and zstd layers, and
+  that the reported digests equal an engine-computed reference.
+  `inspect_reads_standard_input` covers the `-` layer operand.
+- `verify_matches_and_reports_each_mismatch` covers `oci verify`: a matching
+  `--digest`/`--diff-id` pair yields `verified: true` at exit 0, a wrong
+  compressed digest yields `verified: false` with a `mismatch` object naming the
+  `compressed digest` kind at exit 1, and a malformed `sha256:` argument is a
+  usage error at exit 2.
+- `apply_materializes_files_and_executes_whiteout` shows `oci apply` materializes
+  a file and runs a `.wh.` whiteout through `OciLayerApplier`, reporting
+  `applied: true` with `materialized`/`removed` counts.
+  `apply_digest_mismatch_leaves_destination_unchanged` proves a tampered digest
+  reports `applied: false` and leaves `DEST` untouched at exit 1.
+  `apply_refuses_unsafe_paths_with_exit_one` shows a traversal entry is counted
+  in `rejected` and produces exit 1 without escaping the destination.
+- `apply_rejects_stdin_and_missing_digests_as_usage` confirms `oci apply` refuses
+  the non-seekable `-` operand and a missing `--diff-id` as usage errors (exit
+  2), and `unknown_oci_subcommand_is_usage_error` covers an unknown and a missing
+  `oci` subcommand.
+
 ## Reproduced gates
 
 - Working tree, Windows x86_64, default portable codec profile:
@@ -77,7 +114,7 @@ version change, or versioned release candidate is part of this snapshot.
 
 ## Out of scope for this slice
 
-Deterministic layer creation, a range-source adapter example, the
-`oxarchive oci` CLI subcommand, and a full 10 GiB soak are deferred to RM-203,
-RM-204, and RM-205. Remote matrix, nightly fuzz, big-endian, and CodeQL gates
+Deterministic layer creation, a range-source adapter example, and a full 10 GiB
+soak are deferred to RM-203 and RM-204. The `oxarchive oci` CLI subcommand
+lands here as RM-205. Remote matrix, nightly fuzz, big-endian, and CodeQL gates
 remain required before the RM-200 epic can close.

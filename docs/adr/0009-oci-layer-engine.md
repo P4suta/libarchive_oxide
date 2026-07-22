@@ -53,9 +53,13 @@ the overlay markers.
 - **Supported inputs this unit.** tar, tar+gzip, and tar+zstd, with hardlink,
   symlink, xattr, uid/gid mapping, path-conflict, and symlink-escape handling.
 
-Deterministic layer creation, a range-source adapter example, and an
-`oxarchive oci` CLI subcommand are deliberately out of scope and are deferred to
-later units (RM-203, RM-204, RM-205), along with a full 10 GiB soak.
+Deterministic layer creation, a range-source adapter example, and a full 10 GiB
+soak are deliberately out of scope and are deferred to later units (RM-203,
+RM-204). The `oxarchive oci` CLI (RM-205) does not extend this decision: it
+consumes the same `OciLayerEngine`, `OciLayerApplier`, `OciLayerPlan`, and
+`OciApplyReport` types unchanged and re-implements no OCI policy of its own, so
+whiteout, opaque-directory, digest, ownership, and path decisions stay owned by
+this module.
 
 ## Consequences
 
