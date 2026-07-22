@@ -66,6 +66,7 @@ Detailed bodies used for initial issue creation live in
 | RM-304 | RM-300 | implementation (DEV-110) | tar/cpio/ar/ISO producer corpora with metadata-fidelity comparison through the shared harness |
 | RM-305 | RM-300 | implementation (DEV-111) | CAB/XAR read-only interop corpora read back through arca against independent producers |
 | RM-306 | RM-300 | implementation (DEV-112) | RAR5/UDF feasibility ADR recording scope, licensing, and go/no-go for read support |
+| RM-307 | RM-300 | implementation (DEV-115) | Codec-capability contract (ADR-0012: core purity never bends to a codec, gaps are typed capabilities and tracked deficits with resolution paths) and a grid support-matrix (method × read/write × portable/native) with a codec-deficit ledger |
 
 The cross-epic acceptance mapping, local reproductions, performance/RSS data,
 and remote-only gates are collected in the
