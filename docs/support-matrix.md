@@ -38,8 +38,11 @@ ZIP-LZMA header and an end-of-stream marker (general-purpose bit 1) and reads bo
 the end-marker and known-size conventions. Zstandard read is pure-Rust on both
 profiles (`ruzstd` / `compression-codecs`); Zstandard *write* is `native-codecs`
 only — see the deficit table for why, and note this is a tracked debt, not a
-resting state. Deflate64 has no implementation in either direction. Traditional
-ZipCrypto is not enabled by default.
+resting state. Deflate64 (method 9) is not yet implemented in either direction; per
+[ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md) the read path is decided
+(adopt the external pure-Rust `deflate64` decoder behind the codec-provider
+boundary, landing in a follow-on slice) and write is a retired won't-do (no
+pure-Rust encoder exists). Traditional ZipCrypto is not enabled by default.
 
 7z BCJ/Delta, Deflate, BZip2, Zstandard, PPMd, AES, multi-folder, and arbitrary
 coder-graph coverage remain roadmap work.
@@ -57,10 +60,16 @@ read+write on portable.
 | Deficit | Surfaces as | Why | Resolution path | Tracking |
 |---|---|---|---|---|
 | Portable **streaming** zstd encode | ZIP write method 93 on `portable-codecs` → structured `Unsupported`; `native-codecs` write works | `ruzstd` ships only a one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, used for outer-filter frames and `create --zstd`). It cannot emit a single ZIP member as a bounded stream without buffering the whole member, which would break the core bounded-memory guarantee. The engine refuses the path rather than weaken the guarantee. | A streaming, single-stream pure-Rust zstd encoder — upstream to `ruzstd` or a dedicated crate the engine consumes. | RM-307 → follow-on codec initiative |
-| Deflate64 (read + write) | ZIP method 9 → structured `Unsupported` | No pure-Rust Deflate64 encoder exists; decoders are scarce and write has effectively no consumer demand. | Feasibility decision (own read-only decoder, external decoder, or leave unsupported); no encoder planned. | RM-306 feasibility ADR |
+| Deflate64 (method 9) | ZIP method 9 read/write → structured `Unsupported` (not yet implemented) | Read: a mature pure-Rust decoder (`deflate64`) exists but is not yet wired. Write: no pure-Rust encoder exists and demand is effectively nil (matches libarchive). | Read: adopt the external `deflate64` decoder behind the codec-provider boundary in a follow-on slice. Write: **won't-do**, retired per [ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md). | RM-306 / ADR-0013 |
 
-RAR5, CAB, XAR, and UDF are not currently implemented. They are read-only
-targets for the Modern Archive Profile.
+RAR5 and UDF read scope is resolved by
+[ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md): UDF is a scoped read-only
+go (revisions 1.02/1.50/2.01 first, activated from the shared Volume Recognition
+Sequence), pending its implementation slice; RAR5 read is feasible in principle,
+but the provider is deferred in its entirety until a clean-room pure-Rust
+decompressor exists, because `.rar` archives in the wild are almost always
+compressed. CAB and XAR remain read-only targets tracked by RM-305. All four are
+not yet implemented; each cell flips only when its provider lands.
 
 ## Outer compression filters
 
