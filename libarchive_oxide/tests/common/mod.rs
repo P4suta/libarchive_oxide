@@ -277,6 +277,9 @@ pub fn zip_crate_decode(bytes: &[u8]) -> Vec<EntryShape> {
         let method = match f.compression() {
             zip::CompressionMethod::Stored => CompressionMethod::Store,
             zip::CompressionMethod::Deflated => CompressionMethod::Deflate,
+            zip::CompressionMethod::Bzip2 => CompressionMethod::Bzip2,
+            zip::CompressionMethod::Zstd => CompressionMethod::Zstd,
+            zip::CompressionMethod::Lzma => CompressionMethod::Lzma,
             _ => CompressionMethod::Other(0),
         };
         let mut content = Vec::new();

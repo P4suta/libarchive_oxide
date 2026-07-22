@@ -19,7 +19,7 @@ an explicit native performance profile is also available. See [Codec backends](#
 | tar | sequential v7/ustar/pax/GNU | sequential | known-size entries; GNU sparse supported |
 | cpio | sequential binary/odc/newc/crc | sequential | known-size entries |
 | ar | sequential GNU/BSD | sequential | thin references are identified, never followed |
-| ZIP/ZIP64 | seek or streaming, Store/Deflate | streaming with descriptors | optional WinZip AES; no Deflate64, BZip2, LZMA, or Zstandard methods yet |
+| ZIP/ZIP64 | seek or streaming, Store/Deflate/BZip2/Zstandard/LZMA | streaming with descriptors (Zstandard write is native-codecs only) | optional WinZip AES; no Deflate64 method yet |
 | 7z | seek, LZMA/LZMA2 | seek | optional `sevenz`; single folder; no general coder graph |
 | ISO 9660 | seek, Rock Ridge/Joliet | seek | no UDF |
 

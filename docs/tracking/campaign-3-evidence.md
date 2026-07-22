@@ -27,6 +27,18 @@ change, or versioned release candidate is part of this snapshot.
 | Support-matrix encryption/metadata column split | RM-301 | `docs/support-matrix.md` | Archive-containers table gains an explicit `Encryption` column separated from `Metadata/method notes` |
 | Producer-corpus provenance registries | RM-301 | `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md`, `libarchive_oxide/tests/fixtures/sevenz/PROVENANCE.md` | per-format `crate@version` producer/consumer registry and deterministic in-code generation policy |
 | This evidence snapshot | RM-301 | `docs/tracking/campaign-3-evidence.md` | RM-301 harness scope, formats proven, and reproduced gates |
+| ZIP BZip2 (method 12) read | RM-302 | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/src/zip.rs` | `ZipBody::Bzip2` low-level `bzip2::Decompress` streaming arm mirroring Deflate; CRC-32, size, bomb, and truncation guards; feature-off fall-through to the structured `Unsupported` error |
+| ZIP BZip2 (method 12) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Bzip2` + `bzip2::Compress` Run/Finish encoder mirroring Deflate; `ZipMethod::Bzip2` public variant flows through `provider.rs`; version-needed 46 in local and central headers |
+| ZIP BZip2 3x2 interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_bzip2.rs`, `libarchive_oxide/tests/seek_stream_v2.rs` | three producers (arca, `zip@8.6.0`, first-party raw `.bz2` builder) × two consumers (arca, `zip@8.6.0`); round-trip loop plus truncation, bomb, and feature-off Unsupported tests |
+| Support-matrix ZIP BZip2 update | RM-302 | `docs/support-matrix.md` | ZIP row lists Store/Deflate/BZip2; the not-yet-implemented note drops BZip2 |
+| ZIP Zstandard (method 93) read | RM-302 | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/src/zip.rs` | `ZipBody::Zstd` drives the shared `PipelineCodec` (portable `ruzstd` / native `compression-codecs`) behind one static-dispatch enum — no new trait object; CRC-32, size, bomb (`Limits::decoded_total`), and truncation guards; gated on `zstd`, present on BOTH profiles |
+| ZIP Zstandard (method 93) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Zstd` + streaming `compression_codecs::ZstdEncoder` (pinned level 3) gated on `native-codecs`; version-needed 63 in local and central headers; on the portable profile the two `provider.rs` dispatch sites route to a deferred structured `Unsupported` error surfaced at entry-open |
+| ZIP Zstandard interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_zstd.rs`, `libarchive_oxide/tests/seek_stream_v2.rs` | READ proven on both profiles by two external producers (`zip@8.6.0`, first-party raw-zstd builder over independent-C `zstd` 0.13.3) × two consumers (arca, `zip@8.6.0`); WRITE + a third producer (arca) proven on native-codecs, decoded by both the `zip` crate and independent-C libzstd; truncation, bomb, portable-write-Unsupported, and feature-off Unsupported adversarial tests |
+| Support-matrix ZIP Zstandard update | RM-302 | `docs/support-matrix.md` | ZIP row splits Read (adds Zstandard) from Write (Zstandard native-codecs only); the not-yet-implemented note drops Zstandard and records the write profile-asymmetry |
+| ZIP LZMA (method 14) read | RM-302 | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/src/zip.rs` | `ZipBody::Lzma` parses the 9-byte ZIP-LZMA header (prop_size==5, props byte, dict size), validates the dict against `codec_memory`, buffers the raw LZMA1 member, and drives a pull-based `lzma_rust2::LzmaReader` with the central-directory uncompressed size (handles both EOS-marker and known-size conventions); CRC-32, size, bomb (`Limits::decoded_total`), truncation, and bad-header guards; gated on `xz`, present on BOTH profiles |
+| ZIP LZMA (method 14) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Lzma` + `lzma_rust2::LzmaWriter::new_no_header` (raw LZMA1, EOS marker) drained through an in-crate `VecSink` (no trait object, `#![forbid(unsafe_code)]` intact); pinned preset 6 (props 93, 8 MiB dict); emits the 9-byte ZIP-LZMA header once at entry start; general-purpose bit 1 (`0x0002`) set in local+central flags outside the `0x0809` cross-check mask; version-needed 63 |
+| ZIP LZMA interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_lzma.rs`, `libarchive_oxide/tests/seek_stream_v2.rs`, `libarchive_oxide/tests/fixtures/zip/python-lzma/` | three producers (arca + first-party raw-LZMA1 builder, both `lzma-rust2`; + committed CPython 3.14.6/liblzma fixture, independent codec) × two consumers (arca, `zip@8.6.0` with `lzma`); WRITE evidence = the `zip` crate decodes arca's method-14 output byte-identically; round-trip, empty-member, truncation, bad-property-size, bomb, and feature-off Unsupported tests; the committed fixture + `generate.py` are byte-reproducible (SHA-256 recorded in `PROVENANCE.md`) |
+| Support-matrix + PROVENANCE ZIP LZMA update | RM-302 | `docs/support-matrix.md`, `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md` | ZIP row adds LZMA to Read and Write; the not-yet-implemented note now lists ONLY Deflate64; PROVENANCE records the committed-fixture escape hatch and the two-independent-codecs honesty note |
 
 ## RM-301
 
@@ -77,6 +89,170 @@ change, or versioned release candidate is part of this snapshot.
   no trait object, no closure, no generic parameter, and no new runtime
   dependency, and the crate keeps `#![forbid(unsafe_code)]`.
 
+## RM-302
+
+- RM-302 is the first slice to add a new archive method through the RM-301
+  harness: ZIP BZip2 (method code 12), read and write, gated behind the `bzip2`
+  feature (on by default via `portable-codecs`, and also present in
+  `native-codecs`). The runtime `bzip2` crate is already an optional dependency,
+  so no new runtime dependency is added; the codec works identically on the
+  portable (`libbz2-rs-sys`) and native (`libbz2`) backends because only the
+  backend-neutral `Decompress`/`Compress`/`Action`/`Status`/`Compression` surface
+  is used.
+- Read: `ZipBody::Bzip2` is a gated variant of the seek reader's body enum that
+  mirrors the existing `Deflate` arm but swaps miniz `inflate` for the low-level
+  `bzip2::Decompress::decompress` streaming call. Because that call returns only
+  `Result<Status, Error>` (not a consumed/written pair), progress is derived from
+  `total_in()`/`total_out()` deltas snapshotted around each call. A ZIP method-12
+  payload is a complete standalone `.bz2` stream, so `Status::StreamEnd` drives
+  finalization, at which point the produced size is checked against the central
+  directory and the running CRC-32 (`crate::filter::gzip::Crc32`) is verified. The
+  same per-iteration `decoded_total` + `Limits::decoded_total()` check as Deflate
+  bounds a decompression bomb before the whole payload is buffered; a stalled
+  decoder with no remaining input is reported as a truncated-stream `Malformed`
+  error, and every `Err(_)`/`MemNeeded` maps to a structured error rather than a
+  panic. `prepare_zip_body` selects the Bzip2 body only under the feature; with the
+  feature off, method 12 falls through to the existing `Unsupported { method,
+  end_offset }` arm, so a method-12 member still enumerates and skips and yields
+  the structured "payload coder 12 is unsupported" error on read.
+- Write: `StreamZipMethod::Bzip2` and the public `ZipMethod::Bzip2` variant are
+  both gated, so a feature-off caller cannot even name the method (compile-time
+  exclusion, no runtime panic path). The encoder mirrors the Deflate contract with
+  `bzip2::Compress`: `Action::Run` per data chunk and `Action::Finish` at
+  end-entry, single library call per invocation, returning `NeedOutput` on
+  `FinishOk` and terminating on `StreamEnd`, with progress again derived from the
+  `total_in()`/`total_out()` counters. Local and central "version needed to
+  extract" fields are written as 46 for method-12 members. Both `ZipMethod ->
+  StreamZipMethod` match sites in `provider.rs` are gated by the same cfg, so each
+  match stays exhaustive with no wildcard on both builds.
+- Evidence reuses the RM-301 harness. `tests/interop_zip_bzip2.rs` (whole-file
+  gated on `bzip2`) proves method 12 with three independent producers — arca's ZIP
+  writer with `ZipMethod::Bzip2`, the `zip` crate with `CompressionMethod::Bzip2`
+  (its dev-dependency gains the `bzip2` feature), and a first-party raw-ZIP builder
+  that stores a raw `.bz2` stream produced by the `bzip2` crate directly with
+  method 12 and version-needed 46 — and two consumers (arca via `read_with_arca`
+  and the `zip` crate via `zip_crate_decode`, which now maps
+  `CompressionMethod::Bzip2`), asserting byte-level content equality plus the BZip2
+  codec on non-empty file members. `tests/seek_stream_v2.rs` adds `ZipMethod::Bzip2`
+  to the streaming round-trip loops and three adversarial tests: a truncated
+  bzip2 payload yields a `Malformed` structured error, a bzip2 bomb is bounded by a
+  small `Limits::decoded_total` (`Limit` error), and — under `#[cfg(not(feature =
+  "bzip2"))]` — a method-12 member reports the `Unsupported` structured error while
+  still enumerating. The crate keeps `#![forbid(unsafe_code)]` and adds no trait
+  object (`ZipMethod`/`StreamZipMethod`/`ZipBody` remain plain enums).
+
+### RM-302 Zstandard sub-slice (method 93) — profile-asymmetric
+
+- The Zstandard sub-slice deliberately splits READ from WRITE by build profile.
+  READ works on BOTH codec profiles and is gated on `zstd` (both `portable-codecs`
+  and `native-codecs` enable it): a ZIP method-93 payload is a RAW zstd frame — the
+  exact input both existing `ZstdDecoder` impls consume — so `ZipBody::Zstd` does
+  not hand-drive `ruzstd`/`compression_codecs`. Instead it boxes and drives
+  `crate::pipeline_codec::PipelineCodec`, the enum that already unifies the two
+  profiles (portable `ruzstd::FrameDecoder`; native `ExternalDecoder<ZstdDecoder>`
+  with a `window_log_max` derived from `Limits::codec_memory()`). This adds NO new
+  trait object (`PipelineCodec` is an enum, `ExternalDecoder<D>` is generic), so the
+  xtask no-dyn guard stays green. The read arm mirrors the Bzip2 refill/CRC/size
+  loop but reads progress from `CodecStep`; `PipelineCodec::process` returns a
+  structured `ArchiveError` (`.with_format("zstd")`) on truncation/corruption, and
+  the same per-iteration `Limits::decoded_total()` check bounds a bomb on both
+  profiles (the portable `ruzstd` decoder accepts no window cap, so the decoded-total
+  check is the load-bearing defense there).
+- WRITE works ONLY under `native-codecs` and is gated on `native-codecs` (NOT
+  `zstd`): the portable `ruzstd` path is treated as decode-only for ZIP production.
+  `StreamZipMethod::Zstd` drives a true streaming `compression_codecs::ZstdEncoder`
+  at a pinned deterministic level 3 — `encode`/`finish` over `PartialBuffer`,
+  mirroring the Bzip2 Run/Finish arm; small members that buffer internally and emit
+  `(consumed, 0)` are tolerated as back-pressure, and the frame is terminated by the
+  `finish` loop at end-entry. Local and central "version needed to extract" for
+  method 93 is written as 63 (the APPNOTE 6.3.x codec-introduction version used by
+  the libarchive/7-Zip/info-zip lineage; APPNOTE defines no version for zstd and the
+  `zip` crate emits its generic 45 default — both are advisory and interop-safe, and
+  63 ≥ 45 so the zip64 escalation is preserved).
+- The public `ZipMethod::Zstd` variant is gated on `zstd`, so it is nameable on a
+  portable read-only build; because `StreamZipMethod::Zstd` exists only under
+  `native-codecs`, the two `provider.rs` dispatch sites map `ZipMethod::Zstd ->
+  StreamZipMethod::Zstd` only when both cfgs hold, and otherwise defer a structured
+  `Unsupported` error ("ZIP Zstandard write requires the native-codecs profile")
+  raised at the first entry-open — a clean structured error, never a panic or a
+  compile break. With the `zstd` feature off entirely, `ZipMethod::Zstd`,
+  `StreamZipMethod::Zstd`, and `ZipBody::Zstd` are all cfg'd out and a method-93 read
+  falls through to the existing `Unsupported { method, end_offset }` arm, staying
+  enumerable (identical to the bzip2-off behavior).
+- Evidence (`tests/interop_zip_zstd.rs`, whole-file gated on `zstd`) is stated with
+  its profile asymmetry honestly: READ is proven on BOTH profiles by TWO independent
+  external producers — the `zip` crate with `CompressionMethod::Zstd` (its
+  dev-dependency gains the `zstd` feature) and a first-party raw-ZIP builder
+  embedding a raw zstd frame from the independent-C `zstd` crate (dev-dep
+  `zstd-codec`, package `zstd` 0.13.3) — each read back byte-identical by arca and by
+  the `zip` crate, with a method-93 assertion through the `zip` consumer. WRITE plus
+  a THIRD producer (arca itself) are proven ONLY under `native-codecs`: arca's
+  method-93 members are decoded to identical content by both the `zip` crate and, via
+  a central-directory frame extraction, the independent-C `zstd` crate. Portable runs
+  therefore assert two producers, not three. `tests/seek_stream_v2.rs` adds
+  `ZipMethod::Zstd` to the streaming round-trip loops only under `native-codecs`
+  (round-trip needs the encoder), keeps portable read coverage via the raw-zstd
+  fixture, and adds adversarial tests: a truncated zstd payload yields a `Malformed`
+  structured error, a zstd bomb is bounded by a small `Limits::decoded_total`
+  (`Limit` error), a portable `ZipMethod::Zstd` write is rejected with the deferred
+  `Unsupported` error at entry-open, and — under `#[cfg(not(feature = "zstd"))]` — a
+  method-93 member reports the `Unsupported` structured error while still
+  enumerating. No new source file is created, no new runtime dependency is added
+  (`ruzstd` via `zstd`, `compression-codecs` via `native-codecs`), and the crate
+  keeps `#![forbid(unsafe_code)]`.
+
+### RM-302 LZMA sub-slice (method 14) — committed-fixture + two-independent-codecs
+
+- The LZMA sub-slice wires ZIP compression method 14, read and write, gated behind
+  the `xz` feature (which enables `lzma-rust2`, already a dependency for 7z/xz).
+  Unlike Zstandard there is no portable-vs-native split: `xz` is on for BOTH the
+  `portable-codecs` and `native-codecs` profiles, so LZMA read+write are available
+  on both, and `map_zip_method` returns `StreamZipMethod::Lzma` with no deferred
+  Unsupported. With `xz` off, `ZipMethod::Lzma` does not exist (it is a
+  `#[cfg(feature = "xz")]` public variant, unselectable at the type level) and a
+  method-14 read falls through to the structured `Unsupported { method, end_offset }`
+  arm, staying enumerable.
+- Wire format (PKWARE APPNOTE 5.8): arca emits — and accepts — a 9-byte ZIP-LZMA
+  header (2-byte informational SDK version `[9,20]`, `u16 LE` prop_size == 5, the
+  lc/lp/pb props byte, `u32 LE` dict size) followed by a raw LZMA1 range-coded
+  stream terminated by an end-of-stream marker. The writer always uses the
+  EOS-marker convention (general-purpose bit 1, `0x0002`, set in both local and
+  central flags, deliberately outside the `0x0809` local/central cross-check mask);
+  the reader handles BOTH conventions by driving `LzmaReader::new_with_props` with
+  the central-directory uncompressed size unconditionally (size-or-marker, whichever
+  first), matching the `zip` crate. Pinned preset 6 gives props byte 93 (lc=3, lp=0,
+  pb=2) and an 8 MiB dict, reproducing CPython/liblzma's header near byte-for-byte;
+  version-needed is 63 (APPNOTE 6.3.0). The one intentional deviation from the
+  bzip2/zstd chunked-input arms: `lzma-rust2` exposes only a pull-based `LzmaReader`
+  that owns its source (which cannot borrow the shared archive handle), so the
+  compressed member is buffered once via `take(payload_len).read_to_end` (grows with
+  actual bytes — a lying `compressed_size` cannot pre-allocate) with the dict
+  validated against `codec_memory` and output still bounded incrementally by
+  `decoded_total`. The writer drains `LzmaWriter`'s output through an in-crate
+  `VecSink(Vec<u8>)` (a `std::io::Write` newtype, not a trait object) so
+  `#![forbid(unsafe_code)]` and the `no-dyn` gate both hold.
+- Evidence is stated with its two-independent-codecs limit honestly: only
+  `lzma-rust2` (pure-Rust) and `liblzma` (C) exist. `tests/interop_zip_lzma.rs`
+  (whole-file gated on `xz`) runs a three-producer / two-consumer matrix — producers
+  `arca` and a first-party raw-LZMA1 ZIP builder (both `lzma-rust2`, independent ZIP
+  *container* builders) plus the committed `python-lzma/lzma-basic.zip` fixture (the
+  sole INDEPENDENT-codec liblzma reference), consumers arca and `zip@8.6.0` (with its
+  `lzma` feature). Because the `zip` crate cannot WRITE LZMA, WRITE evidence is the
+  `zip` crate decoding arca's method-14 output to byte-identical content with a
+  method-14 assertion — the strong ZIP-container + header + stream validity check.
+  The committed fixture is generated deterministically by `generate.py` (committed
+  alongside, SPDX header inline; SHA-256 recorded in `PROVENANCE.md` and verified
+  byte-reproducible), covered by the existing `REUSE.toml` `**/tests/fixtures/**`
+  override with no `.license` sidecar (same mechanism as `tests/fixtures/zstd/*.zst`);
+  its `sub/empty.txt` member exercises the zero-length (EOS-only) LZMA read edge.
+  `tests/seek_stream_v2.rs` adds `ZipMethod::Lzma` to both streaming round-trip
+  sweeps and adversarial tests: round-trip, empty-member round-trip, a truncated
+  stream (`Malformed`), a bad property-size header (`Malformed`), an LZMA bomb bounded
+  by a small `Limits::decoded_total` (`Limit`), and — under
+  `#[cfg(not(feature = "xz"))]` — the feature-off `Unsupported` path. No new source
+  file is created, no new runtime dependency is added (`lzma-rust2` was already
+  present via `xz`/`sevenz`), and the crate keeps `#![forbid(unsafe_code)]`.
+
 ## Reproduced gates
 
 - Working tree, Windows x86_64, portable codec profile with `--features sevenz,aes`:
@@ -96,6 +272,20 @@ change, or versioned release candidate is part of this snapshot.
   `RUSTDOCFLAGS="-D warnings" cargo doc -p libarchive_oxide --no-deps --features sevenz,aes`
   all pass; the crate keeps `#![forbid(unsafe_code)]` (`src/lib.rs`) with no new
   runtime dependency (`Cargo.toml` unchanged).
+- RM-302 Zstandard sub-slice, Windows x86_64: the portable read profile
+  (`cargo test -p libarchive_oxide --features sevenz,aes`) and the native
+  read+write profile
+  (`cargo test -p libarchive_oxide --no-default-features --features "native-codecs,aes,sevenz"`)
+  both passed with 0 failures — `interop_zip_zstd` runs `zip_zstd_interop` on both
+  profiles and additionally `zip_zstd_write_is_decoded_by_independent_libzstd_and_zip_crate`
+  on native; `seek_stream_v2` gains `zip_zstd_roundtrips_through_seek_reader`,
+  `zip_zstd_truncated_payload_is_structured_error`, `zip_zstd_bomb_is_bounded_by_limits`,
+  the portable-only `zip_zstd_write_without_encoder_is_structured_unsupported`, and
+  the feature-off `zip_method_93_is_unsupported_without_zstd_feature`. The feature-off
+  build `cargo build -p libarchive_oxide --no-default-features --features "gzip,bzip2,xz,lz4,aes,sevenz"`
+  compiles with method 93 degrading to the structured `Unsupported` read path, and
+  `cargo clippy -p libarchive_oxide --tests` on both `portable-codecs` and
+  `native-codecs` plus `cargo fmt --check` are clean.
 
 ## Out of scope for this slice
 

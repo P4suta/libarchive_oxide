@@ -1232,18 +1232,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
  "aes",
+ "bzip2",
  "constant_time_eq",
  "crc32fast",
  "flate2",
  "getrandom",
  "hmac",
  "indexmap",
+ "lzma-rust2",
  "memchr",
  "pbkdf2",
  "sha1",
  "typed-path",
  "zeroize",
  "zopfli",
+ "zstd",
 ]
 
 [[package]]

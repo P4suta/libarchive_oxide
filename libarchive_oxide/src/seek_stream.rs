@@ -14,6 +14,11 @@ use libarchive_oxide_core::{
 use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
+#[cfg(feature = "zstd")]
+use libarchive_oxide_core::filter::FilterId;
+#[cfg(feature = "zstd")]
+use libarchive_oxide_core::{CodecStatus, EndOfInput};
+
 use crate::filter::gzip::Crc32;
 use crate::{ArchiveWriter, ReaderEvent, SecretBytes, StreamError};
 
@@ -155,6 +160,39 @@ enum ZipBody {
         expected_size: u64,
         end_offset: u64,
     },
+    #[cfg(feature = "bzip2")]
+    Bzip2 {
+        compressed_unread: u64,
+        compressed: Vec<u8>,
+        compressed_start: usize,
+        decompress: Box<bzip2::Decompress>,
+        expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
+    #[cfg(feature = "zstd")]
+    Zstd {
+        compressed_unread: u64,
+        compressed: Vec<u8>,
+        compressed_start: usize,
+        decoder: Box<crate::pipeline_codec::PipelineCodec>,
+        expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
+    #[cfg(feature = "xz")]
+    Lzma {
+        reader: Box<lzma_rust2::LzmaReader<std::io::Cursor<Vec<u8>>>>,
+        expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
     #[cfg(feature = "aes")]
     AesStored {
         encrypted_remaining: u64,
@@ -192,6 +230,12 @@ impl std::fmt::Debug for ZipBody {
             Self::Idle => "Idle",
             Self::Stored { .. } => "Stored",
             Self::Deflate { .. } => "Deflate",
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2 { .. } => "Bzip2",
+            #[cfg(feature = "zstd")]
+            Self::Zstd { .. } => "Zstd",
+            #[cfg(feature = "xz")]
+            Self::Lzma { .. } => "Lzma",
             #[cfg(feature = "aes")]
             Self::AesStored { .. } => "AesStored",
             #[cfg(feature = "aes")]
@@ -699,6 +743,288 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                         return Ok(ReaderEvent::Data(&self.event_data));
                     }
                 },
+                #[cfg(feature = "bzip2")]
+                ZipBody::Bzip2 {
+                    compressed_unread,
+                    compressed,
+                    compressed_start,
+                    decompress: state,
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    if *compressed_start == compressed.len() && *compressed_unread != 0 {
+                        let count = usize::try_from((*compressed_unread).min(BUFFER as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context("compressed read size exceeds address space"),
+                                )
+                            })?;
+                        let mut next = vec![0; count];
+                        self.input.read_exact(&mut next).map_err(StreamError::io)?;
+                        *compressed = next;
+                        *compressed_unread -= count as u64;
+                        *compressed_start = 0;
+                    }
+                    self.event_data.resize(BUFFER, 0);
+                    let before_in = state.total_in();
+                    let before_out = state.total_out();
+                    let status = state
+                        .decompress(&compressed[*compressed_start..], &mut self.event_data)
+                        .map_err(|_| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Malformed)
+                                    .with_format("zip")
+                                    .with_context("bzip2 decoder failed"),
+                            )
+                        })?;
+                    if matches!(status, bzip2::Status::MemNeeded) {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Malformed)
+                                .with_format("zip")
+                                .with_context("bzip2 decoder ran out of memory"),
+                        ));
+                    }
+                    let consumed = usize::try_from(state.total_in() - before_in).map_err(|_| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("bzip2 consumed count exceeds address space"),
+                        )
+                    })?;
+                    let written =
+                        usize::try_from(state.total_out() - before_out).map_err(|_| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("bzip2 output count exceeds address space"),
+                            )
+                        })?;
+                    *compressed_start += consumed;
+                    self.event_data.truncate(written);
+                    crc.update(&self.event_data);
+                    *produced = produced.checked_add(written as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("bzip2 output count overflow"),
+                        )
+                    })?;
+                    let next_total =
+                        self.decoded_total
+                            .checked_add(written as u64)
+                            .ok_or_else(|| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context("decoded total overflow"),
+                                )
+                            })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    match status {
+                        bzip2::Status::StreamEnd => {
+                            if *produced != *expected_size {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Integrity)
+                                        .with_format("zip")
+                                        .with_context(
+                                            "bzip2 size does not match central directory",
+                                        ),
+                                ));
+                            }
+                            if crc.finalize() != *expected_crc {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Integrity)
+                                        .with_format("zip")
+                                        .with_context("bzip2 entry CRC32 mismatch"),
+                                ));
+                            }
+                            self.body = ZipBody::EndEntry;
+                        },
+                        _ => {
+                            if consumed == 0 && written == 0 && *compressed_unread == 0 {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Malformed)
+                                        .with_format("zip")
+                                        .with_context("truncated bzip2 stream"),
+                                ));
+                            }
+                        },
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
+                #[cfg(feature = "zstd")]
+                ZipBody::Zstd {
+                    compressed_unread,
+                    compressed,
+                    compressed_start,
+                    decoder,
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    if *compressed_start == compressed.len() && *compressed_unread != 0 {
+                        let count = usize::try_from((*compressed_unread).min(BUFFER as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context("compressed read size exceeds address space"),
+                                )
+                            })?;
+                        let mut next = vec![0; count];
+                        self.input.read_exact(&mut next).map_err(StreamError::io)?;
+                        *compressed = next;
+                        *compressed_unread -= count as u64;
+                        *compressed_start = 0;
+                    }
+                    self.event_data.resize(BUFFER, 0);
+                    let end = if *compressed_unread == 0 {
+                        EndOfInput::End
+                    } else {
+                        EndOfInput::More
+                    };
+                    let step = decoder
+                        .process(&compressed[*compressed_start..], &mut self.event_data, end)
+                        .map_err(StreamError::archive)?;
+                    *compressed_start += step.consumed;
+                    self.event_data.truncate(step.produced);
+                    crc.update(&self.event_data);
+                    *produced = produced.checked_add(step.produced as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("zstd output count overflow"),
+                        )
+                    })?;
+                    let next_total = self
+                        .decoded_total
+                        .checked_add(step.produced as u64)
+                        .ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("decoded total overflow"),
+                            )
+                        })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    if matches!(step.status, CodecStatus::Done) {
+                        if *produced != *expected_size {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("zstd size does not match central directory"),
+                            ));
+                        }
+                        if crc.finalize() != *expected_crc {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("zstd entry CRC32 mismatch"),
+                            ));
+                        }
+                        self.body = ZipBody::EndEntry;
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
+                #[cfg(feature = "xz")]
+                ZipBody::Lzma {
+                    reader,
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    self.event_data.resize(BUFFER, 0);
+                    let n = reader.read(&mut self.event_data).map_err(|_| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Malformed)
+                                .with_format("zip")
+                                .with_context("truncated or invalid LZMA stream"),
+                        )
+                    })?;
+                    self.event_data.truncate(n);
+                    crc.update(&self.event_data);
+                    *produced = produced.checked_add(n as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("LZMA output count overflow"),
+                        )
+                    })?;
+                    let next_total = self.decoded_total.checked_add(n as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total overflow"),
+                        )
+                    })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    if n == 0 {
+                        if *produced != *expected_size {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("LZMA size does not match central directory"),
+                            ));
+                        }
+                        if crc.finalize() != *expected_crc {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("LZMA entry CRC32 mismatch"),
+                            ));
+                        }
+                        self.body = ZipBody::EndEntry;
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
                 #[cfg(feature = "aes")]
                 ZipBody::AesStored {
                     encrypted_remaining,
@@ -925,6 +1251,12 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
             | ZipBody::Deflate { end_offset, .. }
             | ZipBody::Unsupported { end_offset, .. }
             | ZipBody::Raw { end_offset, .. } => end_offset,
+            #[cfg(feature = "bzip2")]
+            ZipBody::Bzip2 { end_offset, .. } => end_offset,
+            #[cfg(feature = "zstd")]
+            ZipBody::Zstd { end_offset, .. } => end_offset,
+            #[cfg(feature = "xz")]
+            ZipBody::Lzma { end_offset, .. } => end_offset,
             #[cfg(feature = "aes")]
             ZipBody::AesStored { end_offset, .. } | ZipBody::AesDeflate { end_offset, .. } => {
                 end_offset
@@ -961,6 +1293,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
         &self.input
     }
 
+    #[allow(clippy::too_many_lines)]
     fn prepare_zip_body(&mut self, entry: &ZipIndex) -> Result<(), StreamError> {
         self.input
             .seek(SeekFrom::Start(entry.local_offset))
@@ -1055,10 +1388,116 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                     expected_size: entry.uncompressed_size,
                     end_offset,
                 },
+                #[cfg(feature = "bzip2")]
+                12 => ZipBody::Bzip2 {
+                    compressed_unread: entry.compressed_size,
+                    compressed: Vec::with_capacity(BUFFER),
+                    compressed_start: 0,
+                    decompress: Box::new(bzip2::Decompress::new(false)),
+                    expected_crc: entry.crc32,
+                    crc: Crc32::new(),
+                    produced: 0,
+                    expected_size: entry.uncompressed_size,
+                    end_offset,
+                },
+                #[cfg(feature = "zstd")]
+                93 => ZipBody::Zstd {
+                    compressed_unread: entry.compressed_size,
+                    compressed: Vec::with_capacity(BUFFER),
+                    compressed_start: 0,
+                    decoder: Box::new(crate::pipeline_codec::PipelineCodec::new(
+                        FilterId::Zstd,
+                        self.limits,
+                    )?),
+                    expected_crc: entry.crc32,
+                    crc: Crc32::new(),
+                    produced: 0,
+                    expected_size: entry.uncompressed_size,
+                    end_offset,
+                },
+                #[cfg(feature = "xz")]
+                14 => self.prepare_lzma_body(entry, end_offset)?,
                 method => ZipBody::Unsupported { method, end_offset },
             }
         };
         Ok(())
+    }
+
+    /// Parses the 9-byte ZIP-LZMA header, buffers the raw LZMA1 stream, and
+    /// constructs a pull-based [`lzma_rust2::LzmaReader`].
+    ///
+    /// The member payload is buffered once (lzma-rust2 exposes only a
+    /// pull-based LZMA1 reader that owns its source, which cannot borrow the
+    /// shared archive handle). The buffer grows with the *actual* bytes read,
+    /// so a lying `compressed_size` cannot pre-allocate; `dict_size` is
+    /// validated against the codec-memory limit; output stays bounded by
+    /// `decoded_total` in the read loop. `self.input` is already sought to the
+    /// member's data offset.
+    #[cfg(feature = "xz")]
+    fn prepare_lzma_body(
+        &mut self,
+        entry: &ZipIndex,
+        end_offset: u64,
+    ) -> Result<ZipBody, StreamError> {
+        let malformed = |context: &'static str| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context(context),
+            )
+        };
+        // ZIP-LZMA header: [2] version, [2] prop_size (== 5), [5] props.
+        let mut head = [0_u8; 9];
+        self.input.read_exact(&mut head).map_err(StreamError::io)?;
+        let prop_size = u16::from_le_bytes([head[2], head[3]]);
+        if prop_size != 5 {
+            return Err(malformed("ZIP LZMA property size is not 5"));
+        }
+        let props = head[4];
+        let dict_size = u32::from_le_bytes([head[5], head[6], head[7], head[8]]);
+        if self
+            .limits
+            .codec_memory()
+            .is_some_and(|maximum| u64::from(dict_size) > maximum as u64)
+        {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("zip")
+                    .with_context("LZMA dictionary exceeds codec workspace limit"),
+            ));
+        }
+        // Buffer the remaining raw LZMA1 stream. read_to_end grows with actual
+        // bytes, so a lying huge compressed_size yields a short buffer, not a
+        // pre-allocation, and truncation surfaces as a decode error later.
+        let payload_len = entry
+            .compressed_size
+            .checked_sub(9)
+            .ok_or_else(|| malformed("ZIP LZMA member is shorter than its 9-byte header"))?;
+        let mut buffer = Vec::new();
+        self.input
+            .by_ref()
+            .take(payload_len)
+            .read_to_end(&mut buffer)
+            .map_err(StreamError::io)?;
+        // Drive the reader with the central-directory uncompressed size
+        // unconditionally: LzmaReader stops at "known size OR end marker,
+        // whichever first", decoding both EOS-marker and known-size members.
+        let reader = lzma_rust2::LzmaReader::new_with_props(
+            std::io::Cursor::new(buffer),
+            entry.uncompressed_size,
+            props,
+            dict_size,
+            None,
+        )
+        .map_err(|_| malformed("ZIP LZMA decoder setup failed"))?;
+        Ok(ZipBody::Lzma {
+            reader: Box::new(reader),
+            expected_crc: entry.crc32,
+            crc: Crc32::new(),
+            produced: 0,
+            expected_size: entry.uncompressed_size,
+            end_offset,
+        })
     }
 
     #[cfg(feature = "aes")]
