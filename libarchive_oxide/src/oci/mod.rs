@@ -19,13 +19,19 @@
 //! [`OciLayerApplier::plan`], and commit it with [`OciLayerApplier::apply`].
 //! Application verifies the compressed digest and diffID before touching the
 //! destination and honors OCI whiteout and opaque-directory markers.
+//!
+//! To create a layer, queue ordered entries into an [`OciLayerBuilder`] and call
+//! [`OciLayerBuilder::build`]. The builder is deterministic: identical input
+//! produces byte-identical blobs and identical [`LayerDigests`].
 
 mod apply;
+mod create;
 mod digest;
 mod layer;
 mod plan;
 
 pub use apply::{OciApplyReport, OciLayerApplier};
+pub use create::{OciLayerBlob, OciLayerBuilder, OciLayerFilter};
 pub use digest::{LayerDigests, encode_hex};
 pub use layer::{
     DigestKind, DigestMismatch, OciLayerEngine, OciLayerEntry, OciLayerError, OciLayerSession,
