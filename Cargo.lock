@@ -1239,6 +1239,7 @@ dependencies = [
  "getrandom",
  "hmac",
  "indexmap",
+ "lzma-rust2",
  "memchr",
  "pbkdf2",
  "sha1",

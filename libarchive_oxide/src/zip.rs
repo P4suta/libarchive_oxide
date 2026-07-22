@@ -21,4 +21,11 @@ pub enum ZipMethod {
     /// `native-codecs` profile (the portable `ruzstd` path is decode-only).
     #[cfg(feature = "zstd")]
     Zstd,
+    /// Encode bytes as LZMA (method 14).
+    ///
+    /// Raw LZMA1 with a ZIP-specific 9-byte header, terminated by an
+    /// end-of-stream marker. Read and write are both available whenever the
+    /// `xz` feature is enabled (both codec profiles).
+    #[cfg(feature = "xz")]
+    Lzma,
 }

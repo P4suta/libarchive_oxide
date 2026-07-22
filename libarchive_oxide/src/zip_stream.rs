@@ -41,6 +41,43 @@ pub(crate) enum StreamZipMethod {
     Bzip2,
     #[cfg(feature = "native-codecs")]
     Zstd,
+    #[cfg(feature = "xz")]
+    Lzma,
+}
+
+/// Deterministic LZMA preset for ZIP member production (method 14).
+///
+/// Preset 6 yields props byte 93 (lc=3, lp=0, pb=2) and an 8 MiB dictionary,
+/// matching CPython/liblzma's default ZIP-LZMA header. Consumers compare
+/// decoded content, not compressed bytes.
+#[cfg(feature = "xz")]
+const ZIP_LZMA_PRESET: u32 = 6;
+
+/// Informational LZMA SDK version bytes written into the ZIP-LZMA header.
+///
+/// Decoder-ignored (the `zip` crate reads it into a dropped field; `CPython`
+/// emits `[9, 4]`); any value is spec-valid.
+#[cfg(feature = "xz")]
+const ZIP_LZMA_VERSION: [u8; 2] = [9, 20];
+
+/// In-crate `std::io::Write` sink that appends into an owned `Vec<u8>`.
+///
+/// `LzmaWriter` owns its output, but the ZIP writer must drain compressed
+/// bytes between `write` calls; this sink is reached via `inner_mut().0`.
+/// Keeps `#![forbid(unsafe_code)]` intact and adds no trait object.
+#[cfg(feature = "xz")]
+struct VecSink(Vec<u8>);
+
+#[cfg(feature = "xz")]
+impl std::io::Write for VecSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Deterministic Zstandard compression level for ZIP member production.
@@ -156,6 +193,10 @@ struct OpenEntry {
     bz_compress: Option<Compress>,
     #[cfg(feature = "native-codecs")]
     zstd: Option<compression_codecs::ZstdEncoder>,
+    #[cfg(feature = "xz")]
+    lzma: Option<lzma_rust2::LzmaWriter<VecSink>>,
+    #[cfg(feature = "xz")]
+    lzma_tail: Vec<u8>,
     #[cfg(feature = "aes")]
     aes: Option<ZipAesEncoder>,
 }
@@ -437,6 +478,8 @@ impl ZipStreamEncoder {
                 StreamZipMethod::Bzip2 => 12,
                 #[cfg(feature = "native-codecs")]
                 StreamZipMethod::Zstd => 93,
+                #[cfg(feature = "xz")]
+                StreamZipMethod::Lzma => 14,
                 _ => 8,
             }
         };
@@ -469,12 +512,16 @@ impl ZipStreamEncoder {
             }
         }
         let utf8 = matches!(metadata.path().encoding(), PathEncoding::Utf8);
-        let flags = 0x0008 | if utf8 { 0x0800 } else { 0 } | u16::from(encrypted);
+        // LZMA members set general-purpose bit 1 (0x0002) to signal the
+        // end-of-stream-marker convention. It sits outside the 0x0809
+        // local/central cross-check mask, so it never trips consistency checks.
+        let lzma_flag = if payload_method == 14 { 0x0002 } else { 0 };
+        let flags = 0x0008 | lzma_flag | if utf8 { 0x0800 } else { 0 } | u16::from(encrypted);
         let version_needed = if encrypted {
             51
         } else if payload_method == 12 {
             46
-        } else if payload_method == 93 {
+        } else if payload_method == 93 || payload_method == 14 {
             63
         } else if zip64_size {
             45
@@ -527,6 +574,25 @@ impl ZipStreamEncoder {
         #[cfg(feature = "native-codecs")]
         let zstd =
             (payload_method == 93).then(|| compression_codecs::ZstdEncoder::new(ZIP_ZSTD_LEVEL));
+        // LZMA: preload the sink with the 9-byte ZIP-LZMA header, then wrap it
+        // in a raw-LZMA1 writer (no container) that emits an EOS marker. The
+        // header becomes the first bytes of the member payload.
+        #[cfg(feature = "xz")]
+        let lzma = if payload_method == 14 {
+            let options = lzma_rust2::LzmaOptions::with_preset(ZIP_LZMA_PRESET);
+            let mut sink = VecSink(Vec::new());
+            sink.0.extend_from_slice(&ZIP_LZMA_VERSION);
+            sink.0.extend_from_slice(&5_u16.to_le_bytes());
+            sink.0.push(options.get_props());
+            sink.0.extend_from_slice(&options.dict_size.to_le_bytes());
+            Some(
+                lzma_rust2::LzmaWriter::new_no_header(sink, &options, true).map_err(|_| {
+                    Self::error(ErrorKind::Malformed, "ZIP lzma encoder setup failed")
+                })?,
+            )
+        } else {
+            None
+        };
         self.phase = Phase::Open(Box::new(OpenEntry {
             name,
             comment,
@@ -551,6 +617,10 @@ impl ZipStreamEncoder {
             bz_compress,
             #[cfg(feature = "native-codecs")]
             zstd,
+            #[cfg(feature = "xz")]
+            lzma,
+            #[cfg(feature = "xz")]
+            lzma_tail: Vec::new(),
             #[cfg(feature = "aes")]
             aes,
         }));
@@ -641,6 +711,37 @@ impl ZipStreamEncoder {
         Ok((source.written_len(), destination.written_len()))
     }
 
+    // LZMA drives a pull-free sink: `write_all` consumes ALL input (filling the
+    // LZ window, possibly emitting zero compressed bytes), then buffered
+    // compressed bytes are drained into `output`. Leftover bytes are drained
+    // first on the next step, before any new input is fed.
+    #[cfg(feature = "xz")]
+    fn lzma_step(
+        entry: &mut OpenEntry,
+        data: &[u8],
+        output: &mut [u8],
+    ) -> Result<(usize, usize), ArchiveError> {
+        use std::io::Write as _;
+
+        let writer = entry
+            .lzma
+            .as_mut()
+            .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP lzma state is missing"))?;
+        if !writer.inner().0.is_empty() {
+            let n = writer.inner().0.len().min(output.len());
+            output[..n].copy_from_slice(&writer.inner().0[..n]);
+            writer.inner_mut().0.drain(..n);
+            return Ok((0, n));
+        }
+        writer
+            .write_all(data)
+            .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP lzma encoder failed"))?;
+        let n = writer.inner().0.len().min(output.len());
+        output[..n].copy_from_slice(&writer.inner().0[..n]);
+        writer.inner_mut().0.drain(..n);
+        Ok((data.len(), n))
+    }
+
     fn compress_step(
         entry: &mut OpenEntry,
         data: &[u8],
@@ -653,6 +754,10 @@ impl ZipStreamEncoder {
         #[cfg(feature = "native-codecs")]
         if entry.payload_method == 93 {
             return Self::zstd_step(entry, data, output);
+        }
+        #[cfg(feature = "xz")]
+        if entry.payload_method == 14 {
+            return Self::lzma_step(entry, data, output);
         }
         Self::deflate_step(entry, data, output)
     }
@@ -765,6 +870,28 @@ impl ZipStreamEncoder {
                 .finish(&mut destination)
                 .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP zstd finalization failed"))?;
             return Ok((destination.written_len(), done));
+        }
+        #[cfg(feature = "xz")]
+        if entry.payload_method == 14 {
+            if let Some(writer) = entry.lzma.as_mut() {
+                if !writer.inner().0.is_empty() {
+                    // Flush any buffered stream bytes before finalizing.
+                    let n = drain_into(&mut writer.inner_mut().0, output);
+                    return Ok((n, false));
+                }
+                // Sink drained: finalize (writes the EOS marker) and stash the
+                // remaining bytes in `lzma_tail` for draining.
+                let writer = entry
+                    .lzma
+                    .take()
+                    .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP lzma state is missing"))?;
+                entry.lzma_tail = writer
+                    .finish()
+                    .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP lzma finalization failed"))?
+                    .0;
+            }
+            let n = drain_into(&mut entry.lzma_tail, output);
+            return Ok((n, entry.lzma_tail.is_empty()));
         }
         Ok((0, true))
     }
@@ -955,7 +1082,7 @@ impl ZipStreamEncoder {
                 51
             } else if record.method == 12 {
                 46
-            } else if record.method == 93 {
+            } else if record.method == 93 || record.method == 14 {
                 63
             } else if size_zip64 || offset_zip64 {
                 45
@@ -1238,6 +1365,16 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
         month_part - 9
     };
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Copies as much of `source`'s front into `output` as fits, removing the
+/// copied bytes from `source`, and returns the count written.
+#[cfg(feature = "xz")]
+fn drain_into(source: &mut Vec<u8>, output: &mut [u8]) -> usize {
+    let n = source.len().min(output.len());
+    output[..n].copy_from_slice(&source[..n]);
+    source.drain(..n);
+    n
 }
 
 fn push_u16(output: &mut Vec<u8>, value: u16) {

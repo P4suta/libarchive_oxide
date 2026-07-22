@@ -30,6 +30,7 @@ the reserved location for any future byte-exact external-tool artifact (see
 | `arca` | `libarchive_oxide` | workspace | no (self / system under test) | Store + Deflate | in-code (`ArchiveWriter`) |
 | `zip@8.6.0` | `zip` | 8.6.0 | yes | Store + Deflate | in-code (`ZipWriter`) |
 | `raw-zip-builder` | first-party bytes in `tests/interop_foundation.rs` | n/a | yes (independent of both arca and the `zip` crate; hand-written local-header + central-directory layout) | Store (+ Deflate via `flat2`) | in-code |
+| `python-lzma` | `CPython zipfile`/`liblzma` | CPython 3.14.6 (MSC v.1944 x64) | yes (independent liblzma reference) | LZMA (14) | committed blob (`python-lzma/lzma-basic.zip`) |
 
 Consumers: `arca` (self, via `read_with_arca`) and `zip@8.6.0` (the `zip` crate,
 via `ZipArchive::by_index`).
@@ -83,3 +84,53 @@ If a future slice needs a byte-exact artifact from an external tool (e.g. Info-Z
 here plus a regeneration block recording: tool name, exact version, exact command
 line, capture date, SHA-256 of the committed file, and the upstream
 license/redistribution note. Regeneration must be byte-reproducible.
+
+## Committed LZMA fixture (external-tool escape hatch)
+
+The one committed binary fixture in this tree, used by `tests/interop_zip_lzma.rs`
+as the INDEPENDENT-codec reference for ZIP method 14 (LZMA).
+
+- **File:** `python-lzma/lzma-basic.zip`
+- **Generator (committed alongside):** `python-lzma/generate.py` (SPDX header inline).
+- **Producer:** `CPython 3.14.6 zipfile`/`liblzma` (MSC v.1944 x64) — fully
+  independent of both arca and `lzma-rust2`.
+- **Exact command:**
+
+  ```sh
+  python libarchive_oxide/tests/fixtures/zip/python-lzma/generate.py \
+         libarchive_oxide/tests/fixtures/zip/python-lzma/lzma-basic.zip
+  ```
+
+- **SHA-256 of the committed `.zip`:**
+  `040d334b05510fe4631d49eb9a90a1e4a1f0f501ab4f23d5152c451bab45b739` (size 474 bytes).
+  Bound to the exact `generate.py` content; verified byte-reproducible across runs.
+- **Fixed inputs (determinism levers):** member set + order
+  `readme.txt` (17 B), `sub/big.txt` (8800 B), `sub/empty.txt` (0 B);
+  `date_time=(1980,1,1,0,0,0)`; `external_attr=0o644<<16`;
+  `compress_type=zipfile.ZIP_LZMA`. No OS metadata; Python stores no explicit
+  `sub/` directory entry. All three members carry general-purpose flag `0x0002`
+  (EOS-marker convention); `sub/empty.txt` exercises the zero-length LZMA read.
+- **REUSE:** covered by the repo-wide `REUSE.toml` override
+  (`path = ["**/tests/fixtures/**"]`, `SPDX-License-Identifier = "MIT OR Apache-2.0"`),
+  exactly as the committed `tests/fixtures/zstd/*.zst` blobs are — NO `.license`
+  sidecar. REUSE-ours is correct here: arca *generated* these bytes with a
+  first-party script; CPython's `zipfile`/`lzma` are stdlib tooling, not a
+  redistributed third-party artifact.
+
+### Two-independent-codecs honesty note (LZMA / method 14)
+
+Only TWO independent LZMA codecs exist in this ecosystem: `lzma-rust2` (pure-Rust)
+and `liblzma` (C). In the method-14 interop matrix, producer `arca` and producer
+`raw-zip-lzma-builder` are independent ZIP *container* builders but BOTH drive
+`lzma-rust2`; the committed `python-lzma` fixture is the sole INDEPENDENT-codec
+(liblzma) reference. The `zip` crate consumer (with its `lzma` feature) is also
+`lzma-rust2`-backed, so WRITE evidence — the `zip` crate decoding arca's method-14
+output to byte-identical content — proves arca's ZIP-container framing + 9-byte
+LZMA header + stream are spec-valid, with the codec shared. The interop
+independence for LZMA is real but narrower than for Store/Deflate.
+
+## Method coverage — RM-302 LZMA sub-slice
+
+- **ZIP LZMA (method 14):** 3 producers (`arca` + `raw-zip-lzma-builder`, both
+  `lzma-rust2`; + `python-lzma`, independent `liblzma`), 2 consumers
+  (`arca` + `zip@8.6.0` with `lzma`). Read + write, gated on the `xz` feature.

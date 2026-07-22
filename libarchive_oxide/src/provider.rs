@@ -939,6 +939,8 @@ fn map_zip_method(method: crate::ZipMethod) -> (StreamZipMethod, Option<&'static
                 "ZIP Zstandard write requires the native-codecs profile (no portable zstd encoder)",
             ),
         ),
+        #[cfg(feature = "xz")]
+        crate::ZipMethod::Lzma => (StreamZipMethod::Lzma, None),
     }
 }
 

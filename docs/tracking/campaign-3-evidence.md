@@ -35,6 +35,10 @@ change, or versioned release candidate is part of this snapshot.
 | ZIP Zstandard (method 93) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Zstd` + streaming `compression_codecs::ZstdEncoder` (pinned level 3) gated on `native-codecs`; version-needed 63 in local and central headers; on the portable profile the two `provider.rs` dispatch sites route to a deferred structured `Unsupported` error surfaced at entry-open |
 | ZIP Zstandard interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_zstd.rs`, `libarchive_oxide/tests/seek_stream_v2.rs` | READ proven on both profiles by two external producers (`zip@8.6.0`, first-party raw-zstd builder over independent-C `zstd` 0.13.3) × two consumers (arca, `zip@8.6.0`); WRITE + a third producer (arca) proven on native-codecs, decoded by both the `zip` crate and independent-C libzstd; truncation, bomb, portable-write-Unsupported, and feature-off Unsupported adversarial tests |
 | Support-matrix ZIP Zstandard update | RM-302 | `docs/support-matrix.md` | ZIP row splits Read (adds Zstandard) from Write (Zstandard native-codecs only); the not-yet-implemented note drops Zstandard and records the write profile-asymmetry |
+| ZIP LZMA (method 14) read | RM-302 | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/src/zip.rs` | `ZipBody::Lzma` parses the 9-byte ZIP-LZMA header (prop_size==5, props byte, dict size), validates the dict against `codec_memory`, buffers the raw LZMA1 member, and drives a pull-based `lzma_rust2::LzmaReader` with the central-directory uncompressed size (handles both EOS-marker and known-size conventions); CRC-32, size, bomb (`Limits::decoded_total`), truncation, and bad-header guards; gated on `xz`, present on BOTH profiles |
+| ZIP LZMA (method 14) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Lzma` + `lzma_rust2::LzmaWriter::new_no_header` (raw LZMA1, EOS marker) drained through an in-crate `VecSink` (no trait object, `#![forbid(unsafe_code)]` intact); pinned preset 6 (props 93, 8 MiB dict); emits the 9-byte ZIP-LZMA header once at entry start; general-purpose bit 1 (`0x0002`) set in local+central flags outside the `0x0809` cross-check mask; version-needed 63 |
+| ZIP LZMA interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_lzma.rs`, `libarchive_oxide/tests/seek_stream_v2.rs`, `libarchive_oxide/tests/fixtures/zip/python-lzma/` | three producers (arca + first-party raw-LZMA1 builder, both `lzma-rust2`; + committed CPython 3.14.6/liblzma fixture, independent codec) × two consumers (arca, `zip@8.6.0` with `lzma`); WRITE evidence = the `zip` crate decodes arca's method-14 output byte-identically; round-trip, empty-member, truncation, bad-property-size, bomb, and feature-off Unsupported tests; the committed fixture + `generate.py` are byte-reproducible (SHA-256 recorded in `PROVENANCE.md`) |
+| Support-matrix + PROVENANCE ZIP LZMA update | RM-302 | `docs/support-matrix.md`, `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md` | ZIP row adds LZMA to Read and Write; the not-yet-implemented note now lists ONLY Deflate64; PROVENANCE records the committed-fixture escape hatch and the two-independent-codecs honesty note |
 
 ## RM-301
 
@@ -196,6 +200,58 @@ change, or versioned release candidate is part of this snapshot.
   enumerating. No new source file is created, no new runtime dependency is added
   (`ruzstd` via `zstd`, `compression-codecs` via `native-codecs`), and the crate
   keeps `#![forbid(unsafe_code)]`.
+
+### RM-302 LZMA sub-slice (method 14) — committed-fixture + two-independent-codecs
+
+- The LZMA sub-slice wires ZIP compression method 14, read and write, gated behind
+  the `xz` feature (which enables `lzma-rust2`, already a dependency for 7z/xz).
+  Unlike Zstandard there is no portable-vs-native split: `xz` is on for BOTH the
+  `portable-codecs` and `native-codecs` profiles, so LZMA read+write are available
+  on both, and `map_zip_method` returns `StreamZipMethod::Lzma` with no deferred
+  Unsupported. With `xz` off, `ZipMethod::Lzma` does not exist (it is a
+  `#[cfg(feature = "xz")]` public variant, unselectable at the type level) and a
+  method-14 read falls through to the structured `Unsupported { method, end_offset }`
+  arm, staying enumerable.
+- Wire format (PKWARE APPNOTE 5.8): arca emits — and accepts — a 9-byte ZIP-LZMA
+  header (2-byte informational SDK version `[9,20]`, `u16 LE` prop_size == 5, the
+  lc/lp/pb props byte, `u32 LE` dict size) followed by a raw LZMA1 range-coded
+  stream terminated by an end-of-stream marker. The writer always uses the
+  EOS-marker convention (general-purpose bit 1, `0x0002`, set in both local and
+  central flags, deliberately outside the `0x0809` local/central cross-check mask);
+  the reader handles BOTH conventions by driving `LzmaReader::new_with_props` with
+  the central-directory uncompressed size unconditionally (size-or-marker, whichever
+  first), matching the `zip` crate. Pinned preset 6 gives props byte 93 (lc=3, lp=0,
+  pb=2) and an 8 MiB dict, reproducing CPython/liblzma's header near byte-for-byte;
+  version-needed is 63 (APPNOTE 6.3.0). The one intentional deviation from the
+  bzip2/zstd chunked-input arms: `lzma-rust2` exposes only a pull-based `LzmaReader`
+  that owns its source (which cannot borrow the shared archive handle), so the
+  compressed member is buffered once via `take(payload_len).read_to_end` (grows with
+  actual bytes — a lying `compressed_size` cannot pre-allocate) with the dict
+  validated against `codec_memory` and output still bounded incrementally by
+  `decoded_total`. The writer drains `LzmaWriter`'s output through an in-crate
+  `VecSink(Vec<u8>)` (a `std::io::Write` newtype, not a trait object) so
+  `#![forbid(unsafe_code)]` and the `no-dyn` gate both hold.
+- Evidence is stated with its two-independent-codecs limit honestly: only
+  `lzma-rust2` (pure-Rust) and `liblzma` (C) exist. `tests/interop_zip_lzma.rs`
+  (whole-file gated on `xz`) runs a three-producer / two-consumer matrix — producers
+  `arca` and a first-party raw-LZMA1 ZIP builder (both `lzma-rust2`, independent ZIP
+  *container* builders) plus the committed `python-lzma/lzma-basic.zip` fixture (the
+  sole INDEPENDENT-codec liblzma reference), consumers arca and `zip@8.6.0` (with its
+  `lzma` feature). Because the `zip` crate cannot WRITE LZMA, WRITE evidence is the
+  `zip` crate decoding arca's method-14 output to byte-identical content with a
+  method-14 assertion — the strong ZIP-container + header + stream validity check.
+  The committed fixture is generated deterministically by `generate.py` (committed
+  alongside, SPDX header inline; SHA-256 recorded in `PROVENANCE.md` and verified
+  byte-reproducible), covered by the existing `REUSE.toml` `**/tests/fixtures/**`
+  override with no `.license` sidecar (same mechanism as `tests/fixtures/zstd/*.zst`);
+  its `sub/empty.txt` member exercises the zero-length (EOS-only) LZMA read edge.
+  `tests/seek_stream_v2.rs` adds `ZipMethod::Lzma` to both streaming round-trip
+  sweeps and adversarial tests: round-trip, empty-member round-trip, a truncated
+  stream (`Malformed`), a bad property-size header (`Malformed`), an LZMA bomb bounded
+  by a small `Limits::decoded_total` (`Limit`), and — under
+  `#[cfg(not(feature = "xz"))]` — the feature-off `Unsupported` path. No new source
+  file is created, no new runtime dependency is added (`lzma-rust2` was already
+  present via `xz`/`sevenz`), and the crate keeps `#![forbid(unsafe_code)]`.
 
 ## Reproduced gates
 
