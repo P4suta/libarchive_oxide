@@ -1,8 +1,8 @@
-# ADR-0010: Bounded package-validation profiles and the Debian `.deb` validator
+# ADR-0010: Bounded package-validation profiles, the Debian `.deb` and RPM validators
 
 - Status: accepted
 - Date: 2026-07-22
-- Tracks: RM-211 / DEV-75
+- Tracks: RM-211 / DEV-75, RM-212 / DEV-100
 
 ## Context
 
@@ -28,10 +28,12 @@ adapter's per-operation findings.
 
 ## Decision
 
-- A new `package` module (`finding`, `deb`) builds on the existing bounded
-  primitives rather than adding a new parser: the outer `ar` container, the
-  `Pipeline` sans-io nested decoder, the compile-time provider capability query,
-  the archive-path sanitizer, and the core `Limits`.
+- A new `package` module (`finding`, `deb`, `rpm`) builds on the existing
+  bounded primitives rather than adding a general new parser: the outer `ar`
+  container, the `Pipeline` sans-io nested decoder, the compile-time provider
+  capability query, the archive-path sanitizer, and the core `Limits`. The RPM
+  lead and header structure — which is neither `ar`, `tar`, nor `zip` — is the
+  one exception and adds a small bounded hand-written parser inside `rpm`.
 - **Bounded, no-extract validation.** `DebValidator::validate` inspects an
   untrusted package without ever materializing it or buffering a whole member.
   Only bounded prefixes are retained — 64 bytes of the `debian-binary` body and
@@ -67,15 +69,66 @@ adapter's per-operation findings.
   a valid version stamp, both required tarballs, and no blocking (`Warning` or
   `Error`) finding. A readable container can still fail its profile, and the two
   are never collapsed into one boolean.
-- **Supported inputs this unit.** The Debian `.deb` profile only: member order,
-  duplicate members, missing/unknown members, unsafe member and nested-entry
-  paths, malformed or truncated nesting, duplicate nested paths, decompression
-  bombs, and the four inner filters (gzip/xz/zstd/bzip2, plus plain tar).
+- **Supported inputs, Debian unit (RM-211).** The Debian `.deb` profile only:
+  member order, duplicate members, missing/unknown members, unsafe member and
+  nested-entry paths, malformed or truncated nesting, duplicate nested paths,
+  decompression bombs, and the four inner filters (gzip/xz/zstd/bzip2, plus
+  plain tar).
 
-RPM, the ZIP-based package families, and a package-validation CLI surface are
-deferred to later Campaign 2 units (RM-212 onward and RM-215 for the CLI). This
-decision owns no rendering or transport policy: any front end consumes the same
-`DebValidation`, `PackageFinding`, and `SupportStatus` types unchanged and
+### RPM profile (RM-212)
+
+- **RPM is a bespoke binary stream, not a generic container.** Per the RPM v3/v4
+  format, an `.rpm` is a fixed 96-byte *lead* (magic `ED AB EE DB`), a
+  *signature header*, a *main header* (both using the same RPM header structure
+  of magic `8E AD E8 01`, a big-endian index-entry count and data-store size, a
+  run of 16-byte index entries, then the data store), and finally a *payload*
+  that is a cpio archive wrapped in one outer filter named by the main header's
+  `PAYLOADCOMPRESSOR` tag. `RpmValidator::validate` parses this with a small
+  bounded, hand-written parser rather than the `ar` reader, but reuses every
+  other primitive — the `Pipeline` nested decoder, the provider capability
+  query, the path sanitizer, the `Limits`, and the whole `finding` vocabulary.
+- **Header sizes are checked before they are allocated.** Each header's declared
+  index length (`nindex × 16`) plus data-store length (`hsize`) is validated
+  against `Limits::metadata_bytes` *before* any of those bytes are read, so a
+  header claiming a huge store is refused as a `HeaderTooLarge` finding rather
+  than allocated — the header-bomb budget. The lead is read as a fixed 96 bytes
+  and each header section is consumed exactly; the signature header's data store
+  is padded to the next eight-byte boundary, the main header is not.
+- **Only the two payload tags are read, and only from within the store.** The
+  main-header index is scanned for `PAYLOADFORMAT` (1124) and `PAYLOADCOMPRESSOR`
+  (1125), each a NUL-terminated string read from the data store at a
+  bounds-checked offset. A `PAYLOADFORMAT` that is absent or not `cpio` is a
+  `PayloadFormatMismatch` finding.
+- **The payload is streamed through one bounded `Pipeline`, never extracted.**
+  The remaining bytes are fed chunk by chunk (`feed` / `poll_event` /
+  `finish_input`) into a single pipeline that buffers only a six-byte prefix to
+  classify the outer filter, then decodes only enough to walk the nested cpio.
+  The detected filter is cross-checked against `PAYLOADCOMPRESSOR`; a
+  disagreement is a `CompressorMismatch` finding. Unsafe or duplicate cpio entry
+  paths, truncation, and a decode past the configured `Limits` become
+  `UnsafeEntryPath`, `DuplicateEntryPath`, `TruncatedMember`, and
+  `DecompressionBomb` findings, and a recognized filter this build cannot decode
+  is the same `UnsupportedCompression` capability finding used by the Debian
+  profile.
+- **Same separated verdict, same shared vocabulary.** `RpmValidation` exposes the
+  same `SupportStatus { container_readable, profile_valid }`: an invalid lead or
+  header clears `container_readable`, while a readable container that carries the
+  wrong payload format, a compressor mismatch, or any blocking payload finding
+  reads but is not `profile_valid`. The RPM-specific codes (`InvalidLead`,
+  `InvalidHeader`, `HeaderTooLarge`, `PayloadFormatMismatch`, `CompressorMismatch`)
+  are additions to the shared `PackageFindingCode` enum; every other code is
+  reused unchanged.
+- **Supported inputs, RPM unit (RM-212).** Lead and header magic/version and
+  size validation, header-bomb refusal, `PAYLOADFORMAT`/`PAYLOADCOMPRESSOR`
+  extraction, detected-versus-declared compressor cross-check, unsafe/duplicate
+  cpio entry paths, truncation, decompression bombs, and the payload filters
+  gzip/xz/zstd/bzip2 (plus a plain `none` cpio). Signature and digest
+  verification are explicitly out of scope for this unit.
+
+The ZIP-based package families and a package-validation CLI surface are deferred
+to later Campaign 2 units (RM-215 for the CLI). This decision owns no rendering
+or transport policy: any front end consumes the same `DebValidation`,
+`RpmValidation`, `PackageFinding`, and `SupportStatus` types unchanged and
 re-implements no package policy of its own.
 
 ## Consequences
@@ -93,8 +146,9 @@ Because the validator is generic over `Read` and over the codec provider set,
 the same call path serves an in-memory buffer, a file, or a range-backed source,
 and swapping the provider set lets a caller detect exactly which members a
 reduced build cannot decode without the validator conflating that with
-corruption. The shared `finding` vocabulary is profile-agnostic, so RPM and the
-ZIP-based families reuse it directly and only add their own container-reading
-front end. Signature and cryptographic-integrity verification, digest checking,
-and any package-validation CLI are outside this unit and remain later Campaign 2
-work.
+corruption. The shared `finding` vocabulary is profile-agnostic: the RPM profile
+already reuses it directly and only adds a small bounded lead/header parser and
+five RPM-specific codes, and the ZIP-based families will do the same with only
+their own container-reading front end. Signature and cryptographic-integrity
+verification, digest checking, and any package-validation CLI are outside these
+units and remain later Campaign 2 work.

@@ -88,7 +88,8 @@ pub use oci::{
     OciRemoval, OwnershipMapper, OwnershipTable,
 };
 pub use package::{
-    DebValidation, DebValidator, PackageFinding, PackageFindingCode, Severity, SupportStatus,
+    DebValidation, DebValidator, PackageFinding, PackageFindingCode, RpmValidation, RpmValidator,
+    Severity, SupportStatus,
 };
 pub use path::{sanitize, sanitize_archive_path};
 pub use provider::{
