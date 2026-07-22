@@ -107,11 +107,62 @@ a `findings` array of filesystem capability findings. Policy flags are
 and returns exit 1. `oci apply` requires a seekable `LAYER` file so it can rewind
 between the verify and apply passes; `-` is a usage error (exit 2).
 
+## `oxarchive package`
+
+```text
+oxarchive package validate PACKAGE --type <deb|rpm|jar|nuget|wheel|epub|apk|ipa|msix>
+```
+
+The `package validate` subcommand drives the library's package validators
+(`DebValidator`, `RpmValidator`, `ZipPackageValidator` over `ZipPackageProfile`,
+and `AppPackageValidator` over `AppPackageProfile`) directly. The CLI
+re-implements no package-structure interpretation or finding classification; it
+selects a profile, opens a bounded input, and renders the shared typed
+`SupportStatus` and `PackageFinding` values. Every invocation emits machine
+JSON regardless of the top-level `--json` flag, and the record carries
+`schema_version: "oxarchive.output.v0alpha1"`.
+
+`--type` is required and selects the profile: `deb`, `rpm`, `jar`, `nuget`,
+`wheel`, `epub`, `apk`, `ipa`, or `msix` (a repeated `--type`, or the equals
+form `--type=jar`, is accepted; a repeat is a usage error). A missing `--type`,
+an unknown type, an unknown subcommand, a missing subcommand, or more than one
+`PACKAGE` operand is a usage error (exit 2).
+
+`package validate` emits one `package_validation` object:
+
+1. `schema_version` and `type: "package_validation"`.
+2. `profile` echoes the stable lowercase `--type` label.
+3. `container_readable` (bool) reports whether the outer container structure was
+   parseable at all.
+4. `profile_valid` (bool) reports whether the package additionally satisfied its
+   profile with no blocking findings. The two verdicts are independent: a
+   readable container can still fail its profile.
+5. `findings` is an array of the shared typed findings, each carrying
+   `severity` (`info`/`warning`/`error`, the stable `Severity` label), `code`
+   (the stable `PackageFindingCode` identifier such as `missing-debian-binary`
+   or `missing-required-member`), `path` (the archive-native member or entry
+   name, lossily decoded, or `null`), `path_raw_hex` (the same bytes as hex, or
+   `null`), and `detail` (human context). Severity and code are read from the
+   finding accessors and are never re-derived by the CLI.
+
+The record is written before any exit-code error, so a machine consumer always
+observes the findings even when the profile was not satisfied. Exit is 0 when
+`profile_valid` is true, 1 when the container was read but the profile was not
+satisfied or a runtime error occurred, and 2 for a usage failure.
+
+`PACKAGE` may be `-` to read standard input for the `deb` and `rpm` profiles,
+which need only sequential reads. The ZIP-container profiles (`jar`, `nuget`,
+`wheel`, `epub`, `apk`, `ipa`, `msix`) parse a central directory at the end of
+the file and therefore require a seekable file; `-` is a usage error (exit 2)
+for them.
+
 ## Standard streams and unsafe paths
 
 - `inspect`, `plan`, `apply`, and `verify` accept archive input `-`.
 - `oci inspect` and `oci verify` accept layer input `-`; `oci apply` requires a
   seekable file and rejects `-`.
+- `package validate` accepts `PACKAGE` `-` for the `deb` and `rpm` profiles; the
+  ZIP-container profiles require a seekable file and reject `-`.
 - `create` accepts archive output `-`; inputs are filesystem paths.
 - `oxtar`, `oxcpio`, and `oxcat` retain their documented stdin/stdout
   compatibility forms.

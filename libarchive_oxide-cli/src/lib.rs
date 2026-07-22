@@ -15,6 +15,7 @@ pub mod cat;
 pub mod cpio;
 pub mod oci;
 pub mod oxarchive;
+pub mod package;
 pub mod tar;
 pub mod unzip;
 
