@@ -78,6 +78,16 @@ pub enum PackageFindingCode {
     DecompressionBomb,
     /// A member used a compression method this build cannot decode.
     UnsupportedCompression,
+    /// The RPM lead was missing, truncated, or carried an invalid magic.
+    InvalidLead,
+    /// An RPM header section had an invalid magic or version, or was truncated.
+    InvalidHeader,
+    /// An RPM header's declared index or data store exceeded the metadata budget.
+    HeaderTooLarge,
+    /// The RPM payload-format tag was absent or not the expected `cpio`.
+    PayloadFormatMismatch,
+    /// The detected payload filter disagreed with the declared compressor tag.
+    CompressorMismatch,
 }
 
 impl PackageFindingCode {
@@ -99,6 +109,11 @@ impl PackageFindingCode {
             Self::DuplicateEntryPath => "duplicate-entry-path",
             Self::DecompressionBomb => "decompression-bomb",
             Self::UnsupportedCompression => "unsupported-compression",
+            Self::InvalidLead => "invalid-lead",
+            Self::InvalidHeader => "invalid-header",
+            Self::HeaderTooLarge => "header-too-large",
+            Self::PayloadFormatMismatch => "payload-format-mismatch",
+            Self::CompressorMismatch => "compressor-mismatch",
         }
     }
 
@@ -106,7 +121,9 @@ impl PackageFindingCode {
     #[must_use]
     pub const fn default_severity(self) -> Severity {
         match self {
-            Self::UnknownMember | Self::UnsupportedCompression => Severity::Warning,
+            Self::UnknownMember | Self::UnsupportedCompression | Self::CompressorMismatch => {
+                Severity::Warning
+            },
             _ => Severity::Error,
         }
     }

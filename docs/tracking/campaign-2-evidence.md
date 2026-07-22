@@ -8,12 +8,13 @@ bytes and digests across order, timestamps, ownership, PAX emission, and
 padding), RM-204 (byte/range source adapters that feed the engine with no
 networking, authentication, or cloud SDK dependency), and RM-205 (the
 `oxarchive oci` inspect/verify/apply CLI over the same engine, plan, and report
-types). It also records the first slice of the package-validator epic RM-210:
+types). It also records the first two slices of the package-validator epic RM-210:
 RM-211 (the bounded package-validation framework and the Debian `.deb`
-validator). RM-201/202 (#52), RM-205 (#53), RM-204 (#54), and RM-203 (#55) have
-reached `main`; RM-211 is based on the `feat/rm-211-deb-validator` working tree.
-The parent epics close only after
-every slice has passed its required remote checks and reached `main`.
+validator) and RM-212 (the bounded RPM profile validator). RM-201/202 (#52),
+RM-205 (#53), RM-204 (#54), RM-203 (#55), and RM-211 (#56) have reached `main`;
+RM-212 is based on the `feat/rm-212-rpm-validator` working tree. The parent
+epics close only after every slice has passed its required remote checks and
+reached `main`.
 
 No tag, package publication, GitHub Release, release-workflow execution,
 version change, or versioned release candidate is part of this snapshot.
@@ -40,6 +41,10 @@ version change, or versioned release candidate is part of this snapshot.
 | Bounded Debian `.deb` validator | RM-211 | `libarchive_oxide/src/package/deb.rs` | `DebValidator`, `DebValidation`, `ar` `ReaderEvent` + per-member `Pipeline` |
 | Package module surface and re-exports | RM-211 | `libarchive_oxide/src/package/mod.rs`, `src/lib.rs` | public `package` types re-exported from the crate root |
 | Debian validation tests | RM-211 | `libarchive_oxide/tests/package_deb.rs` | 12 tests, happy path and adversarial no-extract refusals |
+| Bounded RPM validator | RM-212 | `libarchive_oxide/src/package/rpm.rs` | `RpmValidator`, `RpmValidation`, bounded lead/header parser + payload `Pipeline` |
+| RPM finding codes | RM-212 | `libarchive_oxide/src/package/finding.rs` | `InvalidLead`, `InvalidHeader`, `HeaderTooLarge`, `PayloadFormatMismatch`, `CompressorMismatch` |
+| RPM re-exports on the package surface | RM-212 | `libarchive_oxide/src/package/mod.rs`, `src/lib.rs` | public `RpmValidator`/`RpmValidation` re-exported from the crate root |
+| RPM validation tests | RM-212 | `libarchive_oxide/tests/package_rpm.rs` | 10 tests, happy path and adversarial no-extract refusals |
 
 ## RM-201
 
@@ -217,6 +222,45 @@ version change, or versioned release candidate is part of this snapshot.
   finding derived from the `ProviderCapability` query rather than as corruption,
   and the profile is not confirmed valid.
 
+## RM-212
+
+- ADR-0010 extends bounded no-extract package validation to RPM, a bespoke
+  binary stream rather than an `ar`, `tar`, or `zip` container. `RpmValidator`
+  parses the fixed 96-byte lead, the signature header, and the main header with a
+  small bounded hand-written parser, then streams the compressed cpio payload
+  through one `Pipeline`. It never materializes the package or whole-buffers the
+  payload: each header's declared index and data store are checked against
+  `Limits::metadata_bytes` before they are read, only the two payload tags are
+  extracted from the store, and only a six-byte prefix is retained to classify
+  the payload's outer filter.
+- `well_formed_rpm_is_valid_across_payload_filters` assembles a conforming RPM
+  for a plain cpio payload and for gzip, xz, zstd, and bzip2 payloads, and
+  confirms each reads, validates with no findings, reports the detected outer
+  filter through `payload_filter`, and echoes the `PAYLOADCOMPRESSOR` tag through
+  `payload_compressor`.
+- The container-structure refusals are covered by `invalid_lead_magic_is_rejected`
+  (a corrupted `ED AB EE DB` lead), `invalid_header_magic_is_rejected` (a
+  corrupted `8E AD E8` header intro), and `oversized_header_is_rejected_as_bomb`
+  (a signature header claiming a 50 MB store against a 64 KiB metadata budget),
+  each asserting the container does not read and the specific `InvalidLead`,
+  `InvalidHeader`, or `HeaderTooLarge` code is present — the header-bomb budget
+  refuses the store before allocating it.
+- The payload-profile refusals are covered by `truncated_payload_is_rejected`
+  (`TruncatedMember`/`MalformedNesting`), `wrong_payload_format_is_rejected` (a
+  `PAYLOADFORMAT` of `tar` yields `PayloadFormatMismatch`),
+  `compressor_tag_mismatch_is_reported` (an xz payload tagged `gzip` yields
+  `CompressorMismatch` while `payload_filter` still reports xz),
+  `traversal_entry_path_is_rejected` (`UnsafeEntryPath`), and
+  `decompression_bomb_is_bounded` (a 200 KB expansion bounded to 8 KiB is refused
+  as `DecompressionBomb`) — each asserting the container still reads while the
+  profile is not valid, demonstrating the separated verdict.
+- `unsupported_compression_reports_capability_finding` swaps in a codec provider
+  that recognizes zstd frames but advertises no capability (mirroring a build
+  without the `zstd` feature); the container reads and `payload_filter` reports
+  zstd, but the payload is reported as an `UnsupportedCompression` capability
+  finding derived from the `ProviderCapability` query rather than as corruption,
+  and the profile is not confirmed valid.
+
 ## Reproduced gates
 
 - Working tree, Windows x86_64, default portable codec profile:
@@ -234,6 +278,8 @@ version change, or versioned release candidate is part of this snapshot.
   passed, including the existing engine, codec, zip, and CLI contract suites.
 - `cargo test -p libarchive_oxide --test package_deb` passed 12/12 (RM-211) on
   the working tree, Windows x86_64, default portable codec profile.
+- `cargo test -p libarchive_oxide --test package_rpm` passed 10/10 (RM-212) on
+  the working tree, Windows x86_64, default portable codec profile.
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   the `no-dyn` gate (static dispatch; the OCI builder and the package validator
   add no trait objects), and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` all
@@ -247,8 +293,9 @@ as RM-205, and the SDK-free range adapter example as RM-204. Only a full 10 GiB
 soak remains out of scope for the RM-200 slices. The remote matrix, nightly fuzz,
 big-endian, and CodeQL gates remain required before the RM-200 epic can close.
 
-For the RM-210 package-validator epic, RM-211 lands only the framework and the
-Debian `.deb` profile. The RPM profile, the ZIP-based package families (JAR,
-IPA, MSIX, NuGet, Wheel, EPUB), and a package-validation CLI surface (RM-215)
-are later slices and are not part of this snapshot. Remote checks and reaching
-`main` remain required before the RM-210 epic can close.
+For the RM-210 package-validator epic, RM-211 lands the framework and the Debian
+`.deb` profile and RM-212 adds the RPM profile. The ZIP-based package families
+(JAR, IPA, MSIX, NuGet, Wheel, EPUB) and a package-validation CLI surface
+(RM-215) are later slices and are not part of this snapshot. Signature and digest
+verification are out of scope for both the Debian and RPM profiles. Remote checks
+and reaching `main` remain required before the RM-210 epic can close.
