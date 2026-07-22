@@ -89,7 +89,7 @@ pub use oci::{
 };
 pub use package::{
     DebValidation, DebValidator, PackageFinding, PackageFindingCode, RpmValidation, RpmValidator,
-    Severity, SupportStatus,
+    Severity, SupportStatus, ZipPackageProfile, ZipPackageValidation, ZipPackageValidator,
 };
 pub use path::{sanitize, sanitize_archive_path};
 pub use provider::{

@@ -8,11 +8,12 @@ bytes and digests across order, timestamps, ownership, PAX emission, and
 padding), RM-204 (byte/range source adapters that feed the engine with no
 networking, authentication, or cloud SDK dependency), and RM-205 (the
 `oxarchive oci` inspect/verify/apply CLI over the same engine, plan, and report
-types). It also records the first two slices of the package-validator epic RM-210:
+types). It also records the first three slices of the package-validator epic RM-210:
 RM-211 (the bounded package-validation framework and the Debian `.deb`
-validator) and RM-212 (the bounded RPM profile validator). RM-201/202 (#52),
+validator), RM-212 (the bounded RPM profile validator), and RM-213 (the bounded
+ZIP-container profiles: JAR, NuGet, Wheel, and EPUB). RM-201/202 (#52),
 RM-205 (#53), RM-204 (#54), RM-203 (#55), and RM-211 (#56) have reached `main`;
-RM-212 is based on the `feat/rm-212-rpm-validator` working tree. The parent
+RM-212 and RM-213 are based on their respective working trees. The parent
 epics close only after every slice has passed its required remote checks and
 reached `main`.
 
@@ -45,6 +46,10 @@ version change, or versioned release candidate is part of this snapshot.
 | RPM finding codes | RM-212 | `libarchive_oxide/src/package/finding.rs` | `InvalidLead`, `InvalidHeader`, `HeaderTooLarge`, `PayloadFormatMismatch`, `CompressorMismatch` |
 | RPM re-exports on the package surface | RM-212 | `libarchive_oxide/src/package/mod.rs`, `src/lib.rs` | public `RpmValidator`/`RpmValidation` re-exported from the crate root |
 | RPM validation tests | RM-212 | `libarchive_oxide/tests/package_rpm.rs` | 10 tests, happy path and adversarial no-extract refusals |
+| Bounded ZIP-container validator | RM-213 | `libarchive_oxide/src/package/zip_profile.rs` | `ZipPackageValidator`, `ZipPackageValidation`, `ZipPackageProfile`, bounded central-directory reader |
+| ZIP-container finding codes | RM-213 | `libarchive_oxide/src/package/finding.rs` | `MimetypeNotFirst`, `MimetypeNotStored`, `MimetypeInvalidContent`, `UnexpectedEncryption` |
+| ZIP profile re-exports on the package surface | RM-213 | `libarchive_oxide/src/package/mod.rs`, `src/lib.rs` | public `ZipPackageValidator`/`ZipPackageValidation`/`ZipPackageProfile` re-exported from the crate root |
+| ZIP-container validation tests | RM-213 | `libarchive_oxide/tests/package_zip.rs` | 19 tests, happy path and adversarial no-extract refusals |
 
 ## RM-201
 
@@ -261,6 +266,42 @@ version change, or versioned release candidate is part of this snapshot.
   finding derived from the `ProviderCapability` query rather than as corruption,
   and the profile is not confirmed valid.
 
+## RM-213
+
+- ADR-0010 extends bounded no-extract package validation to the ZIP-container
+  families. `ZipPackageValidator` takes a `ZipPackageProfile` (JAR, NuGet, Wheel,
+  or EPUB) and never decompresses a payload: a bounded hand-written parser locates
+  the end-of-central-directory record (with a ZIP64 fallback) and walks the
+  central directory to collect each member's name, order, compression method,
+  encryption flag, and declared uncompressed size, all bounded by
+  `Limits::metadata_bytes`, `Limits::entries`, and `Limits::path_bytes`. Because
+  the ZIP index lives at the end of the file, the validator requires `Read + Seek`.
+- `jar_with_manifest_is_valid`, `nuget_with_content_types_and_single_nuspec_is_valid`,
+  `wheel_with_dist_info_members_is_valid`, and `epub_with_stored_first_mimetype_is_valid`
+  confirm a conforming archive for each profile reads and validates with no
+  findings; `jar_from_real_deflate_writer_is_valid` proves the central-directory
+  reader interoperates with the crate's own sequential deflate ZIP writer
+  (data-descriptor output and all).
+- The missing-member refusals — `jar_without_manifest_is_rejected`,
+  `nuget_without_content_types_is_rejected`, `nuget_with_two_root_nuspecs_is_rejected`
+  (a second root manifest is a `DuplicateMember`), `wheel_without_wheel_member_is_rejected`,
+  and `epub_without_container_is_rejected` — each assert the container still reads
+  while the profile is not valid, demonstrating the separated verdict.
+- The EPUB `mimetype` structural rules are covered by
+  `epub_mimetype_not_first_is_rejected` (`MimetypeNotFirst`),
+  `epub_mimetype_not_stored_is_rejected` (`MimetypeNotStored`), and
+  `epub_mimetype_bad_body_is_rejected` (`MimetypeInvalidContent`, from the single
+  bounded media-type-length body read).
+- The shared ZIP-structure defenses are covered by
+  `traversing_member_name_is_rejected` (`UnsafeEntryPath`),
+  `duplicate_member_path_is_rejected` (`DuplicateEntryPath`),
+  `unsupported_method_is_reported` (an LZMA method yields the
+  `UnsupportedCompression` capability finding), `encrypted_member_is_reported`
+  (`UnexpectedEncryption`), `decompression_bomb_is_refused_by_budget` (a summed
+  declared size over a 64-byte `decoded_total` budget yields `DecompressionBomb`
+  with no decompression), and `garbage_container_is_unreadable`
+  (`ContainerUnreadable` with `container_readable` cleared).
+
 ## Reproduced gates
 
 - Working tree, Windows x86_64, default portable codec profile:
@@ -280,6 +321,8 @@ version change, or versioned release candidate is part of this snapshot.
   the working tree, Windows x86_64, default portable codec profile.
 - `cargo test -p libarchive_oxide --test package_rpm` passed 10/10 (RM-212) on
   the working tree, Windows x86_64, default portable codec profile.
+- `cargo test -p libarchive_oxide --test package_zip` passed 19/19 (RM-213) on
+  the working tree, Windows x86_64, default portable codec profile.
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   the `no-dyn` gate (static dispatch; the OCI builder and the package validator
   add no trait objects), and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` all
@@ -294,8 +337,9 @@ soak remains out of scope for the RM-200 slices. The remote matrix, nightly fuzz
 big-endian, and CodeQL gates remain required before the RM-200 epic can close.
 
 For the RM-210 package-validator epic, RM-211 lands the framework and the Debian
-`.deb` profile and RM-212 adds the RPM profile. The ZIP-based package families
-(JAR, IPA, MSIX, NuGet, Wheel, EPUB) and a package-validation CLI surface
-(RM-215) are later slices and are not part of this snapshot. Signature and digest
-verification are out of scope for both the Debian and RPM profiles. Remote checks
-and reaching `main` remain required before the RM-210 epic can close.
+`.deb` profile, RM-212 adds the RPM profile, and RM-213 adds the ZIP-container
+profiles (JAR, NuGet, Wheel, EPUB). The remaining ZIP-based families (IPA, MSIX)
+and a package-validation CLI surface (RM-215) are later slices and are not part
+of this snapshot. Signature and digest verification are out of scope for the
+Debian, RPM, and ZIP-container profiles alike. Remote checks and reaching `main`
+remain required before the RM-210 epic can close.

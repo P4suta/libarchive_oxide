@@ -119,15 +119,17 @@ profile, and "planned" means neither verdict is produced yet.
 | Debian `.deb` | `ar` with leading `debian-binary`, then `control.tar.*` and `data.tar.*` | yes | yes | bounded no-extract; inner tarballs stored plain or under one gzip/xz/zstd/bzip2 filter; member order, duplicates, unsafe names/paths, truncation, and decompression bombs are typed findings; a method this build cannot decode is a capability finding, not a hard failure |
 | RPM | lead + signature/main header + cpio payload | yes | yes | bounded no-extract; the fixed 96-byte lead and both RPM headers are parsed by a bounded hand-written parser that refuses a header bomb before it is allocated; cpio payload stored plain (`none`) or under one gzip/xz/zstd/bzip2 filter; invalid lead/header magic, an oversized header, a `PAYLOADFORMAT` other than `cpio`, a detected filter that disagrees with `PAYLOADCOMPRESSOR`, unsafe/duplicate cpio entry paths, truncation, and decompression bombs are typed findings; a method this build cannot decode is a capability finding, not a hard failure; signature and digest verification remain follow-on work |
 | Alpine `apk` | signed control/data `tar.gz` segments | planned | planned | |
-| Java `JAR` | ZIP with `META-INF/MANIFEST.MF` | planned | planned | shares the ZIP-based package family |
+| Java `JAR` | ZIP with `META-INF/MANIFEST.MF` | yes | yes | bounded no-extract; the central directory is read for member names, order, methods, and encryption flags without decompressing any payload; unsafe/duplicate paths, encryption, an undecodable method, and a decompression bomb (summed declared uncompressed size over the budget) are typed findings |
 | Apple `IPA` | ZIP with `Payload/*.app` | planned | planned | ZIP-based |
 | `MSIX`/APPX | ZIP with `OPC`/`AppxManifest.xml` | planned | planned | ZIP-based |
-| NuGet `.nupkg` | ZIP with `OPC` and `.nuspec` | planned | planned | ZIP-based |
-| Python `Wheel` | ZIP with `*.dist-info/` | planned | planned | ZIP-based |
-| `EPUB` | ZIP with `mimetype` and `META-INF/container.xml` | planned | planned | ZIP-based |
+| NuGet `.nupkg` | ZIP with `[Content_Types].xml` and one root `.nuspec` | yes | yes | bounded no-extract; requires `[Content_Types].xml` and exactly one root `*.nuspec`; shares the ZIP-structure defenses of the JAR profile |
+| Python `Wheel` | ZIP with `*.dist-info/{METADATA,RECORD,WHEEL}` | yes | yes | bounded no-extract; requires the three `*.dist-info` members; shares the ZIP-structure defenses of the JAR profile |
+| `EPUB` | ZIP with `mimetype` and `META-INF/container.xml` | yes | yes | bounded no-extract; the first member must be a stored `mimetype` whose body is `application/epub+zip` (the only member body read, and only the media-type length), plus `META-INF/container.xml`; a compressed, misordered, or wrong-bodied `mimetype` is a typed finding |
 
 The Debian profile is exercised by twelve bounded validation tests
-(`tests/package_deb.rs`) and the RPM profile by ten (`tests/package_rpm.rs`);
-both are described in [ADR-0010](adr/0010-package-profiles.md). The ZIP-based
-package families and a package-validation CLI surface are later Campaign 2 units
-and remain planned.
+(`tests/package_deb.rs`), the RPM profile by ten (`tests/package_rpm.rs`), and
+the four ZIP-container profiles (JAR, NuGet, Wheel, EPUB) by nineteen
+(`tests/package_zip.rs`); all are described in
+[ADR-0010](adr/0010-package-profiles.md). The remaining ZIP-based families
+(IPA, MSIX/APPX) and a package-validation CLI surface (RM-215) are later
+Campaign 2 units and remain planned.
