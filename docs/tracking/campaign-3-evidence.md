@@ -27,6 +27,10 @@ change, or versioned release candidate is part of this snapshot.
 | Support-matrix encryption/metadata column split | RM-301 | `docs/support-matrix.md` | Archive-containers table gains an explicit `Encryption` column separated from `Metadata/method notes` |
 | Producer-corpus provenance registries | RM-301 | `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md`, `libarchive_oxide/tests/fixtures/sevenz/PROVENANCE.md` | per-format `crate@version` producer/consumer registry and deterministic in-code generation policy |
 | This evidence snapshot | RM-301 | `docs/tracking/campaign-3-evidence.md` | RM-301 harness scope, formats proven, and reproduced gates |
+| ZIP BZip2 (method 12) read | RM-302 | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/src/zip.rs` | `ZipBody::Bzip2` low-level `bzip2::Decompress` streaming arm mirroring Deflate; CRC-32, size, bomb, and truncation guards; feature-off fall-through to the structured `Unsupported` error |
+| ZIP BZip2 (method 12) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Bzip2` + `bzip2::Compress` Run/Finish encoder mirroring Deflate; `ZipMethod::Bzip2` public variant flows through `provider.rs`; version-needed 46 in local and central headers |
+| ZIP BZip2 3x2 interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_bzip2.rs`, `libarchive_oxide/tests/seek_stream_v2.rs` | three producers (arca, `zip@8.6.0`, first-party raw `.bz2` builder) × two consumers (arca, `zip@8.6.0`); round-trip loop plus truncation, bomb, and feature-off Unsupported tests |
+| Support-matrix ZIP BZip2 update | RM-302 | `docs/support-matrix.md` | ZIP row lists Store/Deflate/BZip2; the not-yet-implemented note drops BZip2 |
 
 ## RM-301
 
@@ -76,6 +80,58 @@ change, or versioned release candidate is part of this snapshot.
   corpus layout, and a "how to extend" guide for RM-302/303/304. The harness adds
   no trait object, no closure, no generic parameter, and no new runtime
   dependency, and the crate keeps `#![forbid(unsafe_code)]`.
+
+## RM-302
+
+- RM-302 is the first slice to add a new archive method through the RM-301
+  harness: ZIP BZip2 (method code 12), read and write, gated behind the `bzip2`
+  feature (on by default via `portable-codecs`, and also present in
+  `native-codecs`). The runtime `bzip2` crate is already an optional dependency,
+  so no new runtime dependency is added; the codec works identically on the
+  portable (`libbz2-rs-sys`) and native (`libbz2`) backends because only the
+  backend-neutral `Decompress`/`Compress`/`Action`/`Status`/`Compression` surface
+  is used.
+- Read: `ZipBody::Bzip2` is a gated variant of the seek reader's body enum that
+  mirrors the existing `Deflate` arm but swaps miniz `inflate` for the low-level
+  `bzip2::Decompress::decompress` streaming call. Because that call returns only
+  `Result<Status, Error>` (not a consumed/written pair), progress is derived from
+  `total_in()`/`total_out()` deltas snapshotted around each call. A ZIP method-12
+  payload is a complete standalone `.bz2` stream, so `Status::StreamEnd` drives
+  finalization, at which point the produced size is checked against the central
+  directory and the running CRC-32 (`crate::filter::gzip::Crc32`) is verified. The
+  same per-iteration `decoded_total` + `Limits::decoded_total()` check as Deflate
+  bounds a decompression bomb before the whole payload is buffered; a stalled
+  decoder with no remaining input is reported as a truncated-stream `Malformed`
+  error, and every `Err(_)`/`MemNeeded` maps to a structured error rather than a
+  panic. `prepare_zip_body` selects the Bzip2 body only under the feature; with the
+  feature off, method 12 falls through to the existing `Unsupported { method,
+  end_offset }` arm, so a method-12 member still enumerates and skips and yields
+  the structured "payload coder 12 is unsupported" error on read.
+- Write: `StreamZipMethod::Bzip2` and the public `ZipMethod::Bzip2` variant are
+  both gated, so a feature-off caller cannot even name the method (compile-time
+  exclusion, no runtime panic path). The encoder mirrors the Deflate contract with
+  `bzip2::Compress`: `Action::Run` per data chunk and `Action::Finish` at
+  end-entry, single library call per invocation, returning `NeedOutput` on
+  `FinishOk` and terminating on `StreamEnd`, with progress again derived from the
+  `total_in()`/`total_out()` counters. Local and central "version needed to
+  extract" fields are written as 46 for method-12 members. Both `ZipMethod ->
+  StreamZipMethod` match sites in `provider.rs` are gated by the same cfg, so each
+  match stays exhaustive with no wildcard on both builds.
+- Evidence reuses the RM-301 harness. `tests/interop_zip_bzip2.rs` (whole-file
+  gated on `bzip2`) proves method 12 with three independent producers — arca's ZIP
+  writer with `ZipMethod::Bzip2`, the `zip` crate with `CompressionMethod::Bzip2`
+  (its dev-dependency gains the `bzip2` feature), and a first-party raw-ZIP builder
+  that stores a raw `.bz2` stream produced by the `bzip2` crate directly with
+  method 12 and version-needed 46 — and two consumers (arca via `read_with_arca`
+  and the `zip` crate via `zip_crate_decode`, which now maps
+  `CompressionMethod::Bzip2`), asserting byte-level content equality plus the BZip2
+  codec on non-empty file members. `tests/seek_stream_v2.rs` adds `ZipMethod::Bzip2`
+  to the streaming round-trip loops and three adversarial tests: a truncated
+  bzip2 payload yields a `Malformed` structured error, a bzip2 bomb is bounded by a
+  small `Limits::decoded_total` (`Limit` error), and — under `#[cfg(not(feature =
+  "bzip2"))]` — a method-12 member reports the `Unsupported` structured error while
+  still enumerating. The crate keeps `#![forbid(unsafe_code)]` and adds no trait
+  object (`ZipMethod`/`StreamZipMethod`/`ZipBody` remain plain enums).
 
 ## Reproduced gates
 

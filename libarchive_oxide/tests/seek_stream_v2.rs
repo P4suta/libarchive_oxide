@@ -3,7 +3,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Seek-capable ZIP streaming contracts.
-#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::cast_possible_truncation
+)]
 
 use std::cell::Cell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -385,11 +390,20 @@ fn zip_store_and_deflate_payloads_stream_without_whole_entry_vecs() {
         collect(zip_fixture(ZipMethod::Deflate)),
         vec![b'a'; 200_000]
     );
+    #[cfg(feature = "bzip2")]
+    assert_eq!(collect(zip_fixture(ZipMethod::Bzip2)), vec![b'a'; 200_000]);
 }
 
 #[test]
 fn common_writer_streams_unknown_size_zip_with_data_descriptors() {
-    for method in [ZipMethod::Store, ZipMethod::Deflate] {
+    let methods = {
+        #[allow(unused_mut)]
+        let mut v = vec![ZipMethod::Store, ZipMethod::Deflate];
+        #[cfg(feature = "bzip2")]
+        v.push(ZipMethod::Bzip2);
+        v
+    };
+    for method in methods {
         let archive = streaming_zip_fixture(method);
         assert_ne!(archive[6] & 0x08, 0);
         assert!(archive.windows(4).any(|window| window == b"PK\x07\x08"));
@@ -920,5 +934,183 @@ fn common_sevenz_writer_rejects_declared_size_mismatch() {
             .archive_error()
             .map(libarchive_oxide_core::ArchiveError::kind),
         Some(ErrorKind::Protocol)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ZIP BZip2 (method 12) adversarial contracts.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "bzip2")]
+fn raw_bzip2_zip(content: &[u8], body_override: Option<Vec<u8>>) -> Vec<u8> {
+    use std::io::Write;
+
+    let full = {
+        let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        e.write_all(content).unwrap();
+        e.finish().unwrap()
+    };
+    let body = body_override.unwrap_or(full);
+    let crc = {
+        let mut c = flate2::Crc::new();
+        c.update(content);
+        c.sum()
+    };
+    let name = b"member.bin";
+    let mut out = Vec::new();
+    let put16 = |o: &mut Vec<u8>, v: u16| o.extend_from_slice(&v.to_le_bytes());
+    let put32 = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_le_bytes());
+    let local_offset = out.len() as u32;
+    out.extend_from_slice(b"PK\x03\x04");
+    put16(&mut out, 46);
+    put16(&mut out, 0);
+    put16(&mut out, 12);
+    put16(&mut out, 0);
+    put16(&mut out, 0x21);
+    put32(&mut out, crc);
+    put32(&mut out, body.len() as u32);
+    put32(&mut out, content.len() as u32);
+    put16(&mut out, name.len() as u16);
+    put16(&mut out, 0);
+    out.extend_from_slice(name);
+    out.extend_from_slice(&body);
+    let central_offset = out.len() as u32;
+    let mut central = Vec::new();
+    central.extend_from_slice(b"PK\x01\x02");
+    put16(&mut central, 0x031e);
+    put16(&mut central, 46);
+    put16(&mut central, 0);
+    put16(&mut central, 12);
+    put16(&mut central, 0);
+    put16(&mut central, 0x21);
+    put32(&mut central, crc);
+    put32(&mut central, body.len() as u32);
+    put32(&mut central, content.len() as u32);
+    put16(&mut central, name.len() as u16);
+    put16(&mut central, 0);
+    put16(&mut central, 0);
+    put16(&mut central, 0);
+    put16(&mut central, 0);
+    put32(&mut central, 0);
+    put32(&mut central, local_offset);
+    central.extend_from_slice(name);
+    let central_size = central.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    put16(&mut out, 0);
+    put16(&mut out, 0);
+    put16(&mut out, 1);
+    put16(&mut out, 1);
+    put32(&mut out, central_size);
+    put32(&mut out, central_offset);
+    put16(&mut out, 0);
+    out
+}
+
+#[cfg(feature = "bzip2")]
+#[test]
+fn zip_bzip2_roundtrips_through_seek_reader() {
+    let content = b"bzip2 payload for the seek reader\n".repeat(50);
+    let bytes = raw_bzip2_zip(&content, None);
+    let mut reader = SeekArchiveReader::new(Cursor::new(bytes)).unwrap();
+    let mut body = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(chunk) => body.extend_from_slice(chunk),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(body, content);
+}
+
+#[cfg(feature = "bzip2")]
+#[test]
+fn zip_bzip2_truncated_payload_is_structured_error() {
+    let content = b"bzip2 payload that will be truncated\n".repeat(50);
+    let full = {
+        use std::io::Write;
+        let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        e.write_all(&content).unwrap();
+        e.finish().unwrap()
+    };
+    // Drop the trailing footer/CRC so the declared compressed_size matches the
+    // truncated body and the decoder runs out of input before StreamEnd.
+    let truncated = full[..full.len() - 4].to_vec();
+    let bytes = raw_bzip2_zip(&content, Some(truncated));
+    let mut reader = SeekArchiveReader::new(Cursor::new(bytes)).unwrap();
+    let mut error = None;
+    loop {
+        match reader.next_event() {
+            Ok(ReaderEvent::Done) => break,
+            Ok(_) => {},
+            Err(e) => {
+                error = Some(e);
+                break;
+            },
+        }
+    }
+    let error = error.expect("truncated bzip2 stream must fail");
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Malformed)
+    );
+}
+
+#[cfg(feature = "bzip2")]
+#[test]
+fn zip_bzip2_bomb_is_bounded_by_limits() {
+    let content = vec![0_u8; 1 << 20];
+    let bytes = raw_bzip2_zip(&content, None);
+    let limits = Limits::default().with_decoded_total(Some(4096));
+    let mut reader = SeekArchiveReader::with_limits(Cursor::new(bytes), limits).unwrap();
+    let mut error = None;
+    loop {
+        match reader.next_event() {
+            Ok(ReaderEvent::Done) => break,
+            Ok(_) => {},
+            Err(e) => {
+                error = Some(e);
+                break;
+            },
+        }
+    }
+    let error = error.expect("bzip2 bomb must be bounded by limits");
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Limit)
+    );
+}
+
+#[cfg(not(feature = "bzip2"))]
+#[test]
+fn zip_method_12_is_unsupported_without_bzip2_feature() {
+    let mut bytes = zip_fixture(ZipMethod::Store);
+    let central = bytes
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .unwrap();
+    bytes[8..10].copy_from_slice(&12_u16.to_le_bytes());
+    bytes[central + 10..central + 12].copy_from_slice(&12_u16.to_le_bytes());
+
+    let mut reader = SeekArchiveReader::new(Cursor::new(bytes)).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::Entry(_)
+    ));
+    let error = reader.next_event().unwrap_err();
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Unsupported)
     );
 }

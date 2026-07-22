@@ -890,6 +890,8 @@ impl BuiltinFormatEncoder {
         let method = match method {
             crate::ZipMethod::Store => StreamZipMethod::Store,
             crate::ZipMethod::Deflate => StreamZipMethod::Deflate,
+            #[cfg(feature = "bzip2")]
+            crate::ZipMethod::Bzip2 => StreamZipMethod::Bzip2,
         };
         Self {
             inner: BuiltinFormatEncoderInner::Zip(Box::new(ZipStreamEncoder::with_method(
@@ -913,6 +915,8 @@ impl BuiltinFormatEncoder {
         let method = match method {
             crate::ZipMethod::Store => StreamZipMethod::Store,
             crate::ZipMethod::Deflate => StreamZipMethod::Deflate,
+            #[cfg(feature = "bzip2")]
+            crate::ZipMethod::Bzip2 => StreamZipMethod::Bzip2,
         };
         Self {
             inner: BuiltinFormatEncoderInner::Zip(Box::new(ZipStreamEncoder::with_password(

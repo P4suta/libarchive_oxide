@@ -12,4 +12,7 @@ pub enum ZipMethod {
     Store,
     /// Encode bytes as raw DEFLATE.
     Deflate,
+    /// Encode bytes as `bzip2` (method 12).
+    #[cfg(feature = "bzip2")]
+    Bzip2,
 }
