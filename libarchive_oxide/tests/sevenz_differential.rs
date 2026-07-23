@@ -19,7 +19,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::doc_markdown,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    clippy::cast_possible_truncation
 )]
 
 use std::io::Cursor;
@@ -30,6 +31,7 @@ use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Lim
 use sevenz_rust2::{
     ArchiveEntry, ArchiveReader as SevenReader, ArchiveWriter as SevenWriter, EncoderConfiguration,
     EncoderMethod, Password, SourceReader,
+    encoder_options::{DeltaOptions, EncoderOptions},
 };
 
 mod common;
@@ -270,5 +272,95 @@ fn arca_reads_sevenz_rust2_compressed_header() {
     for (g, e) in got.iter().zip(expected.iter()) {
         assert_eq!(g.path(), e.0.as_slice());
         assert_eq!(g.content(), e.1.as_slice());
+    }
+}
+
+/// Deterministic pseudo-random bytes; branch opcodes occur naturally so the BCJ filters transform.
+fn pseudo_random(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0xdead_beef_cafe_0007;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// Encodes one file through `sevenz-rust2` with an explicit content-coder chain. The chain is given
+/// innermost-first (the compressor, then the filters that wrap it), matching `set_content_methods`.
+fn sevenz_with_methods(methods: Vec<EncoderConfiguration>, name: &str, data: &[u8]) -> Vec<u8> {
+    let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
+    w.set_content_methods(methods);
+    w.push_archive_entry(ArchiveEntry::new_file(name), Some(data))
+        .unwrap();
+    w.finish().unwrap().into_inner()
+}
+
+/// A folder whose coder graph chains the delta filter with LZMA2 must decode in arca: LZMA2
+/// decompresses the pack stream, then the delta stage reconstructs the original bytes. `sevenz-rust2`
+/// (using `lzma_rust2`'s independent delta implementation) is the producer; arca is the consumer.
+#[test]
+fn arca_reads_sevenz_rust2_delta_lzma2() {
+    let data = pseudo_random(40_003);
+    for distance in [1u32, 4, 256] {
+        let methods = vec![
+            EncoderConfiguration::new(EncoderMethod::LZMA2),
+            EncoderConfiguration::new(EncoderMethod::DELTA_FILTER)
+                .with_options(EncoderOptions::Delta(DeltaOptions::from_distance(distance))),
+        ];
+        let bytes = sevenz_with_methods(methods, "delta.bin", &data);
+        // sevenz-rust2 must agree the archive is a valid delta+LZMA2 chain it can also read back.
+        let mut reader = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+            .expect("sevenz-rust2 opens its own delta+LZMA2 archive");
+        assert_eq!(reader.read_file("delta.bin").unwrap(), data);
+
+        let got = read_with_arca(&bytes);
+        let expected = vec![EntryShape::new(
+            b"delta.bin".to_vec(),
+            EntryKind::File,
+            data.clone(),
+        )];
+        assert_eq!(
+            got, expected,
+            "arca delta+LZMA2 mismatch at distance {distance}"
+        );
+    }
+}
+
+/// The same shape with a BCJ branch filter: LZMA2 over a BCJ-filtered payload. arca must resolve the
+/// two-coder graph, decompress LZMA2, then invert the branch transform. Exercised for the x86
+/// (stateful) filter and a couple of fixed-stride RISC families.
+#[test]
+fn arca_reads_sevenz_rust2_bcj_lzma2() {
+    let data = pseudo_random(60_011);
+    let filters = [
+        ("x86", EncoderMethod::BCJ_X86_FILTER),
+        ("arm", EncoderMethod::BCJ_ARM_FILTER),
+        ("ppc", EncoderMethod::BCJ_PPC_FILTER),
+        ("sparc", EncoderMethod::BCJ_SPARC_FILTER),
+    ];
+    for (label, method) in filters {
+        let methods = vec![
+            EncoderConfiguration::new(EncoderMethod::LZMA2),
+            EncoderConfiguration::new(method),
+        ];
+        let bytes = sevenz_with_methods(methods, "bcj.bin", &data);
+        let mut reader = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+            .unwrap_or_else(|e| panic!("sevenz-rust2 opens its own {label} archive: {e}"));
+        assert_eq!(
+            reader.read_file("bcj.bin").unwrap(),
+            data,
+            "{label} self-read"
+        );
+
+        let got = read_with_arca(&bytes);
+        let expected = vec![EntryShape::new(
+            b"bcj.bin".to_vec(),
+            EntryKind::File,
+            data.clone(),
+        )];
+        assert_eq!(got, expected, "arca BCJ+LZMA2 mismatch for {label}");
     }
 }

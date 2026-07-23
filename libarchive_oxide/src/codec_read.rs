@@ -22,7 +22,7 @@ pub(crate) const BUFFER: usize = 64 * 1024;
 /// Generic over the inner reader `Inner` and the codec `C`, so a single
 /// implementation serves every codec that implements [`Codec`]. `name` labels
 /// the codec in error messages.
-pub(crate) struct CodecReader<Inner: Read, C: Codec> {
+pub(crate) struct CodecReader<Inner, C> {
     input: Inner,
     decoder: C,
     name: &'static str,
@@ -53,6 +53,12 @@ impl<Inner: Read, C: Codec> CodecReader<Inner, C> {
     /// Reclaims the inner reader at its current physical position.
     pub(crate) fn into_inner(self) -> Inner {
         self.input
+    }
+
+    /// Borrows the inner reader (used to reach the raw source below a chain).
+    #[cfg(feature = "sevenz")]
+    pub(crate) fn get_ref(&self) -> &Inner {
+        &self.input
     }
 
     fn fill(&mut self) -> io::Result<()> {

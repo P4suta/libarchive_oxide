@@ -4,6 +4,10 @@
 
 //! Compression filter implementations and runtime dispatch.
 
+#[cfg(feature = "sevenz")]
+pub(crate) mod bcj;
+#[cfg(feature = "sevenz")]
+pub(crate) mod delta;
 pub mod gzip;
 #[cfg(all(feature = "lz4", not(feature = "native-codecs")))]
 pub(crate) mod lz4;

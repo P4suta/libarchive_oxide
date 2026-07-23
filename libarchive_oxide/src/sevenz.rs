@@ -6,12 +6,12 @@
 //!
 //! Readers parse every folder's full coder graph (any number of coders, bind
 //! pairs, and packed streams) so listing works for any archive. Decoding is
-//! limited to linear LZMA2/LZMA chains over a single pack stream: a folder built
-//! that way streams normally, while richer graphs (BCJ2, `PPMd`, multi-coder
-//! filter chains) list but report `Unsupported` on extraction. Exactly one
-//! folder decode chain is live at a time, so memory stays bounded regardless of
-//! folder count. Writers still emit a single solid LZMA2 folder. BCJ, delta, and
-//! AES decode are not yet implemented.
+//! limited to linear chains over a single pack stream whose coders are each
+//! LZMA2/LZMA or a decode-only byte filter (delta, BCJ): such a folder streams
+//! normally, while richer graphs (BCJ2, `PPMd`, multi-pack) list but report
+//! `Unsupported` on extraction. Exactly one folder decode chain is live at a
+//! time, so memory stays bounded regardless of folder count. Writers still emit
+//! a single solid LZMA2 folder. AES decode is not yet implemented.
 
 use std::io::{Read, Seek, SeekFrom, Take, Write};
 
@@ -20,6 +20,9 @@ use libarchive_oxide_core::{
     Extension, Limits, Owner, PathEncoding, Timestamp,
 };
 
+use crate::codec_read::CodecReader;
+use crate::filter::bcj::{BcjDecoder, BranchKind};
+use crate::filter::delta::DeltaDecoder;
 use crate::{ReaderEvent, StreamError};
 
 type Result<T> = core::result::Result<T, HeaderError>;
@@ -65,6 +68,24 @@ const K_START_POS: u8 = 0x18;
 const METHOD_LZMA2: u8 = 0x21;
 /// LZMA (v1) coder method id (3 bytes) — how mainstream 7-Zip compresses encoded headers and folders.
 const METHOD_LZMA: [u8; 3] = [0x03, 0x01, 0x01];
+/// Delta filter coder method id (1 byte); its single property byte is `distance - 1`.
+const METHOD_DELTA: u8 = 0x03;
+/// BCJ x86 filter coder method id.
+const METHOD_BCJ_X86: [u8; 4] = [0x03, 0x03, 0x01, 0x03];
+/// BCJ PowerPC filter coder method id.
+const METHOD_BCJ_PPC: [u8; 4] = [0x03, 0x03, 0x02, 0x05];
+/// BCJ IA-64 filter coder method id.
+const METHOD_BCJ_IA64: [u8; 4] = [0x03, 0x03, 0x04, 0x01];
+/// BCJ ARM filter coder method id.
+const METHOD_BCJ_ARM: [u8; 4] = [0x03, 0x03, 0x05, 0x01];
+/// BCJ ARM-Thumb filter coder method id.
+const METHOD_BCJ_ARMT: [u8; 4] = [0x03, 0x03, 0x07, 0x01];
+/// BCJ SPARC filter coder method id.
+const METHOD_BCJ_SPARC: [u8; 4] = [0x03, 0x03, 0x08, 0x05];
+/// BCJ ARM64 filter coder method id (1 byte).
+const METHOD_BCJ_ARM64: u8 = 0x0A;
+/// BCJ RISC-V filter coder method id (1 byte).
+const METHOD_BCJ_RISCV: u8 = 0x0B;
 
 /// `FILE_ATTRIBUTE_DIRECTORY`.
 const ATTR_DIRECTORY: u32 = 0x10;
@@ -87,17 +108,29 @@ const WRITER_PRESET: u32 = 6;
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 /// One coder's decode method as parsed from a folder graph. Decoding supports LZMA2 (what this
-/// crate writes) and plain LZMA (what 7-Zip and `sevenz-rust2` use for compressed/encoded headers
-/// and folders). Every other method id (BCJ, delta, `PPMd`, Deflate, `BZip2`, Zstd, BCJ2, …) parses
-/// into [`CoderMethod::Unsupported`] so listing works, but its payload cannot be decoded here.
+/// crate writes), plain LZMA (what 7-Zip and `sevenz-rust2` use for compressed/encoded headers and
+/// folders), and the decode-only delta and BCJ byte filters. Every other method id (`PPMd`,
+/// Deflate, `BZip2`, Zstd, BCJ2, …) parses into [`CoderMethod::Unsupported`] so listing works, but
+/// its payload cannot be decoded here.
 #[derive(Debug, Clone, Copy)]
 enum CoderMethod {
     /// LZMA2, carrying its one-byte dictionary-size property.
     Lzma2 { dict_prop: u8 },
     /// LZMA (v1), carrying its 5 property bytes: `lc/lp/pb` byte + little-endian `u32` dict size.
     Lzma { props: [u8; 5] },
+    /// A decode-only byte-to-byte filter (delta or BCJ) applied after its inner coder.
+    Filter(SevenFilter),
     /// A coder whose metadata can be listed but whose payload cannot be decoded.
     Unsupported,
+}
+
+/// A 7z transform filter that decodes in place after the coder feeding it.
+#[derive(Debug, Clone, Copy)]
+enum SevenFilter {
+    /// Delta filter with a byte `distance` in `1..=256`.
+    Delta { distance: usize },
+    /// Branch/Call/Jump filter for a given instruction family, with a running start position.
+    Bcj { kind: BranchKind, start: usize },
 }
 
 /// One coder in a folder's graph, with its input/output stream arity.
@@ -428,8 +461,9 @@ impl HeaderParser {
 
 /// One stage of a folder's decode chain, recursively wrapping the stage below it. The innermost
 /// stage is the raw pack stream (`Source`); each coder in the folder's decode order wraps the
-/// stage below with its own reader, keeping dispatch static (no trait objects). Only LZMA/LZMA2
-/// stages exist today; a folder is built as a chain only when it is a linear LZMA/LZMA2 graph.
+/// stage below with its own reader, keeping dispatch static (no trait objects). Stages are
+/// LZMA/LZMA2 coders or decode-only byte filters (delta, BCJ); a folder is built as a chain only
+/// when it is a linear graph of such coders over one pack stream.
 enum SevenStage<R> {
     /// The base pack stream, bounded to the folder's packed bytes.
     Source(Take<R>),
@@ -437,6 +471,10 @@ enum SevenStage<R> {
     Lzma2(Box<lzma_rust2::Lzma2Reader<SevenStage<R>>>),
     /// An LZMA (v1) coder reading the stage below.
     Lzma(Box<lzma_rust2::LzmaReader<SevenStage<R>>>),
+    /// A delta decode filter reading the stage below.
+    Delta(Box<CodecReader<SevenStage<R>, DeltaDecoder>>),
+    /// A BCJ decode filter reading the stage below.
+    Bcj(Box<CodecReader<SevenStage<R>, BcjDecoder>>),
 }
 
 enum SevenInput<R> {
@@ -451,6 +489,8 @@ impl<R: Read> SevenStage<R> {
             Self::Source(take) => take.get_ref(),
             Self::Lzma2(reader) => reader.inner().source_ref(),
             Self::Lzma(reader) => reader.inner().source_ref(),
+            Self::Delta(reader) => reader.get_ref().source_ref(),
+            Self::Bcj(reader) => reader.get_ref().source_ref(),
         }
     }
 
@@ -460,6 +500,8 @@ impl<R: Read> SevenStage<R> {
             Self::Source(take) => take.into_inner(),
             Self::Lzma2(reader) => reader.into_inner().into_source(),
             Self::Lzma(reader) => reader.into_inner().into_source(),
+            Self::Delta(reader) => reader.into_inner().into_source(),
+            Self::Bcj(reader) => reader.into_inner().into_source(),
         }
     }
 }
@@ -487,6 +529,8 @@ impl<R: Read> Read for SevenStage<R> {
             Self::Source(take) => take.read(output),
             Self::Lzma2(reader) => reader.read(output),
             Self::Lzma(reader) => reader.read(output),
+            Self::Delta(reader) => reader.read(output),
+            Self::Bcj(reader) => reader.read(output),
         }
     }
 }
@@ -1227,6 +1271,12 @@ fn wrap_coder<R: Read>(
                 .map_err(|_| seven_error(ErrorKind::Malformed, "LZMA decoder setup failed"))?,
             )))
         },
+        CoderMethod::Filter(SevenFilter::Delta { distance }) => Ok(SevenStage::Delta(Box::new(
+            CodecReader::new(inner, DeltaDecoder::new(distance), "7z-delta"),
+        ))),
+        CoderMethod::Filter(SevenFilter::Bcj { kind, start }) => Ok(SevenStage::Bcj(Box::new(
+            CodecReader::new(inner, BcjDecoder::new(kind, start), "7z-bcj"),
+        ))),
         CoderMethod::Unsupported => Err(seven_error(
             ErrorKind::Unsupported,
             "payload coder is unsupported",
@@ -1604,8 +1654,48 @@ fn classify_method(codec: &[u8], props: &[u8]) -> Result<CoderMethod> {
         let mut p = [0u8; 5];
         p.copy_from_slice(props);
         Ok(CoderMethod::Lzma { props: p })
+    } else if codec == [METHOD_DELTA] {
+        // The delta filter stores one property byte: `distance - 1`. An absent
+        // property (rare) means distance 1; any other length is not a valid delta.
+        let distance = match props {
+            [] => 1,
+            [prop] => usize::from(*prop) + 1,
+            _ => return Ok(CoderMethod::Unsupported),
+        };
+        Ok(CoderMethod::Filter(SevenFilter::Delta { distance }))
+    } else if let Some(kind) = bcj_branch_kind(codec) {
+        // BCJ filters carry either no property or a 4-byte little-endian start offset.
+        let start = match props {
+            [] => 0,
+            [a, b, c, d] => usize_of(u64::from(u32::from_le_bytes([*a, *b, *c, *d])))?,
+            _ => return Ok(CoderMethod::Unsupported),
+        };
+        Ok(CoderMethod::Filter(SevenFilter::Bcj { kind, start }))
     } else {
         Ok(CoderMethod::Unsupported)
+    }
+}
+
+/// Maps a BCJ coder method id onto its [`BranchKind`], or `None` if it is not a BCJ filter.
+fn bcj_branch_kind(codec: &[u8]) -> Option<BranchKind> {
+    if codec == METHOD_BCJ_X86 {
+        Some(BranchKind::X86)
+    } else if codec == METHOD_BCJ_ARM {
+        Some(BranchKind::Arm)
+    } else if codec == METHOD_BCJ_ARMT {
+        Some(BranchKind::ArmThumb)
+    } else if codec == [METHOD_BCJ_ARM64] {
+        Some(BranchKind::Arm64)
+    } else if codec == METHOD_BCJ_PPC {
+        Some(BranchKind::Ppc)
+    } else if codec == METHOD_BCJ_SPARC {
+        Some(BranchKind::Sparc)
+    } else if codec == METHOD_BCJ_IA64 {
+        Some(BranchKind::Ia64)
+    } else if codec == [METHOD_BCJ_RISCV] {
+        Some(BranchKind::RiscV)
+    } else {
+        None
     }
 }
 
