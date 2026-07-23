@@ -12,7 +12,7 @@ use compression_codecs::Encode;
 use compression_codecs::core::util::PartialBuffer;
 use libarchive_oxide_core::{
     ArchiveEncoder, ArchiveError, ArchiveMetadata, EncodeCommand, EncodeStatus, EncodeStep,
-    EntryKind, EntryMetadata, ErrorKind, Limits, PathEncoding, Timestamp,
+    EntryKind, EntryMetadata, EntryTimes, ErrorKind, Limits, Owner, PathEncoding, Timestamp,
 };
 use miniz_oxide::deflate::core::{CompressorOxide, create_comp_flags_from_zip_params};
 use miniz_oxide::deflate::stream::deflate;
@@ -30,6 +30,14 @@ const ZIP64_EOCD_SIGNATURE: u32 = 0x0606_4b50;
 const ZIP64_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
 const ZIP64_EXTRA: u16 = 0x0001;
 const AES_EXTRA: u16 = 0x9901;
+/// Info-ZIP Extended Timestamp extra field (`UT`).
+const EXTENDED_TIMESTAMP_EXTRA: u16 = 0x5455;
+/// NTFS timestamps extra field (0x000a): also carries modification/access/change times.
+const NTFS_TIMESTAMP_EXTRA: u16 = 0x000a;
+/// Info-ZIP New Unix extra field (`Ux`): numeric uid/gid.
+const INFOZIP_UNIX_NEW_EXTRA: u16 = 0x7855;
+/// Info-ZIP Unix extra field (`UX`): access/modification time (uid/gid live in the local header).
+const INFOZIP_UNIX_OLD_EXTRA: u16 = 0x5855;
 const U16_SENTINEL: u16 = u16::MAX;
 const U32_SENTINEL: u32 = u32::MAX;
 
@@ -438,7 +446,39 @@ impl ZipStreamEncoder {
             push_u16(&mut preserved_extra, value_length);
             preserved_extra.extend_from_slice(extension.value());
         }
-        let maximum_extra = usize::from(U16_SENTINEL) - if zip64_size { 20 } else { 0 };
+        // RM-308: emit structured extras derived from typed metadata (timestamps,
+        // Unix uid/gid) when the entry does not already carry an equivalent raw
+        // form, so a preserved-extra round trip never duplicates one. Reading
+        // promotes these ids to `EntryTimes`/`Owner` while also preserving their
+        // raw bytes, so a re-read entry keeps its original extra and no derived
+        // copy is appended; an entry created from typed metadata alone gains the
+        // structured form. The timestamp guard covers every raw field the reader
+        // promotes into `EntryTimes` — the Extended Timestamp itself, NTFS times,
+        // and the Info-ZIP `UX` times — so none of them re-synthesizes a 0x5455.
+        if !zip_extra_contains_id(&preserved_extra, EXTENDED_TIMESTAMP_EXTRA)
+            && !zip_extra_contains_id(&preserved_extra, NTFS_TIMESTAMP_EXTRA)
+            && !zip_extra_contains_id(&preserved_extra, INFOZIP_UNIX_OLD_EXTRA)
+        {
+            push_extended_timestamp(&mut preserved_extra, metadata.times());
+        }
+        if !zip_extra_contains_id(&preserved_extra, INFOZIP_UNIX_NEW_EXTRA)
+            && !zip_extra_contains_id(&preserved_extra, INFOZIP_UNIX_OLD_EXTRA)
+        {
+            push_infozip_unix(&mut preserved_extra, metadata.owner());
+        }
+        // Reserve room for the ZIP64 extended-information field in BOTH headers.
+        // The local header carries only the two sizes (20 bytes), but the central
+        // header can also carry the local-header offset when it is >= 4 GiB, so a
+        // size+offset entry needs 28 bytes there. Reserving only the local 20 let a
+        // maximal preserved-extra block push the central extra past the u16 length
+        // field, which `field_u16` would then clamp while the bytes were still
+        // written — an 8-byte desync corrupting the central directory. Reserve the
+        // larger of the two so the size check refuses the entry instead.
+        let offset_zip64 = self.offset >= u64::from(U32_SENTINEL);
+        let local_zip64_reserve = if zip64_size { 20 } else { 0 };
+        let central_zip64_reserve = zip64_extra_reserve(zip64_size, offset_zip64);
+        let maximum_extra =
+            usize::from(U16_SENTINEL) - local_zip64_reserve.max(central_zip64_reserve);
         if preserved_extra.len() > maximum_extra {
             return Err(Self::error(
                 ErrorKind::Limit,
@@ -1389,6 +1429,80 @@ fn push_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Reports whether an already-serialized ZIP extra buffer carries `wanted`.
+///
+/// `extra` is built by this writer from valid `(id, len, value)` triples, so the
+/// walk stays in bounds; a would-be overflow simply stops the scan.
+fn zip_extra_contains_id(extra: &[u8], wanted: u16) -> bool {
+    let mut cursor = 0;
+    while cursor + 4 <= extra.len() {
+        let id = u16::from_le_bytes([extra[cursor], extra[cursor + 1]]);
+        if id == wanted {
+            return true;
+        }
+        let length = usize::from(u16::from_le_bytes([extra[cursor + 2], extra[cursor + 3]]));
+        let Some(next) = cursor
+            .checked_add(4)
+            .and_then(|base| base.checked_add(length))
+        else {
+            return false;
+        };
+        cursor = next;
+    }
+    false
+}
+
+/// Appends an Info-ZIP Extended Timestamp (`UT`, 0x5455) built from `times`.
+///
+/// The flag byte marks which of modification/access/change times follow, each a
+/// signed 32-bit Unix second count. A time whose seconds do not fit `i32` is
+/// dropped rather than truncated; an all-empty field is not emitted.
+fn push_extended_timestamp(output: &mut Vec<u8>, times: EntryTimes) {
+    let mut flags = 0_u8;
+    let mut body = Vec::new();
+    for (bit, timestamp) in [
+        (0x01_u8, times.modified),
+        (0x02, times.accessed),
+        (0x04, times.changed),
+    ] {
+        if let Some(timestamp) = timestamp {
+            if let Ok(seconds) = i32::try_from(timestamp.secs) {
+                flags |= bit;
+                body.extend_from_slice(&seconds.to_le_bytes());
+            }
+        }
+    }
+    if flags == 0 {
+        return;
+    }
+    push_u16(output, EXTENDED_TIMESTAMP_EXTRA);
+    push_u16(output, field_u16(1 + body.len()));
+    output.push(flags);
+    output.extend_from_slice(&body);
+}
+
+/// Appends an Info-ZIP New Unix (`Ux`, 0x7855) field carrying numeric uid/gid.
+///
+/// Emitted only when both ids are present and fit the 16-bit form; an id that
+/// overflows `u16` is left unrepresented rather than silently wrapped. Info-ZIP's
+/// strict `Ux` form is empty in the central directory (uid/gid live only in the
+/// local header), but arca's seek reader indexes the central directory, so the
+/// uid/gid body is written into both headers to keep ownership recoverable from
+/// the central directory on an arca round trip. Independent readers that only
+/// expect the local form ignore the extra field for content.
+fn push_infozip_unix(output: &mut Vec<u8>, owner: &Owner) {
+    let (Some(uid), Some(gid)) = (owner.uid, owner.gid) else {
+        return;
+    };
+    let (Ok(uid), Ok(gid)) = (u16::try_from(uid), u16::try_from(gid)) else {
+        return;
+    };
+    push_u16(output, INFOZIP_UNIX_NEW_EXTRA);
+    push_u16(output, 4);
+    push_u16(output, uid);
+    push_u16(output, gid);
+}
+
 fn push_aes_extra(output: &mut Vec<u8>, real_method: u16) {
     push_u16(output, AES_EXTRA);
     push_u16(output, 7);
@@ -1398,10 +1512,56 @@ fn push_aes_extra(output: &mut Vec<u8>, real_method: u16) {
     push_u16(output, real_method);
 }
 
+/// Bytes a ZIP64 extended-information extra field occupies in the central
+/// directory: a 4-byte tag+size header plus one `u64` per selected field. The
+/// size flag covers both the uncompressed and compressed sizes (16 bytes); a
+/// local-header offset >= 4 GiB adds one more `u64` (8 bytes). Returns 0 when no
+/// ZIP64 field is written. Used to reserve extra-field headroom so a maximal
+/// preserved-extra block cannot overflow the u16 length field.
+fn zip64_extra_reserve(size_zip64: bool, offset_zip64: bool) -> usize {
+    if !size_zip64 && !offset_zip64 {
+        return 0;
+    }
+    let size_body = if size_zip64 { 16 } else { 0 };
+    let offset_body = if offset_zip64 { 8 } else { 0 };
+    4 + size_body + offset_body
+}
+
 fn field_u16(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(U16_SENTINEL)
 }
 
 fn field_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(U32_SENTINEL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{U16_SENTINEL, zip64_extra_reserve};
+
+    #[test]
+    fn zip64_extra_reserve_covers_every_field_combination() {
+        assert_eq!(zip64_extra_reserve(false, false), 0);
+        assert_eq!(zip64_extra_reserve(true, false), 20); // header + 2 sizes
+        assert_eq!(zip64_extra_reserve(false, true), 12); // header + offset
+        assert_eq!(zip64_extra_reserve(true, true), 28); // header + 2 sizes + offset
+    }
+
+    #[test]
+    fn maximum_extra_reserves_the_worst_case_zip64_field() {
+        // The extra-length budget must leave room for the LARGER of the local
+        // header's ZIP64 field (two sizes, 20 bytes) and the central header's
+        // (sizes plus the local-offset, up to 28 bytes), so a maximal preserved
+        // extra block can never push either header past the u16 extra-length field
+        // and desync it through a silent `field_u16` clamp.
+        for (size_zip64, offset_zip64) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let local = if size_zip64 { 20 } else { 0 };
+            let central = zip64_extra_reserve(size_zip64, offset_zip64);
+            let maximum_extra = usize::from(U16_SENTINEL) - local.max(central);
+            assert!(local + maximum_extra <= usize::from(U16_SENTINEL));
+            assert!(central + maximum_extra <= usize::from(U16_SENTINEL));
+        }
+    }
 }

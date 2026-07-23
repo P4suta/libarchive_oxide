@@ -43,6 +43,17 @@ change, or versioned release candidate is part of this snapshot.
 | XAR read-only provider | RM-305 | `libarchive_oxide/src/xar.rs`, `.../format.rs`, `.../provider.rs`, `.../seek_stream.rs` | `XarSeekReader`: big-endian header, zlib TOC bounded by `metadata_bytes`, a hand-rolled bounded XML pull-scanner over the `<file>` tree, stored + zlib (`x-gzip`) heap data; `x-bzip2`/unknown encodings are structured `Unsupported`; `FormatId::Xar`, decode-only |
 | CAB/XAR interop + adversarial evidence | RM-305 | `libarchive_oxide/tests/interop_cab_meta.rs`, `libarchive_oxide/tests/interop_xar_meta.rs`, `libarchive_oxide/tests/fixtures/{cab,xar}/PROVENANCE.md` | first-party in-code raw builders (independent DEFLATE/zlib via `flat2`) read back through the RM-301 harness; multi-file/nested/empty round trips plus unsupported-method and truncated-header structured-error negatives; a three-lens adversarial review with a verification pass |
 | Support-matrix CAB/XAR read-only rows | RM-305 | `docs/support-matrix.md` | CAB and XAR added to the archive-containers table as read-only seek providers; removed from the not-implemented list (RAR5/UDF remain, tracked by RM-306) |
+| RAR5/UDF/Deflate64 feasibility ADR | RM-306 | `docs/adr/0013-rar5-udf-deflate64-feasibility.md`, `docs/support-matrix.md` | Deflate64 read = go (adopt external pure-Rust `deflate64` behind the codec-provider boundary, follow-on slice) / write = won't-do; UDF read-only go (rev 1.02/1.50/2.01, follow-on); RAR5 deferred in its entirety (no clean-room pure-Rust decompressor); codec-deficit ledger + not-yet-implemented prose updated; no `src/` change, no dependency added |
+| Metadata-fidelity harness extension | RM-304 | `libarchive_oxide/tests/common/mod.rs` | additive `read_seq_with_arca` (sequential `ArchiveReader`), `MetaShape` (REAL kind + mode/uid/gid/mtime/link_target, no kind folding), `read_meta_seq_with_arca` / `read_meta_seek_with_arca`, `assert_producers_agree_seq`; the content-only `EntryShape` path is unchanged |
+| tar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_tar_meta.rs`, `libarchive_oxide/tests/fixtures/tar/PROVENANCE.md` | 3 producers (arca, `tar@0.4`, first-party raw ustar builder) × 2 consumers (arca sequential reader, `tar@0.4`); mode/uid/gid/mtime and symlink-target fidelity |
+| cpio producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_cpio_meta.rs`, `libarchive_oxide/tests/fixtures/cpio/PROVENANCE.md` | 3 producers (arca `newc`, first-party raw `newc`, first-party raw `odc` — genuinely distinct on-disk framings) × 2 consumers (arca, first-party raw `newc` parser); mode/uid/gid/mtime plus a typed hardlink pair (File payload + Hardlink alias) |
+| ar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_ar_meta.rs`, `libarchive_oxide/tests/fixtures/ar/PROVENANCE.md` | 3 producers (arca, `ar@0.9`, first-party raw `!<arch>` builder) × 2 consumers (arca, `ar@0.9`); mode/uid/gid/mtime (ar is flat regular-files-only, so no dir/symlink fidelity) |
+| ISO producer corpus + Rock Ridge metadata round trip | RM-304 | `libarchive_oxide/tests/interop_iso_meta.rs`, `libarchive_oxide/tests/fixtures/iso/PROVENANCE.md` | arca self round trip plus an external `xorriso`/`genisoimage`/`mkisofs` independent producer (graceful skip); Rock Ridge PX/TF/SL fidelity (mode/uid/gid/mtime + symlink target) through the seek reader |
+| ZIP Info-ZIP Unix uid/gid read | RM-308 | `libarchive_oxide/src/seek_stream.rs` | `zip_unix_owner` parses the Info-ZIP New Unix (0x7855) central body into `Owner` uid/gid; `zip_times` gains a 0x5855 (`UX`) access/modification-time arm. The central `UX` uid/gid trailer (a local-header layout) is deliberately not read to avoid a positional guess; both are bounded, structured-error walks reusing the shared `le16`/`.get()` guards |
+| ZIP Extended-Timestamp / Unix uid/gid write-back | RM-308 | `libarchive_oxide/src/zip_stream.rs` | `push_extended_timestamp` (0x5455) and `push_infozip_unix` (0x7855) synthesize extras from typed `EntryTimes`/`Owner`, guarded by `zip_extra_contains_id` so a preserved raw field is never duplicated; accounted against the metadata and extra-field budgets in both local and central headers |
+| ZIP extra structured-interpretation tests | RM-308 | `libarchive_oxide/tests/seek_stream_v2.rs` | typed-owner read, owner+timestamp round trip from typed metadata, no-duplicate preserved timestamp, and short-field no-misread |
+| ZIP extra 3x2 interop + metadata fidelity | RM-308 | `libarchive_oxide/tests/interop_zip_extra.rs` | three producers (arca from typed metadata, `zip@8.6.0`, raw builder embedding 0x7855/0x5455) × two consumers (arca, `zip@8.6.0`); asserts uid/gid/mtime fidelity through arca on both the raw producer and arca's own output; malformed/truncated extras stay covered by the existing `read_zip` fuzz target |
+| Support-matrix ZIP metadata update | RM-308 | `docs/support-matrix.md` | ZIP row records typed interpretation of Unicode/timestamp/Info-ZIP Unix extras and write synthesis |
 
 ## RM-301
 
@@ -257,6 +268,37 @@ change, or versioned release candidate is part of this snapshot.
   file is created, no new runtime dependency is added (`lzma-rust2` was already
   present via `xz`/`sevenz`), and the crate keeps `#![forbid(unsafe_code)]`.
 
+## RM-306
+
+- ADR-0013 (`docs/adr/0013-rar5-udf-deflate64-feasibility.md`) resolves the RAR5,
+  UDF, and Deflate64 feasibility questions RM-300 and ADR-0012 delegated here. It
+  is a feasibility-and-scope decision that lands no provider; each support-matrix
+  cell still flips only when its provider is implemented.
+- **Deflate64 (method 9):** read is a *go* via the external pure-Rust `deflate64`
+  decoder consumed behind the codec-provider boundary (satisfies the C-free
+  portable profile, keeps `#![forbid(unsafe_code)]` and bounded 64 KiB-window
+  decode), landing in a follow-on slice; write is a retired *won't-do* (no
+  pure-Rust encoder exists, demand is nil). This supersedes ADR-0012's
+  "Deflate64 (read + write)" deficit, now recorded as a write-only won't-do row.
+- **UDF:** a *go* for a scoped read-only in-tree pure-Rust provider (Phase 1:
+  revisions 1.02/1.50/2.01, AVDP → VDS → File Set Descriptor → ICB/File Entry →
+  FIDs/allocation descriptors), activated from the Volume Recognition Sequence
+  arca already parses for ISO 9660; write, VAT/sequential CD-R, sparable maps, and
+  UDF 2.50/2.60 metadata partitions are out of Phase-1 scope. ECMA-167 and OSTA
+  UDF specs are free public PDFs with only generic RAND boilerplate, recorded as a
+  low-but-nonzero tracked IP risk.
+- **RAR5:** legally defensible as an independent read-only decoder (RAR compression
+  is a trade secret, not a patent; the UnRAR license does not reach non-derived
+  code), but the provider is *deferred in its entirety*: no clean-room,
+  forbid(unsafe), pure-Rust RAR5 decompressor exists, FFI to C UnRAR is disqualified
+  by the portable profile, and a metadata-plus-Stored-only cut would read almost no
+  real archive (`.rar` in the wild is almost always compressed). Recorded as a
+  tracked deficit; decode-only / clean-room / nominative-naming constraints are
+  fixed for any future work.
+- RM-306 adds no runtime code and no dependency; it updates `docs/support-matrix.md`
+  (deficit ledger + not-yet-implemented prose) and is the RAR5/UDF provenance
+  appendix ADR-0011 reserved.
+
 ## RM-307
 
 - ADR-0012 (`docs/adr/0012-codec-capability-contract.md`) codifies the
@@ -346,6 +388,116 @@ change, or versioned release candidate is part of this snapshot.
   pass was run over both modules before commit. Per-format `PROVENANCE.md` registers
   the in-code raw builder and documents the external independent producers
   (makecab/gcab/cabextract for CAB; the `xar` CLI / `bsdtar --format=xar` for XAR).
+## RM-304
+
+- RM-304 lifts the RM-301 interoperability harness from content-only evidence to
+  metadata fidelity for the sequential and disc formats, and it is a test/corpus
+  slice: no `src/` runtime change. tar/cpio/ar already encode and decode their
+  metadata (see `libarchive_oxide-core/tests/protocol_v2.rs`); RM-304 proves it
+  through the high-level `ArchiveWriter`/`ArchiveReader` against independent
+  producers and consumers.
+- Harness extension (`tests/common/mod.rs`, additive — the content-only
+  `EntryShape` path is untouched): `read_seq_with_arca` reads tar/cpio/ar through
+  the non-seek `ArchiveReader` (the seek reader only indexes ZIP/ISO); `MetaShape`
+  preserves the REAL entry kind (Symlink/Hardlink are no longer folded to File) and
+  the typed mode/uid/gid/mtime/link-target; `read_meta_seq_with_arca` /
+  `read_meta_seek_with_arca` project an archive into path-sorted `MetaShape`s; and
+  `assert_producers_agree_seq` mirrors `assert_producers_agree` through the
+  sequential reader. Producers/consumers stay bare `fn` pointers, so `no-dyn` and
+  `#![forbid(unsafe_code)]` hold.
+- **tar**: three producers (arca, the `tar` crate at 0.4, and a first-party raw
+  ustar builder with a computed header checksum) agree on content through arca's
+  sequential reader, and arca's output is accepted by both arca and the `tar`
+  crate. Metadata fidelity asserts mode `0o640`, uid/gid, mtime, and a symlink
+  target survive both arca's own writer and the `tar` crate's — the strongest,
+  fully in-code slice.
+- **cpio**: three producers (arca `newc`, a first-party raw `newc`, and a
+  first-party raw `odc`) and two consumers (arca and a first-party raw `newc`
+  parser). Honesty note: no mature pure-Rust cpio *producer* crate exists, so the
+  third producer is a second first-party builder in a genuinely different on-disk
+  dialect (octal `odc` vs hex `newc`, no padding vs 4-byte alignment) rather than a
+  third-party crate — real on-disk-layout independence, not third-party-crate
+  independence. Metadata fidelity covers mode/uid/gid/mtime and a typed hardlink
+  pair (a payload-bearing File with `nlink=2` and its zero-size `Hardlink` alias
+  with a `link_target`). Crc and the binary dialects are covered by
+  `protocol_v2.rs`.
+- **ar**: three producers (arca, the `ar` crate at 0.9, and a first-party raw
+  `!<arch>` builder) and two consumers (arca and the `ar` crate). ar is flat
+  regular-files-only (no directory or symlink concept), so fidelity is mode (masked
+  to the low 12 bits on read)/uid/gid/mtime; names are kept short so all producers
+  stay on the byte-compatible short-name path (long BSD/GNU names are covered in
+  `protocol_v2.rs`).
+- **ISO**: producer independence is fundamentally narrower — there is no usable
+  pure-Rust independent ISO reader on every target (`iso9660` is a libcdio C
+  binding; `cdfs` needs FUSE), confirmed by `iso_differential.rs`. Content interop
+  is therefore an arca write → arca read self round trip, and the INDEPENDENT
+  producer is an external mastering tool (`xorriso`/`genisoimage`/`mkisofs`, `-R -J`)
+  that arca reads back, with a graceful skip when none is installed. Metadata
+  fidelity round-trips mode/uid/gid/mtime and a symlink target through arca's
+  DEFAULT Rock Ridge emission (PX/TF/SL, emitted unconditionally by `iso_stream.rs`
+  and auto-detected by the reader), read via the seek reader.
+- New dev-dependencies (test-only, no effect on the shipped crate's portable/C-free
+  profile): `tar = "0.4"` and `ar = "0.9"`, both pure-Rust independent
+  producers/consumers. Per-format `PROVENANCE.md` registries record each producer,
+  its independence, and the external-tool escape hatch for ISO.
+## RM-308
+
+- ZIP extra fields carry typed metadata the reader previously left opaque. Before
+  RM-308 the central-directory parser already promoted ZIP64 (0x0001), WinZip AES
+  (0x9901), Info-ZIP Unicode path/comment (0x7075/0x6375), and the Extended
+  Timestamp (0x5455) / NTFS (0x000a) fields into structured metadata, but the
+  Info-ZIP Unix uid/gid fields were left only as opaque `zip-extra` blobs. RM-308
+  adds `zip_unix_owner`, which parses the Info-ZIP New Unix (`Ux`, 0x7855) central
+  body into `Owner` uid/gid, and extends `zip_times` with an Info-ZIP Unix (`UX`,
+  0x5855) access/modification-time arm. Both are bounded single-purpose walks over
+  the extra buffer that reuse the shared `le16`/`.get()` truncation guards and
+  return a structured `Malformed` error rather than misreading a short or
+  overrunning field.
+- Owner surfacing is honestly scoped to the central directory the seek reader
+  indexes. Info-ZIP places `Ux`/`UX` uid/gid in the LOCAL header (the central `Ux`
+  body is empty and the central `UX` body is times-only), so a strict foreign
+  archive's uid/gid is preserved as raw extra but not surfaced as typed `Owner`;
+  the central `UX` uid/gid trailer is not read to avoid a positional guess. arca
+  writes uid/gid into the central directory so its own round trips keep ownership.
+  A local-header owner-hydration pass (mirroring the symlink-target hydration) is a
+  tracked follow-up if strict foreign-archive owner fidelity is needed.
+- The raw bytes of every extra remain preserved in the `zip-extra` namespace, so
+  the typed fields are an additive view and round trips stay byte-lossless — a
+  design that avoids the precision loss (NTFS 100 ns) and local/central-header
+  asymmetry that stripping-and-regenerating would introduce.
+- On write, `push_extended_timestamp` (0x5455) and `push_infozip_unix` (0x7855)
+  synthesize the extras from typed `EntryTimes`/`Owner` for entries created from
+  metadata alone (the previous writer emitted only a DOS 2-second modification
+  time). `zip_extra_contains_id` guards both so an entry that already carries an
+  equivalent raw form never gains a duplicate copy: the timestamp guard covers
+  every raw field the reader promotes into `EntryTimes` — the Extended Timestamp
+  (0x5455), NTFS (0x000a), and Info-ZIP `UX` (0x5855) — so a preserve round trip of
+  any of them stays byte-idempotent; the owner guard covers 0x7855 and 0x5855. A
+  uid/gid that overflows the 16-bit form is left unrepresented rather than silently
+  wrapped. The synthesized bytes are counted against the metadata and extra-field
+  budgets and appear identically in the local and central headers (emitted exactly
+  once, before both the local-header serialization and the move into the central
+  record).
+- `#![forbid(unsafe_code)]`, the `no-dyn` static-dispatch gate, and bounded memory
+  are all preserved: the new parsers and emitters are plain functions with no trait
+  object and no new dependency.
+- Evidence: `tests/seek_stream_v2.rs` adds a typed-owner read for 0x7855, a
+  times-only read for 0x5855, an owner+timestamp round trip synthesized purely from
+  typed metadata, a no-duplicate check for a preserved Extended Timestamp, a
+  no-second-synthesis check for preserved 0x5855/0x000a times, and a short-field
+  no-misread check. `tests/interop_zip_extra.rs` proves content interop across three
+  independent producers (arca from typed metadata, `zip@8.6.0`, and a raw builder
+  embedding 0x7855/0x5455 verbatim) and two consumers (arca, `zip@8.6.0`), asserts
+  uid/gid/mtime fidelity through arca for both the raw producer's and arca's own
+  output, and independently rescans arca's raw output bytes for the exact
+  synthesized 0x7855/0x5455 TLVs so a shared writer/reader convention error cannot
+  pass undetected. Malformed and truncated extras remain covered by the existing
+  `read_zip` fuzz target, which exercises the central-directory parse path.
+- A three-lens adversarial review (round-trip, bounds-safety, spec-interop) with an
+  independent verification pass was run over the diff before commit; its two
+  confirmed findings — a timestamp no-duplicate guard blind to 0x5855/0x000a, and a
+  central-vs-local uid/gid layout assumption — were fixed and their fixes are the
+  guard-widening and central-`UX`-uid/gid-suppression described above.
 
 ## Reproduced gates
 

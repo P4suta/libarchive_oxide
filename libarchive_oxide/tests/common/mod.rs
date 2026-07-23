@@ -30,8 +30,8 @@
 
 use std::io::Cursor;
 
-use libarchive_oxide::{ReaderEvent, SeekArchiveReader};
-use libarchive_oxide_core::EntryKind;
+use libarchive_oxide::{ArchiveReader, ReaderEvent, SeekArchiveReader};
+use libarchive_oxide_core::{EntryKind, EntryMetadata};
 
 /// Compression method WHERE OBSERVABLE. arca's reader decodes transparently and exposes no
 /// per-entry codec, so [`read_with_arca`] always yields `None`. `Some(..)` is set only by
@@ -216,6 +216,109 @@ pub fn read_with_arca(bytes: &[u8]) -> Vec<EntryShape> {
     }
 }
 
+/// (2b) Read a SEQUENTIAL archive (tar / cpio / ar) into content shapes via the
+/// non-seek [`ArchiveReader`]. `SeekArchiveReader` only indexes ZIP and ISO, so
+/// tar-family bytes need this reader. Usable directly as a [`ConsumerCase::decode`]
+/// field. `method` stays `None` (arca abstracts compression). Panics on arca error
+/// (test-only).
+#[track_caller]
+pub fn read_seq_with_arca(bytes: &[u8]) -> Vec<EntryShape> {
+    let mut reader = ArchiveReader::new(Cursor::new(bytes.to_vec()));
+    let mut out: Vec<EntryShape> = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Entry(meta) => out.push(EntryShape::new(
+                meta.path().as_bytes().to_vec(),
+                meta.kind(),
+                Vec::new(),
+            )),
+            ReaderEvent::Data(d) => out.last_mut().unwrap().push_data(d),
+            ReaderEvent::ArchiveMetadata(_) | ReaderEvent::EndEntry => {},
+            ReaderEvent::Done => return out,
+            _ => panic!("unexpected future reader event"),
+        }
+    }
+}
+
+/// A metadata projection read back from an archive for fidelity comparison
+/// (RM-304). Unlike [`EntryShape`] — which folds every non-directory kind to
+/// `File` and drops mode/owner/time/link metadata — this preserves the REAL entry
+/// kind and the typed metadata a format round-trips, so per-format tests can
+/// assert that mode, uid/gid, mtime, and symlink/hardlink targets survive a
+/// producer. Content is NOT carried here; content interop is [`EntryShape`]'s job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetaShape {
+    pub path: Vec<u8>,
+    pub kind: EntryKind,
+    pub mode: Option<u32>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+    pub mtime: Option<i64>,
+    pub link_target: Option<Vec<u8>>,
+}
+
+impl MetaShape {
+    /// Projects an arca `EntryMetadata` into the comparable subset, applying the
+    /// same one-trailing-slash directory normalization as [`EntryShape::new`].
+    pub fn from_metadata(meta: &EntryMetadata) -> Self {
+        let kind = meta.kind();
+        let mut path = meta.path().as_bytes().to_vec();
+        if kind == EntryKind::Dir && path.last() == Some(&b'/') {
+            path.pop();
+        }
+        Self {
+            path,
+            kind,
+            mode: meta.mode(),
+            uid: meta.owner().uid,
+            gid: meta.owner().gid,
+            mtime: meta.times().modified.map(|time| time.secs),
+            link_target: meta.link_target().map(|target| target.as_bytes().to_vec()),
+        }
+    }
+
+    /// The uid/gid pair, for terse assertions.
+    #[must_use]
+    pub fn owner(&self) -> (Option<u64>, Option<u64>) {
+        (self.uid, self.gid)
+    }
+}
+
+fn sorted_meta_by_path(mut v: Vec<MetaShape>) -> Vec<MetaShape> {
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    v
+}
+
+/// Reads metadata shapes from a SEQUENTIAL archive (tar / cpio / ar), path-sorted.
+#[track_caller]
+pub fn read_meta_seq_with_arca(bytes: &[u8]) -> Vec<MetaShape> {
+    let mut reader = ArchiveReader::new(Cursor::new(bytes.to_vec()));
+    let mut out = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Entry(meta) => out.push(MetaShape::from_metadata(&meta)),
+            ReaderEvent::Data(_) | ReaderEvent::ArchiveMetadata(_) | ReaderEvent::EndEntry => {},
+            ReaderEvent::Done => return sorted_meta_by_path(out),
+            _ => panic!("unexpected future reader event"),
+        }
+    }
+}
+
+/// Reads metadata shapes from a SEEK archive (ISO / ZIP), path-sorted.
+#[track_caller]
+pub fn read_meta_seek_with_arca(bytes: &[u8]) -> Vec<MetaShape> {
+    let mut reader = SeekArchiveReader::new(Cursor::new(bytes.to_vec())).unwrap();
+    let mut out = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Entry(meta) => out.push(MetaShape::from_metadata(&meta)),
+            ReaderEvent::Data(_) | ReaderEvent::ArchiveMetadata(_) | ReaderEvent::EndEntry => {},
+            ReaderEvent::Done => return sorted_meta_by_path(out),
+            _ => panic!("unexpected future reader event"),
+        }
+    }
+}
+
 /// (3) N-producer evidence (*"≥3 producers can be read"*, applied repeatedly). Every producer
 /// encodes the SAME `entries`; arca reads each output back and each read-back must equal the
 /// canonical shapes DERIVED from `entries` (source of truth → a shared bug in all producers cannot
@@ -233,6 +336,26 @@ pub fn assert_producers_agree(
     );
     for p in producers {
         let got = sorted_by_path(read_with_arca(&(p.encode)(entries)));
+        assert_eq!(got, expected, "producer {} disagreed", p.name);
+    }
+    expected
+}
+
+/// Sequential-format variant of [`assert_producers_agree`]: reads each producer's
+/// output back through the non-seek [`read_seq_with_arca`] (tar / cpio / ar).
+#[track_caller]
+pub fn assert_producers_agree_seq(
+    entries: &[LogicalEntry],
+    producers: &[ProducerCase],
+) -> Vec<EntryShape> {
+    let expected = sorted_by_path(
+        entries
+            .iter()
+            .map(|e| EntryShape::new(e.path.clone(), e.kind, e.content.clone()))
+            .collect(),
+    );
+    for p in producers {
+        let got = sorted_by_path(read_seq_with_arca(&(p.encode)(entries)));
         assert_eq!(got, expected, "producer {} disagreed", p.name);
     }
     expected

@@ -2660,11 +2660,12 @@ fn parse_zip_index<R: Read + Seek>(
             PathEncoding::Bytes
         };
         let times = zip_times(extra)?;
+        let owner = zip_unix_owner(extra)?;
         let mut builder =
             EntryMetadata::builder(kind, ArchivePath::from_encoded(name.to_vec(), encoding))
                 .size(Some(uncompressed_size))
                 .mode((unix_mode != 0).then_some(unix_mode & 0o7777))
-                .owner(Owner::default())
+                .owner(owner)
                 .encrypted(flags & 0x0001 != 0)
                 .comment((!comment.is_empty()).then(|| comment.to_vec()))
                 .times(times);
@@ -3125,6 +3126,26 @@ fn zip_times(extra: &[u8]) -> Result<EntryTimes, StreamError> {
             0x000a if value.len() >= 4 => {
                 parse_ntfs_times(&value[4..], &mut times)?;
             },
+            0x5855 if value.len() >= 8 => {
+                if let Some(bytes) = value
+                    .get(0..4)
+                    .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+                {
+                    times.accessed = Some(Timestamp {
+                        secs: i64::from(i32::from_le_bytes(bytes)),
+                        nanos: 0,
+                    });
+                }
+                if let Some(bytes) = value
+                    .get(4..8)
+                    .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+                {
+                    times.modified = Some(Timestamp {
+                        secs: i64::from(i32::from_le_bytes(bytes)),
+                        nanos: 0,
+                    });
+                }
+            },
             _ => {},
         }
         cursor = finish;
@@ -3137,6 +3158,49 @@ fn zip_times(extra: &[u8]) -> Result<EntryTimes, StreamError> {
         ));
     }
     Ok(times)
+}
+
+/// Parses Info-ZIP numeric uid/gid from the central-directory extra fields.
+///
+/// Only the New Unix field (`Ux`, 0x7855) is read for ownership: when its body is
+/// present it is `uid`(2), `gid`(2). The older Unix field (`UX`, 0x5855) is *not*
+/// read for uid/gid here — its central-directory form is defined as access and
+/// modification times only (uid/gid appear only in the local header), so reading
+/// bytes 8..12 of a central `UX` field would be a positional guess; those times
+/// are surfaced by [`zip_times`] instead. Truncated fields are structured errors;
+/// absent fields leave the id unset. Info-ZIP archives that place uid/gid solely
+/// in the local header are not surfaced by this central-directory reader (the raw
+/// fields are still preserved); arca records uid/gid in the central directory on
+/// write so its own round trips keep ownership. [`zip_times`] runs first and
+/// rejects a malformed extra header before this parser is reached.
+fn zip_unix_owner(extra: &[u8]) -> Result<Owner, StreamError> {
+    let mut owner = Owner::default();
+    let mut cursor = 0;
+    while cursor + 4 <= extra.len() {
+        let id = le16(extra, cursor)?;
+        let length = usize::from(le16(extra, cursor + 2)?);
+        let start = cursor + 4;
+        let finish = start.checked_add(length).ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context("Unix extra field length overflow"),
+            )
+        })?;
+        let value = extra.get(start..finish).ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context("truncated Unix extra field"),
+            )
+        })?;
+        if id == 0x7855 && value.len() >= 4 {
+            owner.uid = Some(u64::from(le16(value, 0)?));
+            owner.gid = Some(u64::from(le16(value, 2)?));
+        }
+        cursor = finish;
+    }
+    Ok(owner)
 }
 
 fn parse_ntfs_times(mut tags: &[u8], times: &mut EntryTimes) -> Result<(), StreamError> {
