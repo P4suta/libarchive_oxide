@@ -39,6 +39,11 @@ change, or versioned release candidate is part of this snapshot.
 | ZIP LZMA (method 14) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Lzma` + `lzma_rust2::LzmaWriter::new_no_header` (raw LZMA1, EOS marker) drained through an in-crate `VecSink` (no trait object, `#![forbid(unsafe_code)]` intact); pinned preset 6 (props 93, 8 MiB dict); emits the 9-byte ZIP-LZMA header once at entry start; general-purpose bit 1 (`0x0002`) set in local+central flags outside the `0x0809` cross-check mask; version-needed 63 |
 | ZIP LZMA interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_lzma.rs`, `libarchive_oxide/tests/seek_stream_v2.rs`, `libarchive_oxide/tests/fixtures/zip/python-lzma/` | three producers (arca + first-party raw-LZMA1 builder, both `lzma-rust2`; + committed CPython 3.14.6/liblzma fixture, independent codec) × two consumers (arca, `zip@8.6.0` with `lzma`); WRITE evidence = the `zip` crate decodes arca's method-14 output byte-identically; round-trip, empty-member, truncation, bad-property-size, bomb, and feature-off Unsupported tests; the committed fixture + `generate.py` are byte-reproducible (SHA-256 recorded in `PROVENANCE.md`) |
 | Support-matrix + PROVENANCE ZIP LZMA update | RM-302 | `docs/support-matrix.md`, `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md` | ZIP row adds LZMA to Read and Write; the not-yet-implemented note now lists ONLY Deflate64; PROVENANCE records the committed-fixture escape hatch and the two-independent-codecs honesty note |
+| Metadata-fidelity harness extension | RM-304 | `libarchive_oxide/tests/common/mod.rs` | additive `read_seq_with_arca` (sequential `ArchiveReader`), `MetaShape` (REAL kind + mode/uid/gid/mtime/link_target, no kind folding), `read_meta_seq_with_arca` / `read_meta_seek_with_arca`, `assert_producers_agree_seq`; the content-only `EntryShape` path is unchanged |
+| tar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_tar_meta.rs`, `libarchive_oxide/tests/fixtures/tar/PROVENANCE.md` | 3 producers (arca, `tar@0.4`, first-party raw ustar builder) × 2 consumers (arca sequential reader, `tar@0.4`); mode/uid/gid/mtime and symlink-target fidelity |
+| cpio producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_cpio_meta.rs`, `libarchive_oxide/tests/fixtures/cpio/PROVENANCE.md` | 3 producers (arca `newc`, first-party raw `newc`, first-party raw `odc` — genuinely distinct on-disk framings) × 2 consumers (arca, first-party raw `newc` parser); mode/uid/gid/mtime plus a typed hardlink pair (File payload + Hardlink alias) |
+| ar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_ar_meta.rs`, `libarchive_oxide/tests/fixtures/ar/PROVENANCE.md` | 3 producers (arca, `ar@0.9`, first-party raw `!<arch>` builder) × 2 consumers (arca, `ar@0.9`); mode/uid/gid/mtime (ar is flat regular-files-only, so no dir/symlink fidelity) |
+| ISO producer corpus + Rock Ridge metadata round trip | RM-304 | `libarchive_oxide/tests/interop_iso_meta.rs`, `libarchive_oxide/tests/fixtures/iso/PROVENANCE.md` | arca self round trip plus an external `xorriso`/`genisoimage`/`mkisofs` independent producer (graceful skip); Rock Ridge PX/TF/SL fidelity (mode/uid/gid/mtime + symlink target) through the seek reader |
 | ZIP Info-ZIP Unix uid/gid read | RM-308 | `libarchive_oxide/src/seek_stream.rs` | `zip_unix_owner` parses the Info-ZIP New Unix (0x7855) central body into `Owner` uid/gid; `zip_times` gains a 0x5855 (`UX`) access/modification-time arm. The central `UX` uid/gid trailer (a local-header layout) is deliberately not read to avoid a positional guess; both are bounded, structured-error walks reusing the shared `le16`/`.get()` guards |
 | ZIP Extended-Timestamp / Unix uid/gid write-back | RM-308 | `libarchive_oxide/src/zip_stream.rs` | `push_extended_timestamp` (0x5455) and `push_infozip_unix` (0x7855) synthesize extras from typed `EntryTimes`/`Owner`, guarded by `zip_extra_contains_id` so a preserved raw field is never duplicated; accounted against the metadata and extra-field budgets in both local and central headers |
 | ZIP extra structured-interpretation tests | RM-308 | `libarchive_oxide/tests/seek_stream_v2.rs` | typed-owner read, owner+timestamp round trip from typed metadata, no-duplicate preserved timestamp, and short-field no-misread |
@@ -292,6 +297,58 @@ change, or versioned release candidate is part of this snapshot.
   architecture-and-documentation slice establishing the contract that RM-302..306
   and future codec work inherit.
 
+## RM-304
+
+- RM-304 lifts the RM-301 interoperability harness from content-only evidence to
+  metadata fidelity for the sequential and disc formats, and it is a test/corpus
+  slice: no `src/` runtime change. tar/cpio/ar already encode and decode their
+  metadata (see `libarchive_oxide-core/tests/protocol_v2.rs`); RM-304 proves it
+  through the high-level `ArchiveWriter`/`ArchiveReader` against independent
+  producers and consumers.
+- Harness extension (`tests/common/mod.rs`, additive — the content-only
+  `EntryShape` path is untouched): `read_seq_with_arca` reads tar/cpio/ar through
+  the non-seek `ArchiveReader` (the seek reader only indexes ZIP/ISO); `MetaShape`
+  preserves the REAL entry kind (Symlink/Hardlink are no longer folded to File) and
+  the typed mode/uid/gid/mtime/link-target; `read_meta_seq_with_arca` /
+  `read_meta_seek_with_arca` project an archive into path-sorted `MetaShape`s; and
+  `assert_producers_agree_seq` mirrors `assert_producers_agree` through the
+  sequential reader. Producers/consumers stay bare `fn` pointers, so `no-dyn` and
+  `#![forbid(unsafe_code)]` hold.
+- **tar**: three producers (arca, the `tar` crate at 0.4, and a first-party raw
+  ustar builder with a computed header checksum) agree on content through arca's
+  sequential reader, and arca's output is accepted by both arca and the `tar`
+  crate. Metadata fidelity asserts mode `0o640`, uid/gid, mtime, and a symlink
+  target survive both arca's own writer and the `tar` crate's — the strongest,
+  fully in-code slice.
+- **cpio**: three producers (arca `newc`, a first-party raw `newc`, and a
+  first-party raw `odc`) and two consumers (arca and a first-party raw `newc`
+  parser). Honesty note: no mature pure-Rust cpio *producer* crate exists, so the
+  third producer is a second first-party builder in a genuinely different on-disk
+  dialect (octal `odc` vs hex `newc`, no padding vs 4-byte alignment) rather than a
+  third-party crate — real on-disk-layout independence, not third-party-crate
+  independence. Metadata fidelity covers mode/uid/gid/mtime and a typed hardlink
+  pair (a payload-bearing File with `nlink=2` and its zero-size `Hardlink` alias
+  with a `link_target`). Crc and the binary dialects are covered by
+  `protocol_v2.rs`.
+- **ar**: three producers (arca, the `ar` crate at 0.9, and a first-party raw
+  `!<arch>` builder) and two consumers (arca and the `ar` crate). ar is flat
+  regular-files-only (no directory or symlink concept), so fidelity is mode (masked
+  to the low 12 bits on read)/uid/gid/mtime; names are kept short so all producers
+  stay on the byte-compatible short-name path (long BSD/GNU names are covered in
+  `protocol_v2.rs`).
+- **ISO**: producer independence is fundamentally narrower — there is no usable
+  pure-Rust independent ISO reader on every target (`iso9660` is a libcdio C
+  binding; `cdfs` needs FUSE), confirmed by `iso_differential.rs`. Content interop
+  is therefore an arca write → arca read self round trip, and the INDEPENDENT
+  producer is an external mastering tool (`xorriso`/`genisoimage`/`mkisofs`, `-R -J`)
+  that arca reads back, with a graceful skip when none is installed. Metadata
+  fidelity round-trips mode/uid/gid/mtime and a symlink target through arca's
+  DEFAULT Rock Ridge emission (PX/TF/SL, emitted unconditionally by `iso_stream.rs`
+  and auto-detected by the reader), read via the seek reader.
+- New dev-dependencies (test-only, no effect on the shipped crate's portable/C-free
+  profile): `tar = "0.4"` and `ar = "0.9"`, both pure-Rust independent
+  producers/consumers. Per-format `PROVENANCE.md` registries record each producer,
+  its independence, and the external-tool escape hatch for ISO.
 ## RM-308
 
 - ZIP extra fields carry typed metadata the reader previously left opaque. Before
