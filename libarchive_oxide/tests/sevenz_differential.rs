@@ -155,6 +155,78 @@ fn arca_reads_sevenz_rust2_lzma_folder() {
     assert_eq!(got, expected);
 }
 
+/// Non-solid archives put every file in its own folder (its own pack stream and coder). `sevenz-rust2`
+/// produces exactly that when each entry is pushed with the singular `push_archive_entry`. arca must
+/// walk the resulting `Vec<Folder>`, activating one decoder at a time, and reproduce every file's
+/// bytes — the core of RM-303 step 1. Directory and empty-file entries (which carry no folder) are
+/// interleaved to confirm the file->folder mapping skips them correctly.
+#[test]
+fn arca_reads_sevenz_rust2_multi_folder() {
+    let a = b"alpha folder payload\n".to_vec();
+    let b = b"beta folder payload, repeated for compressibility\n".repeat(30);
+    let c = b"gamma folder payload with different bytes\n".repeat(12);
+
+    let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
+    // A directory and an empty file carry no content stream, so they never open a folder.
+    w.push_archive_entry::<&[u8]>(ArchiveEntry::new_directory("pkg"), None)
+        .unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("pkg/a.txt"), Some(a.as_slice()))
+        .unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("pkg/b.txt"), Some(b.as_slice()))
+        .unwrap();
+    w.push_archive_entry::<&[u8]>(ArchiveEntry::new_file("pkg/empty.txt"), None)
+        .unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("pkg/c.txt"), Some(c.as_slice()))
+        .unwrap();
+    let bytes = w.finish().unwrap().into_inner();
+
+    // Three distinct content files => three separate folders/blocks (non-solid).
+    let reader = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+        .expect("sevenz-rust2 opens its own multi-folder archive");
+    assert!(
+        !reader.archive().is_solid,
+        "push_archive_entry should produce a non-solid (multi-folder) archive"
+    );
+    assert!(
+        reader.archive().blocks.len() >= 3,
+        "expected one folder per content file, got {} folders",
+        reader.archive().blocks.len()
+    );
+
+    let got = read_with_arca(&bytes);
+    let expected = vec![
+        EntryShape::new(b"pkg".to_vec(), EntryKind::Dir, Vec::new()),
+        EntryShape::new(b"pkg/a.txt".to_vec(), EntryKind::File, a.clone()),
+        EntryShape::new(b"pkg/b.txt".to_vec(), EntryKind::File, b.clone()),
+        EntryShape::new(b"pkg/empty.txt".to_vec(), EntryKind::File, Vec::new()),
+        EntryShape::new(b"pkg/c.txt".to_vec(), EntryKind::File, c.clone()),
+    ];
+    assert_eq!(got, expected);
+}
+
+/// The same non-solid multi-folder shape, but with the plain-LZMA coder: each file is its own
+/// folder, so arca must tear down one `LzmaReader` and seek+build the next between entries.
+#[test]
+fn arca_reads_sevenz_rust2_multi_folder_lzma() {
+    let a = b"first lzma folder\n".repeat(8);
+    let b = b"second lzma folder, a good deal longer than the first\n".repeat(25);
+
+    let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
+    w.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::LZMA)]);
+    w.push_archive_entry(ArchiveEntry::new_file("a.bin"), Some(a.as_slice()))
+        .unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("b.bin"), Some(b.as_slice()))
+        .unwrap();
+    let bytes = w.finish().unwrap().into_inner();
+
+    let got = read_with_arca(&bytes);
+    let expected = vec![
+        EntryShape::new(b"a.bin".to_vec(), EntryKind::File, a.clone()),
+        EntryShape::new(b"b.bin".to_vec(), EntryKind::File, b.clone()),
+    ];
+    assert_eq!(got, expected);
+}
+
 /// A compressed (`kEncodedHeader`) next header is what mainstream 7-Zip / `sevenz-rust2` emit once an
 /// archive carries more than a trivial number of entries: `sevenz-rust2` LZMA-compresses the header
 /// whenever that shrinks it. Enough long, repetitive names force that path, so this archive lands on
