@@ -14,11 +14,33 @@ use libarchive_oxide_core::Codec;
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, CodecStatus, EndOfInput, ErrorKind, Limits};
 
+#[cfg(any(feature = "zstd", feature = "lz4"))]
+use crate::codec_read::CodecReader;
 #[cfg(not(feature = "native-codecs"))]
 use crate::filter::gzip::GzipEncoder;
 use crate::pipeline_codec::PipelineCodec;
 
 const BUFFER: usize = 64 * 1024;
+
+/// A bounded outer-filter reader: the shared [`CodecReader`] engine driving a [`PipelineCodec`].
+#[cfg(any(feature = "zstd", feature = "lz4"))]
+type PipelineRead<R> = CodecReader<R, PipelineCodec>;
+
+/// Builds a [`PipelineRead`] for an outer filter, constructing its [`PipelineCodec`] first.
+#[cfg(any(feature = "zstd", feature = "lz4"))]
+fn pipeline_reader<R: Read>(
+    input: R,
+    filter: FilterId,
+    limits: Limits,
+) -> io::Result<PipelineRead<R>> {
+    let name = match filter {
+        FilterId::Zstd => "zstd",
+        FilterId::Lz4 => "LZ4",
+        _ => "codec",
+    };
+    let codec = PipelineCodec::new(filter, limits).map_err(codec_archive_io)?;
+    Ok(CodecReader::new(input, codec, name))
+}
 
 /// Auto-detecting streaming input filter.
 ///
@@ -96,7 +118,7 @@ impl<R: Read> FilterReader<R> {
         if available.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
             #[cfg(feature = "zstd")]
             {
-                return PipelineRead::new(input, FilterId::Zstd, limits)
+                return pipeline_reader(input, FilterId::Zstd, limits)
                     .map(Box::new)
                     .map(FilterReaderInner::Zstd)
                     .map(|inner| Self {
@@ -130,7 +152,7 @@ impl<R: Read> FilterReader<R> {
         }
         if available.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
             #[cfg(feature = "lz4")]
-            return PipelineRead::new(input, FilterId::Lz4, limits)
+            return pipeline_reader(input, FilterId::Lz4, limits)
                 .map(Box::new)
                 .map(FilterReaderInner::Lz4)
                 .map(|inner| Self {
@@ -189,131 +211,6 @@ impl<R: Read> Read for PrefixReader<R> {
             return Ok(count);
         }
         self.input.read(output)
-    }
-}
-
-#[cfg(any(feature = "zstd", feature = "lz4"))]
-struct PipelineRead<R: Read> {
-    input: R,
-    decoder: PipelineCodec,
-    filter_name: &'static str,
-    buffer: Vec<u8>,
-    start: usize,
-    end: usize,
-    eof: bool,
-    done: bool,
-    failed: bool,
-}
-
-#[cfg(any(feature = "zstd", feature = "lz4"))]
-impl<R: Read> PipelineRead<R> {
-    fn new(input: R, filter: FilterId, limits: Limits) -> io::Result<Self> {
-        let filter_name = match filter {
-            FilterId::Zstd => "zstd",
-            FilterId::Lz4 => "LZ4",
-            _ => "codec",
-        };
-        Ok(Self {
-            input,
-            decoder: PipelineCodec::new(filter, limits).map_err(codec_archive_io)?,
-            filter_name,
-            buffer: vec![0; BUFFER],
-            start: 0,
-            end: 0,
-            eof: false,
-            done: false,
-            failed: false,
-        })
-    }
-
-    fn into_inner(self) -> R {
-        self.input
-    }
-
-    fn fill(&mut self) -> io::Result<()> {
-        if self.start != 0 {
-            self.buffer.copy_within(self.start..self.end, 0);
-            self.end -= self.start;
-            self.start = 0;
-        }
-        if self.end == self.buffer.len() || self.eof {
-            return Ok(());
-        }
-        let read = self.input.read(&mut self.buffer[self.end..])?;
-        if read == 0 {
-            self.eof = true;
-        } else {
-            self.end += read;
-        }
-        Ok(())
-    }
-
-    fn fail<T>(&mut self, error: io::Error) -> io::Result<T> {
-        self.failed = true;
-        Err(error)
-    }
-}
-
-#[cfg(any(feature = "zstd", feature = "lz4"))]
-impl<R: Read> Read for PipelineRead<R> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() || self.done {
-            return Ok(0);
-        }
-        if self.failed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} reader is in a failed state", self.filter_name),
-            ));
-        }
-        loop {
-            if self.start == self.end && !self.eof {
-                self.fill()?;
-            }
-            let input_length = self.end - self.start;
-            let end = if self.eof {
-                EndOfInput::End
-            } else {
-                EndOfInput::More
-            };
-            let step = match self
-                .decoder
-                .process(&self.buffer[self.start..self.end], output, end)
-                .and_then(|step| step.validate(input_length, output.len()))
-            {
-                Ok(step) => step,
-                Err(error) => return self.fail(codec_archive_io(error)),
-            };
-            self.start += step.consumed;
-            if step.produced != 0 {
-                return Ok(step.produced);
-            }
-            match step.status {
-                CodecStatus::Done => {
-                    self.done = true;
-                    return Ok(0);
-                },
-                CodecStatus::NeedInput if self.start == self.end && !self.eof => {
-                    self.fill()?;
-                },
-                CodecStatus::NeedOutput if step.consumed != 0 => {},
-                CodecStatus::NeedInput if self.eof => {
-                    return self.fail(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{} decoder requested input after the source ended",
-                            self.filter_name
-                        ),
-                    ));
-                },
-                _ => {
-                    return self.fail(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{} reader made no progress", self.filter_name),
-                    ));
-                },
-            }
-        }
     }
 }
 

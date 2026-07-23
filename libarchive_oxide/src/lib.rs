@@ -32,6 +32,8 @@ pub mod async_seek;
 #[cfg(feature = "async")]
 pub mod async_stream;
 mod cab;
+#[cfg(any(feature = "zstd", feature = "lz4"))]
+mod codec_read;
 pub mod create;
 pub mod engine;
 pub mod extractor;

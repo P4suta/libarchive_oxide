@@ -174,6 +174,19 @@ impl PipelineCodec {
     }
 }
 
+impl Codec for PipelineCodec {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> Result<CodecStep, ArchiveError> {
+        // Delegates to the inherent method (inherent resolution wins, so this does not recurse),
+        // letting `PipelineCodec` drive the generic `CodecReader<_, PipelineCodec>`.
+        PipelineCodec::process(self, input, output, end)
+    }
+}
+
 #[cfg(all(feature = "zstd", feature = "native-codecs"))]
 fn native_zstd_decoder(limits: Limits) -> Result<compression_codecs::ZstdDecoder, ArchiveError> {
     let Some(memory_limit) = limits.codec_memory() else {
