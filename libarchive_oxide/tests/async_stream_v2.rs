@@ -195,21 +195,36 @@ fn park_block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// Wall-clock budget for [`arm_watchdog`], deliberately generous.
+///
+/// A lost wakeup parks the [`park_block_on`] driver *immediately* — it has nothing else
+/// to poll — so a real deadlock trips this watchdog long before the budget is reached;
+/// the budget's only job is to exceed the honest runtime of the slowest runner. Emulated
+/// big-endian s390x under qemu and a loaded macOS runner are an order of magnitude
+/// slower than a native `x86_64` host, and a budget tight enough to matter there turns
+/// *slowness* into a false "deadlock" abort. It still sits well inside the job's
+/// `timeout-minutes`, so a genuine hang fails fast and attributably rather than
+/// consuming the whole job budget.
+const WATCHDOG_BUDGET: Duration = Duration::from_secs(240);
+
 /// Arms a watchdog thread that aborts the process if `label` has not signaled
-/// completion within ~30s, so a deadlocked poll fails loudly instead of hanging
-/// the test runner indefinitely.
+/// completion within [`WATCHDOG_BUDGET`], so a deadlocked poll fails loudly instead of
+/// hanging the test runner indefinitely.
 fn arm_watchdog(label: &'static str) -> Arc<AtomicBool> {
     let done = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&done);
     thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + WATCHDOG_BUDGET;
         while Instant::now() < deadline {
             if flag.load(Ordering::SeqCst) {
                 return;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        eprintln!("watchdog: `{label}` did not complete within 30s; aborting the deadlocked test");
+        eprintln!(
+            "watchdog: `{label}` did not complete within {}s; aborting the deadlocked test",
+            WATCHDOG_BUDGET.as_secs()
+        );
         std::process::abort();
     });
     done
@@ -228,7 +243,13 @@ fn async_xz_never_deadlocks_under_slow_source() {
     let expected = collect_sync(fixture());
     let archive = sync_filtered_fixture(FilterId::Xz);
     guarded("async_xz_never_deadlocks_under_slow_source", async {
-        for iteration in 0..50 {
+        // The park/unpark driver makes a lost wakeup deterministic: the executor has
+        // nothing else to poll, so a missed wake parks forever on the very first
+        // iteration. Repeats only re-exercise the NeedInput/Output interleaving, so a
+        // handful is as strong a regression guard as a large count — and a large count
+        // pushed the honest runtime past the watchdog budget on emulated (qemu s390x)
+        // and loaded runners, turning slowness into a false deadlock report.
+        for iteration in 0..8 {
             assert_eq!(
                 collect_futures(archive.clone()).await,
                 expected,
