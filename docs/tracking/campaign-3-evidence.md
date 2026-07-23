@@ -44,6 +44,11 @@ change, or versioned release candidate is part of this snapshot.
 | cpio producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_cpio_meta.rs`, `libarchive_oxide/tests/fixtures/cpio/PROVENANCE.md` | 3 producers (arca `newc`, first-party raw `newc`, first-party raw `odc` — genuinely distinct on-disk framings) × 2 consumers (arca, first-party raw `newc` parser); mode/uid/gid/mtime plus a typed hardlink pair (File payload + Hardlink alias) |
 | ar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_ar_meta.rs`, `libarchive_oxide/tests/fixtures/ar/PROVENANCE.md` | 3 producers (arca, `ar@0.9`, first-party raw `!<arch>` builder) × 2 consumers (arca, `ar@0.9`); mode/uid/gid/mtime (ar is flat regular-files-only, so no dir/symlink fidelity) |
 | ISO producer corpus + Rock Ridge metadata round trip | RM-304 | `libarchive_oxide/tests/interop_iso_meta.rs`, `libarchive_oxide/tests/fixtures/iso/PROVENANCE.md` | arca self round trip plus an external `xorriso`/`genisoimage`/`mkisofs` independent producer (graceful skip); Rock Ridge PX/TF/SL fidelity (mode/uid/gid/mtime + symlink target) through the seek reader |
+| ZIP Info-ZIP Unix uid/gid read | RM-308 | `libarchive_oxide/src/seek_stream.rs` | `zip_unix_owner` parses the Info-ZIP New Unix (0x7855) central body into `Owner` uid/gid; `zip_times` gains a 0x5855 (`UX`) access/modification-time arm. The central `UX` uid/gid trailer (a local-header layout) is deliberately not read to avoid a positional guess; both are bounded, structured-error walks reusing the shared `le16`/`.get()` guards |
+| ZIP Extended-Timestamp / Unix uid/gid write-back | RM-308 | `libarchive_oxide/src/zip_stream.rs` | `push_extended_timestamp` (0x5455) and `push_infozip_unix` (0x7855) synthesize extras from typed `EntryTimes`/`Owner`, guarded by `zip_extra_contains_id` so a preserved raw field is never duplicated; accounted against the metadata and extra-field budgets in both local and central headers |
+| ZIP extra structured-interpretation tests | RM-308 | `libarchive_oxide/tests/seek_stream_v2.rs` | typed-owner read, owner+timestamp round trip from typed metadata, no-duplicate preserved timestamp, and short-field no-misread |
+| ZIP extra 3x2 interop + metadata fidelity | RM-308 | `libarchive_oxide/tests/interop_zip_extra.rs` | three producers (arca from typed metadata, `zip@8.6.0`, raw builder embedding 0x7855/0x5455) × two consumers (arca, `zip@8.6.0`); asserts uid/gid/mtime fidelity through arca on both the raw producer and arca's own output; malformed/truncated extras stay covered by the existing `read_zip` fuzz target |
+| Support-matrix ZIP metadata update | RM-308 | `docs/support-matrix.md` | ZIP row records typed interpretation of Unicode/timestamp/Info-ZIP Unix extras and write synthesis |
 
 ## RM-301
 
@@ -344,6 +349,64 @@ change, or versioned release candidate is part of this snapshot.
   profile): `tar = "0.4"` and `ar = "0.9"`, both pure-Rust independent
   producers/consumers. Per-format `PROVENANCE.md` registries record each producer,
   its independence, and the external-tool escape hatch for ISO.
+## RM-308
+
+- ZIP extra fields carry typed metadata the reader previously left opaque. Before
+  RM-308 the central-directory parser already promoted ZIP64 (0x0001), WinZip AES
+  (0x9901), Info-ZIP Unicode path/comment (0x7075/0x6375), and the Extended
+  Timestamp (0x5455) / NTFS (0x000a) fields into structured metadata, but the
+  Info-ZIP Unix uid/gid fields were left only as opaque `zip-extra` blobs. RM-308
+  adds `zip_unix_owner`, which parses the Info-ZIP New Unix (`Ux`, 0x7855) central
+  body into `Owner` uid/gid, and extends `zip_times` with an Info-ZIP Unix (`UX`,
+  0x5855) access/modification-time arm. Both are bounded single-purpose walks over
+  the extra buffer that reuse the shared `le16`/`.get()` truncation guards and
+  return a structured `Malformed` error rather than misreading a short or
+  overrunning field.
+- Owner surfacing is honestly scoped to the central directory the seek reader
+  indexes. Info-ZIP places `Ux`/`UX` uid/gid in the LOCAL header (the central `Ux`
+  body is empty and the central `UX` body is times-only), so a strict foreign
+  archive's uid/gid is preserved as raw extra but not surfaced as typed `Owner`;
+  the central `UX` uid/gid trailer is not read to avoid a positional guess. arca
+  writes uid/gid into the central directory so its own round trips keep ownership.
+  A local-header owner-hydration pass (mirroring the symlink-target hydration) is a
+  tracked follow-up if strict foreign-archive owner fidelity is needed.
+- The raw bytes of every extra remain preserved in the `zip-extra` namespace, so
+  the typed fields are an additive view and round trips stay byte-lossless — a
+  design that avoids the precision loss (NTFS 100 ns) and local/central-header
+  asymmetry that stripping-and-regenerating would introduce.
+- On write, `push_extended_timestamp` (0x5455) and `push_infozip_unix` (0x7855)
+  synthesize the extras from typed `EntryTimes`/`Owner` for entries created from
+  metadata alone (the previous writer emitted only a DOS 2-second modification
+  time). `zip_extra_contains_id` guards both so an entry that already carries an
+  equivalent raw form never gains a duplicate copy: the timestamp guard covers
+  every raw field the reader promotes into `EntryTimes` — the Extended Timestamp
+  (0x5455), NTFS (0x000a), and Info-ZIP `UX` (0x5855) — so a preserve round trip of
+  any of them stays byte-idempotent; the owner guard covers 0x7855 and 0x5855. A
+  uid/gid that overflows the 16-bit form is left unrepresented rather than silently
+  wrapped. The synthesized bytes are counted against the metadata and extra-field
+  budgets and appear identically in the local and central headers (emitted exactly
+  once, before both the local-header serialization and the move into the central
+  record).
+- `#![forbid(unsafe_code)]`, the `no-dyn` static-dispatch gate, and bounded memory
+  are all preserved: the new parsers and emitters are plain functions with no trait
+  object and no new dependency.
+- Evidence: `tests/seek_stream_v2.rs` adds a typed-owner read for 0x7855, a
+  times-only read for 0x5855, an owner+timestamp round trip synthesized purely from
+  typed metadata, a no-duplicate check for a preserved Extended Timestamp, a
+  no-second-synthesis check for preserved 0x5855/0x000a times, and a short-field
+  no-misread check. `tests/interop_zip_extra.rs` proves content interop across three
+  independent producers (arca from typed metadata, `zip@8.6.0`, and a raw builder
+  embedding 0x7855/0x5455 verbatim) and two consumers (arca, `zip@8.6.0`), asserts
+  uid/gid/mtime fidelity through arca for both the raw producer's and arca's own
+  output, and independently rescans arca's raw output bytes for the exact
+  synthesized 0x7855/0x5455 TLVs so a shared writer/reader convention error cannot
+  pass undetected. Malformed and truncated extras remain covered by the existing
+  `read_zip` fuzz target, which exercises the central-directory parse path.
+- A three-lens adversarial review (round-trip, bounds-safety, spec-interop) with an
+  independent verification pass was run over the diff before commit; its two
+  confirmed findings — a timestamp no-duplicate guard blind to 0x5855/0x000a, and a
+  central-vs-local uid/gid layout assumption — were fixed and their fixes are the
+  guard-widening and central-`UX`-uid/gid-suppression described above.
 
 ## Reproduced gates
 

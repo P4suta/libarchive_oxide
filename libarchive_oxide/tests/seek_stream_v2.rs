@@ -574,6 +574,235 @@ fn zip_unicode_and_timestamp_extras_are_typed_and_preserved() {
     }
 }
 
+fn read_single_entry(archive: Vec<u8>) -> EntryMetadata {
+    let mut reader = SeekArchiveReader::new(Cursor::new(archive)).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    let ReaderEvent::Entry(metadata) = reader.next_event().unwrap() else {
+        panic!("ZIP entry expected");
+    };
+    metadata
+}
+
+#[test]
+fn zip_infozip_unix_extras_are_typed_as_owner() {
+    // Info-ZIP New Unix (0x7855): uid(2), gid(2).
+    let mut new_unix = Vec::new();
+    new_unix.extend_from_slice(&1000_u16.to_le_bytes());
+    new_unix.extend_from_slice(&1001_u16.to_le_bytes());
+    // Info-ZIP Unix (0x5855): AcTime(4), ModTime(4), UID(2), GID(2).
+    let mut old_unix = Vec::new();
+    old_unix.extend_from_slice(&77_i32.to_le_bytes());
+    old_unix.extend_from_slice(&88_i32.to_le_bytes());
+    old_unix.extend_from_slice(&2000_u16.to_le_bytes());
+    old_unix.extend_from_slice(&2001_u16.to_le_bytes());
+
+    let new_meta = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("new.txt"))
+        .size(Some(0))
+        .extension(Extension::new(
+            "zip-extra",
+            0x7855_u16.to_le_bytes().to_vec(),
+            new_unix,
+        ))
+        .build();
+    let mut writer =
+        ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Store, Limits::default());
+    writer.start_entry(&new_meta).unwrap();
+    writer.end_entry().unwrap();
+    let read = read_single_entry(writer.finish().unwrap());
+    assert_eq!(read.owner().uid, Some(1000));
+    assert_eq!(read.owner().gid, Some(1001));
+
+    let old_meta = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("old.txt"))
+        .size(Some(0))
+        .extension(Extension::new(
+            "zip-extra",
+            0x5855_u16.to_le_bytes().to_vec(),
+            old_unix,
+        ))
+        .build();
+    let mut writer =
+        ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Store, Limits::default());
+    writer.start_entry(&old_meta).unwrap();
+    writer.end_entry().unwrap();
+    let read = read_single_entry(writer.finish().unwrap());
+    // The Info-ZIP UX (0x5855) central form is access/modification time only; the
+    // uid/gid trailing this 12-byte body belong to the local-header layout and are
+    // deliberately NOT read from the central directory (avoids a positional guess).
+    assert_eq!(read.owner().uid, None);
+    assert_eq!(read.owner().gid, None);
+    assert_eq!(read.times().accessed.map(|value| value.secs), Some(77));
+    assert_eq!(read.times().modified.map(|value| value.secs), Some(88));
+}
+
+#[test]
+fn zip_preserved_time_extras_do_not_synthesize_a_second_timestamp() {
+    // A raw field that already carries access/modification times (Info-ZIP UX
+    // 0x5855, or NTFS 0x000a) must suppress the writer's synthesized Extended
+    // Timestamp (0x5455) even when typed times are also present, so a round trip
+    // never duplicates the timestamp payload across two extra fields.
+    for id in [0x5855_u16, 0x000a] {
+        let raw = if id == 0x5855 {
+            let mut ux = Vec::new();
+            ux.extend_from_slice(&55_i32.to_le_bytes());
+            ux.extend_from_slice(&66_i32.to_le_bytes());
+            ux
+        } else {
+            let mut ntfs = vec![0; 4];
+            ntfs.extend_from_slice(&1_u16.to_le_bytes());
+            ntfs.extend_from_slice(&24_u16.to_le_bytes());
+            for seconds in [66_i64, 55, 44] {
+                ntfs.extend_from_slice(&filetime(seconds).to_le_bytes());
+            }
+            ntfs
+        };
+        let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("t.txt"))
+            .size(Some(0))
+            .times(EntryTimes {
+                modified: Some(Timestamp { secs: 66, nanos: 0 }),
+                accessed: Some(Timestamp { secs: 55, nanos: 0 }),
+                ..EntryTimes::default()
+            })
+            .extension(Extension::new("zip-extra", id.to_le_bytes().to_vec(), raw))
+            .build();
+        let mut writer =
+            ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Store, Limits::default());
+        writer.start_entry(&metadata).unwrap();
+        writer.end_entry().unwrap();
+        let read = read_single_entry(writer.finish().unwrap());
+        assert!(
+            read.extensions()
+                .iter()
+                .any(|extension| extension.key() == id.to_le_bytes()),
+            "raw time-bearing extra {id:#06x} should be preserved"
+        );
+        assert!(
+            !read
+                .extensions()
+                .iter()
+                .any(|extension| extension.key() == 0x5455_u16.to_le_bytes()),
+            "no derived Extended Timestamp should be synthesized when {id:#06x} times exist"
+        );
+        assert_eq!(read.times().modified.map(|value| value.secs), Some(66));
+    }
+}
+
+#[test]
+fn zip_owner_and_timestamps_round_trip_as_derived_extras() {
+    // Typed metadata carries no raw extras; the writer must synthesize the
+    // Extended Timestamp (0x5455) and Info-ZIP New Unix (0x7855) fields, and the
+    // reader must surface them again.
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("typed.txt"))
+        .size(Some(4))
+        .owner(Owner {
+            uid: Some(4242),
+            gid: Some(2424),
+            ..Owner::default()
+        })
+        .times(EntryTimes {
+            modified: Some(Timestamp {
+                secs: 1_700_000_100,
+                nanos: 0,
+            }),
+            accessed: Some(Timestamp {
+                secs: 1_700_000_200,
+                nanos: 0,
+            }),
+            ..EntryTimes::default()
+        })
+        .build();
+    let mut writer =
+        ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Store, Limits::default());
+    writer.start_entry(&metadata).unwrap();
+    writer.write_data(b"body").unwrap();
+    writer.end_entry().unwrap();
+    let read = read_single_entry(writer.finish().unwrap());
+
+    assert_eq!(read.owner().uid, Some(4242));
+    assert_eq!(read.owner().gid, Some(2424));
+    assert_eq!(
+        read.times().modified.map(|value| value.secs),
+        Some(1_700_000_100)
+    );
+    assert_eq!(
+        read.times().accessed.map(|value| value.secs),
+        Some(1_700_000_200)
+    );
+    for id in [0x5455_u16, 0x7855] {
+        assert!(
+            read.extensions()
+                .iter()
+                .any(|extension| extension.key() == id.to_le_bytes()),
+            "derived extra {id:#06x} missing from round trip"
+        );
+    }
+}
+
+#[test]
+fn zip_preserved_extended_timestamp_is_not_duplicated() {
+    // An entry that already carries a raw Extended Timestamp must not gain a
+    // second, writer-synthesized copy even when typed times are also present.
+    let mut raw_timestamp = vec![0x01_u8];
+    raw_timestamp.extend_from_slice(&123_i32.to_le_bytes());
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("dup.txt"))
+        .size(Some(0))
+        .times(EntryTimes {
+            modified: Some(Timestamp {
+                secs: 999,
+                nanos: 0,
+            }),
+            ..EntryTimes::default()
+        })
+        .extension(Extension::new(
+            "zip-extra",
+            0x5455_u16.to_le_bytes().to_vec(),
+            raw_timestamp,
+        ))
+        .build();
+    let mut writer =
+        ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Store, Limits::default());
+    writer.start_entry(&metadata).unwrap();
+    writer.end_entry().unwrap();
+    let read = read_single_entry(writer.finish().unwrap());
+    let count = read
+        .extensions()
+        .iter()
+        .filter(|extension| extension.key() == 0x5455_u16.to_le_bytes())
+        .count();
+    assert_eq!(count, 1, "Extended Timestamp extra was duplicated");
+    // The preserved raw field wins: its modification time is 123, not the typed 999.
+    assert_eq!(read.times().modified.map(|value| value.secs), Some(123));
+}
+
+#[test]
+fn zip_short_infozip_unix_extra_is_not_misread() {
+    // A truncated New Unix field (2 bytes, below the 4-byte uid+gid form) must be
+    // ignored rather than silently misinterpreted into a bogus owner.
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("short.txt"))
+        .size(Some(0))
+        .extension(Extension::new(
+            "zip-extra",
+            0x7855_u16.to_le_bytes().to_vec(),
+            vec![0x2a, 0x00],
+        ))
+        .build();
+    let mut writer =
+        ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Store, Limits::default());
+    writer.start_entry(&metadata).unwrap();
+    writer.end_entry().unwrap();
+    let read = read_single_entry(writer.finish().unwrap());
+    assert_eq!(read.owner().uid, None);
+    assert_eq!(read.owner().gid, None);
+    // The unrecognized short field is still preserved verbatim.
+    assert!(
+        read.extensions()
+            .iter()
+            .any(|extension| extension.key() == 0x7855_u16.to_le_bytes())
+    );
+}
+
 #[test]
 fn zip_symlink_payload_is_exposed_as_a_typed_link_target() {
     let target = b"target/file.txt";
