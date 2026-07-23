@@ -86,6 +86,28 @@ pub trait Codec {
         output: &mut [u8],
         end: EndOfInput,
     ) -> Result<CodecStep, ArchiveError>;
+
+    /// Non-blocking, executor-safe drive used by async adapters.
+    ///
+    /// Unlike [`process`](Codec::process) this must never block the calling
+    /// thread. `Ok(None)` means "would block": the codec has arranged for
+    /// `waker` to be woken once it can make progress, and the caller should
+    /// return `Poll::Pending` and poll again after the wake. The default
+    /// delegates to [`process`](Codec::process), which is correct for every
+    /// codec that never blocks a caller — in-process pull decoders and codecs
+    /// that signal backpressure through [`CodecStatus`] rather than a blocking
+    /// wait. Only a codec that would otherwise block a thread (e.g. one backed
+    /// by a worker thread and a blocking channel) needs to override this.
+    fn poll_process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+        waker: &core::task::Waker,
+    ) -> Result<Option<CodecStep>, ArchiveError> {
+        let _ = waker;
+        self.process(input, output, end).map(Some)
+    }
 }
 
 /// A borrowed entry-data window.

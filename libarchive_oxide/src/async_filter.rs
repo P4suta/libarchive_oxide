@@ -247,11 +247,21 @@ impl<R: AsyncRead + Unpin> AsyncRead for AsyncCodecReader<R> {
             };
             let step = match this
                 .codec
-                .process(&this.compressed[this.start..this.end], output, end)
-                .and_then(|step| step.validate(input_length, output.len()))
+                .poll_process(
+                    &this.compressed[this.start..this.end],
+                    output,
+                    end,
+                    cx.waker(),
+                )
+                .transpose()
             {
-                Ok(step) => step,
-                Err(error) => return Poll::Ready(Err(archive_codec_error(error))),
+                Some(result) => {
+                    match result.and_then(|step| step.validate(input_length, output.len())) {
+                        Ok(step) => step,
+                        Err(error) => return Poll::Ready(Err(archive_codec_error(error))),
+                    }
+                },
+                None => return Poll::Pending,
             };
             this.start += step.consumed;
             if step.produced != 0 {

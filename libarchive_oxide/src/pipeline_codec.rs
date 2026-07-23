@@ -4,6 +4,9 @@
 
 //! Private static dispatch for caller-driven outer codecs.
 
+#[cfg(feature = "async")]
+use std::task::Waker;
+
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, Codec, CodecStep, EndOfInput, ErrorKind, Limits};
 
@@ -138,6 +141,35 @@ impl PipelineCodec {
             Self::Xz(codec) => codec.process(input, output, end),
             #[cfg(feature = "lz4")]
             Self::Lz4(codec) => codec.process(input, output, end),
+        }
+    }
+
+    /// Non-blocking mirror of [`process`](Self::process) for async adapters.
+    ///
+    /// Every variant inherits the blocking-delegating default except `Xz`,
+    /// which overrides [`Codec::poll_process`] to avoid parking the executor
+    /// thread on its worker channel.
+    #[cfg(feature = "async")]
+    pub(crate) fn poll_process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+        waker: &Waker,
+    ) -> Result<Option<CodecStep>, ArchiveError> {
+        match self {
+            #[cfg(feature = "native-codecs")]
+            Self::Gzip(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(not(feature = "native-codecs"))]
+            Self::Gzip(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "bzip2")]
+            Self::Bzip2(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "zstd")]
+            Self::Zstd(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "xz")]
+            Self::Xz(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "lz4")]
+            Self::Lz4(codec) => codec.poll_process(input, output, end, waker),
         }
     }
 }
