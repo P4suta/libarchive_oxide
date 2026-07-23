@@ -172,6 +172,8 @@ impl PipelineCodec {
             Self::Gzip(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(not(feature = "native-codecs"))]
             Self::Gzip(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "sevenz")]
+            Self::Deflate(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "bzip2")]
             Self::Bzip2(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "zstd")]
