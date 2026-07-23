@@ -438,7 +438,19 @@ impl ZipStreamEncoder {
             push_u16(&mut preserved_extra, value_length);
             preserved_extra.extend_from_slice(extension.value());
         }
-        let maximum_extra = usize::from(U16_SENTINEL) - if zip64_size { 20 } else { 0 };
+        // Reserve room for the ZIP64 extended-information field in BOTH headers.
+        // The local header carries only the two sizes (20 bytes), but the central
+        // header can also carry the local-header offset when it is >= 4 GiB, so a
+        // size+offset entry needs 28 bytes there. Reserving only the local 20 let a
+        // maximal preserved-extra block push the central extra past the u16 length
+        // field, which `field_u16` would then clamp while the bytes were still
+        // written — an 8-byte desync corrupting the central directory. Reserve the
+        // larger of the two so the size check refuses the entry instead.
+        let offset_zip64 = self.offset >= u64::from(U32_SENTINEL);
+        let local_zip64_reserve = if zip64_size { 20 } else { 0 };
+        let central_zip64_reserve = zip64_extra_reserve(zip64_size, offset_zip64);
+        let maximum_extra =
+            usize::from(U16_SENTINEL) - local_zip64_reserve.max(central_zip64_reserve);
         if preserved_extra.len() > maximum_extra {
             return Err(Self::error(
                 ErrorKind::Limit,
@@ -1398,10 +1410,56 @@ fn push_aes_extra(output: &mut Vec<u8>, real_method: u16) {
     push_u16(output, real_method);
 }
 
+/// Bytes a ZIP64 extended-information extra field occupies in the central
+/// directory: a 4-byte tag+size header plus one `u64` per selected field. The
+/// size flag covers both the uncompressed and compressed sizes (16 bytes); a
+/// local-header offset >= 4 GiB adds one more `u64` (8 bytes). Returns 0 when no
+/// ZIP64 field is written. Used to reserve extra-field headroom so a maximal
+/// preserved-extra block cannot overflow the u16 length field.
+fn zip64_extra_reserve(size_zip64: bool, offset_zip64: bool) -> usize {
+    if !size_zip64 && !offset_zip64 {
+        return 0;
+    }
+    let size_body = if size_zip64 { 16 } else { 0 };
+    let offset_body = if offset_zip64 { 8 } else { 0 };
+    4 + size_body + offset_body
+}
+
 fn field_u16(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(U16_SENTINEL)
 }
 
 fn field_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(U32_SENTINEL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{U16_SENTINEL, zip64_extra_reserve};
+
+    #[test]
+    fn zip64_extra_reserve_covers_every_field_combination() {
+        assert_eq!(zip64_extra_reserve(false, false), 0);
+        assert_eq!(zip64_extra_reserve(true, false), 20); // header + 2 sizes
+        assert_eq!(zip64_extra_reserve(false, true), 12); // header + offset
+        assert_eq!(zip64_extra_reserve(true, true), 28); // header + 2 sizes + offset
+    }
+
+    #[test]
+    fn maximum_extra_reserves_the_worst_case_zip64_field() {
+        // The extra-length budget must leave room for the LARGER of the local
+        // header's ZIP64 field (two sizes, 20 bytes) and the central header's
+        // (sizes plus the local-offset, up to 28 bytes), so a maximal preserved
+        // extra block can never push either header past the u16 extra-length field
+        // and desync it through a silent `field_u16` clamp.
+        for (size_zip64, offset_zip64) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let local = if size_zip64 { 20 } else { 0 };
+            let central = zip64_extra_reserve(size_zip64, offset_zip64);
+            let maximum_extra = usize::from(U16_SENTINEL) - local.max(central);
+            assert!(local + maximum_extra <= usize::from(U16_SENTINEL));
+            assert!(central + maximum_extra <= usize::from(U16_SENTINEL));
+        }
+    }
 }
