@@ -6,10 +6,15 @@
 #![cfg(feature = "async")]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::future::Future;
 use std::io::{Cursor, Write};
 use std::panic::RefUnwindSafe;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use futures_io::AsyncRead;
 use futures_lite::future::block_on;
@@ -159,6 +164,80 @@ impl AsyncRead for AsyncOneByte {
     }
 }
 
+/// Minimal std-only executor that polls `future` to completion, parking the
+/// thread between polls behind a *real* `Waker` built from thread unpark.
+///
+/// Unlike `futures_lite::block_on`, it has no internal timer: if a codec
+/// returns `Poll::Pending` without ever waking its waker, this parks forever.
+/// That is exactly the deadlock we regression-test, and the watchdog turns the
+/// hang into a fast, deterministic failure.
+fn park_block_on<F: Future>(future: F) -> F::Output {
+    use std::task::Wake;
+
+    struct ThreadWaker(thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = std::task::Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+/// Arms a watchdog thread that aborts the process if `label` has not signaled
+/// completion within ~30s, so a deadlocked poll fails loudly instead of hanging
+/// the test runner indefinitely.
+fn arm_watchdog(label: &'static str) -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("watchdog: `{label}` did not complete within 30s; aborting the deadlocked test");
+        std::process::abort();
+    });
+    done
+}
+
+/// Drives `future` on the park/unpark executor under the abort watchdog.
+fn guarded<F: Future>(label: &'static str, future: F) -> F::Output {
+    let done = arm_watchdog(label);
+    let output = park_block_on(future);
+    done.store(true, Ordering::SeqCst);
+    output
+}
+
+#[test]
+fn async_xz_never_deadlocks_under_slow_source() {
+    let expected = collect_sync(fixture());
+    let archive = sync_filtered_fixture(FilterId::Xz);
+    guarded("async_xz_never_deadlocks_under_slow_source", async {
+        for iteration in 0..50 {
+            assert_eq!(
+                collect_futures(archive.clone()).await,
+                expected,
+                "xz iteration {iteration}"
+            );
+        }
+    });
+}
+
 fn sync_filtered_fixture(filter: FilterId) -> Vec<u8> {
     let mut writer =
         ArchiveWriter::with_filter(Vec::new(), FormatId::Tar, Some(filter), Limits::default())
@@ -171,7 +250,7 @@ fn sync_filtered_fixture(filter: FilterId) -> Vec<u8> {
 
 #[test]
 fn futures_reader_and_writer_match_sync_contract() {
-    block_on(async {
+    guarded("futures_reader_and_writer_match_sync_contract", async {
         let expected = collect_sync(fixture());
         assert_eq!(collect_futures(fixture()).await, expected);
 
@@ -227,48 +306,51 @@ fn futures_reader_and_writer_match_sync_contract() {
 
 #[test]
 fn async_reader_concatenates_every_filter_and_rejects_trailing_data() {
-    block_on(async {
-        let plain = fixture();
-        let expected = collect_sync(plain.clone());
-        let split = plain.len() / 2;
-        for filter in [
-            FilterId::Gzip,
-            FilterId::Bzip2,
-            FilterId::Zstd,
-            FilterId::Xz,
-            FilterId::Lz4,
-        ] {
-            let mut members = compress(&plain[..split], filter).unwrap();
-            members.extend_from_slice(&compress(&plain[split..], filter).unwrap());
-            assert_eq!(collect_futures(members).await, expected, "{filter:?}");
+    guarded(
+        "async_reader_concatenates_every_filter_and_rejects_trailing_data",
+        async {
+            let plain = fixture();
+            let expected = collect_sync(plain.clone());
+            let split = plain.len() / 2;
+            for filter in [
+                FilterId::Gzip,
+                FilterId::Bzip2,
+                FilterId::Zstd,
+                FilterId::Xz,
+                FilterId::Lz4,
+            ] {
+                let mut members = compress(&plain[..split], filter).unwrap();
+                members.extend_from_slice(&compress(&plain[split..], filter).unwrap());
+                assert_eq!(collect_futures(members).await, expected, "{filter:?}");
 
-            let mut trailing = compress(&plain, filter).unwrap();
-            trailing.push(0);
-            let mut reader = AsyncArchiveReader::new(AsyncOneByte {
-                bytes: trailing,
-                position: 0,
-            });
-            loop {
-                match reader.next_event().await {
-                    Ok(ReaderEvent::Done) => panic!("{filter:?} accepted trailing data"),
-                    Ok(_) => {},
-                    Err(error) => {
-                        assert_eq!(
-                            error.io_error().map(std::io::Error::kind),
-                            Some(std::io::ErrorKind::InvalidData),
-                            "{filter:?}: {error}"
-                        );
-                        break;
-                    },
+                let mut trailing = compress(&plain, filter).unwrap();
+                trailing.push(0);
+                let mut reader = AsyncArchiveReader::new(AsyncOneByte {
+                    bytes: trailing,
+                    position: 0,
+                });
+                loop {
+                    match reader.next_event().await {
+                        Ok(ReaderEvent::Done) => panic!("{filter:?} accepted trailing data"),
+                        Ok(_) => {},
+                        Err(error) => {
+                            assert_eq!(
+                                error.io_error().map(std::io::Error::kind),
+                                Some(std::io::ErrorKind::InvalidData),
+                                "{filter:?}: {error}"
+                            );
+                            break;
+                        },
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 #[test]
 fn async_reader_composes_four_nested_filters() {
-    block_on(async {
+    guarded("async_reader_composes_four_nested_filters", async {
         let plain = fixture();
         let expected = collect_sync(plain.clone());
         let mut nested = plain;

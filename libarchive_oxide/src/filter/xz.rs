@@ -6,8 +6,9 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::task::Waker;
 use std::thread;
 
 use libarchive_oxide_core::{
@@ -31,9 +32,42 @@ enum WorkerEvent {
     Output(Vec<u8>),
 }
 
+/// Cloneable worker-event sender that wakes the async owner after every send.
+///
+/// The worker thread and its input pipe both hold clones. `send` first delivers
+/// the event over the blocking channel, then wakes (and clears) any async waker
+/// registered by the owner, so a parked executor observes both `NeedInput` and
+/// `Output` progress. `wake_owner` performs just the wake, used on worker exit.
+#[derive(Clone)]
+struct EventSink {
+    sender: SyncSender<WorkerEvent>,
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl EventSink {
+    fn send(&self, event: WorkerEvent) -> Result<(), mpsc::SendError<WorkerEvent>> {
+        let result = self.sender.send(event);
+        self.wake_owner();
+        result
+    }
+
+    fn wake_owner(&self) {
+        wake_cell(&self.waker);
+    }
+}
+
+/// Wakes and clears the waker parked in `cell`, tolerating lock poisoning.
+fn wake_cell(cell: &Mutex<Option<Waker>>) {
+    if let Ok(mut guard) = cell.lock() {
+        if let Some(waker) = guard.take() {
+            waker.wake();
+        }
+    }
+}
+
 struct InputPipe {
     receiver: Receiver<InputMessage>,
-    events: SyncSender<WorkerEvent>,
+    events: EventSink,
     current: Vec<u8>,
     position: usize,
     ended: bool,
@@ -455,6 +489,8 @@ pub(crate) struct XzDecoder {
     sender: Option<SyncSender<InputMessage>>,
     // Preserve the public readers' historical Sync and RefUnwindSafe auto traits.
     events: Mutex<Receiver<WorkerEvent>>,
+    // Shared slot the worker wakes; `Arc<Mutex<..>>` keeps Sync + RefUnwindSafe.
+    waker_cell: Arc<Mutex<Option<Waker>>>,
     worker: Mutex<Option<thread::JoinHandle<io::Result<()>>>>,
     validator: XzValidator,
     pending_input: Vec<u8>,
@@ -469,9 +505,14 @@ impl XzDecoder {
     pub(crate) fn new(limits: Limits) -> Result<Self, ArchiveError> {
         let (sender, input) = mpsc::sync_channel(2);
         let (event_sender, events) = mpsc::sync_channel(2);
+        let waker_cell = Arc::new(Mutex::new(None));
+        let sink = EventSink {
+            sender: event_sender,
+            waker: Arc::clone(&waker_cell),
+        };
         let worker = thread::Builder::new()
             .name("libarchive-oxide-xz".into())
-            .spawn(move || decode_worker(input, &event_sender))
+            .spawn(move || decode_worker(input, sink))
             .map_err(|error| {
                 ArchiveError::new(ErrorKind::Capability)
                     .with_format("xz")
@@ -480,6 +521,7 @@ impl XzDecoder {
         Ok(Self {
             sender: Some(sender),
             events: Mutex::new(events),
+            waker_cell,
             worker: Mutex::new(Some(worker)),
             validator: XzValidator::new(limits),
             pending_input: Vec::with_capacity(MAX_STAGED),
@@ -617,6 +659,38 @@ impl XzDecoder {
             Ok(0)
         }
     }
+
+    /// Parks `waker` in the shared slot so the worker can wake it. Uses
+    /// [`Waker::will_wake`] to skip a redundant clone when re-registering the
+    /// same executor waker across polls.
+    fn register_waker(&self, waker: &Waker) {
+        if let Ok(mut guard) = self.waker_cell.lock() {
+            let refresh = guard
+                .as_ref()
+                .is_none_or(|existing| !existing.will_wake(waker));
+            if refresh {
+                *guard = Some(waker.clone());
+            }
+        }
+    }
+
+    /// Waits for the next worker event, blocking on the sync path (`waker` is
+    /// `None`) and non-blocking on the async path (`Some`). In the async case
+    /// the waker is registered *before* the deciding `try_recv`, so a would-be
+    /// blocking read reports `Ok(None)` ("pending") after arranging a wake.
+    fn pump(
+        &mut self,
+        output: &mut [u8],
+        waker: Option<&Waker>,
+    ) -> Result<Option<usize>, ArchiveError> {
+        match waker {
+            None => self.wait_event(output).map(Some),
+            Some(waker) => {
+                self.register_waker(waker);
+                self.poll_event(output)
+            },
+        }
+    }
 }
 
 impl fmt::Debug for XzDecoder {
@@ -636,24 +710,32 @@ impl fmt::Debug for XzDecoder {
     }
 }
 
-impl Codec for XzDecoder {
+impl XzDecoder {
+    /// Shared engine for the sync and async codec entry points.
+    ///
+    /// `waker` is `None` on the blocking [`Codec::process`] path (the returned
+    /// step is always `Some`, byte-for-byte identical to the historical
+    /// behavior) and `Some` on the async [`Codec::poll_process`] path, where
+    /// `Ok(None)` means "would block": a wake has been arranged and the caller
+    /// should return `Poll::Pending`.
     #[allow(clippy::too_many_lines)] // Progress, backpressure, and terminal ordering stay together.
-    fn process(
+    fn drive(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         end: EndOfInput,
-    ) -> Result<CodecStep, ArchiveError> {
+        waker: Option<&Waker>,
+    ) -> Result<Option<CodecStep>, ArchiveError> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
         if self.done {
             if input.is_empty() {
-                return Ok(CodecStep {
+                return Ok(Some(CodecStep {
                     consumed: 0,
                     produced: 0,
                     status: CodecStatus::Done,
-                });
+                }));
             }
             return Err(self.fail(malformed("data follows the completed XZ stream")));
         }
@@ -662,11 +744,11 @@ impl Codec for XzDecoder {
         let mut produced = self.drain_output(output);
         loop {
             if self.done {
-                return Ok(CodecStep {
+                return Ok(Some(CodecStep {
                     consumed,
                     produced,
                     status: CodecStatus::Done,
-                });
+                }));
             }
             while produced < output.len() {
                 let Some(read) = self.poll_event(&mut output[produced..])? else {
@@ -678,11 +760,11 @@ impl Codec for XzDecoder {
                 }
             }
             if self.done {
-                return Ok(CodecStep {
+                return Ok(Some(CodecStep {
                     consumed,
                     produced,
                     status: CodecStatus::Done,
-                });
+                }));
             }
 
             let flushed = self.flush_input()?;
@@ -722,18 +804,21 @@ impl Codec for XzDecoder {
                 }
             }
             if self.done {
-                return Ok(CodecStep {
+                return Ok(Some(CodecStep {
                     consumed,
                     produced,
                     status: CodecStatus::Done,
-                });
+                }));
             }
             if effective_end
                 && produced == 0
                 && self.pending_output.is_empty()
                 && !output.is_empty()
             {
-                produced += self.wait_event(&mut output[produced..])?;
+                let Some(read) = self.pump(&mut output[produced..], waker)? else {
+                    return Ok(None);
+                };
+                produced += read;
                 continue;
             }
             if produced != 0 || consumed != 0 {
@@ -747,28 +832,34 @@ impl Codec for XzDecoder {
                 } else {
                     CodecStatus::NeedInput
                 };
-                return Ok(CodecStep {
+                return Ok(Some(CodecStep {
                     consumed,
                     produced,
                     status,
-                });
+                }));
             }
             if effective_end {
                 if output.is_empty() && !self.pending_output.is_empty() {
-                    return Ok(CodecStep {
+                    return Ok(Some(CodecStep {
                         consumed,
                         produced,
                         status: CodecStatus::NeedOutput,
-                    });
+                    }));
                 }
-                produced += self.wait_event(&mut output[produced..])?;
+                let Some(read) = self.pump(&mut output[produced..], waker)? else {
+                    return Ok(None);
+                };
+                produced += read;
                 continue;
             }
             if !input.is_empty() || !self.pending_input.is_empty() {
-                produced += self.wait_event(&mut output[produced..])?;
+                let Some(read) = self.pump(&mut output[produced..], waker)? else {
+                    return Ok(None);
+                };
+                produced += read;
                 continue;
             }
-            return Ok(CodecStep {
+            return Ok(Some(CodecStep {
                 consumed: 0,
                 produced,
                 status: if output.is_empty() && !self.pending_output.is_empty() {
@@ -776,35 +867,67 @@ impl Codec for XzDecoder {
                 } else {
                     CodecStatus::NeedInput
                 },
-            });
+            }));
         }
     }
 }
 
-fn decode_worker(
-    input: Receiver<InputMessage>,
-    events: &SyncSender<WorkerEvent>,
-) -> io::Result<()> {
-    let pipe = InputPipe {
-        receiver: input,
-        events: events.clone(),
-        current: Vec::new(),
-        position: 0,
-        ended: false,
-    };
-    let mut decoder = lzma_rust2::XzReader::new(pipe, true);
-    let mut output = vec![0; BUFFER];
-    loop {
-        match decoder.read(&mut output) {
-            Ok(0) => return Ok(()),
-            Ok(read) => events
-                .send(WorkerEvent::Output(output[..read].to_vec()))
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "XZ codec owner was dropped")
-                })?,
-            Err(error) => return Err(error),
-        }
+impl Codec for XzDecoder {
+    // The `None` waker drives the blocking path, which never yields `Ok(None)`;
+    // the `expect` documents that invariant on the one impossible branch.
+    #[allow(clippy::expect_used)]
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> Result<CodecStep, ArchiveError> {
+        self.drive(input, output, end, None)
+            .map(|step| step.expect("blocking XZ drive always yields a step"))
     }
+
+    fn poll_process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+        waker: &Waker,
+    ) -> Result<Option<CodecStep>, ArchiveError> {
+        self.drive(input, output, end, Some(waker))
+    }
+}
+
+fn decode_worker(input: Receiver<InputMessage>, events: EventSink) -> io::Result<()> {
+    // Retain ONLY the waker Arc. The decode loop runs in an inner scope that
+    // owns every `EventSink` (this one and the pipe's clone); when the scope
+    // ends all event senders drop and the event channel disconnects. Only then
+    // do we wake, so a parked owner's next `try_recv` observes `Disconnected`
+    // (terminal progress) rather than `Empty` (a lost wakeup / deadlock).
+    let waker_cell = Arc::clone(&events.waker);
+    let result = (move || -> io::Result<()> {
+        let pipe = InputPipe {
+            receiver: input,
+            events: events.clone(),
+            current: Vec::new(),
+            position: 0,
+            ended: false,
+        };
+        let mut decoder = lzma_rust2::XzReader::new(pipe, true);
+        let mut output = vec![0; BUFFER];
+        loop {
+            match decoder.read(&mut output) {
+                Ok(0) => return Ok(()),
+                Ok(read) => events
+                    .send(WorkerEvent::Output(output[..read].to_vec()))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "XZ codec owner was dropped")
+                    })?,
+                Err(error) => return Err(error),
+            }
+        }
+    })();
+    wake_cell(&waker_cell);
+    result
 }
 
 fn validate_block_memory(header: &[u8], codec_memory: Option<usize>) -> Result<(), ArchiveError> {
