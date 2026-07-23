@@ -7,14 +7,16 @@
 //! Readers parse every folder's full coder graph (any number of coders, bind
 //! pairs, and packed streams) so listing works for any archive. Decoding is
 //! limited to linear chains over a single pack stream whose coders are each
-//! LZMA2/LZMA or a decode-only byte filter (delta, BCJ): such a folder streams
-//! normally, while richer graphs (BCJ2, `PPMd`, multi-pack) list but report
-//! `Unsupported` on extraction. Exactly one folder decode chain is live at a
+//! LZMA2/LZMA, a decode-only byte filter (delta, BCJ), or a general-purpose
+//! coder reused from the shared codec dispatch (Deflate, `BZip2`, Zstd): such a
+//! folder streams normally, while richer graphs (BCJ2, `PPMd`, multi-pack) list
+//! but report `Unsupported` on extraction. Exactly one folder decode chain is live at a
 //! time, so memory stays bounded regardless of folder count. Writers still emit
 //! a single solid LZMA2 folder. AES decode is not yet implemented.
 
 use std::io::{Read, Seek, SeekFrom, Take, Write};
 
+use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
     ArchiveError, ArchiveMetadata, ArchivePath, EntryKind, EntryMetadata, EntryTimes, ErrorKind,
     Extension, Limits, Owner, PathEncoding, Timestamp,
@@ -23,6 +25,7 @@ use libarchive_oxide_core::{
 use crate::codec_read::CodecReader;
 use crate::filter::bcj::{BcjDecoder, BranchKind};
 use crate::filter::delta::DeltaDecoder;
+use crate::pipeline_codec::PipelineCodec;
 use crate::{ReaderEvent, StreamError};
 
 type Result<T> = core::result::Result<T, HeaderError>;
@@ -86,6 +89,21 @@ const METHOD_BCJ_SPARC: [u8; 4] = [0x03, 0x03, 0x08, 0x05];
 const METHOD_BCJ_ARM64: u8 = 0x0A;
 /// BCJ RISC-V filter coder method id (1 byte).
 const METHOD_BCJ_RISCV: u8 = 0x0B;
+/// Deflate coder method id (3 bytes) — RAW DEFLATE (RFC 1951), no gzip/zlib framing.
+const METHOD_DEFLATE: [u8; 3] = [0x04, 0x01, 0x08];
+/// `BZip2` coder method id (3 bytes).
+const METHOD_BZIP2: [u8; 3] = [0x04, 0x02, 0x02];
+/// Zstandard coder method id (4 bytes), as used by the 7-Zip-zstd fork and `sevenz-rust2`.
+const METHOD_ZSTD: [u8; 4] = [0x04, 0xF7, 0x11, 0x01];
+
+/// Peak decompression working set for a bzip2 stream at the largest (900 KiB) block size.
+/// libbzip2 documents ~3.7 MiB for `-9` decompression; rounded up. A folder's bzip2 coder is
+/// refused when the configured codec-memory budget cannot hold it.
+const BZIP2_DECODE_WORKSPACE: usize = 4 * 1024 * 1024;
+/// Smallest zstd window (the format's minimum `Window_Log` of 10 → 1 KiB) the decoder must be
+/// allowed to allocate. The native zstd backend additionally caps the frame window to the
+/// codec-memory budget inside [`PipelineCodec`]; this floor rejects a nonsensically tiny budget.
+const ZSTD_MIN_WINDOW: usize = 1024;
 
 /// `FILE_ATTRIBUTE_DIRECTORY`.
 const ATTR_DIRECTORY: u32 = 0x10;
@@ -109,9 +127,9 @@ const WRITER_PRESET: u32 = 6;
 
 /// One coder's decode method as parsed from a folder graph. Decoding supports LZMA2 (what this
 /// crate writes), plain LZMA (what 7-Zip and `sevenz-rust2` use for compressed/encoded headers and
-/// folders), and the decode-only delta and BCJ byte filters. Every other method id (`PPMd`,
-/// Deflate, `BZip2`, Zstd, BCJ2, …) parses into [`CoderMethod::Unsupported`] so listing works, but
-/// its payload cannot be decoded here.
+/// folders), the decode-only delta and BCJ byte filters, and the general-purpose Deflate/BZip2/Zstd
+/// coders reused from the shared [`PipelineCodec`] dispatch. Every other method id (`PPMd`, BCJ2, …)
+/// parses into [`CoderMethod::Unsupported`] so listing works, but its payload cannot be decoded here.
 #[derive(Debug, Clone, Copy)]
 enum CoderMethod {
     /// LZMA2, carrying its one-byte dictionary-size property.
@@ -124,13 +142,18 @@ enum CoderMethod {
     Unsupported,
 }
 
-/// A 7z transform filter that decodes in place after the coder feeding it.
+/// A 7z coder that arca decodes by reusing an existing codec. Delta and BCJ are decode-only byte
+/// filters applied in place after the coder feeding them; [`SevenFilter::Pipeline`] instead reuses
+/// a caller-driven [`PipelineCodec`] (Deflate/BZip2/Zstd) as a decompression coder in the chain.
 #[derive(Debug, Clone, Copy)]
 enum SevenFilter {
     /// Delta filter with a byte `distance` in `1..=256`.
     Delta { distance: usize },
     /// Branch/Call/Jump filter for a given instruction family, with a running start position.
     Bcj { kind: BranchKind, start: usize },
+    /// A general-purpose decompression coder reused from the shared [`PipelineCodec`] dispatch:
+    /// 7z Deflate (raw), `BZip2`, or Zstd, identified by its [`FilterId`].
+    Pipeline { filter: FilterId },
 }
 
 /// One coder in a folder's graph, with its input/output stream arity.
@@ -475,6 +498,9 @@ enum SevenStage<R> {
     Delta(Box<CodecReader<SevenStage<R>, DeltaDecoder>>),
     /// A BCJ decode filter reading the stage below.
     Bcj(Box<CodecReader<SevenStage<R>, BcjDecoder>>),
+    /// A general-purpose decompression coder (Deflate/BZip2/Zstd) reused from [`PipelineCodec`],
+    /// reading the stage below.
+    Pipeline(Box<CodecReader<SevenStage<R>, PipelineCodec>>),
 }
 
 enum SevenInput<R> {
@@ -491,6 +517,7 @@ impl<R: Read> SevenStage<R> {
             Self::Lzma(reader) => reader.inner().source_ref(),
             Self::Delta(reader) => reader.get_ref().source_ref(),
             Self::Bcj(reader) => reader.get_ref().source_ref(),
+            Self::Pipeline(reader) => reader.get_ref().source_ref(),
         }
     }
 
@@ -502,6 +529,7 @@ impl<R: Read> SevenStage<R> {
             Self::Lzma(reader) => reader.into_inner().into_source(),
             Self::Delta(reader) => reader.into_inner().into_source(),
             Self::Bcj(reader) => reader.into_inner().into_source(),
+            Self::Pipeline(reader) => reader.into_inner().into_source(),
         }
     }
 }
@@ -531,6 +559,7 @@ impl<R: Read> Read for SevenStage<R> {
             Self::Lzma(reader) => reader.read(output),
             Self::Delta(reader) => reader.read(output),
             Self::Bcj(reader) => reader.read(output),
+            Self::Pipeline(reader) => reader.read(output),
         }
     }
 }
@@ -1277,11 +1306,44 @@ fn wrap_coder<R: Read>(
         CoderMethod::Filter(SevenFilter::Bcj { kind, start }) => Ok(SevenStage::Bcj(Box::new(
             CodecReader::new(inner, BcjDecoder::new(kind, start), "7z-bcj"),
         ))),
+        CoderMethod::Filter(SevenFilter::Pipeline { filter }) => {
+            validate_pipeline_memory(filter, limits)?;
+            let codec = PipelineCodec::new(filter, limits).map_err(StreamError::archive)?;
+            Ok(SevenStage::Pipeline(Box::new(CodecReader::new(
+                inner,
+                codec,
+                "7z-pipeline",
+            ))))
+        },
         CoderMethod::Unsupported => Err(seven_error(
             ErrorKind::Unsupported,
             "payload coder is unsupported",
         )),
     }
+}
+
+/// Bounds a reused [`PipelineCodec`] coder's working set against the configured codec-memory
+/// budget, mirroring [`validate_dictionary`] for LZMA. Deflate has a fixed 32 KiB window and is
+/// always within budget; `BZip2` and Zstd are refused when the budget cannot hold their workspace.
+fn validate_pipeline_memory(
+    filter: FilterId,
+    limits: Limits,
+) -> core::result::Result<(), StreamError> {
+    let Some(budget) = limits.codec_memory() else {
+        return Ok(());
+    };
+    let needed = match filter {
+        FilterId::Bzip2 => BZIP2_DECODE_WORKSPACE,
+        FilterId::Zstd => ZSTD_MIN_WINDOW,
+        _ => return Ok(()),
+    };
+    if budget < needed {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "7z codec workspace exceeds codec-memory limit",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_dictionary(dictionary: u32, limits: Limits) -> core::result::Result<(), StreamError> {
@@ -1671,6 +1733,36 @@ fn classify_method(codec: &[u8], props: &[u8]) -> Result<CoderMethod> {
             _ => return Ok(CoderMethod::Unsupported),
         };
         Ok(CoderMethod::Filter(SevenFilter::Bcj { kind, start }))
+    } else if codec == METHOD_DEFLATE {
+        // Raw DEFLATE, always available under the `sevenz` feature (it shares the gzip codec's
+        // `miniz_oxide` core). The coder carries no decode-relevant properties.
+        Ok(CoderMethod::Filter(SevenFilter::Pipeline {
+            filter: FilterId::Deflate,
+        }))
+    } else if codec == METHOD_BZIP2 {
+        // BZip2 lists on every build but only decodes when the `bzip2` codec is compiled in.
+        #[cfg(feature = "bzip2")]
+        {
+            Ok(CoderMethod::Filter(SevenFilter::Pipeline {
+                filter: FilterId::Bzip2,
+            }))
+        }
+        #[cfg(not(feature = "bzip2"))]
+        {
+            Ok(CoderMethod::Unsupported)
+        }
+    } else if codec == METHOD_ZSTD {
+        // Zstd lists on every build but only decodes when the `zstd` codec is compiled in.
+        #[cfg(feature = "zstd")]
+        {
+            Ok(CoderMethod::Filter(SevenFilter::Pipeline {
+                filter: FilterId::Zstd,
+            }))
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            Ok(CoderMethod::Unsupported)
+        }
     } else {
         Ok(CoderMethod::Unsupported)
     }

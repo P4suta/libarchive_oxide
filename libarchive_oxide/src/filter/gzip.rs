@@ -362,6 +362,157 @@ impl Codec for GzipDecoder {
     }
 }
 
+/// Raw DEFLATE (RFC 1951) inflate with no framing.
+///
+/// The gzip decoder above wraps this same `miniz_oxide` raw-inflate core in RFC 1952
+/// header/trailer handling; the 7z Deflate coder, by contrast, stores bare deflate
+/// blocks with no header, trailer, or checksum, so it drives the raw core directly.
+/// The window is a fixed 32 KiB, so the decoder's working set is inherently bounded;
+/// a `decoded_total` guard adds decompression-bomb defense on top.
+#[cfg(feature = "sevenz")]
+pub(crate) struct RawInflateDecoder {
+    inflate: Box<InflateState>,
+    limits: Limits,
+    decoded_total: u64,
+    done: bool,
+}
+
+#[cfg(feature = "sevenz")]
+impl core::fmt::Debug for RawInflateDecoder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RawInflateDecoder")
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "sevenz")]
+impl RawInflateDecoder {
+    /// Creates a raw-DEFLATE decompressor with mandatory resource limits.
+    #[must_use]
+    pub(crate) fn new(limits: Limits) -> Self {
+        Self {
+            inflate: Box::new(InflateState::new(DataFormat::Raw)),
+            limits,
+            decoded_total: 0,
+            done: false,
+        }
+    }
+
+    fn account_output(&mut self, produced: usize) -> Result<()> {
+        if produced == 0 {
+            return Ok(());
+        }
+        let next = self
+            .decoded_total
+            .checked_add(produced as u64)
+            .ok_or_else(|| gzip_error(ErrorKind::Limit, "decoded byte count overflow"))?;
+        if self
+            .limits
+            .decoded_total()
+            .is_some_and(|maximum| next > maximum)
+        {
+            return Err(gzip_error(
+                ErrorKind::Limit,
+                "decoded stream exceeds configured limit",
+            ));
+        }
+        self.decoded_total = next;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sevenz")]
+impl Codec for RawInflateDecoder {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> core::result::Result<CodecStep, ArchiveError> {
+        if self.done {
+            if input.is_empty() {
+                return Ok(CodecStep {
+                    consumed: 0,
+                    produced: 0,
+                    status: CodecStatus::Done,
+                });
+            }
+            return Err(gzip_error(
+                ErrorKind::Malformed,
+                "data follows the completed deflate stream",
+            ));
+        }
+        // `miniz_oxide`'s streaming `inflate` errors on empty input under `MZFlush::None`, so an
+        // empty chunk is handled explicitly: flush the tail at end-of-input, otherwise wait.
+        if input.is_empty() {
+            if !matches!(end, EndOfInput::End) {
+                return Ok(CodecStep {
+                    consumed: 0,
+                    produced: 0,
+                    status: CodecStatus::NeedInput,
+                });
+            }
+            let res = inflate(&mut self.inflate, &[], output, MZFlush::Finish);
+            let produced = res.bytes_written;
+            self.account_output(produced)?;
+            return match res.status {
+                Ok(MZStatus::StreamEnd) => {
+                    self.done = true;
+                    CodecStep {
+                        consumed: 0,
+                        produced,
+                        status: CodecStatus::Done,
+                    }
+                    .validate(input.len(), output.len())
+                },
+                Ok(_) if produced > 0 => CodecStep {
+                    consumed: 0,
+                    produced,
+                    status: CodecStatus::NeedOutput,
+                }
+                .validate(input.len(), output.len()),
+                _ => Err(gzip_error(ErrorKind::Malformed, "truncated deflate stream")),
+            };
+        }
+
+        let res = inflate(&mut self.inflate, input, output, MZFlush::None);
+        let consumed = res.bytes_consumed;
+        let produced = res.bytes_written;
+        self.account_output(produced)?;
+        match res.status {
+            Ok(MZStatus::StreamEnd) => {
+                self.done = true;
+                return CodecStep {
+                    consumed,
+                    produced,
+                    status: CodecStatus::Done,
+                }
+                .validate(input.len(), output.len());
+            },
+            Ok(_) | Err(MZError::Buf) => {},
+            Err(_) => return Err(gzip_error(ErrorKind::Malformed, "inflate error")),
+        }
+        // Report progress in a shape the driver can always advance on: output-full asks for more
+        // output; input-drained asks for more input; a genuine no-progress stall is malformed.
+        let status = if produced == output.len() {
+            CodecStatus::NeedOutput
+        } else if consumed == input.len() {
+            CodecStatus::NeedInput
+        } else if consumed == 0 && produced == 0 {
+            return Err(gzip_error(ErrorKind::Malformed, "deflate stream stalled"));
+        } else {
+            CodecStatus::NeedOutput
+        };
+        CodecStep {
+            consumed,
+            produced,
+            status,
+        }
+        .validate(input.len(), output.len())
+    }
+}
+
 const GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

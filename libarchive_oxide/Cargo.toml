@@ -120,7 +120,9 @@ ruzstd = "0.8.2"
 zstd-codec = { package = "zstd", version = "0.13.3" }
 # Independent SHA-256 reference for OCI layer digest/diffID tests.
 sha2 = "0.11"
-sevenz-rust2 = "0.21.3"
+# `bzip2` is on by default; `deflate` and `zstd` are enabled so the 7z differential
+# tests can produce Deflate/Zstd folders for arca's reuse-codec decode path.
+sevenz-rust2 = { version = "0.21.3", features = ["deflate", "zstd"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto", "bzip2", "zstd", "lzma"] }
 # Independent tar/ar producers and consumers used only for RM-304 interop tests.
 tar = { version = "0.4", default-features = false }

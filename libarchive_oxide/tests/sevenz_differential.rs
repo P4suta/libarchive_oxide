@@ -364,3 +364,63 @@ fn arca_reads_sevenz_rust2_bcj_lzma2() {
         assert_eq!(got, expected, "arca BCJ+LZMA2 mismatch for {label}");
     }
 }
+
+/// A payload that mixes a highly compressible run with pseudo-random noise, so the general-purpose
+/// coders below (Deflate/BZip2/Zstd) emit real, non-degenerate compressed folders.
+fn mixed_payload() -> Vec<u8> {
+    let mut data = b"the quick brown fox jumps over the lazy dog\n".repeat(400);
+    data.extend(pseudo_random(20_000));
+    data.extend(b"trailing repeated tail tail tail tail tail\n".repeat(120));
+    data
+}
+
+/// Round-trips one file through `sevenz-rust2` with a single content coder `method`, asserting the
+/// producer can read its own archive and that arca reproduces the original bytes exactly.
+#[track_caller]
+fn assert_arca_reads_method(method: EncoderMethod, label: &str) {
+    let data = mixed_payload();
+    let bytes = sevenz_with_methods(
+        vec![EncoderConfiguration::new(method)],
+        "payload.bin",
+        &data,
+    );
+    let mut reader = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+        .unwrap_or_else(|e| panic!("sevenz-rust2 opens its own {label} archive: {e}"));
+    assert_eq!(
+        reader.read_file("payload.bin").unwrap(),
+        data,
+        "{label} self-read"
+    );
+
+    let got = read_with_arca(&bytes);
+    let expected = vec![EntryShape::new(
+        b"payload.bin".to_vec(),
+        EntryKind::File,
+        data.clone(),
+    )];
+    assert_eq!(got, expected, "arca {label} decode mismatch");
+}
+
+/// The 7z Deflate coder (method `04 01 08`) is RAW DEFLATE — no gzip header, trailer, or checksum.
+/// arca reuses the shared `PipelineCodec` raw-inflate arm (the same `miniz_oxide` core the gzip
+/// decoder sits on) to decode it. Always available under the `sevenz` feature.
+#[test]
+fn arca_reads_sevenz_rust2_deflate() {
+    assert_arca_reads_method(EncoderMethod::DEFLATE, "deflate");
+}
+
+/// The 7z BZip2 coder (method `04 02 02`), reusing arca's existing BZip2 codec through the folder
+/// coder graph. Gated on arca's `bzip2` feature; `sevenz-rust2`'s bzip2 support is on by default.
+#[cfg(feature = "bzip2")]
+#[test]
+fn arca_reads_sevenz_rust2_bzip2() {
+    assert_arca_reads_method(EncoderMethod::BZIP2, "bzip2");
+}
+
+/// The 7z Zstd coder (method `04 F7 11 01`), reusing arca's existing Zstd codec (portable `ruzstd`
+/// or native `compression-codecs`) through the folder coder graph. Gated on arca's `zstd` feature.
+#[cfg(feature = "zstd")]
+#[test]
+fn arca_reads_sevenz_rust2_zstd() {
+    assert_arca_reads_method(EncoderMethod::ZSTD, "zstd");
+}

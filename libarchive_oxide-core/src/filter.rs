@@ -20,6 +20,11 @@ pub enum FilterId {
     Lz4,
     /// Bzip2 stream.
     Bzip2,
+    /// Raw DEFLATE (RFC 1951) with no framing — the 7z Deflate coder stores bare
+    /// deflate blocks with no gzip header, trailer, or checksum. Has no stream
+    /// signature, so it never participates in [`FilterId::probe`]; it is only ever
+    /// selected structurally from a 7z folder's coder graph.
+    Deflate,
 }
 
 impl FilterId {
