@@ -94,11 +94,22 @@ impl AesParams {
 }
 
 /// Encodes a password (interpreted as a UTF-8 string) as UTF-16LE code units, the
-/// form 7-Zip hashes. Lossy for invalid UTF-8, matching `String::from_utf8_lossy`.
+/// form 7-Zip hashes. Lossy for invalid UTF-8 (one U+FFFD per maximal invalid
+/// subsequence), matching `String::from_utf8_lossy`.
+///
+/// Uses [`slice::utf8_chunks`] rather than `from_utf8_lossy` so the password is never
+/// copied into an intermediate owned `String`: `chunk.valid()` borrows directly from
+/// the caller's buffer, so no un-zeroized heap copy of password-derived bytes is left
+/// behind on the invalid-UTF-8 path. The returned buffer is the caller's to zeroize.
 fn password_utf16le(password: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(password.len() * 2);
-    for unit in String::from_utf8_lossy(password).encode_utf16() {
-        out.extend_from_slice(&unit.to_le_bytes());
+    let mut out = Vec::with_capacity(password.len().saturating_mul(2));
+    for chunk in password.utf8_chunks() {
+        for unit in chunk.valid().encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        if !chunk.invalid().is_empty() {
+            out.extend_from_slice(&(char::REPLACEMENT_CHARACTER as u16).to_le_bytes());
+        }
     }
     out
 }
@@ -280,6 +291,27 @@ mod tests {
         assert_eq!(params.salt_len, 16);
         assert_eq!(&params.salt, &salt);
         assert_eq!(&params.iv, &iv);
+    }
+
+    #[test]
+    fn password_utf16le_matches_lossy_reference() {
+        // The `utf8_chunks`-based encoder (which avoids an un-zeroized password copy)
+        // must be byte-identical to `String::from_utf8_lossy(..).encode_utf16()`,
+        // including one U+FFFD per maximal invalid subsequence.
+        let cases: [&[u8]; 5] = [
+            b"correct horse",
+            &[0x66, 0x6f, 0xff, 0x6f], // valid, one invalid byte, valid
+            &[0xff, 0xfe, 0xfd],       // all invalid
+            &[0xf0, 0x28, 0x8c, 0x28], // invalid lead + stray continuations
+            &[],
+        ];
+        for pw in cases {
+            let reference: Vec<u8> = String::from_utf8_lossy(pw)
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            assert_eq!(password_utf16le(pw), reference, "pw = {pw:02x?}");
+        }
     }
 
     #[test]
