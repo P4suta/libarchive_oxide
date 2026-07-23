@@ -91,8 +91,15 @@ pub(crate) fn run(bin_name: &str, args: &[&str]) -> Output {
 }
 
 /// Runs `bin` in `cwd`, feeding `stdin_bytes` to stdin, returning the captured [`Output`].
+///
+/// A binary that rejects its arguments — e.g. `-` refused as a usage error — exits
+/// *without* reading stdin and closes the pipe, so the parent's write races the child's
+/// exit: it succeeds if the bytes fit the pipe buffer first, and fails with `BrokenPipe`
+/// (EPIPE) otherwise. That race is inherent to the behavior under test, so a broken pipe
+/// is an expected outcome here rather than a test failure; every other write error still
+/// fails loudly. Stdin is always closed before waiting so the child sees EOF.
 pub(crate) fn run_stdin(bin_name: &str, args: &[&str], cwd: &Path, stdin_bytes: &[u8]) -> Output {
-    use std::io::Write;
+    use std::io::{ErrorKind, Write};
     let mut child = Command::new(bin(bin_name))
         .args(args)
         .current_dir(cwd)
@@ -101,12 +108,14 @@ pub(crate) fn run_stdin(bin_name: &str, args: &[&str], cwd: &Path, stdin_bytes: 
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn bin");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(stdin_bytes)
-        .expect("write stdin");
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        match stdin.write_all(stdin_bytes) {
+            Ok(()) => {},
+            Err(error) if error.kind() == ErrorKind::BrokenPipe => {},
+            Err(error) => panic!("write stdin: {error}"),
+        }
+    }
     child.wait_with_output().expect("wait")
 }
 
