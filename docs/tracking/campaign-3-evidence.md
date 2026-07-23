@@ -39,6 +39,7 @@ change, or versioned release candidate is part of this snapshot.
 | ZIP LZMA (method 14) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Lzma` + `lzma_rust2::LzmaWriter::new_no_header` (raw LZMA1, EOS marker) drained through an in-crate `VecSink` (no trait object, `#![forbid(unsafe_code)]` intact); pinned preset 6 (props 93, 8 MiB dict); emits the 9-byte ZIP-LZMA header once at entry start; general-purpose bit 1 (`0x0002`) set in local+central flags outside the `0x0809` cross-check mask; version-needed 63 |
 | ZIP LZMA interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_lzma.rs`, `libarchive_oxide/tests/seek_stream_v2.rs`, `libarchive_oxide/tests/fixtures/zip/python-lzma/` | three producers (arca + first-party raw-LZMA1 builder, both `lzma-rust2`; + committed CPython 3.14.6/liblzma fixture, independent codec) × two consumers (arca, `zip@8.6.0` with `lzma`); WRITE evidence = the `zip` crate decodes arca's method-14 output byte-identically; round-trip, empty-member, truncation, bad-property-size, bomb, and feature-off Unsupported tests; the committed fixture + `generate.py` are byte-reproducible (SHA-256 recorded in `PROVENANCE.md`) |
 | Support-matrix + PROVENANCE ZIP LZMA update | RM-302 | `docs/support-matrix.md`, `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md` | ZIP row adds LZMA to Read and Write; the not-yet-implemented note now lists ONLY Deflate64; PROVENANCE records the committed-fixture escape hatch and the two-independent-codecs honesty note |
+| RAR5/UDF/Deflate64 feasibility ADR | RM-306 | `docs/adr/0013-rar5-udf-deflate64-feasibility.md`, `docs/support-matrix.md` | Deflate64 read = go (adopt external pure-Rust `deflate64` behind the codec-provider boundary, follow-on slice) / write = won't-do; UDF read-only go (rev 1.02/1.50/2.01, follow-on); RAR5 deferred in its entirety (no clean-room pure-Rust decompressor); codec-deficit ledger + not-yet-implemented prose updated; no `src/` change, no dependency added |
 | Metadata-fidelity harness extension | RM-304 | `libarchive_oxide/tests/common/mod.rs` | additive `read_seq_with_arca` (sequential `ArchiveReader`), `MetaShape` (REAL kind + mode/uid/gid/mtime/link_target, no kind folding), `read_meta_seq_with_arca` / `read_meta_seek_with_arca`, `assert_producers_agree_seq`; the content-only `EntryShape` path is unchanged |
 | tar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_tar_meta.rs`, `libarchive_oxide/tests/fixtures/tar/PROVENANCE.md` | 3 producers (arca, `tar@0.4`, first-party raw ustar builder) × 2 consumers (arca sequential reader, `tar@0.4`); mode/uid/gid/mtime and symlink-target fidelity |
 | cpio producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_cpio_meta.rs`, `libarchive_oxide/tests/fixtures/cpio/PROVENANCE.md` | 3 producers (arca `newc`, first-party raw `newc`, first-party raw `odc` — genuinely distinct on-disk framings) × 2 consumers (arca, first-party raw `newc` parser); mode/uid/gid/mtime plus a typed hardlink pair (File payload + Hardlink alias) |
@@ -262,6 +263,37 @@ change, or versioned release candidate is part of this snapshot.
   `#[cfg(not(feature = "xz"))]` — the feature-off `Unsupported` path. No new source
   file is created, no new runtime dependency is added (`lzma-rust2` was already
   present via `xz`/`sevenz`), and the crate keeps `#![forbid(unsafe_code)]`.
+
+## RM-306
+
+- ADR-0013 (`docs/adr/0013-rar5-udf-deflate64-feasibility.md`) resolves the RAR5,
+  UDF, and Deflate64 feasibility questions RM-300 and ADR-0012 delegated here. It
+  is a feasibility-and-scope decision that lands no provider; each support-matrix
+  cell still flips only when its provider is implemented.
+- **Deflate64 (method 9):** read is a *go* via the external pure-Rust `deflate64`
+  decoder consumed behind the codec-provider boundary (satisfies the C-free
+  portable profile, keeps `#![forbid(unsafe_code)]` and bounded 64 KiB-window
+  decode), landing in a follow-on slice; write is a retired *won't-do* (no
+  pure-Rust encoder exists, demand is nil). This supersedes ADR-0012's
+  "Deflate64 (read + write)" deficit, now recorded as a write-only won't-do row.
+- **UDF:** a *go* for a scoped read-only in-tree pure-Rust provider (Phase 1:
+  revisions 1.02/1.50/2.01, AVDP → VDS → File Set Descriptor → ICB/File Entry →
+  FIDs/allocation descriptors), activated from the Volume Recognition Sequence
+  arca already parses for ISO 9660; write, VAT/sequential CD-R, sparable maps, and
+  UDF 2.50/2.60 metadata partitions are out of Phase-1 scope. ECMA-167 and OSTA
+  UDF specs are free public PDFs with only generic RAND boilerplate, recorded as a
+  low-but-nonzero tracked IP risk.
+- **RAR5:** legally defensible as an independent read-only decoder (RAR compression
+  is a trade secret, not a patent; the UnRAR license does not reach non-derived
+  code), but the provider is *deferred in its entirety*: no clean-room,
+  forbid(unsafe), pure-Rust RAR5 decompressor exists, FFI to C UnRAR is disqualified
+  by the portable profile, and a metadata-plus-Stored-only cut would read almost no
+  real archive (`.rar` in the wild is almost always compressed). Recorded as a
+  tracked deficit; decode-only / clean-room / nominative-naming constraints are
+  fixed for any future work.
+- RM-306 adds no runtime code and no dependency; it updates `docs/support-matrix.md`
+  (deficit ledger + not-yet-implemented prose) and is the RAR5/UDF provenance
+  appendix ADR-0011 reserved.
 
 ## RM-307
 
