@@ -183,7 +183,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: just@1.50.0
+      # Run REUSE through `uvx` exactly as `just reuse` does locally, instead of the
+      # `fsfe/reuse-action` Docker action. That action pulled `fsfe/reuse` from Docker Hub at run
+      # time, whose image-manifest fetch intermittently timed out and turned `ci-required` red for a
+      # network reason unrelated to compliance. PyPI (uv/reuse) is far more reliable than anonymous
+      # Docker Hub pulls, and running the same command as local keeps CI and the dev box from drifting.
+      - name: install uv
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf --retry 5 --retry-connrefused https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: just reuse
 
   license-sync:
     name: crate package, codec and release policy
