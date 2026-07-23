@@ -14,6 +14,8 @@ scheme, metadata field, or producer quirk is accepted.
 | ZIP/ZIP64 | seek or streaming | see [ZIP compression methods](#zip-compression-methods) grid | see grid | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode/timestamp extras; unknown extras are preserved |
 | 7z | seek | LZMA/LZMA2, encoded headers, solid single-folder archives | yes | none (AES unsupported) | optional `sevenz`; multiple folders and general coder graphs are unsupported |
 | ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | UDF and continuation-area coverage are not complete |
+| CAB | seek | read-only (MSCF): Store and MSZIP folders | no (read-only) | none | QUANTUM/LZX folders and cross-cabinet spanning are structured `Unsupported`; the MSZIP window is carried across a folder's `CFDATA` blocks |
+| XAR | seek | read-only: stored and zlib (`x-gzip`) data | no (read-only) | none | zlib-XML TOC; `x-bzip2` and other data encodings are structured `Unsupported` |
 
 ### ZIP compression methods
 
@@ -59,8 +61,10 @@ read+write on portable.
 | Portable **streaming** zstd encode | ZIP write method 93 on `portable-codecs` → structured `Unsupported`; `native-codecs` write works | `ruzstd` ships only a one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, used for outer-filter frames and `create --zstd`). It cannot emit a single ZIP member as a bounded stream without buffering the whole member, which would break the core bounded-memory guarantee. The engine refuses the path rather than weaken the guarantee. | A streaming, single-stream pure-Rust zstd encoder — upstream to `ruzstd` or a dedicated crate the engine consumes. | RM-307 → follow-on codec initiative |
 | Deflate64 (read + write) | ZIP method 9 → structured `Unsupported` | No pure-Rust Deflate64 encoder exists; decoders are scarce and write has effectively no consumer demand. | Feasibility decision (own read-only decoder, external decoder, or leave unsupported); no encoder planned. | RM-306 feasibility ADR |
 
-RAR5, CAB, XAR, and UDF are not currently implemented. They are read-only
-targets for the Modern Archive Profile.
+CAB and XAR are implemented as read-only seek-native providers (see the archive
+containers table above). RAR5 and UDF are not currently implemented; they are
+read-only targets for the Modern Archive Profile whose feasibility and scope are
+tracked separately (RM-306).
 
 ## Outer compression filters
 

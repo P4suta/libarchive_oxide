@@ -26,6 +26,10 @@ pub enum FormatId {
     SevenZip,
     /// ISO 9660.
     Iso9660,
+    /// Microsoft Cabinet (read-only).
+    Cab,
+    /// XAR extensible archive (read-only).
+    Xar,
 }
 
 impl FormatId {
@@ -42,6 +46,8 @@ impl FormatId {
                 Self::SevenZip,
                 [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c].as_slice(),
             ),
+            (Self::Cab, b"MSCF".as_slice()),
+            (Self::Xar, b"xar!".as_slice()),
         ] {
             if prefix.len() >= signature.len() && prefix.starts_with(signature) {
                 return ProbeResult::Match(identifier);
@@ -69,6 +75,8 @@ impl FormatId {
             b"PK\x03\x04".as_slice(),
             b"PK\x05\x06".as_slice(),
             [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c].as_slice(),
+            b"MSCF".as_slice(),
+            b"xar!".as_slice(),
         ] {
             if prefix.len() < signature.len() && signature.starts_with(prefix) {
                 minimum = minimum.min(signature.len());

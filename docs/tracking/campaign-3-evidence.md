@@ -39,6 +39,10 @@ change, or versioned release candidate is part of this snapshot.
 | ZIP LZMA (method 14) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Lzma` + `lzma_rust2::LzmaWriter::new_no_header` (raw LZMA1, EOS marker) drained through an in-crate `VecSink` (no trait object, `#![forbid(unsafe_code)]` intact); pinned preset 6 (props 93, 8 MiB dict); emits the 9-byte ZIP-LZMA header once at entry start; general-purpose bit 1 (`0x0002`) set in local+central flags outside the `0x0809` cross-check mask; version-needed 63 |
 | ZIP LZMA interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_lzma.rs`, `libarchive_oxide/tests/seek_stream_v2.rs`, `libarchive_oxide/tests/fixtures/zip/python-lzma/` | three producers (arca + first-party raw-LZMA1 builder, both `lzma-rust2`; + committed CPython 3.14.6/liblzma fixture, independent codec) × two consumers (arca, `zip@8.6.0` with `lzma`); WRITE evidence = the `zip` crate decodes arca's method-14 output byte-identically; round-trip, empty-member, truncation, bad-property-size, bomb, and feature-off Unsupported tests; the committed fixture + `generate.py` are byte-reproducible (SHA-256 recorded in `PROVENANCE.md`) |
 | Support-matrix + PROVENANCE ZIP LZMA update | RM-302 | `docs/support-matrix.md`, `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md` | ZIP row adds LZMA to Read and Write; the not-yet-implemented note now lists ONLY Deflate64; PROVENANCE records the committed-fixture escape hatch and the two-independent-codecs honesty note |
+| CAB read-only provider | RM-305 | `libarchive_oxide/src/cab.rs`, `libarchive_oxide-core/src/format.rs`, `libarchive_oxide/src/provider.rs`, `libarchive_oxide/src/seek_stream.rs` | `CabSeekReader`: MSCF header, CFFOLDER/CFFILE/CFDATA tables, Store + MSZIP (the 32 KiB LZ window is carried across a folder's `CFDATA` blocks via a miniz_oxide wrapping ring); QUANTUM/LZX/cross-cabinet/spanning are structured `Unsupported`; registered as a read-only seek-native provider (`FormatId::Cab`, capability decode-only) |
+| XAR read-only provider | RM-305 | `libarchive_oxide/src/xar.rs`, `.../format.rs`, `.../provider.rs`, `.../seek_stream.rs` | `XarSeekReader`: big-endian header, zlib TOC bounded by `metadata_bytes`, a hand-rolled bounded XML pull-scanner over the `<file>` tree, stored + zlib (`x-gzip`) heap data; `x-bzip2`/unknown encodings are structured `Unsupported`; `FormatId::Xar`, decode-only |
+| CAB/XAR interop + adversarial evidence | RM-305 | `libarchive_oxide/tests/interop_cab_meta.rs`, `libarchive_oxide/tests/interop_xar_meta.rs`, `libarchive_oxide/tests/fixtures/{cab,xar}/PROVENANCE.md` | first-party in-code raw builders (independent DEFLATE/zlib via `flat2`) read back through the RM-301 harness; multi-file/nested/empty round trips plus unsupported-method and truncated-header structured-error negatives; a three-lens adversarial review with a verification pass |
+| Support-matrix CAB/XAR read-only rows | RM-305 | `docs/support-matrix.md` | CAB and XAR added to the archive-containers table as read-only seek providers; removed from the not-implemented list (RAR5/UDF remain, tracked by RM-306) |
 
 ## RM-301
 
@@ -286,6 +290,62 @@ change, or versioned release candidate is part of this snapshot.
 - RM-307 adds no runtime code and no dependency; it is an
   architecture-and-documentation slice establishing the contract that RM-302..306
   and future codec work inherit.
+
+## RM-305
+
+- CAB and XAR are arca's FIRST read-only built-in seek-native providers: every
+  prior built-in format (ZIP, 7z, ISO, tar, cpio, ar) is read+write, so RM-305
+  also proves the read-only registration path. Both decode through the always-on
+  `miniz_oxide` codec, so they need no feature gate and stay pure-Rust / C-free on
+  the portable profile.
+- Registration (five points, all in the scaffold): `FormatId::Cab` / `FormatId::Xar`
+  (`libarchive_oxide-core/src/format.rs`) with `MSCF` / `xar!` probe signatures;
+  `format_capability` → `FormatCapabilities::new(true, false, true)` (decode yes,
+  encode NO, seek yes) and `format_name` in `provider.rs`; a `SeekDispatch::Cab` /
+  `SeekDispatch::Xar` arm plus signature detection in `SeekArchiveReader::open`; and
+  `mod cab` / `mod xar` in `lib.rs`. Each reader implements the same
+  `new`/`next_event`/`skip_entry`/`into_inner`/`source_ref` contract as the 7z
+  reader and drives the identical `Idle → Entry → Data(≤64 KiB) → EndEntry → Done`
+  phase machine.
+- **CAB** (`cab.rs`): a bounded MSCF parser. The `CFHEADER` (with optional reserve
+  and prev/next-cabinet strings), the `CFFOLDER` and `CFFILE` tables, and the
+  per-folder `CFDATA` blocks are all walked within the `Limits` budget. A folder is
+  a solid unit decoded one `CFDATA` block at a time — no whole folder is
+  materialized. Store copies bytes through; MSZIP verifies the `CK` block magic and
+  inflates each block's raw DEFLATE while carrying the folder's 32 KiB LZ77 window
+  across blocks via a fresh `DecompressorOxide` over a preserved power-of-two
+  wrapping ring (so a back-reference in block N resolves into block N−1's output).
+  QUANTUM/LZX methods, cross-cabinet continuation files (`iFolder` sentinels), and
+  spanning blocks (`cbUncomp == 0`) list their metadata then surface a structured
+  `Unsupported` on the payload.
+- **XAR** (`xar.rs`): the 28-byte big-endian header locates the zlib-compressed TOC
+  (inflated with `DataFormat::Zlib`, capped at `min(toc_length_uncompressed,
+  metadata_bytes)` and length-verified) and the heap (`heap_start = header.size +
+  toc_length_compressed`, never a hard-coded 28). A hand-rolled bounded XML
+  pull-scanner (an explicit DFS `<file>`-frame stack, no DOM, no XML crate) resolves
+  each entry's `/`-joined path, emitting a directory before its children, bounded by
+  `entries` / `path_bytes` / a nesting-depth cap. Regular files stream their heap
+  blob per entry (seek-per-blob for the unordered/shared-heap model) as stored
+  (`octet-stream`, `S == L` enforced) or zlib (`x-gzip`, RFC-1950 — decoded as zlib,
+  NOT gzip), with the decoded length verified against `<length>`. `x-bzip2` and any
+  unknown encoding are structured `Unsupported`; version ≠ 1 is `Unsupported`.
+- Write is rejected without a code path of its own: the decode-only capability makes
+  `format_encoder` return a typed `Capability` error, and `SeekArchiveWriter::with_format`
+  falls through its default arm to `Unsupported` for `FormatId::Cab`/`Xar`.
+- `#![forbid(unsafe_code)]`, the `no-dyn` gate, and bounded memory hold: both readers
+  are plain generic structs over `R: Read + Seek` with concrete enums (no trait
+  objects), stream payload in ≤ 64 KiB chunks, and return a structured `StreamError`
+  for every malformed/truncated/unsupported/limit case (never a panic/unwrap).
+- Evidence: `tests/interop_cab_meta.rs` and `tests/interop_xar_meta.rs` build valid
+  archives with first-party in-code raw byte builders (independent DEFLATE/zlib via
+  `flat2`, which arca re-inflates with `miniz_oxide` — codec independence), read
+  them back through the RM-301 harness, and assert content round trips over
+  multi-file/nested/empty corpora, plus negatives for an unsupported compression
+  method and a truncated/out-of-range header. A three-lens adversarial review
+  (panic/bounds, spec-correctness, malformed-input) with an independent verification
+  pass was run over both modules before commit. Per-format `PROVENANCE.md` registers
+  the in-code raw builder and documents the external independent producers
+  (makecab/gcab/cabextract for CAB; the `xar` CLI / `bsdtar --format=xar` for XAR).
 
 ## Reproduced gates
 

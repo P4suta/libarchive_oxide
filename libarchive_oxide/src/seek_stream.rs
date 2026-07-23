@@ -254,6 +254,8 @@ enum SeekDispatch<R> {
     Indexed(Box<IndexedArchiveReader<R>>),
     #[cfg(feature = "sevenz")]
     SevenZ(Box<crate::sevenz::SevenZSeekReader<R>>),
+    Cab(Box<crate::cab::CabSeekReader<R>>),
+    Xar(Box<crate::xar::XarSeekReader<R>>),
 }
 
 /// Seek-capable archive reader.
@@ -299,6 +301,16 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
         let mut signature = [0_u8; 6];
         let read = read_prefix(&mut input, &mut signature)?;
         input.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
+        if read >= 4 && &signature[..4] == b"MSCF" {
+            return Ok(Self {
+                inner: SeekDispatch::Cab(Box::new(crate::cab::CabSeekReader::new(input, limits)?)),
+            });
+        }
+        if read >= 4 && &signature[..4] == b"xar!" {
+            return Ok(Self {
+                inner: SeekDispatch::Xar(Box::new(crate::xar::XarSeekReader::new(input, limits)?)),
+            });
+        }
         if read == signature.len() && signature == [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c] {
             #[cfg(feature = "sevenz")]
             {
@@ -330,6 +342,8 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
             SeekDispatch::Indexed(reader) => reader.next_event(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.next_event(),
+            SeekDispatch::Cab(reader) => reader.next_event(),
+            SeekDispatch::Xar(reader) => reader.next_event(),
         }
     }
 
@@ -339,6 +353,8 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
             SeekDispatch::Indexed(reader) => reader.skip_entry(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.skip_entry(),
+            SeekDispatch::Cab(reader) => reader.skip_entry(),
+            SeekDispatch::Xar(reader) => reader.skip_entry(),
         }
     }
 
@@ -349,6 +365,8 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
             SeekDispatch::Indexed(reader) => reader.format(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(_) => FormatId::SevenZip,
+            SeekDispatch::Cab(_) => FormatId::Cab,
+            SeekDispatch::Xar(_) => FormatId::Xar,
         }
     }
 
@@ -359,6 +377,8 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
             SeekDispatch::Indexed(reader) => reader.into_inner(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.into_inner(),
+            SeekDispatch::Cab(reader) => reader.into_inner(),
+            SeekDispatch::Xar(reader) => reader.into_inner(),
         }
     }
 
@@ -367,6 +387,8 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
             SeekDispatch::Indexed(reader) => reader.source_ref(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.source_ref(),
+            SeekDispatch::Cab(reader) => reader.source_ref(),
+            SeekDispatch::Xar(reader) => reader.source_ref(),
         }
     }
 }

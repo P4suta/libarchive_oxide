@@ -31,6 +31,7 @@ pub mod async_range;
 pub mod async_seek;
 #[cfg(feature = "async")]
 pub mod async_stream;
+mod cab;
 pub mod create;
 pub mod engine;
 pub mod extractor;
@@ -55,6 +56,7 @@ pub mod spool;
 pub mod stream;
 #[cfg(feature = "tokio")]
 pub mod tokio_stream;
+mod xar;
 mod zip;
 mod zip_stream;
 

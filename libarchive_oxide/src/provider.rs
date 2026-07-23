@@ -1025,6 +1025,10 @@ impl StaticFormatProviders for BuiltinFormatProviders {
                 ProviderCapability::Available(FormatCapabilities::new(true, true, true))
             },
             FormatId::SevenZip => ProviderCapability::Disabled,
+            // CAB and XAR are seek-native READ-ONLY providers: decode yes, encode no.
+            FormatId::Cab | FormatId::Xar => {
+                ProviderCapability::Available(FormatCapabilities::new(true, false, true))
+            },
             _ => ProviderCapability::Unknown,
         }
     }
@@ -1345,6 +1349,8 @@ pub(crate) const fn format_name(format: FormatId) -> &'static str {
         FormatId::Zip => "zip",
         FormatId::SevenZip => "7z",
         FormatId::Iso9660 => "iso9660",
+        FormatId::Cab => "cab",
+        FormatId::Xar => "xar",
         _ => "unknown",
     }
 }
