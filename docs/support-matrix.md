@@ -11,7 +11,7 @@ scheme, metadata field, or producer quirk is accepted.
 | tar | sequential | v7, ustar, pax, GNU | yes | none | pax extensions and GNU sparse; known-size entry creation |
 | cpio | sequential | binary little/big endian, odc, newc, crc | yes | none | known-size entry creation |
 | ar | sequential | GNU and BSD | yes | none | thin members are reported as external references and are never materialized automatically |
-| ZIP/ZIP64 | seek or streaming | see [ZIP compression methods](#zip-compression-methods) grid | see grid | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode/timestamp extras; unknown extras are preserved |
+| ZIP/ZIP64 | seek or streaming | see [ZIP compression methods](#zip-compression-methods) grid | see grid | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode path/comment, and extended/NTFS/Info-ZIP-UX timestamp extras are interpreted as typed metadata; Info-ZIP Unix uid/gid are surfaced when recorded in the central directory (as arca writes them) and synthesized on write; unknown extras are preserved verbatim |
 | 7z | seek | LZMA/LZMA2, encoded headers, solid single-folder archives | yes | none (AES unsupported) | optional `sevenz`; multiple folders and general coder graphs are unsupported |
 | ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | UDF and continuation-area coverage are not complete |
 
