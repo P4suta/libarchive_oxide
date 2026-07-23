@@ -14,6 +14,8 @@ scheme, metadata field, or producer quirk is accepted.
 | ZIP/ZIP64 | seek or streaming | see [ZIP compression methods](#zip-compression-methods) grid | see grid | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode path/comment, and extended/NTFS/Info-ZIP-UX timestamp extras are interpreted as typed metadata; Info-ZIP Unix uid/gid are surfaced when recorded in the central directory (as arca writes them) and synthesized on write; unknown extras are preserved verbatim |
 | 7z | seek | LZMA/LZMA2, encoded headers, solid single-folder archives | yes | none (AES unsupported) | optional `sevenz`; multiple folders and general coder graphs are unsupported |
 | ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | UDF and continuation-area coverage are not complete |
+| CAB | seek | read-only (MSCF): Store and MSZIP folders | no (read-only) | none | QUANTUM/LZX folders and cross-cabinet spanning are structured `Unsupported`; the MSZIP window is carried across a folder's `CFDATA` blocks |
+| XAR | seek | read-only: stored and zlib (`x-gzip`) data | no (read-only) | none | zlib-XML TOC; `x-bzip2` and other data encodings are structured `Unsupported` |
 
 ### ZIP compression methods
 
@@ -62,14 +64,14 @@ read+write on portable.
 | Portable **streaming** zstd encode | ZIP write method 93 on `portable-codecs` → structured `Unsupported`; `native-codecs` write works | `ruzstd` ships only a one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, used for outer-filter frames and `create --zstd`). It cannot emit a single ZIP member as a bounded stream without buffering the whole member, which would break the core bounded-memory guarantee. The engine refuses the path rather than weaken the guarantee. | A streaming, single-stream pure-Rust zstd encoder — upstream to `ruzstd` or a dedicated crate the engine consumes. | RM-307 → follow-on codec initiative |
 | Deflate64 (method 9) | ZIP method 9 read/write → structured `Unsupported` (not yet implemented) | Read: a mature pure-Rust decoder (`deflate64`) exists but is not yet wired. Write: no pure-Rust encoder exists and demand is effectively nil (matches libarchive). | Read: adopt the external `deflate64` decoder behind the codec-provider boundary in a follow-on slice. Write: **won't-do**, retired per [ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md). | RM-306 / ADR-0013 |
 
-RAR5 and UDF read scope is resolved by
+CAB and XAR are implemented as read-only seek-native providers (see the archive
+containers table above). RAR5 and UDF read scope is resolved by
 [ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md): UDF is a scoped read-only
 go (revisions 1.02/1.50/2.01 first, activated from the shared Volume Recognition
 Sequence), pending its implementation slice; RAR5 read is feasible in principle,
 but the provider is deferred in its entirety until a clean-room pure-Rust
 decompressor exists, because `.rar` archives in the wild are almost always
-compressed. CAB and XAR remain read-only targets tracked by RM-305. All four are
-not yet implemented; each cell flips only when its provider lands.
+compressed.
 
 ## Outer compression filters
 
