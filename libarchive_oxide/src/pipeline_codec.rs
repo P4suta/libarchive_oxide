@@ -23,6 +23,10 @@ pub(crate) enum PipelineCodec {
     Gzip(ExternalDecoder<compression_codecs::GzipDecoder>),
     #[cfg(not(feature = "native-codecs"))]
     Gzip(Box<GzipDecoder>),
+    /// Raw DEFLATE (no gzip framing) — the 7z Deflate coder. Backed by the same
+    /// `miniz_oxide` raw-inflate core the gzip decoder sits on.
+    #[cfg(feature = "sevenz")]
+    Deflate(Box<crate::filter::gzip::RawInflateDecoder>),
     #[cfg(feature = "bzip2")]
     Bzip2(ExternalDecoder<compression_codecs::BzDecoder>),
     #[cfg(all(feature = "zstd", feature = "native-codecs"))]
@@ -55,6 +59,10 @@ impl PipelineCodec {
                     Ok(Self::Gzip(Box::new(GzipDecoder::new(limits))))
                 }
             },
+            #[cfg(feature = "sevenz")]
+            FilterId::Deflate => Ok(Self::Deflate(Box::new(
+                crate::filter::gzip::RawInflateDecoder::new(limits),
+            ))),
             FilterId::Bzip2 => {
                 #[cfg(feature = "bzip2")]
                 {
@@ -133,6 +141,8 @@ impl PipelineCodec {
             Self::Gzip(codec) => codec.process(input, output, end),
             #[cfg(not(feature = "native-codecs"))]
             Self::Gzip(codec) => codec.process(input, output, end),
+            #[cfg(feature = "sevenz")]
+            Self::Deflate(codec) => codec.process(input, output, end),
             #[cfg(feature = "bzip2")]
             Self::Bzip2(codec) => codec.process(input, output, end),
             #[cfg(feature = "zstd")]
@@ -162,6 +172,8 @@ impl PipelineCodec {
             Self::Gzip(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(not(feature = "native-codecs"))]
             Self::Gzip(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "sevenz")]
+            Self::Deflate(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "bzip2")]
             Self::Bzip2(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "zstd")]
@@ -171,6 +183,19 @@ impl PipelineCodec {
             #[cfg(feature = "lz4")]
             Self::Lz4(codec) => codec.poll_process(input, output, end, waker),
         }
+    }
+}
+
+impl Codec for PipelineCodec {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> Result<CodecStep, ArchiveError> {
+        // Delegates to the inherent method (inherent resolution wins, so this does not recurse),
+        // letting `PipelineCodec` drive the generic `CodecReader<_, PipelineCodec>`.
+        PipelineCodec::process(self, input, output, end)
     }
 }
 
@@ -200,6 +225,7 @@ fn disabled(filter: FilterId) -> ArchiveError {
 const fn filter_name(filter: FilterId) -> &'static str {
     match filter {
         FilterId::Gzip => "gzip",
+        FilterId::Deflate => "deflate",
         FilterId::Bzip2 => "bzip2",
         FilterId::Zstd => "zstd",
         FilterId::Xz => "xz",

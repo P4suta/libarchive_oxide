@@ -12,7 +12,7 @@ scheme, metadata field, or producer quirk is accepted.
 | cpio | sequential | binary little/big endian, odc, newc, crc | yes | none | known-size entry creation |
 | ar | sequential | GNU and BSD | yes | none | thin members are reported as external references and are never materialized automatically |
 | ZIP/ZIP64 | seek or streaming | see [ZIP compression methods](#zip-compression-methods) grid | see grid | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode path/comment, and extended/NTFS/Info-ZIP-UX timestamp extras are interpreted as typed metadata; Info-ZIP Unix uid/gid are surfaced when recorded in the central directory (as arca writes them) and synthesized on write; unknown extras are preserved verbatim |
-| 7z | seek | LZMA/LZMA2, encoded headers, solid single-folder archives | yes | none (AES unsupported) | optional `sevenz`; multiple folders and general coder graphs are unsupported |
+| 7z | seek | LZMA, LZMA2, Delta, BCJ (x86/PPC/IA64/ARM/ARMT/SPARC/ARM64/RISC-V), Deflate, BZip2, Zstandard; multi-folder and general coder graphs; plain and encoded headers | yes | AES-256 (SHA-256 KDF) | optional `sevenz`; one active folder decoder (bounded); PPMd and BCJ2 are structured `Unsupported` — see [deficits](#codec-capability-deficits) |
 | ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | UDF and continuation-area coverage are not complete |
 | CAB | seek | read-only (MSCF): Store and MSZIP folders | no (read-only) | none | QUANTUM/LZX folders and cross-cabinet spanning are structured `Unsupported`; the MSZIP window is carried across a folder's `CFDATA` blocks |
 | XAR | seek | read-only: stored and zlib (`x-gzip`) data | no (read-only) | none | zlib-XML TOC; `x-bzip2` and other data encodings are structured `Unsupported` |
@@ -46,8 +46,16 @@ resting state. Deflate64 (method 9) is not yet implemented in either direction; 
 boundary, landing in a follow-on slice) and write is a retired won't-do (no
 pure-Rust encoder exists). Traditional ZipCrypto is not enabled by default.
 
-7z BCJ/Delta, Deflate, BZip2, Zstandard, PPMd, AES, multi-folder, and arbitrary
-coder-graph coverage remain roadmap work.
+7z now reads the general coder graph: multi-folder archives, chained BCJ/Delta
+filters over LZMA/LZMA2, and Deflate/BZip2/Zstandard coders, plus AES-256/SHA-256
+encryption as its own [container column](#archive-containers). Decoding keeps one
+active folder decoder at a time (bounded memory) and verifies each substream's
+stored CRC-32. The two remaining coders — PPMd and BCJ2 — list normally but return
+a structured `Unsupported` on extraction; they are tracked deficits with declared
+resolution paths (see [Codec capability deficits](#codec-capability-deficits)).
+Malformed coder graphs (cycles, stream overlaps, truncation) are fuzzed through the
+structured `read_7z_graph` target, which asserts no panic, bounded work, and only
+typed errors.
 
 ### Codec capability deficits
 
@@ -63,6 +71,8 @@ read+write on portable.
 |---|---|---|---|---|
 | Portable **streaming** zstd encode | ZIP write method 93 on `portable-codecs` → structured `Unsupported`; `native-codecs` write works | `ruzstd` ships only a one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, used for outer-filter frames and `create --zstd`). It cannot emit a single ZIP member as a bounded stream without buffering the whole member, which would break the core bounded-memory guarantee. The engine refuses the path rather than weaken the guarantee. | A streaming, single-stream pure-Rust zstd encoder — upstream to `ruzstd` or a dedicated crate the engine consumes. | RM-307 → follow-on codec initiative |
 | Deflate64 (method 9) | ZIP method 9 read/write → structured `Unsupported` (not yet implemented) | Read: a mature pure-Rust decoder (`deflate64`) exists but is not yet wired. Write: no pure-Rust encoder exists and demand is effectively nil (matches libarchive). | Read: adopt the external `deflate64` decoder behind the codec-provider boundary in a follow-on slice. Write: **won't-do**, retired per [ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md). | RM-306 / ADR-0013 |
+| 7z **PPMd** (method `03 04 01`) | a folder whose coder is PPMd lists normally; reaching its payload returns a structured `Unsupported` | 7z uses the PPMd variant H (PPMd7) model; no bounded-memory pure-Rust decoder is wired, and the engine will not absorb one into its core. | Adopt or contribute a pure-Rust PPMd7 decoder behind the codec-provider boundary, consumed like the other coders; no encoder is planned (read-only, matching libarchive). | RM-303 → follow-on codec initiative |
+| 7z **BCJ2** (method `03 03 01 1B`) | a folder whose coder graph contains BCJ2 lists normally; reaching its payload returns a structured `Unsupported` | BCJ2 is a four-input branch converter (main + two call/jump streams + a range-coder control stream); it is inherently multi-stream and does not fit the one-active-linear-folder decode model that keeps memory bounded. | Extend the folder decoder with a bounded BCJ2 four-stream junction stage (the graph parser already resolves the bind pairs); no encoder is planned. | RM-303 → follow-on decoder slice |
 
 CAB and XAR are implemented as read-only seek-native providers (see the archive
 containers table above). RAR5 and UDF read scope is resolved by

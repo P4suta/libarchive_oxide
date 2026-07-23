@@ -56,8 +56,8 @@ bzip2 = [
 zstd = ["dep:ruzstd"]
 xz = ["dep:lzma-rust2"]
 lz4 = ["dep:lz4_flex", "dep:twox-hash"]
-# WinZip AES-256 AE-2.
-aes = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1", "dep:pbkdf2", "dep:subtle", "dep:getrandom"]
+# WinZip AES-256 AE-2 (ZIP) and AES-256/SHA-256 (7z, via `cbc`).
+aes = ["dep:aes", "dep:cbc", "dep:ctr", "dep:hmac", "dep:sha1", "dep:pbkdf2", "dep:subtle", "dep:getrandom"]
 # 7z single-folder LZMA2 and shared CRC-32.
 sevenz = ["dep:lzma-rust2", "gzip"]
 # Runtime-neutral and Tokio I/O adapters. Both drive the same sans-I/O
@@ -83,8 +83,12 @@ flate2 = { version = "1.1.9", default-features = false, features = ["zlib"], opt
 xz-codec = { package = "xz2", version = "0.1.7", optional = true }
 # Shared by xz and 7z.
 lzma-rust2 = { version = "0.16.5", default-features = false, features = ["std", "encoder", "xz"], optional = true }
-# WinZip AE-2 requires SHA-1.
-aes = { version = "0.9", optional = true }
+# WinZip AE-2 requires SHA-1. `zeroize` wipes the expanded AES key schedule on drop,
+# so a folder/member key never lingers in freed memory after the decoder is dropped
+# (defense in depth for both the 7z CBC and the ZIP AE-2 CTR paths).
+aes = { version = "0.9", features = ["zeroize"], optional = true }
+# 7z AES-256/SHA-256 uses CBC (ZIP AE-2 uses CTR via `ctr`).
+cbc = { version = "0.2", optional = true }
 ctr = { version = "0.10", optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
@@ -120,7 +124,9 @@ ruzstd = "0.8.2"
 zstd-codec = { package = "zstd", version = "0.13.3" }
 # Independent SHA-256 reference for OCI layer digest/diffID tests.
 sha2 = "0.11"
-sevenz-rust2 = "0.21.3"
+# `bzip2` is on by default; `deflate` and `zstd` are enabled so the 7z differential
+# tests can produce Deflate/Zstd folders for arca's reuse-codec decode path.
+sevenz-rust2 = { version = "0.21.3", features = ["deflate", "zstd"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto", "bzip2", "zstd", "lzma"] }
 # Independent tar/ar producers and consumers used only for RM-304 interop tests.
 tar = { version = "0.4", default-features = false }

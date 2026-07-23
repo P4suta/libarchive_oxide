@@ -4,18 +4,31 @@
 
 //! Seek-capable, payload-streaming 7z reader and writer.
 //!
-//! Supports one folder, pack stream, and coder. Writers emit LZMA2. Readers
-//! accept LZMA2 or LZMA, including encoded headers. BCJ, delta, AES, `PPMd`,
-//! multiple folders, multiple coders, and coder graphs are unsupported.
+//! Readers parse every folder's full coder graph (any number of coders, bind
+//! pairs, and packed streams) so listing works for any archive. Decoding is
+//! limited to linear chains over a single pack stream whose coders are each
+//! LZMA2/LZMA, a decode-only byte filter (delta, BCJ), a general-purpose coder
+//! reused from the shared codec dispatch (Deflate, `BZip2`, Zstd), or — under the
+//! `aes` feature, given a password — the AES-256/SHA-256 decryption coder: such a
+//! folder streams normally, while richer graphs (BCJ2, `PPMd`, multi-pack) list
+//! but report `Unsupported` on extraction. Exactly one folder decode chain is live at a
+//! time, so memory stays bounded regardless of folder count. Writers still emit
+//! a single solid LZMA2 folder. Each substream's stored CRC-32 is verified after decode,
+//! which also distinguishes a correct 7z AES password from a wrong one.
 
 use std::io::{Read, Seek, SeekFrom, Take, Write};
 
+use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
     ArchiveError, ArchiveMetadata, ArchivePath, EntryKind, EntryMetadata, EntryTimes, ErrorKind,
     Extension, Limits, Owner, PathEncoding, Timestamp,
 };
 
-use crate::{ReaderEvent, StreamError};
+use crate::codec_read::CodecReader;
+use crate::filter::bcj::{BcjDecoder, BranchKind};
+use crate::filter::delta::DeltaDecoder;
+use crate::pipeline_codec::PipelineCodec;
+use crate::{ReaderEvent, SecretBytes, StreamError};
 
 type Result<T> = core::result::Result<T, HeaderError>;
 
@@ -60,6 +73,41 @@ const K_START_POS: u8 = 0x18;
 const METHOD_LZMA2: u8 = 0x21;
 /// LZMA (v1) coder method id (3 bytes) — how mainstream 7-Zip compresses encoded headers and folders.
 const METHOD_LZMA: [u8; 3] = [0x03, 0x01, 0x01];
+/// Delta filter coder method id (1 byte); its single property byte is `distance - 1`.
+const METHOD_DELTA: u8 = 0x03;
+/// BCJ x86 filter coder method id.
+const METHOD_BCJ_X86: [u8; 4] = [0x03, 0x03, 0x01, 0x03];
+/// BCJ PowerPC filter coder method id.
+const METHOD_BCJ_PPC: [u8; 4] = [0x03, 0x03, 0x02, 0x05];
+/// BCJ IA-64 filter coder method id.
+const METHOD_BCJ_IA64: [u8; 4] = [0x03, 0x03, 0x04, 0x01];
+/// BCJ ARM filter coder method id.
+const METHOD_BCJ_ARM: [u8; 4] = [0x03, 0x03, 0x05, 0x01];
+/// BCJ ARM-Thumb filter coder method id.
+const METHOD_BCJ_ARMT: [u8; 4] = [0x03, 0x03, 0x07, 0x01];
+/// BCJ SPARC filter coder method id.
+const METHOD_BCJ_SPARC: [u8; 4] = [0x03, 0x03, 0x08, 0x05];
+/// BCJ ARM64 filter coder method id (1 byte).
+const METHOD_BCJ_ARM64: u8 = 0x0A;
+/// BCJ RISC-V filter coder method id (1 byte).
+const METHOD_BCJ_RISCV: u8 = 0x0B;
+/// Deflate coder method id (3 bytes) — RAW DEFLATE (RFC 1951), no gzip/zlib framing.
+const METHOD_DEFLATE: [u8; 3] = [0x04, 0x01, 0x08];
+/// `BZip2` coder method id (3 bytes).
+const METHOD_BZIP2: [u8; 3] = [0x04, 0x02, 0x02];
+/// Zstandard coder method id (4 bytes), as used by the 7-Zip-zstd fork and `sevenz-rust2`.
+const METHOD_ZSTD: [u8; 4] = [0x04, 0xF7, 0x11, 0x01];
+/// AES-256/SHA-256 encryption coder method id (4 bytes).
+const METHOD_AES256: [u8; 4] = [0x06, 0xF1, 0x07, 0x01];
+
+/// Peak decompression working set for a bzip2 stream at the largest (900 KiB) block size.
+/// libbzip2 documents ~3.7 MiB for `-9` decompression; rounded up. A folder's bzip2 coder is
+/// refused when the configured codec-memory budget cannot hold it.
+const BZIP2_DECODE_WORKSPACE: usize = 4 * 1024 * 1024;
+/// Smallest zstd window (the format's minimum `Window_Log` of 10 → 1 KiB) the decoder must be
+/// allowed to allocate. The native zstd backend additionally caps the frame window to the
+/// codec-memory budget inside [`PipelineCodec`]; this floor rejects a nonsensically tiny budget.
+const ZSTD_MIN_WINDOW: usize = 1024;
 
 /// `FILE_ATTRIBUTE_DIRECTORY`.
 const ATTR_DIRECTORY: u32 = 0x10;
@@ -81,31 +129,175 @@ const WRITER_PRESET: u32 = 6;
 // Parsed structures
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
-/// The single-coder codec of a folder. Reading supports both LZMA2 (what this crate writes) and plain
-/// LZMA (what 7-Zip and `sevenz-rust2` use for compressed/encoded headers and folders).
+/// One coder's decode method as parsed from a folder graph. Decoding supports LZMA2 (what this
+/// crate writes), plain LZMA (what 7-Zip and `sevenz-rust2` use for compressed/encoded headers and
+/// folders), the decode-only delta and BCJ byte filters, and the general-purpose Deflate/BZip2/Zstd
+/// coders reused from the shared [`PipelineCodec`] dispatch. Every other method id (`PPMd`, BCJ2, …)
+/// parses into [`CoderMethod::Unsupported`] so listing works, but its payload cannot be decoded here.
 #[derive(Debug, Clone, Copy)]
-enum FolderCoder {
+enum CoderMethod {
     /// LZMA2, carrying its one-byte dictionary-size property.
     Lzma2 { dict_prop: u8 },
     /// LZMA (v1), carrying its 5 property bytes: `lc/lp/pb` byte + little-endian `u32` dict size.
     Lzma { props: [u8; 5] },
+    /// A decode-only byte-to-byte filter (delta or BCJ) applied after its inner coder.
+    Filter(SevenFilter),
+    /// AES-256/SHA-256 decryption, carrying its parsed (archive-public) salt/IV/work
+    /// factor. The secret key is derived only at decode time from the caller's password.
+    #[cfg(feature = "aes")]
+    Aes(crate::filter::aes7z::AesParams),
     /// A coder whose metadata can be listed but whose payload cannot be decoded.
     Unsupported,
 }
 
-/// The restricted single-folder description parsed from a `StreamsInfo`.
+/// A 7z coder that arca decodes by reusing an existing codec. Delta and BCJ are decode-only byte
+/// filters applied in place after the coder feeding them; [`SevenFilter::Pipeline`] instead reuses
+/// a caller-driven [`PipelineCodec`] (Deflate/BZip2/Zstd) as a decompression coder in the chain.
+#[derive(Debug, Clone, Copy)]
+enum SevenFilter {
+    /// Delta filter with a byte `distance` in `1..=256`.
+    Delta { distance: usize },
+    /// Branch/Call/Jump filter for a given instruction family, with a running start position.
+    Bcj { kind: BranchKind, start: usize },
+    /// A general-purpose decompression coder reused from the shared [`PipelineCodec`] dispatch:
+    /// 7z Deflate (raw), `BZip2`, or Zstd, identified by its [`FilterId`].
+    Pipeline { filter: FilterId },
+}
+
+/// One coder in a folder's graph, with its input/output stream arity.
+#[derive(Debug, Clone, Copy)]
+struct Coder {
+    method: CoderMethod,
+    /// Number of input streams the coder consumes.
+    num_in: usize,
+    /// Number of output streams the coder produces.
+    num_out: usize,
+}
+
+/// A bind pair links one coder's output stream to another coder's input stream, both addressed by
+/// global stream index within the folder.
+#[derive(Debug, Clone, Copy)]
+struct BindPair {
+    in_index: usize,
+    out_index: usize,
+}
+
+/// A parsed folder coder graph. Spec-complete: it may describe more coders, bind pairs, or packed
+/// streams than the linear LZMA/LZMA2 chains this crate can decode, so listing always works.
+#[derive(Debug, Clone)]
+struct Folder {
+    coders: Vec<Coder>,
+    bind_pairs: Vec<BindPair>,
+    /// Global input-stream indices fed directly by pack streams, in pack-stream order.
+    packed_indices: Vec<usize>,
+}
+
+impl Folder {
+    fn total_in(&self) -> usize {
+        self.coders.iter().map(|coder| coder.num_in).sum()
+    }
+
+    fn total_out(&self) -> usize {
+        self.coders.iter().map(|coder| coder.num_out).sum()
+    }
+
+    /// First global input-stream index owned by coder `index`.
+    fn in_base(&self, index: usize) -> usize {
+        self.coders[..index].iter().map(|coder| coder.num_in).sum()
+    }
+
+    /// First global output-stream index owned by coder `index`.
+    fn out_base(&self, index: usize) -> usize {
+        self.coders[..index].iter().map(|coder| coder.num_out).sum()
+    }
+
+    /// The coder that owns global output stream `out`.
+    fn coder_of_out(&self, out: usize) -> Option<usize> {
+        let mut base = 0;
+        for (index, coder) in self.coders.iter().enumerate() {
+            base += coder.num_out;
+            if out < base {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// The single output stream not consumed by a bind pair — the folder's result.
+    fn final_out_index(&self) -> Result<usize> {
+        (0..self.total_out())
+            .find(|out| !self.bind_pairs.iter().any(|pair| pair.out_index == *out))
+            .ok_or(HeaderError::Malformed(
+                "7z: folder has no final output stream",
+            ))
+    }
+
+    /// True when the graph is a linear chain of single-in/single-out coders fed by exactly one
+    /// pack stream — the shape [`build_folder_reader`] can fold into a decode chain.
+    fn is_linear_chain(&self) -> bool {
+        self.packed_indices.len() == 1
+            && self
+                .coders
+                .iter()
+                .all(|coder| coder.num_in == 1 && coder.num_out == 1)
+    }
+}
+
+/// One folder's fully-resolved decode description: its coder graph, pack-stream layout, output
+/// sizes, and the topological decode order computed by [`resolve_folder`]. An archive carries a
+/// `Vec<FolderInfo>`; each folder decodes independently from its own pack stream(s).
 #[derive(Debug, Clone)]
 struct FolderInfo {
-    /// Absolute offset of the packed stream within the archive bytes.
+    /// The parsed coder graph (spec-complete, possibly beyond what can be decoded).
+    graph: Folder,
+    /// Absolute offset of this folder's first pack stream within the archive bytes.
     pack_offset: usize,
-    /// Length of the packed stream.
-    pack_size: usize,
-    /// Uncompressed size of the whole folder.
+    /// This folder's pack-stream sizes, in `graph.packed_indices` order.
+    pack_sizes: Vec<usize>,
+    /// Uncompressed size of the folder's final output stream (what a reader decodes from it).
     unpack_size: u64,
-    /// The folder's single coder and its properties.
-    coder: FolderCoder,
+    /// Per global output-stream uncompressed sizes, in coder order.
+    output_sizes: Vec<u64>,
+    /// Coder indices in execution order (dependencies first), from [`resolve_folder`].
+    decode_order: Vec<usize>,
     /// Per-substream (per content file) uncompressed sizes, in file order.
     substream_sizes: Vec<u64>,
+    /// Per-substream stored CRC-32 (`None` where the archive defines none), in file order.
+    substream_crcs: Vec<Option<u32>>,
+}
+
+impl FolderInfo {
+    /// Total packed span across every pack stream this folder owns.
+    fn pack_span(&self) -> usize {
+        self.pack_sizes.iter().sum()
+    }
+
+    /// Whether the folder can be decoded here: a linear chain of LZMA/LZMA2 coders over a single
+    /// pack stream. Non-linear graphs (BCJ2, multi-pack) and unsupported methods list but do not
+    /// decode.
+    fn is_decodable(&self) -> bool {
+        self.graph.is_linear_chain()
+            && self
+                .graph
+                .coders
+                .iter()
+                .all(|coder| !matches!(coder.method, CoderMethod::Unsupported))
+    }
+
+    /// Whether the folder chains an AES-256/SHA-256 coder (so decoding needs a password).
+    #[cfg(feature = "aes")]
+    fn is_encrypted(&self) -> bool {
+        self.graph
+            .coders
+            .iter()
+            .any(|coder| matches!(coder.method, CoderMethod::Aes(_)))
+    }
+
+    #[cfg(not(feature = "aes"))]
+    #[allow(clippy::unused_self)]
+    fn is_encrypted(&self) -> bool {
+        false
+    }
 }
 
 /// A parsed directory-entry-like record: name, kind, permissions, mtime, and (for content files)
@@ -119,15 +311,20 @@ struct FileRec {
     anti: bool,
     start_position: Option<u64>,
     has_stream: bool,
+    /// Which folder holds this file's content stream (`None` for empty-stream entries).
+    folder_index: Option<usize>,
+    /// Byte offset of this file's substream within its own folder's decoded output.
     stream_offset: usize,
     size: usize,
+    /// Stored CRC-32 of this file's decoded substream, verified after decode (`None` if absent).
+    crc: Option<u32>,
 }
 
 /// Bounded parser for the 7z next-header metadata.
 #[derive(Debug, Default)]
 struct HeaderParser {
     files: Vec<FileRec>,
-    folder: Option<FolderInfo>,
+    folders: Vec<FolderInfo>,
     header_extensions: Vec<libarchive_oxide_core::Extension>,
 }
 
@@ -135,24 +332,24 @@ impl HeaderParser {
     fn new() -> Self {
         Self {
             files: Vec::new(),
-            folder: None,
+            folders: Vec::new(),
             header_extensions: Vec::new(),
         }
     }
 
     /// Parses a plain `kHeader` body: optional main streams info, then files info.
     fn parse_header(&mut self, r: &mut ByteReader<'_>) -> Result<()> {
-        let mut folder: Option<FolderInfo> = None;
+        let mut folders: Vec<FolderInfo> = Vec::new();
         loop {
             match r.u8()? {
                 K_END => break,
                 K_ARCHIVE_PROPERTIES => self.parse_archive_properties(r)?,
-                K_MAIN_STREAMS_INFO => folder = Some(parse_streams_info(r)?),
-                K_FILES_INFO => self.parse_files_info(r, folder.as_ref())?,
+                K_MAIN_STREAMS_INFO => folders = parse_streams_info(r)?,
+                K_FILES_INFO => self.parse_files_info(r, &folders)?,
                 _ => return Err(HeaderError::Unsupported("7z: unsupported header property")),
             }
         }
-        self.folder = folder;
+        self.folders = folders;
         Ok(())
     }
 
@@ -175,11 +372,7 @@ impl HeaderParser {
 
     /// Parses `FilesInfo`, assembling [`FileRec`]s and assigning content-file windows in order.
     #[allow(clippy::too_many_lines, clippy::needless_range_loop)]
-    fn parse_files_info(
-        &mut self,
-        r: &mut ByteReader<'_>,
-        folder: Option<&FolderInfo>,
-    ) -> Result<()> {
+    fn parse_files_info(&mut self, r: &mut ByteReader<'_>, folders: &[FolderInfo]) -> Result<()> {
         let num_files = usize_of(r.number()?)?;
         if num_files as u64 > MAX_FILES {
             return Err(HeaderError::LimitExceeded("7z: too many files"));
@@ -237,11 +430,24 @@ impl HeaderParser {
                 ));
         }
 
-        // Assemble records. Content files consume substream windows in file order; empty-stream
-        // files are directories unless flagged as empty files.
-        let sizes = folder.map_or(&[][..], |f| f.substream_sizes.as_slice());
+        // Assemble records. Content files consume substream windows in folder-then-file order:
+        // a flat list of `(folder_index, size)` pairs, one per substream across every folder in
+        // order, is drawn down as content files appear. The per-folder byte offset resets whenever
+        // the folder changes. Empty-stream files are directories unless flagged as empty files.
+        let flat: Vec<(usize, u64, Option<u32>)> = folders
+            .iter()
+            .enumerate()
+            .flat_map(|(index, folder)| {
+                folder
+                    .substream_sizes
+                    .iter()
+                    .zip(folder.substream_crcs.iter())
+                    .map(move |(&size, &crc)| (index, size, crc))
+            })
+            .collect();
         let mut content_index = 0usize;
         let mut running = 0usize;
+        let mut current_folder: Option<usize> = None;
         let mut empty_index = 0usize;
 
         for i in 0..num_files {
@@ -249,10 +455,15 @@ impl HeaderParser {
             let full_mode = modes.get(i).copied().flatten();
             let has_stream = !empty_stream[i];
 
-            let (kind, offset, size, is_anti) = if has_stream {
-                let size = usize_of(*sizes.get(content_index).ok_or(HeaderError::Malformed(
-                    "7z: content stream index out of range",
-                ))?)?;
+            let (kind, folder_index, offset, size, is_anti, crc) = if has_stream {
+                let (fi, raw_size, crc) = *flat.get(content_index).ok_or(
+                    HeaderError::Malformed("7z: content stream index out of range"),
+                )?;
+                let size = usize_of(raw_size)?;
+                if current_folder != Some(fi) {
+                    running = 0;
+                    current_folder = Some(fi);
+                }
                 let offset = running;
                 running = running
                     .checked_add(size)
@@ -263,7 +474,7 @@ impl HeaderParser {
                 } else {
                     EntryKind::File
                 };
-                (kind, offset, size, false)
+                (kind, Some(fi), offset, size, false, crc)
             } else {
                 let is_empty_file = empty_file.get(empty_index).copied().unwrap_or(false);
                 let is_anti = anti_empty.get(empty_index).copied().unwrap_or(false);
@@ -273,7 +484,7 @@ impl HeaderParser {
                 } else {
                     EntryKind::Dir
                 };
-                (kind, 0, 0, is_anti)
+                (kind, None, 0, 0, is_anti, None)
             };
 
             let mode = permission_bits(full_mode, kind);
@@ -290,36 +501,71 @@ impl HeaderParser {
                 anti: is_anti,
                 start_position: start_positions.get(i).copied().flatten(),
                 has_stream,
+                folder_index,
                 stream_offset: offset,
                 size,
+                crc,
             });
         }
         Ok(())
     }
 }
 
-enum SevenDecoder<R> {
-    Lzma2(lzma_rust2::Lzma2Reader<Take<R>>),
-    Lzma(lzma_rust2::LzmaReader<Take<R>>),
+/// One stage of a folder's decode chain, recursively wrapping the stage below it. The innermost
+/// stage is the raw pack stream (`Source`); each coder in the folder's decode order wraps the
+/// stage below with its own reader, keeping dispatch static (no trait objects). Stages are
+/// LZMA/LZMA2 coders or decode-only byte filters (delta, BCJ); a folder is built as a chain only
+/// when it is a linear graph of such coders over one pack stream.
+enum SevenStage<R> {
+    /// The base pack stream, bounded to the folder's packed bytes.
+    Source(Take<R>),
+    /// An LZMA2 coder reading the stage below.
+    Lzma2(Box<lzma_rust2::Lzma2Reader<SevenStage<R>>>),
+    /// An LZMA (v1) coder reading the stage below.
+    Lzma(Box<lzma_rust2::LzmaReader<SevenStage<R>>>),
+    /// A delta decode filter reading the stage below.
+    Delta(Box<CodecReader<SevenStage<R>, DeltaDecoder>>),
+    /// A BCJ decode filter reading the stage below.
+    Bcj(Box<CodecReader<SevenStage<R>, BcjDecoder>>),
+    /// A general-purpose decompression coder (Deflate/BZip2/Zstd) reused from [`PipelineCodec`],
+    /// reading the stage below.
+    Pipeline(Box<CodecReader<SevenStage<R>, PipelineCodec>>),
+    /// An AES-256/SHA-256 decryption coder reading the stage below.
+    #[cfg(feature = "aes")]
+    Aes(Box<CodecReader<SevenStage<R>, crate::filter::aes7z::AesDecoder>>),
 }
 
 enum SevenInput<R> {
     Source(R),
-    Decoder(Box<SevenDecoder<R>>),
+    Decoder(Box<SevenStage<R>>),
 }
 
-impl<R: Read> SevenDecoder<R> {
+impl<R: Read> SevenStage<R> {
+    /// Borrows the raw source at the bottom of the chain.
     fn source_ref(&self) -> &R {
         match self {
-            Self::Lzma2(reader) => reader.inner().get_ref(),
-            Self::Lzma(reader) => reader.inner().get_ref(),
+            Self::Source(take) => take.get_ref(),
+            Self::Lzma2(reader) => reader.inner().source_ref(),
+            Self::Lzma(reader) => reader.inner().source_ref(),
+            Self::Delta(reader) => reader.get_ref().source_ref(),
+            Self::Bcj(reader) => reader.get_ref().source_ref(),
+            Self::Pipeline(reader) => reader.get_ref().source_ref(),
+            #[cfg(feature = "aes")]
+            Self::Aes(reader) => reader.get_ref().source_ref(),
         }
     }
 
-    fn into_inner(self) -> R {
+    /// Unwinds the whole chain, reclaiming the raw source (and freeing every codec workspace).
+    fn into_source(self) -> R {
         match self {
-            Self::Lzma2(reader) => reader.into_inner().into_inner(),
-            Self::Lzma(reader) => reader.into_inner().into_inner(),
+            Self::Source(take) => take.into_inner(),
+            Self::Lzma2(reader) => reader.into_inner().into_source(),
+            Self::Lzma(reader) => reader.into_inner().into_source(),
+            Self::Delta(reader) => reader.into_inner().into_source(),
+            Self::Bcj(reader) => reader.into_inner().into_source(),
+            Self::Pipeline(reader) => reader.into_inner().into_source(),
+            #[cfg(feature = "aes")]
+            Self::Aes(reader) => reader.into_inner().into_source(),
         }
     }
 }
@@ -331,13 +577,27 @@ impl<R: Read> SevenInput<R> {
             Self::Decoder(decoder) => decoder.source_ref(),
         }
     }
+
+    /// Reclaims the raw source, dropping any live folder decode chain (and its codec workspaces).
+    fn into_source(self) -> R {
+        match self {
+            Self::Source(source) => source,
+            Self::Decoder(decoder) => (*decoder).into_source(),
+        }
+    }
 }
 
-impl<R: Read> Read for SevenDecoder<R> {
+impl<R: Read> Read for SevenStage<R> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         match self {
+            Self::Source(take) => take.read(output),
             Self::Lzma2(reader) => reader.read(output),
             Self::Lzma(reader) => reader.read(output),
+            Self::Delta(reader) => reader.read(output),
+            Self::Bcj(reader) => reader.read(output),
+            Self::Pipeline(reader) => reader.read(output),
+            #[cfg(feature = "aes")]
+            Self::Aes(reader) => reader.read(output),
         }
     }
 }
@@ -352,17 +612,32 @@ enum SevenPhase {
 }
 
 /// Seek-capable 7z reader used by the opaque runtime dispatch.
+///
+/// The reader owns the raw source through `input`; at most one folder decoder is live at a
+/// time. `input` is `None` only transiently while [`SevenZSeekReader::set_active_folder`]
+/// swaps the source between decoders, so the raw `R` is always reclaimable between calls.
 pub(crate) struct SevenZSeekReader<R> {
-    input: SevenInput<R>,
+    input: Option<SevenInput<R>>,
     limits: Limits,
+    /// Zeroizing password for AES folders (`None` when the caller supplied none). Never logged.
+    password: Option<SecretBytes>,
     archive_metadata: Option<ArchiveMetadata>,
     files: Vec<FileRec>,
-    folder: Option<FolderInfo>,
+    folders: Vec<FolderInfo>,
+    /// The folder whose decoder is currently live (`None` before the first content stream).
+    active_folder: Option<usize>,
     next_file: usize,
     phase: SevenPhase,
     event_data: Vec<u8>,
+    /// Decoded byte position within the currently active folder (reset on every folder switch).
     decoded_position: usize,
     decoded_total: u64,
+    /// Running CRC-32 and the stored digest for the open content entry, present only when the
+    /// entry declares a CRC and a decoder is live. Verified when the entry's data is exhausted.
+    entry_crc: Option<(crate::filter::Crc32, u32)>,
+    /// Whether the active folder contains an AES coder, so a CRC mismatch can be reported as a
+    /// likely wrong password rather than generic corruption.
+    active_folder_encrypted: bool,
 }
 
 impl<R> std::fmt::Debug for SevenZSeekReader<R> {
@@ -378,39 +653,31 @@ impl<R> std::fmt::Debug for SevenZSeekReader<R> {
 }
 
 impl<R: Read + Seek> SevenZSeekReader<R> {
-    pub(crate) fn new(mut input: R, limits: Limits) -> core::result::Result<Self, StreamError> {
-        let (archive_metadata, files, folder) = parse_seek_layout(&mut input, limits)?;
-        validate_seek_layout(&files, folder.as_ref(), limits)?;
-        let input = match folder.as_ref().map(|folder| folder.coder) {
-            None | Some(FolderCoder::Unsupported) => SevenInput::Source(input),
-            Some(coder) => {
-                let folder = folder
-                    .as_ref()
-                    .ok_or_else(|| seven_error(ErrorKind::Protocol, "folder state disappeared"))?;
-                input
-                    .seek(SeekFrom::Start(u64::try_from(folder.pack_offset).map_err(
-                        |_| seven_error(ErrorKind::Limit, "pack offset exceeds u64"),
-                    )?))
-                    .map_err(StreamError::io)?;
-                let take = input.take(
-                    u64::try_from(folder.pack_size)
-                        .map_err(|_| seven_error(ErrorKind::Limit, "pack size exceeds u64"))?,
-                );
-                let decoder = build_seven_decoder(take, coder, folder.unpack_size, limits)?;
-                SevenInput::Decoder(Box::new(decoder))
-            },
-        };
+    pub(crate) fn new(
+        mut input: R,
+        limits: Limits,
+        password: Option<SecretBytes>,
+    ) -> core::result::Result<Self, StreamError> {
+        let (archive_metadata, files, folders) =
+            parse_seek_layout(&mut input, limits, password.as_ref())?;
+        validate_seek_layout(&files, &folders, limits)?;
+        // Folder decoders are built lazily, one at a time, when the first file of each folder is
+        // reached. That keeps exactly one LZMA/LZMA2 workspace resident regardless of folder count.
         Ok(Self {
-            input,
+            input: Some(SevenInput::Source(input)),
             limits,
+            password,
             archive_metadata: Some(archive_metadata),
             files,
-            folder,
+            folders,
+            active_folder: None,
             next_file: 0,
             phase: SevenPhase::Idle,
             event_data: Vec::with_capacity(64 * 1024),
             decoded_position: 0,
             decoded_total: 0,
+            entry_crc: None,
+            active_folder_encrypted: false,
         })
     }
 
@@ -423,7 +690,7 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
             match self.phase {
                 SevenPhase::Idle => {
                     let Some(record) = self.files.get(self.next_file).cloned() else {
-                        self.verify_folder_end()?;
+                        self.finalize_active_folder()?;
                         self.phase = SevenPhase::Done;
                         return Ok(ReaderEvent::Done);
                     };
@@ -433,6 +700,8 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
                     return Ok(ReaderEvent::Entry(metadata));
                 },
                 SevenPhase::Data { remaining: 0 } => {
+                    // The whole substream has been delivered; the stored CRC-32 (if any) must match.
+                    self.verify_entry_crc()?;
                     self.phase = SevenPhase::EndEntry;
                 },
                 SevenPhase::Data { remaining } => {
@@ -446,6 +715,10 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
                         ));
                     }
                     self.event_data.truncate(count);
+                    // Fold the freshly decoded content into the running CRC (disjoint field borrows).
+                    if let Some((crc, _)) = &mut self.entry_crc {
+                        crc.update(&self.event_data[..count]);
+                    }
                     self.phase = SevenPhase::Data {
                         remaining: remaining - count,
                     };
@@ -479,8 +752,13 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
                             "folder ended while skipping a substream",
                         ));
                     }
+                    // Even a skipped substream is CRC-checked — the bytes are decoded anyway.
+                    if let Some((crc, _)) = &mut self.entry_crc {
+                        crc.update(&scratch[..count]);
+                    }
                     remaining -= count;
                 }
+                self.verify_entry_crc()?;
                 self.phase = SevenPhase::EndEntry;
                 Ok(())
             },
@@ -496,15 +774,21 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         }
     }
 
+    // `input` is only `None` transiently inside `set_active_folder`; it is always `Some` at any
+    // point a caller can observe the reader, so the fallbacks below are unreachable in practice.
+    #[allow(clippy::expect_used)]
     pub(crate) fn into_inner(self) -> R {
-        match self.input {
-            SevenInput::Source(source) => source,
-            SevenInput::Decoder(decoder) => (*decoder).into_inner(),
-        }
+        self.input
+            .map(SevenInput::into_source)
+            .expect("7z reader source is present outside a folder switch")
     }
 
+    #[allow(clippy::expect_used)]
     pub(crate) fn source_ref(&self) -> &R {
-        self.input.source_ref()
+        self.input
+            .as_ref()
+            .map(SevenInput::source_ref)
+            .expect("7z reader source is present outside a folder switch")
     }
 
     fn prepare_record(
@@ -512,11 +796,26 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         _index: usize,
         record: &FileRec,
     ) -> core::result::Result<EntryMetadata, StreamError> {
-        if record.has_stream && self.has_decoder() {
+        // Move the live decoder onto this file's folder before touching its bytes. `has_decoder`
+        // is false when the folder's coder is unsupported (its payload is then not decodable).
+        let has_decoder = match (record.has_stream, record.folder_index) {
+            (true, Some(folder_index)) => self.set_active_folder(folder_index)?,
+            _ => false,
+        };
+        if record.has_stream && has_decoder {
             self.drain_to(record.stream_offset)?;
         }
+        // Arm per-substream CRC verification for this entry's decoded content (drain bytes above are
+        // deliberately excluded). Absent a stored digest, decode proceeds unverified.
+        self.entry_crc = if record.has_stream && has_decoder {
+            record
+                .crc
+                .map(|expected| (crate::filter::Crc32::new(), expected))
+        } else {
+            None
+        };
         let mut link_target = None;
-        if record.has_stream && record.kind == EntryKind::Symlink && self.has_decoder() {
+        if record.has_stream && record.kind == EntryKind::Symlink && has_decoder {
             if self
                 .limits
                 .path_bytes()
@@ -529,10 +828,14 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
             }
             let mut target = vec![0; record.size];
             self.read_decoded_exact(&mut target)?;
+            if let Some((crc, _)) = &mut self.entry_crc {
+                crc.update(&target);
+            }
+            self.verify_entry_crc()?;
             link_target = Some(ArchivePath::from_encoded(target, PathEncoding::Utf8));
             self.phase = SevenPhase::EndEntry;
         } else if record.has_stream {
-            self.phase = if self.has_decoder() {
+            self.phase = if has_decoder {
                 SevenPhase::Data {
                     remaining: record.size,
                 }
@@ -618,10 +921,10 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         amount: usize,
     ) -> core::result::Result<usize, StreamError> {
         let count = match &mut self.input {
-            SevenInput::Decoder(decoder) => decoder
+            Some(SevenInput::Decoder(decoder)) => decoder
                 .read(&mut self.event_data[..amount])
                 .map_err(seven_decode_error)?,
-            SevenInput::Source(_) => {
+            _ => {
                 return Err(seven_error(
                     ErrorKind::Unsupported,
                     "payload coder is unsupported",
@@ -663,14 +966,40 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         Ok(())
     }
 
-    fn verify_folder_end(&mut self) -> core::result::Result<(), StreamError> {
-        let Some(folder) = &self.folder else {
+    /// Consumes the running per-substream CRC-32 (if armed) and compares it to the stored digest.
+    /// A mismatch on an encrypted folder is reported as a likely wrong password; otherwise as
+    /// generic corruption. Never a no-op silently: a `None` accumulator simply means the archive
+    /// stored no digest to check against.
+    fn verify_entry_crc(&mut self) -> core::result::Result<(), StreamError> {
+        if let Some((crc, expected)) = self.entry_crc.take() {
+            if crc.finalize() != expected {
+                let context = if self.active_folder_encrypted {
+                    "wrong password or corrupt data"
+                } else {
+                    "substream CRC-32 mismatch"
+                };
+                return Err(seven_error(ErrorKind::Integrity, context));
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies that the currently active folder decoded exactly to its declared size and
+    /// produced nothing past it. A no-op when no decoder is live (no folder yet, or an
+    /// unsupported coder). Called before switching folders and once the last file is consumed.
+    fn finalize_active_folder(&mut self) -> core::result::Result<(), StreamError> {
+        let Some(index) = self.active_folder else {
             return Ok(());
         };
         if !self.has_decoder() {
             return Ok(());
         }
-        let expected = usize::try_from(folder.unpack_size)
+        let unpack_size = self
+            .folders
+            .get(index)
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "active folder index out of range"))?
+            .unpack_size;
+        let expected = usize::try_from(unpack_size)
             .map_err(|_| seven_error(ErrorKind::Limit, "folder size exceeds address space"))?;
         if self.decoded_position != expected {
             return Err(seven_error(
@@ -688,14 +1017,81 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         Ok(())
     }
 
-    const fn has_decoder(&self) -> bool {
-        matches!(&self.input, SevenInput::Decoder(_))
+    /// Makes `folder_index` the active folder, building its decoder if the current one is a
+    /// different folder. The previous folder is finalized first, then its decoder dropped so
+    /// only one codec workspace is ever resident. Returns whether a decoder is now live
+    /// (`false` when the folder's coder is unsupported and its payload cannot be decoded).
+    fn set_active_folder(
+        &mut self,
+        folder_index: usize,
+    ) -> core::result::Result<bool, StreamError> {
+        if self.active_folder == Some(folder_index) {
+            return Ok(self.has_decoder());
+        }
+        self.finalize_active_folder()?;
+        // Read the folder's decode parameters (all `Copy`), releasing the `self.folders` borrow
+        // before touching `self.input`.
+        let folder = self
+            .folders
+            .get(folder_index)
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "folder index out of range"))?;
+        let decodable = folder.is_decodable();
+        let encrypted = folder.is_encrypted();
+        let pack_offset = folder.pack_offset;
+        let pack_size = folder.pack_sizes.first().copied();
+        // Reject a missing password before reclaiming the source, so the raw `R` stays reachable
+        // (via `into_inner`/`source_ref`) after the error. The secret is never touched here.
+        if decodable && encrypted && self.password.is_none() {
+            return Err(seven_error(
+                ErrorKind::Unsupported,
+                "7z AES entry requires a password",
+            ));
+        }
+        let mut source = self.take_source()?;
+        self.decoded_position = 0;
+        self.active_folder = Some(folder_index);
+        self.active_folder_encrypted = encrypted;
+        if !decodable {
+            self.input = Some(SevenInput::Source(source));
+            return Ok(false);
+        }
+        // A decodable folder is a linear chain over exactly one pack stream, so its size is present.
+        let pack_size = pack_size.ok_or_else(|| {
+            seven_error(ErrorKind::Protocol, "decodable folder has no pack stream")
+        })?;
+        let offset = u64::try_from(pack_offset)
+            .map_err(|_| seven_error(ErrorKind::Limit, "pack offset exceeds u64"))?;
+        let size = u64::try_from(pack_size)
+            .map_err(|_| seven_error(ErrorKind::Limit, "pack size exceeds u64"))?;
+        if let Err(error) = source.seek(SeekFrom::Start(offset)) {
+            // Keep the source reachable so `into_inner`/`source_ref` stay valid after the error.
+            self.input = Some(SevenInput::Source(source));
+            return Err(StreamError::io(error));
+        }
+        let take = source.take(size);
+        let folder = &self.folders[folder_index];
+        let decoder = build_folder_reader(take, folder, self.limits, self.password.as_ref())?;
+        self.input = Some(SevenInput::Decoder(Box::new(decoder)));
+        Ok(true)
     }
 
-    fn decoder_mut(&mut self) -> Option<&mut SevenDecoder<R>> {
+    /// Reclaims the raw source, dropping any live folder decoder. Leaves `input` as `None`
+    /// for the caller to restore before returning.
+    fn take_source(&mut self) -> core::result::Result<R, StreamError> {
+        self.input
+            .take()
+            .map(SevenInput::into_source)
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "7z reader source is unavailable"))
+    }
+
+    fn has_decoder(&self) -> bool {
+        matches!(&self.input, Some(SevenInput::Decoder(_)))
+    }
+
+    fn decoder_mut(&mut self) -> Option<&mut SevenStage<R>> {
         match &mut self.input {
-            SevenInput::Source(_) => None,
-            SevenInput::Decoder(decoder) => Some(decoder.as_mut()),
+            Some(SevenInput::Decoder(decoder)) => Some(decoder.as_mut()),
+            _ => None,
         }
     }
 }
@@ -703,7 +1099,9 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
 fn parse_seek_layout(
     input: &mut (impl Read + Seek),
     limits: Limits,
-) -> core::result::Result<(ArchiveMetadata, Vec<FileRec>, Option<FolderInfo>), StreamError> {
+    password: Option<&SecretBytes>,
+) -> core::result::Result<(ArchiveMetadata, Vec<FileRec>, Vec<FolderInfo>), StreamError> {
+    #![allow(clippy::too_many_lines)]
     let image_length = input.seek(SeekFrom::End(0)).map_err(StreamError::io)?;
     input.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
     let mut signature = [0_u8; SIGNATURE_HEADER_SIZE];
@@ -722,7 +1120,7 @@ fn parse_seek_layout(
     let header_size = u64_le(&signature, 20).map_err(seven_legacy_error)?;
     let header_crc = u32_le(&signature, 28).map_err(seven_legacy_error)?;
     if header_size == 0 {
-        return Ok((ArchiveMetadata::new(), Vec::new(), None));
+        return Ok((ArchiveMetadata::new(), Vec::new(), Vec::new()));
     }
     if limits
         .metadata_bytes()
@@ -766,14 +1164,22 @@ fn parse_seek_layout(
         Some(K_HEADER) => header,
         Some(K_ENCODED_HEADER) => {
             let mut encoded = ByteReader::new(&header[1..]);
-            let folder = parse_streams_info(&mut encoded).map_err(seven_legacy_error)?;
-            if matches!(folder.coder, FolderCoder::Unsupported) {
+            let folders = parse_streams_info(&mut encoded).map_err(seven_legacy_error)?;
+            // The encoded next-header is itself decoded through the same folder machinery, but
+            // mainstream 7-Zip always writes it as a single folder; keep that restriction here.
+            let [folder] = folders.as_slice() else {
+                return Err(seven_error(
+                    ErrorKind::Unsupported,
+                    "encoded header must be a single folder",
+                ));
+            };
+            if !folder.is_decodable() {
                 return Err(seven_error(
                     ErrorKind::Unsupported,
                     "encoded-header coder is unsupported",
                 ));
             }
-            decode_seek_header(input, &folder, limits, image_length)?
+            decode_seek_header(input, folder, limits, image_length, password)?
         },
         _ => {
             return Err(seven_error(
@@ -793,14 +1199,14 @@ fn parse_seek_layout(
     parser
         .parse_header(&mut bytes)
         .map_err(seven_legacy_error)?;
-    if let Some(folder) = &parser.folder {
+    for folder in &parser.folders {
         validate_folder_range(folder, image_length)?;
     }
     let archive_metadata = parser
         .header_extensions
         .into_iter()
         .fold(ArchiveMetadata::new(), ArchiveMetadata::with_extension);
-    Ok((archive_metadata, parser.files, parser.folder))
+    Ok((archive_metadata, parser.files, parser.folders))
 }
 
 fn decode_seek_header(
@@ -808,6 +1214,7 @@ fn decode_seek_header(
     folder: &FolderInfo,
     limits: Limits,
     image_length: u64,
+    password: Option<&SecretBytes>,
 ) -> core::result::Result<Vec<u8>, StreamError> {
     if limits
         .metadata_bytes()
@@ -819,16 +1226,20 @@ fn decode_seek_header(
         ));
     }
     validate_folder_range(folder, image_length)?;
+    let pack_size =
+        folder.pack_sizes.first().copied().ok_or_else(|| {
+            seven_error(ErrorKind::Unsupported, "encoded-header has no pack stream")
+        })?;
     input
         .seek(SeekFrom::Start(u64::try_from(folder.pack_offset).map_err(
             |_| seven_error(ErrorKind::Limit, "encoded-header offset exceeds u64"),
         )?))
         .map_err(StreamError::io)?;
     let take = input.take(
-        u64::try_from(folder.pack_size)
+        u64::try_from(pack_size)
             .map_err(|_| seven_error(ErrorKind::Limit, "encoded-header pack size exceeds u64"))?,
     );
-    let mut decoder = build_seven_decoder(take, folder.coder, folder.unpack_size, limits)?;
+    let mut decoder = build_folder_reader(take, folder, limits, password)?;
     let length = usize::try_from(folder.unpack_size)
         .map_err(|_| seven_error(ErrorKind::Limit, "decoded header exceeds address space"))?;
     let mut output = vec![0; length];
@@ -847,7 +1258,7 @@ fn decode_seek_header(
 
 fn validate_seek_layout(
     files: &[FileRec],
-    folder: Option<&FolderInfo>,
+    folders: &[FolderInfo],
     limits: Limits,
 ) -> core::result::Result<(), StreamError> {
     if limits
@@ -893,27 +1304,31 @@ fn validate_seek_layout(
             "file metadata exceeds configured limit",
         ));
     }
-    if let Some(folder) = folder {
-        if limits
-            .decoded_total()
-            .is_some_and(|maximum| folder.unpack_size > maximum)
-        {
-            return Err(seven_error(
-                ErrorKind::Limit,
-                "folder output exceeds decoded-total limit",
-            ));
-        }
-        let total = files
-            .iter()
-            .filter(|file| file.has_stream)
-            .try_fold(0usize, |sum, file| sum.checked_add(file.size))
-            .ok_or_else(|| seven_error(ErrorKind::Malformed, "substream size sum overflow"))?;
-        if u64::try_from(total).ok() != Some(folder.unpack_size) {
-            return Err(seven_error(
-                ErrorKind::Malformed,
-                "substream sizes do not equal folder size",
-            ));
-        }
+    // The sum of every folder's uncompressed output is what the reader will ever decode; bound it
+    // against the decoded-total budget, and confirm it equals the total of the file substreams.
+    let total_unpack = folders
+        .iter()
+        .try_fold(0u64, |sum, folder| sum.checked_add(folder.unpack_size))
+        .ok_or_else(|| seven_error(ErrorKind::Malformed, "folder size sum overflow"))?;
+    if limits
+        .decoded_total()
+        .is_some_and(|maximum| total_unpack > maximum)
+    {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "folder output exceeds decoded-total limit",
+        ));
+    }
+    let total_content = files
+        .iter()
+        .filter(|file| file.has_stream)
+        .try_fold(0usize, |sum, file| sum.checked_add(file.size))
+        .ok_or_else(|| seven_error(ErrorKind::Malformed, "substream size sum overflow"))?;
+    if u64::try_from(total_content).ok() != Some(total_unpack) {
+        return Err(seven_error(
+            ErrorKind::Malformed,
+            "substream sizes do not equal folder size",
+        ));
     }
     Ok(())
 }
@@ -924,7 +1339,7 @@ fn validate_folder_range(
 ) -> core::result::Result<(), StreamError> {
     let start = u64::try_from(folder.pack_offset)
         .map_err(|_| seven_error(ErrorKind::Limit, "pack offset exceeds u64"))?;
-    let size = u64::try_from(folder.pack_size)
+    let size = u64::try_from(folder.pack_span())
         .map_err(|_| seven_error(ErrorKind::Limit, "pack size exceeds u64"))?;
     if start.checked_add(size).is_none_or(|end| end > image_length) {
         return Err(seven_error(
@@ -935,39 +1350,123 @@ fn validate_folder_range(
     Ok(())
 }
 
-fn build_seven_decoder<R: Read>(
-    input: Take<R>,
-    coder: FolderCoder,
+/// Folds a folder's linear decode chain over its single pack stream, wrapping each coder in
+/// [`resolve_folder`] order (dependencies first) so the outermost stage yields the folder's final
+/// output. Only linear LZMA/LZMA2 folders are buildable; anything else reports `Unsupported`, which
+/// leaves the folder listable but not extractable.
+fn build_folder_reader<R: Read>(
+    source: Take<R>,
+    folder: &FolderInfo,
+    limits: Limits,
+    password: Option<&SecretBytes>,
+) -> core::result::Result<SevenStage<R>, StreamError> {
+    if !folder.is_decodable() {
+        return Err(seven_error(
+            ErrorKind::Unsupported,
+            "payload coder is unsupported",
+        ));
+    }
+    let mut stage = SevenStage::Source(source);
+    for &coder_index in &folder.decode_order {
+        let coder = folder.graph.coders[coder_index];
+        // Each stage's uncompressed size is the size of the coder's (single) output stream.
+        let out_size = folder
+            .output_sizes
+            .get(folder.graph.out_base(coder_index))
+            .copied()
+            .ok_or_else(|| seven_error(ErrorKind::Malformed, "coder output size missing"))?;
+        stage = wrap_coder(stage, coder.method, out_size, limits, password)?;
+    }
+    Ok(stage)
+}
+
+/// Wraps `inner` with a single coder's reader, producing the next chain stage.
+fn wrap_coder<R: Read>(
+    inner: SevenStage<R>,
+    method: CoderMethod,
     unpack_size: u64,
     limits: Limits,
-) -> core::result::Result<SevenDecoder<R>, StreamError> {
-    match coder {
-        FolderCoder::Lzma2 { dict_prop } => {
+    #[cfg_attr(not(feature = "aes"), allow(unused_variables))] password: Option<&SecretBytes>,
+) -> core::result::Result<SevenStage<R>, StreamError> {
+    match method {
+        CoderMethod::Lzma2 { dict_prop } => {
             let dictionary = lzma2_dict_size(dict_prop).map_err(seven_legacy_error)?;
             validate_dictionary(dictionary, limits)?;
-            Ok(SevenDecoder::Lzma2(lzma_rust2::Lzma2Reader::new(
-                input, dictionary, None,
-            )))
+            Ok(SevenStage::Lzma2(Box::new(lzma_rust2::Lzma2Reader::new(
+                inner, dictionary, None,
+            ))))
         },
-        FolderCoder::Lzma { props } => {
+        CoderMethod::Lzma { props } => {
             let dictionary = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
             validate_dictionary(dictionary, limits)?;
-            Ok(SevenDecoder::Lzma(
+            Ok(SevenStage::Lzma(Box::new(
                 lzma_rust2::LzmaReader::new_with_props(
-                    input,
+                    inner,
                     unpack_size,
                     props[0],
                     dictionary,
                     None,
                 )
                 .map_err(|_| seven_error(ErrorKind::Malformed, "LZMA decoder setup failed"))?,
-            ))
+            )))
         },
-        FolderCoder::Unsupported => Err(seven_error(
+        CoderMethod::Filter(SevenFilter::Delta { distance }) => Ok(SevenStage::Delta(Box::new(
+            CodecReader::new(inner, DeltaDecoder::new(distance), "7z-delta"),
+        ))),
+        CoderMethod::Filter(SevenFilter::Bcj { kind, start }) => Ok(SevenStage::Bcj(Box::new(
+            CodecReader::new(inner, BcjDecoder::new(kind, start), "7z-bcj"),
+        ))),
+        CoderMethod::Filter(SevenFilter::Pipeline { filter }) => {
+            validate_pipeline_memory(filter, limits)?;
+            let codec = PipelineCodec::new(filter, limits).map_err(StreamError::archive)?;
+            Ok(SevenStage::Pipeline(Box::new(CodecReader::new(
+                inner,
+                codec,
+                "7z-pipeline",
+            ))))
+        },
+        #[cfg(feature = "aes")]
+        CoderMethod::Aes(params) => {
+            // A password is mandatory to decode an AES folder. Its absence is a typed
+            // capability error; the secret itself is never placed in any message.
+            let password = password.ok_or_else(|| {
+                seven_error(ErrorKind::Unsupported, "7z AES entry requires a password")
+            })?;
+            let decoder =
+                crate::filter::aes7z::AesDecoder::new(params, unpack_size, password.expose());
+            Ok(SevenStage::Aes(Box::new(CodecReader::new(
+                inner, decoder, "7z-aes",
+            ))))
+        },
+        CoderMethod::Unsupported => Err(seven_error(
             ErrorKind::Unsupported,
             "payload coder is unsupported",
         )),
     }
+}
+
+/// Bounds a reused [`PipelineCodec`] coder's working set against the configured codec-memory
+/// budget, mirroring [`validate_dictionary`] for LZMA. Deflate has a fixed 32 KiB window and is
+/// always within budget; `BZip2` and Zstd are refused when the budget cannot hold their workspace.
+fn validate_pipeline_memory(
+    filter: FilterId,
+    limits: Limits,
+) -> core::result::Result<(), StreamError> {
+    let Some(budget) = limits.codec_memory() else {
+        return Ok(());
+    };
+    let needed = match filter {
+        FilterId::Bzip2 => BZIP2_DECODE_WORKSPACE,
+        FilterId::Zstd => ZSTD_MIN_WINDOW,
+        _ => return Ok(()),
+    };
+    if budget < needed {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "7z codec workspace exceeds codec-memory limit",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_dictionary(dictionary: u32, limits: Limits) -> core::result::Result<(), StreamError> {
@@ -1011,36 +1510,52 @@ fn seven_error(kind: ErrorKind, context: &'static str) -> StreamError {
     )
 }
 
-/// Parses a `StreamsInfo` (`PackInfo`, `UnpackInfo`, `SubStreamsInfo`) restricted to one pack, one folder,
-/// and one LZMA2 coder.
-fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
+/// Parses a `StreamsInfo` (`PackInfo`, `UnpackInfo`, `SubStreamsInfo`) into one [`FolderInfo`]
+/// per folder. Each folder's full coder graph is parsed (any number of coders, bind pairs, and
+/// packed streams) so listing works for every archive; `CodersUnpackSize` carries one size per
+/// output stream across all folders, and pack streams lie back-to-back from the pack base, each
+/// folder consuming as many as it has packed inputs. Decodability (linear LZMA/LZMA2) is resolved
+/// separately at build time.
+fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<Vec<FolderInfo>> {
+    #![allow(clippy::too_many_lines)]
     let mut pack_pos = 0u64;
-    let mut pack_size: Option<u64> = None;
-    let mut coder: Option<FolderCoder> = None;
-    let mut unpack_size = 0u64;
-    let mut num_substreams = 1usize;
-    let mut substream_sizes: Option<Vec<u64>> = None;
-    // Whether the folder's UnpackInfo carried a CRC. Mainstream 7-Zip and `sevenz-rust2` do NOT put
-    // the folder CRC here — they store it only in SubStreamsInfo — so a single-substream folder still
-    // carries a digest in SubStreamsInfo. Tracking this is what makes real compressed headers parse.
-    let mut folder_has_crc = false;
+    let mut pack_sizes: Option<Vec<u64>> = None;
+    let mut graphs: Vec<Folder> = Vec::new();
+    // One uncompressed size per output stream, flat across every folder in order.
+    let mut output_sizes_all: Vec<u64> = Vec::new();
+    let mut num_folders = 0usize;
+    // Per folder: its UnpackInfo-defined CRC (`None` when absent). Mainstream 7-Zip and `sevenz-rust2`
+    // do NOT put the folder CRC here — they store it only in SubStreamsInfo — so a single-substream
+    // folder still carries a digest there. Tracking this drives the SubStreamsInfo digest count and
+    // supplies the substream CRC for the single-substream + folder-CRC case.
+    let mut folder_crcs: Vec<Option<u32>> = Vec::new();
+    let mut substream_sizes: Option<Vec<Vec<u64>>> = None;
+    let mut substream_crcs: Option<Vec<Vec<Option<u32>>>> = None;
 
     loop {
         match r.u8()? {
             K_END => break,
             K_PACK_INFO => {
                 pack_pos = r.number()?;
-                let num_pack = r.number()?;
-                if num_pack != 1 {
-                    return Err(HeaderError::Unsupported(
-                        "7z: only a single pack stream is supported",
+                let num_pack = usize_of(r.number()?)?;
+                if num_pack > r.remaining() {
+                    return Err(HeaderError::Malformed(
+                        "7z: pack-stream count exceeds header size",
                     ));
                 }
                 loop {
                     match r.u8()? {
                         K_END => break,
-                        K_SIZE => pack_size = Some(r.number()?),
-                        K_CRC => read_digests(r, 1)?,
+                        K_SIZE => {
+                            let mut sizes = Vec::with_capacity(num_pack);
+                            for _ in 0..num_pack {
+                                sizes.push(r.number()?);
+                            }
+                            pack_sizes = Some(sizes);
+                        },
+                        K_CRC => {
+                            let _ = read_digests(r, num_pack)?;
+                        },
                         _ => {
                             return Err(HeaderError::Unsupported(
                                 "7z: unsupported pack-info property",
@@ -1053,25 +1568,39 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
                 if r.u8()? != K_FOLDER {
                     return Err(HeaderError::Malformed("7z: unpack info missing kFolder"));
                 }
-                if r.number()? != 1 {
-                    return Err(HeaderError::Unsupported(
-                        "7z: only a single folder is supported",
-                    ));
-                }
+                num_folders = usize_of(r.number()?)?;
                 if r.u8()? != 0 {
                     return Err(HeaderError::Unsupported("7z: external folder definitions"));
                 }
-                coder = Some(read_folder(r)?);
+                if num_folders > r.remaining() {
+                    return Err(HeaderError::Malformed(
+                        "7z: folder count exceeds header size",
+                    ));
+                }
+                graphs = Vec::with_capacity(num_folders);
+                for _ in 0..num_folders {
+                    graphs.push(read_folder(r)?);
+                }
                 if r.u8()? != K_CODERS_UNPACK_SIZE {
                     return Err(HeaderError::Malformed("7z: missing coders-unpack-size"));
                 }
-                unpack_size = r.number()?;
+                // One unpack size per output stream of every coder, in folder-then-coder order.
+                let total_outputs = graphs.iter().map(Folder::total_out).sum::<usize>();
+                if total_outputs > r.remaining() {
+                    return Err(HeaderError::Malformed(
+                        "7z: output-stream count exceeds header size",
+                    ));
+                }
+                output_sizes_all = Vec::with_capacity(total_outputs);
+                for _ in 0..total_outputs {
+                    output_sizes_all.push(r.number()?);
+                }
+                folder_crcs = vec![None; num_folders];
                 loop {
                     match r.u8()? {
                         K_END => break,
                         K_CRC => {
-                            folder_has_crc = true;
-                            read_digests(r, 1)?;
+                            folder_crcs = read_digests(r, num_folders)?;
                         },
                         _ => {
                             return Err(HeaderError::Unsupported(
@@ -1082,9 +1611,11 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
                 }
             },
             K_SUBSTREAMS_INFO => {
-                let (n, sizes) = parse_substreams_info(r, unpack_size, folder_has_crc)?;
-                num_substreams = n;
+                // SubStreamsInfo needs each folder's final-output (unpack) size.
+                let folder_unpack = folder_unpack_sizes(&graphs, &output_sizes_all)?;
+                let (sizes, crcs) = parse_substreams_info(r, &folder_unpack, &folder_crcs)?;
                 substream_sizes = Some(sizes);
+                substream_crcs = Some(crcs);
             },
             _ => {
                 return Err(HeaderError::Unsupported(
@@ -1094,112 +1625,510 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<FolderInfo> {
         }
     }
 
-    let pack_size = pack_size.ok_or(HeaderError::Malformed("7z: missing pack size"))?;
-    let coder = coder.ok_or(HeaderError::Malformed("7z: missing coder properties"))?;
+    if num_folders == 0 {
+        return Err(HeaderError::Malformed("7z: missing folder definitions"));
+    }
+    if graphs.len() != num_folders {
+        return Err(HeaderError::Malformed("7z: inconsistent folder table"));
+    }
+    let total_outputs = graphs.iter().map(Folder::total_out).sum::<usize>();
+    if output_sizes_all.len() != total_outputs {
+        return Err(HeaderError::Malformed("7z: coder output-size mismatch"));
+    }
+    let folder_unpack = folder_unpack_sizes(&graphs, &output_sizes_all)?;
+    let pack_sizes = pack_sizes.ok_or(HeaderError::Malformed("7z: missing pack sizes"))?;
+    // Every folder draws one pack stream per packed input, so the pack streams must exactly
+    // cover every folder's packed inputs.
+    let total_packed = graphs
+        .iter()
+        .map(|folder| folder.packed_indices.len())
+        .sum::<usize>();
+    if pack_sizes.len() != total_packed {
+        return Err(HeaderError::Malformed(
+            "7z: pack-stream count does not match folder inputs",
+        ));
+    }
     let substream_sizes = match substream_sizes {
-        Some(s) => s,
-        None => vec![unpack_size],
+        Some(sizes) => sizes,
+        None => folder_unpack.iter().map(|&size| vec![size]).collect(),
     };
-    let _ = num_substreams;
-    let pack_offset = SIGNATURE_HEADER_SIZE
+    if substream_sizes.len() != num_folders {
+        return Err(HeaderError::Malformed(
+            "7z: substream folder-count mismatch",
+        ));
+    }
+    // Absent SubStreamsInfo: every folder is single-substream, its CRC (if any) taken from the
+    // folder-level digest.
+    let substream_crcs = match substream_crcs {
+        Some(crcs) => crcs,
+        None => folder_crcs.iter().map(|&crc| vec![crc]).collect(),
+    };
+    if substream_crcs.len() != num_folders {
+        return Err(HeaderError::Malformed(
+            "7z: substream crc folder-count mismatch",
+        ));
+    }
+
+    let base = SIGNATURE_HEADER_SIZE
         .checked_add(usize_of(pack_pos)?)
         .ok_or(HeaderError::Malformed("7z: pack offset overflow"))?;
+    let mut folders = Vec::with_capacity(num_folders);
+    let mut running_pack = base;
+    let mut pack_cursor = 0usize;
+    let mut out_cursor = 0usize;
+    for (index, graph) in graphs.into_iter().enumerate() {
+        let packed_count = graph.packed_indices.len();
+        let total_out = graph.total_out();
+        // This folder's pack streams and their absolute offsets.
+        let pack_offset = running_pack;
+        let mut folder_pack_sizes = Vec::with_capacity(packed_count);
+        for &raw_pack_size in &pack_sizes[pack_cursor..pack_cursor + packed_count] {
+            let pack_size = usize_of(raw_pack_size)?;
+            folder_pack_sizes.push(pack_size);
+            running_pack = running_pack
+                .checked_add(pack_size)
+                .ok_or(HeaderError::Malformed("7z: pack offset overflow"))?;
+        }
+        pack_cursor += packed_count;
+        // This folder's per-output sizes.
+        let output_sizes = output_sizes_all[out_cursor..out_cursor + total_out].to_vec();
+        out_cursor += total_out;
+        // Resolve the decode order (also validates cycles and stream overlaps).
+        let decode_order = resolve_folder(&graph)?;
+        folders.push(FolderInfo {
+            graph,
+            pack_offset,
+            pack_sizes: folder_pack_sizes,
+            unpack_size: folder_unpack[index],
+            output_sizes,
+            decode_order,
+            substream_sizes: substream_sizes[index].clone(),
+            substream_crcs: substream_crcs[index].clone(),
+        });
+    }
+    Ok(folders)
+}
 
-    Ok(FolderInfo {
-        pack_offset,
-        pack_size: usize_of(pack_size)?,
-        unpack_size,
-        coder,
-        substream_sizes,
+/// Each folder's final-output (uncompressed) size, drawn from the flat per-output-stream sizes.
+fn folder_unpack_sizes(graphs: &[Folder], output_sizes_all: &[u64]) -> Result<Vec<u64>> {
+    let mut sizes = Vec::with_capacity(graphs.len());
+    let mut out_cursor = 0usize;
+    for graph in graphs {
+        let total_out = graph.total_out();
+        let slice = output_sizes_all
+            .get(out_cursor..out_cursor + total_out)
+            .ok_or(HeaderError::Malformed("7z: coder output-size mismatch"))?;
+        let final_out = graph.final_out_index()?;
+        let size = *slice
+            .get(final_out)
+            .ok_or(HeaderError::Malformed("7z: final output size missing"))?;
+        sizes.push(size);
+        out_cursor += total_out;
+    }
+    Ok(sizes)
+}
+
+/// Parses a single folder's coder graph: its coders, bind pairs, and packed-stream indices.
+fn read_folder(r: &mut ByteReader<'_>) -> Result<Folder> {
+    let num_coders = usize_of(r.number()?)?;
+    if num_coders == 0 {
+        return Err(HeaderError::Malformed("7z: folder has no coders"));
+    }
+    if num_coders > r.remaining() {
+        return Err(HeaderError::Malformed(
+            "7z: coder count exceeds header size",
+        ));
+    }
+    let mut coders = Vec::with_capacity(num_coders);
+    for _ in 0..num_coders {
+        coders.push(read_coder(r)?);
+    }
+    let total_in = coders.iter().map(|coder| coder.num_in).sum::<usize>();
+    let total_out = coders.iter().map(|coder| coder.num_out).sum::<usize>();
+    if total_out == 0 {
+        return Err(HeaderError::Malformed("7z: folder has no output streams"));
+    }
+    // A folder has (numOutStreams - 1) bind pairs, one per non-final output stream.
+    let num_bind_pairs = total_out - 1;
+    if num_bind_pairs > r.remaining() {
+        return Err(HeaderError::Malformed(
+            "7z: bind-pair count exceeds header size",
+        ));
+    }
+    let mut bind_pairs = Vec::with_capacity(num_bind_pairs);
+    for _ in 0..num_bind_pairs {
+        let in_index = usize_of(r.number()?)?;
+        let out_index = usize_of(r.number()?)?;
+        bind_pairs.push(BindPair {
+            in_index,
+            out_index,
+        });
+    }
+    let num_packed = total_in
+        .checked_sub(num_bind_pairs)
+        .filter(|&packed| packed != 0)
+        .ok_or(HeaderError::Malformed(
+            "7z: folder has no packed input streams",
+        ))?;
+    let packed_indices = if num_packed == 1 {
+        // The single packed stream is implicit: the one input not consumed by a bind pair.
+        let index = (0..total_in)
+            .find(|input| !bind_pairs.iter().any(|pair| pair.in_index == *input))
+            .ok_or(HeaderError::Malformed("7z: no free packed input stream"))?;
+        vec![index]
+    } else {
+        let mut indices = Vec::with_capacity(num_packed);
+        for _ in 0..num_packed {
+            indices.push(usize_of(r.number()?)?);
+        }
+        indices
+    };
+    Ok(Folder {
+        coders,
+        bind_pairs,
+        packed_indices,
     })
 }
 
-/// Parses a single folder definition, returning its coder (LZMA2 or plain LZMA) and properties.
-fn read_folder(r: &mut ByteReader<'_>) -> Result<FolderCoder> {
-    if r.number()? != 1 {
-        return Err(HeaderError::Unsupported(
-            "7z: only a single coder is supported",
-        ));
-    }
+/// Parses a single coder: its method id, stream arity, and properties.
+fn read_coder(r: &mut ByteReader<'_>) -> Result<Coder> {
     let flags = r.u8()?;
     let id_size = usize::from(flags & 0x0F);
     let is_complex = flags & 0x10 != 0;
     let has_attributes = flags & 0x20 != 0;
     if flags & 0x80 != 0 {
-        return Err(HeaderError::Unsupported("7z: reserved coder flag set"));
-    }
-    let codec = r.bytes(id_size)?;
-    if is_complex {
         return Err(HeaderError::Unsupported(
-            "7z: complex coders are not supported",
+            "7z: alternative coder methods are unsupported",
         ));
     }
-    if !has_attributes {
-        return Err(HeaderError::Unsupported("7z: coder without properties"));
-    }
-    let prop_size = usize_of(r.number()?)?;
-    let props = r.bytes(prop_size)?;
+    // Copy the method id out before further reads reborrow the byte reader.
+    let codec = r.bytes(id_size)?.to_vec();
+    let (num_in, num_out) = if is_complex {
+        let num_in = usize_of(r.number()?)?;
+        let num_out = usize_of(r.number()?)?;
+        // Bound the stream arity against the remaining header so it cannot force a huge allocation.
+        if num_in > r.remaining() || num_out > r.remaining() {
+            return Err(HeaderError::Malformed(
+                "7z: coder stream count exceeds header size",
+            ));
+        }
+        if num_in == 0 || num_out == 0 {
+            return Err(HeaderError::Malformed(
+                "7z: coder has no input or output streams",
+            ));
+        }
+        (num_in, num_out)
+    } else {
+        (1, 1)
+    };
+    let props = if has_attributes {
+        let prop_size = usize_of(r.number()?)?;
+        r.bytes(prop_size)?.to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(Coder {
+        method: classify_method(&codec, &props)?,
+        num_in,
+        num_out,
+    })
+}
+
+/// Maps a coder method id and its properties onto a [`CoderMethod`]. LZMA2 and LZMA decode; every
+/// other id lists as [`CoderMethod::Unsupported`].
+fn classify_method(codec: &[u8], props: &[u8]) -> Result<CoderMethod> {
     if codec == [METHOD_LZMA2] {
-        if prop_size != 1 {
+        if props.len() != 1 {
             return Err(HeaderError::Unsupported(
                 "7z: unexpected LZMA2 property size",
             ));
         }
-        Ok(FolderCoder::Lzma2 {
+        Ok(CoderMethod::Lzma2 {
             dict_prop: props[0],
         })
     } else if codec == METHOD_LZMA {
-        if prop_size != 5 {
+        if props.len() != 5 {
             return Err(HeaderError::Unsupported(
                 "7z: unexpected LZMA property size",
             ));
         }
         let mut p = [0u8; 5];
         p.copy_from_slice(props);
-        Ok(FolderCoder::Lzma { props: p })
+        Ok(CoderMethod::Lzma { props: p })
+    } else if codec == [METHOD_DELTA] {
+        // The delta filter stores one property byte: `distance - 1`. An absent
+        // property (rare) means distance 1; any other length is not a valid delta.
+        let distance = match props {
+            [] => 1,
+            [prop] => usize::from(*prop) + 1,
+            _ => return Ok(CoderMethod::Unsupported),
+        };
+        Ok(CoderMethod::Filter(SevenFilter::Delta { distance }))
+    } else if let Some(kind) = bcj_branch_kind(codec) {
+        // BCJ filters carry either no property or a 4-byte little-endian start offset.
+        let start = match props {
+            [] => 0,
+            [a, b, c, d] => usize_of(u64::from(u32::from_le_bytes([*a, *b, *c, *d])))?,
+            _ => return Ok(CoderMethod::Unsupported),
+        };
+        Ok(CoderMethod::Filter(SevenFilter::Bcj { kind, start }))
+    } else if codec == METHOD_DEFLATE {
+        // Raw DEFLATE, always available under the `sevenz` feature (it shares the gzip codec's
+        // `miniz_oxide` core). The coder carries no decode-relevant properties.
+        Ok(CoderMethod::Filter(SevenFilter::Pipeline {
+            filter: FilterId::Deflate,
+        }))
+    } else if codec == METHOD_BZIP2 {
+        // BZip2 lists on every build but only decodes when the `bzip2` codec is compiled in.
+        #[cfg(feature = "bzip2")]
+        {
+            Ok(CoderMethod::Filter(SevenFilter::Pipeline {
+                filter: FilterId::Bzip2,
+            }))
+        }
+        #[cfg(not(feature = "bzip2"))]
+        {
+            Ok(CoderMethod::Unsupported)
+        }
+    } else if codec == METHOD_ZSTD {
+        // Zstd lists on every build but only decodes when the `zstd` codec is compiled in.
+        #[cfg(feature = "zstd")]
+        {
+            Ok(CoderMethod::Filter(SevenFilter::Pipeline {
+                filter: FilterId::Zstd,
+            }))
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            Ok(CoderMethod::Unsupported)
+        }
+    } else if codec == METHOD_AES256 {
+        // AES-256/SHA-256 lists on every build but only decodes when the `aes` feature is
+        // compiled in and the caller supplies a password. Properties that name an external
+        // key or an out-of-range work factor parse as `Unsupported` (listable, not decodable).
+        #[cfg(feature = "aes")]
+        {
+            match crate::filter::aes7z::AesParams::parse(props) {
+                Some(params) => Ok(CoderMethod::Aes(params)),
+                None => Ok(CoderMethod::Unsupported),
+            }
+        }
+        #[cfg(not(feature = "aes"))]
+        {
+            Ok(CoderMethod::Unsupported)
+        }
     } else {
-        Ok(FolderCoder::Unsupported)
+        Ok(CoderMethod::Unsupported)
     }
 }
 
-/// Parses a `SubStreamsInfo` block for the single folder, returning `(num_substreams, sizes)`.
+/// Maps a BCJ coder method id onto its [`BranchKind`], or `None` if it is not a BCJ filter.
+fn bcj_branch_kind(codec: &[u8]) -> Option<BranchKind> {
+    if codec == METHOD_BCJ_X86 {
+        Some(BranchKind::X86)
+    } else if codec == METHOD_BCJ_ARM {
+        Some(BranchKind::Arm)
+    } else if codec == METHOD_BCJ_ARMT {
+        Some(BranchKind::ArmThumb)
+    } else if codec == [METHOD_BCJ_ARM64] {
+        Some(BranchKind::Arm64)
+    } else if codec == METHOD_BCJ_PPC {
+        Some(BranchKind::Ppc)
+    } else if codec == METHOD_BCJ_SPARC {
+        Some(BranchKind::Sparc)
+    } else if codec == METHOD_BCJ_IA64 {
+        Some(BranchKind::Ia64)
+    } else if codec == [METHOD_BCJ_RISCV] {
+        Some(BranchKind::RiscV)
+    } else {
+        None
+    }
+}
+
+/// Resolves a folder's coder graph into a topological decode order (coder indices,
+/// dependencies first). Detects cycles (DFS in-progress marks) and stream overlaps — an input fed
+/// by more than one source, an input fed by none, or an output bound more than once — all reported
+/// as typed `Malformed`. The order is computed for every folder; decodability is a build-time
+/// concern handled by [`build_folder_reader`].
+fn resolve_folder(folder: &Folder) -> Result<Vec<usize>> {
+    let total_in = folder.total_in();
+    let total_out = folder.total_out();
+    // Each input stream must have exactly one source; each output at most one consumer.
+    let mut in_sources = vec![0usize; total_in];
+    let mut out_consumers = vec![0usize; total_out];
+    for pair in &folder.bind_pairs {
+        if pair.in_index >= total_in || pair.out_index >= total_out {
+            return Err(HeaderError::Malformed(
+                "7z: bind pair references a missing stream",
+            ));
+        }
+        in_sources[pair.in_index] += 1;
+        out_consumers[pair.out_index] += 1;
+    }
+    for &packed in &folder.packed_indices {
+        if packed >= total_in {
+            return Err(HeaderError::Malformed(
+                "7z: packed stream references a missing input",
+            ));
+        }
+        in_sources[packed] += 1;
+    }
+    if in_sources.iter().any(|&count| count != 1) {
+        return Err(HeaderError::Malformed(
+            "7z: overlapping or unfed folder input stream",
+        ));
+    }
+    if out_consumers.iter().any(|&count| count > 1) {
+        return Err(HeaderError::Malformed(
+            "7z: overlapping folder output stream",
+        ));
+    }
+    let final_out = folder.final_out_index()?;
+    let sink = folder
+        .coder_of_out(final_out)
+        .ok_or(HeaderError::Malformed("7z: final output has no coder"))?;
+
+    let mut marks = vec![DfsMark::Unvisited; folder.coders.len()];
+    let mut order = Vec::with_capacity(folder.coders.len());
+    visit_coder(folder, sink, &mut marks, &mut order)?;
+    Ok(order)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DfsMark {
+    Unvisited,
+    InProgress,
+    Done,
+}
+
+/// Post-order DFS over the coder graph: a coder is emitted after every coder feeding its inputs,
+/// so the resulting order runs dependencies first. Revisiting an in-progress coder is a cycle.
+fn visit_coder(
+    folder: &Folder,
+    coder: usize,
+    marks: &mut [DfsMark],
+    order: &mut Vec<usize>,
+) -> Result<()> {
+    match marks[coder] {
+        DfsMark::Done => return Ok(()),
+        DfsMark::InProgress => return Err(HeaderError::Malformed("7z: cyclic coder graph")),
+        DfsMark::Unvisited => {},
+    }
+    marks[coder] = DfsMark::InProgress;
+    let in_base = folder.in_base(coder);
+    for local in 0..folder.coders[coder].num_in {
+        let in_index = in_base + local;
+        // Bind-paired inputs depend on the producing coder; packed inputs are leaves.
+        if let Some(pair) = folder
+            .bind_pairs
+            .iter()
+            .find(|pair| pair.in_index == in_index)
+        {
+            let producer = folder
+                .coder_of_out(pair.out_index)
+                .ok_or(HeaderError::Malformed("7z: bind pair output has no coder"))?;
+            visit_coder(folder, producer, marks, order)?;
+        }
+    }
+    marks[coder] = DfsMark::Done;
+    order.push(coder);
+    Ok(())
+}
+
+/// Per-folder substream sizes paired with per-folder substream CRC-32s (`None` where undefined),
+/// both indexed `[folder][substream]`.
+type SubStreamTables = (Vec<Vec<u64>>, Vec<Vec<Option<u32>>>);
+
+/// Parses a `SubStreamsInfo` block covering every folder, returning per-folder substream sizes and
+/// per-folder substream CRC-32s (`None` where undefined).
 ///
-/// `folder_has_crc` says whether the folder's `UnpackInfo` already defined a CRC: a single-substream
-/// folder repeats no digest here only when it did, matching the 7z rule
-/// `numDigests = Σ folders where (numSubstreams != 1 || !folderCrcDefined)`.
+/// `folder_unpack[i]` is folder `i`'s uncompressed size and `folder_crcs[i]` its `UnpackInfo`-level
+/// CRC (if any). The digest count follows the 7z rule
+/// `numDigests = Σ_folders (numSubstreams(i) == 1 && folderCrcDefined(i) ? 0 : numSubstreams(i))`;
+/// a single-substream folder whose CRC is already defined at the folder level reuses that value and
+/// contributes no digest here. Single-substream folders also omit their stored size (it equals the
+/// folder size).
+#[allow(clippy::too_many_lines)]
 fn parse_substreams_info(
     r: &mut ByteReader<'_>,
-    folder_unpack: u64,
-    folder_has_crc: bool,
-) -> Result<(usize, Vec<u64>)> {
-    let mut num = 1usize;
-    let mut sizes: Vec<u64> = Vec::new();
-    let mut have_sizes = false;
+    folder_unpack: &[u64],
+    folder_crcs: &[Option<u32>],
+) -> Result<SubStreamTables> {
+    let num_folders = folder_unpack.len();
+    let mut counts: Vec<usize> = vec![1; num_folders];
+    let mut sizes: Option<Vec<Vec<u64>>> = None;
+    let mut crcs: Option<Vec<Vec<Option<u32>>>> = None;
 
     loop {
         match r.u8()? {
             K_END => break,
-            K_NUM_UNPACK_STREAM => num = usize_of(r.number()?)?,
-            K_SIZE => {
-                let mut sum = 0u64;
-                for _ in 0..num.saturating_sub(1) {
-                    let s = r.number()?;
-                    sum = sum
-                        .checked_add(s)
-                        .ok_or(HeaderError::Malformed("7z: substream size overflow"))?;
-                    sizes.push(s);
+            K_NUM_UNPACK_STREAM => {
+                let mut parsed = Vec::with_capacity(num_folders);
+                for _ in 0..num_folders {
+                    parsed.push(usize_of(r.number()?)?);
                 }
-                let last = folder_unpack
-                    .checked_sub(sum)
-                    .ok_or(HeaderError::Malformed("7z: substream sizes exceed folder"))?;
-                sizes.push(last);
-                have_sizes = true;
+                counts = parsed;
+            },
+            K_SIZE => {
+                let mut per_folder = Vec::with_capacity(num_folders);
+                for (index, &folder_size) in folder_unpack.iter().enumerate() {
+                    let count = counts[index];
+                    if count == 0 {
+                        per_folder.push(Vec::new());
+                        continue;
+                    }
+                    // Only (count - 1) sizes are stored; each needs at least one header byte.
+                    if count.saturating_sub(1) > r.remaining() {
+                        return Err(HeaderError::Malformed(
+                            "7z: substream count exceeds header size",
+                        ));
+                    }
+                    let mut folder_sizes = Vec::with_capacity(count);
+                    let mut sum = 0u64;
+                    for _ in 0..count - 1 {
+                        let size = r.number()?;
+                        sum = sum
+                            .checked_add(size)
+                            .ok_or(HeaderError::Malformed("7z: substream size overflow"))?;
+                        folder_sizes.push(size);
+                    }
+                    let last = folder_size
+                        .checked_sub(sum)
+                        .ok_or(HeaderError::Malformed("7z: substream sizes exceed folder"))?;
+                    folder_sizes.push(last);
+                    per_folder.push(folder_sizes);
+                }
+                sizes = Some(per_folder);
             },
             K_CRC => {
-                // A digest is present for every substream except the single-substream case whose CRC
-                // is already defined on the folder (then it is not repeated).
-                let unknown = if num == 1 && folder_has_crc { 0 } else { num };
-                read_digests(r, unknown)?;
+                // A digest is present for every substream except a single-substream folder whose
+                // CRC is already defined on the folder (that one is not repeated here).
+                let unknown = counts
+                    .iter()
+                    .enumerate()
+                    .fold(0usize, |total, (index, &n)| {
+                        let already = n == 1 && folder_crcs.get(index).copied().flatten().is_some();
+                        total.saturating_add(if already { 0 } else { n })
+                    });
+                let digests = read_digests(r, unknown)?;
+                // Distribute digests over substreams in folder order, reusing the folder-level CRC
+                // for a single-substream folder that carried one.
+                let mut per_folder = Vec::with_capacity(num_folders);
+                let mut next = 0usize;
+                for (index, &n) in counts.iter().enumerate() {
+                    let folder_crc = folder_crcs.get(index).copied().flatten();
+                    if n == 1 && folder_crc.is_some() {
+                        per_folder.push(vec![folder_crc]);
+                    } else {
+                        let mut folder = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            folder.push(digests.get(next).copied().flatten());
+                            next += 1;
+                        }
+                        per_folder.push(folder);
+                    }
+                }
+                crcs = Some(per_folder);
             },
             _ => {
                 return Err(HeaderError::Unsupported(
@@ -1209,35 +2138,71 @@ fn parse_substreams_info(
         }
     }
 
-    if !have_sizes {
-        if num == 1 {
-            sizes = vec![folder_unpack];
-        } else {
-            return Err(HeaderError::Malformed("7z: missing substream sizes"));
+    let sizes = if let Some(sizes) = sizes {
+        sizes
+    } else {
+        // No kSize: every folder must be single-substream, taking the whole folder as its size.
+        let mut per_folder = Vec::with_capacity(num_folders);
+        for (index, &folder_size) in folder_unpack.iter().enumerate() {
+            match counts[index] {
+                0 => per_folder.push(Vec::new()),
+                1 => per_folder.push(vec![folder_size]),
+                _ => return Err(HeaderError::Malformed("7z: missing substream sizes")),
+            }
+        }
+        per_folder
+    };
+    // Absent a SubStreamsInfo kCRC block, a substream's CRC is only known when its folder carried a
+    // single-substream folder-level digest.
+    let crcs = crcs.unwrap_or_else(|| {
+        counts
+            .iter()
+            .enumerate()
+            .map(|(index, &n)| {
+                let folder_crc = folder_crcs.get(index).copied().flatten();
+                if n == 1 && folder_crc.is_some() {
+                    vec![folder_crc]
+                } else {
+                    vec![None; n]
+                }
+            })
+            .collect()
+    });
+    for (index, folder_sizes) in sizes.iter().enumerate() {
+        if folder_sizes.len() != counts[index] {
+            return Err(HeaderError::Malformed("7z: substream count mismatch"));
+        }
+        if crcs[index].len() != counts[index] {
+            return Err(HeaderError::Malformed("7z: substream crc count mismatch"));
         }
     }
-    if sizes.len() != num {
-        return Err(HeaderError::Malformed("7z: substream count mismatch"));
-    }
-    Ok((num, sizes))
+    Ok((sizes, crcs))
 }
 
 /// Reads a `Digests` structure (`AllAreDefined` byte + optional bit vector + one CRC per defined
-/// item), discarding the values after bounds-checking them.
-fn read_digests(r: &mut ByteReader<'_>, count: usize) -> Result<()> {
+/// item), returning the per-item CRC-32 where defined (`None` otherwise). Retaining the values lets
+/// the reader verify each substream after decode — the check that distinguishes a correct 7z AES
+/// password from a wrong one.
+fn read_digests(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<Option<u32>>> {
     if count == 0 {
-        return Ok(());
+        return Ok(Vec::new());
+    }
+    if count > r.remaining() {
+        return Err(HeaderError::Malformed(
+            "7z: digest count exceeds header size",
+        ));
     }
     let all_defined = r.u8()?;
     let defined = if all_defined != 0 {
-        count
+        vec![true; count]
     } else {
-        r.bit_vector(count)?.iter().filter(|&&b| b).count()
+        r.bit_vector(count)?
     };
-    for _ in 0..defined {
-        let _ = r.u32()?;
+    let mut out = Vec::with_capacity(count);
+    for &is_defined in &defined {
+        out.push(if is_defined { Some(r.u32()?) } else { None });
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Parses the `kName` property: an external byte (must be 0) then null-terminated UTF-16LE names.

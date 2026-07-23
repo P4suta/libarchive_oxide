@@ -19,7 +19,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::doc_markdown,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    clippy::cast_possible_truncation
 )]
 
 use std::io::Cursor;
@@ -30,6 +31,7 @@ use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Lim
 use sevenz_rust2::{
     ArchiveEntry, ArchiveReader as SevenReader, ArchiveWriter as SevenWriter, EncoderConfiguration,
     EncoderMethod, Password, SourceReader,
+    encoder_options::{DeltaOptions, EncoderOptions},
 };
 
 mod common;
@@ -155,6 +157,78 @@ fn arca_reads_sevenz_rust2_lzma_folder() {
     assert_eq!(got, expected);
 }
 
+/// Non-solid archives put every file in its own folder (its own pack stream and coder). `sevenz-rust2`
+/// produces exactly that when each entry is pushed with the singular `push_archive_entry`. arca must
+/// walk the resulting `Vec<Folder>`, activating one decoder at a time, and reproduce every file's
+/// bytes — the core of RM-303 step 1. Directory and empty-file entries (which carry no folder) are
+/// interleaved to confirm the file->folder mapping skips them correctly.
+#[test]
+fn arca_reads_sevenz_rust2_multi_folder() {
+    let a = b"alpha folder payload\n".to_vec();
+    let b = b"beta folder payload, repeated for compressibility\n".repeat(30);
+    let c = b"gamma folder payload with different bytes\n".repeat(12);
+
+    let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
+    // A directory and an empty file carry no content stream, so they never open a folder.
+    w.push_archive_entry::<&[u8]>(ArchiveEntry::new_directory("pkg"), None)
+        .unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("pkg/a.txt"), Some(a.as_slice()))
+        .unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("pkg/b.txt"), Some(b.as_slice()))
+        .unwrap();
+    w.push_archive_entry::<&[u8]>(ArchiveEntry::new_file("pkg/empty.txt"), None)
+        .unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("pkg/c.txt"), Some(c.as_slice()))
+        .unwrap();
+    let bytes = w.finish().unwrap().into_inner();
+
+    // Three distinct content files => three separate folders/blocks (non-solid).
+    let reader = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+        .expect("sevenz-rust2 opens its own multi-folder archive");
+    assert!(
+        !reader.archive().is_solid,
+        "push_archive_entry should produce a non-solid (multi-folder) archive"
+    );
+    assert!(
+        reader.archive().blocks.len() >= 3,
+        "expected one folder per content file, got {} folders",
+        reader.archive().blocks.len()
+    );
+
+    let got = read_with_arca(&bytes);
+    let expected = vec![
+        EntryShape::new(b"pkg".to_vec(), EntryKind::Dir, Vec::new()),
+        EntryShape::new(b"pkg/a.txt".to_vec(), EntryKind::File, a.clone()),
+        EntryShape::new(b"pkg/b.txt".to_vec(), EntryKind::File, b.clone()),
+        EntryShape::new(b"pkg/empty.txt".to_vec(), EntryKind::File, Vec::new()),
+        EntryShape::new(b"pkg/c.txt".to_vec(), EntryKind::File, c.clone()),
+    ];
+    assert_eq!(got, expected);
+}
+
+/// The same non-solid multi-folder shape, but with the plain-LZMA coder: each file is its own
+/// folder, so arca must tear down one `LzmaReader` and seek+build the next between entries.
+#[test]
+fn arca_reads_sevenz_rust2_multi_folder_lzma() {
+    let a = b"first lzma folder\n".repeat(8);
+    let b = b"second lzma folder, a good deal longer than the first\n".repeat(25);
+
+    let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
+    w.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::LZMA)]);
+    w.push_archive_entry(ArchiveEntry::new_file("a.bin"), Some(a.as_slice()))
+        .unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("b.bin"), Some(b.as_slice()))
+        .unwrap();
+    let bytes = w.finish().unwrap().into_inner();
+
+    let got = read_with_arca(&bytes);
+    let expected = vec![
+        EntryShape::new(b"a.bin".to_vec(), EntryKind::File, a.clone()),
+        EntryShape::new(b"b.bin".to_vec(), EntryKind::File, b.clone()),
+    ];
+    assert_eq!(got, expected);
+}
+
 /// A compressed (`kEncodedHeader`) next header is what mainstream 7-Zip / `sevenz-rust2` emit once an
 /// archive carries more than a trivial number of entries: `sevenz-rust2` LZMA-compresses the header
 /// whenever that shrinks it. Enough long, repetitive names force that path, so this archive lands on
@@ -198,5 +272,257 @@ fn arca_reads_sevenz_rust2_compressed_header() {
     for (g, e) in got.iter().zip(expected.iter()) {
         assert_eq!(g.path(), e.0.as_slice());
         assert_eq!(g.content(), e.1.as_slice());
+    }
+}
+
+/// Deterministic pseudo-random bytes; branch opcodes occur naturally so the BCJ filters transform.
+fn pseudo_random(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0xdead_beef_cafe_0007;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// Encodes one file through `sevenz-rust2` with an explicit content-coder chain. The chain is given
+/// innermost-first (the compressor, then the filters that wrap it), matching `set_content_methods`.
+fn sevenz_with_methods(methods: Vec<EncoderConfiguration>, name: &str, data: &[u8]) -> Vec<u8> {
+    let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
+    w.set_content_methods(methods);
+    w.push_archive_entry(ArchiveEntry::new_file(name), Some(data))
+        .unwrap();
+    w.finish().unwrap().into_inner()
+}
+
+/// A folder whose coder graph chains the delta filter with LZMA2 must decode in arca: LZMA2
+/// decompresses the pack stream, then the delta stage reconstructs the original bytes. `sevenz-rust2`
+/// (using `lzma_rust2`'s independent delta implementation) is the producer; arca is the consumer.
+#[test]
+fn arca_reads_sevenz_rust2_delta_lzma2() {
+    let data = pseudo_random(40_003);
+    for distance in [1u32, 4, 256] {
+        let methods = vec![
+            EncoderConfiguration::new(EncoderMethod::LZMA2),
+            EncoderConfiguration::new(EncoderMethod::DELTA_FILTER)
+                .with_options(EncoderOptions::Delta(DeltaOptions::from_distance(distance))),
+        ];
+        let bytes = sevenz_with_methods(methods, "delta.bin", &data);
+        // sevenz-rust2 must agree the archive is a valid delta+LZMA2 chain it can also read back.
+        let mut reader = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+            .expect("sevenz-rust2 opens its own delta+LZMA2 archive");
+        assert_eq!(reader.read_file("delta.bin").unwrap(), data);
+
+        let got = read_with_arca(&bytes);
+        let expected = vec![EntryShape::new(
+            b"delta.bin".to_vec(),
+            EntryKind::File,
+            data.clone(),
+        )];
+        assert_eq!(
+            got, expected,
+            "arca delta+LZMA2 mismatch at distance {distance}"
+        );
+    }
+}
+
+/// The same shape with a BCJ branch filter: LZMA2 over a BCJ-filtered payload. arca must resolve the
+/// two-coder graph, decompress LZMA2, then invert the branch transform. Exercised for the x86
+/// (stateful) filter and a couple of fixed-stride RISC families.
+#[test]
+fn arca_reads_sevenz_rust2_bcj_lzma2() {
+    let data = pseudo_random(60_011);
+    let filters = [
+        ("x86", EncoderMethod::BCJ_X86_FILTER),
+        ("arm", EncoderMethod::BCJ_ARM_FILTER),
+        ("ppc", EncoderMethod::BCJ_PPC_FILTER),
+        ("sparc", EncoderMethod::BCJ_SPARC_FILTER),
+    ];
+    for (label, method) in filters {
+        let methods = vec![
+            EncoderConfiguration::new(EncoderMethod::LZMA2),
+            EncoderConfiguration::new(method),
+        ];
+        let bytes = sevenz_with_methods(methods, "bcj.bin", &data);
+        let mut reader = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+            .unwrap_or_else(|e| panic!("sevenz-rust2 opens its own {label} archive: {e}"));
+        assert_eq!(
+            reader.read_file("bcj.bin").unwrap(),
+            data,
+            "{label} self-read"
+        );
+
+        let got = read_with_arca(&bytes);
+        let expected = vec![EntryShape::new(
+            b"bcj.bin".to_vec(),
+            EntryKind::File,
+            data.clone(),
+        )];
+        assert_eq!(got, expected, "arca BCJ+LZMA2 mismatch for {label}");
+    }
+}
+
+/// A payload that mixes a highly compressible run with pseudo-random noise, so the general-purpose
+/// coders below (Deflate/BZip2/Zstd) emit real, non-degenerate compressed folders.
+fn mixed_payload() -> Vec<u8> {
+    let mut data = b"the quick brown fox jumps over the lazy dog\n".repeat(400);
+    data.extend(pseudo_random(20_000));
+    data.extend(b"trailing repeated tail tail tail tail tail\n".repeat(120));
+    data
+}
+
+/// Round-trips one file through `sevenz-rust2` with a single content coder `method`, asserting the
+/// producer can read its own archive and that arca reproduces the original bytes exactly.
+#[track_caller]
+fn assert_arca_reads_method(method: EncoderMethod, label: &str) {
+    let data = mixed_payload();
+    let bytes = sevenz_with_methods(
+        vec![EncoderConfiguration::new(method)],
+        "payload.bin",
+        &data,
+    );
+    let mut reader = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+        .unwrap_or_else(|e| panic!("sevenz-rust2 opens its own {label} archive: {e}"));
+    assert_eq!(
+        reader.read_file("payload.bin").unwrap(),
+        data,
+        "{label} self-read"
+    );
+
+    let got = read_with_arca(&bytes);
+    let expected = vec![EntryShape::new(
+        b"payload.bin".to_vec(),
+        EntryKind::File,
+        data.clone(),
+    )];
+    assert_eq!(got, expected, "arca {label} decode mismatch");
+}
+
+/// The 7z Deflate coder (method `04 01 08`) is RAW DEFLATE — no gzip header, trailer, or checksum.
+/// arca reuses the shared `PipelineCodec` raw-inflate arm (the same `miniz_oxide` core the gzip
+/// decoder sits on) to decode it. Always available under the `sevenz` feature.
+#[test]
+fn arca_reads_sevenz_rust2_deflate() {
+    assert_arca_reads_method(EncoderMethod::DEFLATE, "deflate");
+}
+
+/// The 7z BZip2 coder (method `04 02 02`), reusing arca's existing BZip2 codec through the folder
+/// coder graph. Gated on arca's `bzip2` feature; `sevenz-rust2`'s bzip2 support is on by default.
+#[cfg(feature = "bzip2")]
+#[test]
+fn arca_reads_sevenz_rust2_bzip2() {
+    assert_arca_reads_method(EncoderMethod::BZIP2, "bzip2");
+}
+
+/// The 7z Zstd coder (method `04 F7 11 01`), reusing arca's existing Zstd codec (portable `ruzstd`
+/// or native `compression-codecs`) through the folder coder graph. Gated on arca's `zstd` feature.
+#[cfg(feature = "zstd")]
+#[test]
+fn arca_reads_sevenz_rust2_zstd() {
+    assert_arca_reads_method(EncoderMethod::ZSTD, "zstd");
+}
+
+/// AES-256/SHA-256 (method `06 F1 07 01`) differential coverage. `sevenz-rust2` (with its default
+/// `aes256` feature) produces a password-protected single-coder folder; arca decrypts it through the
+/// coder graph, deriving the key with 7-Zip's own UTF-16LE + SHA-256 KDF, and verifies the stored
+/// per-substream CRC-32 after decode. Gated on arca's `aes` feature.
+#[cfg(feature = "aes")]
+mod aes {
+    use libarchive_oxide::{ReaderEvent, SecretBytes, SeekArchiveReader, StreamError};
+    use libarchive_oxide_core::{ArchiveError, ErrorKind};
+    use sevenz_rust2::encoder_options::AesEncoderOptions;
+
+    use super::*;
+
+    /// Builds a `.7z` whose single content folder is AES-256/SHA-256 encrypted under `password`.
+    /// `encrypt_header` selects between `sevenz-rust2`'s default encrypted next-header (an AES-coded
+    /// `kEncodedHeader`, so even listing needs the password) and a plain header (so the encryption is
+    /// confined to the content folder — the shape that exercises the per-substream CRC check).
+    fn build_aes(password: &str, name: &str, data: &[u8], encrypt_header: bool) -> Vec<u8> {
+        let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
+        w.set_encrypt_header(encrypt_header);
+        let pw: Password = password.into();
+        w.set_content_methods(vec![AesEncoderOptions::new(pw).into()]);
+        w.push_archive_entry(ArchiveEntry::new_file(name), Some(data))
+            .unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    /// Reads the whole (single-entry) archive's content through arca's seek reader with `password`.
+    fn read_aes(bytes: &[u8], password: &str) -> Result<Vec<u8>, StreamError> {
+        let mut reader = SeekArchiveReader::with_password(
+            Cursor::new(bytes.to_vec()),
+            SecretBytes::new(password.as_bytes().to_vec()),
+        )?;
+        let mut content = Vec::new();
+        loop {
+            match reader.next_event()? {
+                ReaderEvent::Data(d) => content.extend_from_slice(d),
+                ReaderEvent::Done => return Ok(content),
+                _ => {},
+            }
+        }
+    }
+
+    /// The correct password (including a non-ASCII code point, to exercise the UTF-16LE encoding)
+    /// decrypts to the original plaintext, matching what `sevenz-rust2` reads back from its own file.
+    /// Uses the default *encrypted* next-header, so this also proves the AES-coded `kEncodedHeader`
+    /// path decodes with the caller's password.
+    #[test]
+    fn correct_password_decodes_encrypted_header_and_content() {
+        let data = mixed_payload();
+        let password = "córrèct-horse-battery-\u{1F510}";
+        let bytes = build_aes(password, "secret.bin", &data, true);
+
+        // The independent producer must read its own archive with the same password.
+        let mut reference =
+            SevenReader::new(Cursor::new(bytes.clone()), Password::from(password)).unwrap();
+        assert_eq!(reference.read_file("secret.bin").unwrap(), data);
+
+        assert_eq!(read_aes(&bytes, password).unwrap(), data);
+    }
+
+    /// A wrong password decrypts the content to garbage of the right length; the stored per-substream
+    /// CRC-32 mismatch is surfaced as a typed `Integrity` error rather than silently returning corrupt
+    /// bytes. A plain header keeps the failure at the content coder (the CRC path), not the header.
+    #[test]
+    fn wrong_password_trips_integrity() {
+        let data = b"top secret payload, not for prying eyes\n".repeat(16);
+        let bytes = build_aes("correct-horse", "s.bin", &data, false);
+
+        // The fixture is sound: the correct password decodes it cleanly.
+        assert_eq!(read_aes(&bytes, "correct-horse").unwrap(), data);
+
+        let error = read_aes(&bytes, "wrong-horse").expect_err("wrong password must fail");
+        assert_eq!(
+            error.archive_error().map(ArchiveError::kind),
+            Some(ErrorKind::Integrity),
+            "wrong 7z AES password must be reported as an integrity failure"
+        );
+    }
+
+    /// Opening a plain-header AES archive without any password lists metadata but reports a typed
+    /// capability error (never a panic, never leaked secrets) when the encrypted content is reached.
+    #[test]
+    fn missing_password_is_unsupported() {
+        let data = b"needs a key to read\n".repeat(8);
+        let bytes = build_aes("pw", "s.bin", &data, false);
+
+        let mut reader = SeekArchiveReader::new(Cursor::new(bytes.clone())).unwrap();
+        let error = loop {
+            match reader.next_event() {
+                Ok(ReaderEvent::Done) => panic!("expected a typed error for the missing password"),
+                Ok(_) => {},
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            error.archive_error().map(ArchiveError::kind),
+            Some(ErrorKind::Unsupported),
+            "a missing 7z AES password must be a typed capability error"
+        );
     }
 }

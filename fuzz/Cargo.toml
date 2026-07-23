@@ -71,6 +71,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "read_7z_graph"
+path = "fuzz_targets/read_7z_graph.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "read_iso"
 path = "fuzz_targets/read_iso.rs"
 test = false

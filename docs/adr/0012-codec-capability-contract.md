@@ -81,10 +81,14 @@ gap must not be mistaken for discharging the obligation to close it.
 |---|---|---|---|---|
 | Portable **streaming** zstd **encode** | ZIP member write method 93 is `native-codecs`-only; portable selection returns a structured `Unsupported` error | `ruzstd` ships only a one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, used for outer-filter *frames* and `create --zstd`); it cannot emit a single ZIP member as a bounded stream without buffering the whole member, which would break the core bounded-memory guarantee. The `native-codecs` `compression-codecs` encoder is a true streaming encoder. | A streaming, single-stream, spec-robust pure-Rust zstd encoder — contributed upstream to `ruzstd` or provided as a dedicated crate the engine consumes. The engine core does not absorb the encoder. | RM-307 (this ADR) → follow-on codec initiative |
 | Deflate64 read and write | ZIP method 9 returns a structured `Unsupported` error and still enumerates | No pure-Rust Deflate64 encoder exists; decoders are scarce and the write direction has effectively no consumer demand. | Feasibility decision (own pure-Rust decoder for read-only, external decoder, or leave unsupported); no encoder is planned. | RM-306 feasibility ADR |
+| 7z **PPMd** decode (method `03 04 01`) | A 7z folder coded with PPMd lists normally; extraction returns a structured `Unsupported` error and enumeration continues | 7z's PPMd7 (variant H) has no wired bounded-memory pure-Rust decoder, and the engine core will not absorb the model. This is a *new decoder deferred*, not a bent guarantee — the coder graph parses, the capability is typed. | Adopt or contribute a pure-Rust PPMd7 decoder consumed behind the codec-provider boundary; read-only, no encoder planned. | RM-303 → follow-on codec initiative |
+| 7z **BCJ2** decode (method `03 03 01 1B`) | A 7z coder graph containing BCJ2 lists normally; extraction returns a structured `Unsupported` error and enumeration continues | BCJ2 is a four-input, multi-stream branch converter that does not fit the one-active-linear-folder decode model that keeps 7z decoding bounded. This is a *multi-stream decode deferred* — the graph resolver already validates its bind pairs; only the decode stage is absent. | Extend the folder decoder with a bounded four-stream BCJ2 junction stage; read-only, no encoder planned. | RM-303 → follow-on decoder slice |
 
-Every other mainstream codec used by the engine (deflate, bzip2, xz/LZMA, lz4)
-has complete pure-Rust read **and** write on the `portable-codecs` profile, so
-these two are the entire ledger, not a pervasive condition.
+Every mainstream compression codec used by the engine (deflate, bzip2, xz/LZMA,
+lz4) has complete pure-Rust read **and** write on the `portable-codecs` profile.
+The two 7z-only entries (PPMd, BCJ2) are read-only-deferred coders behind an
+already-typed capability, not bent guarantees; this table is the entire ledger,
+not a pervasive condition.
 
 ## Consequences
 
