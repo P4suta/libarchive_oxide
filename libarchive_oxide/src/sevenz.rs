@@ -7,12 +7,14 @@
 //! Readers parse every folder's full coder graph (any number of coders, bind
 //! pairs, and packed streams) so listing works for any archive. Decoding is
 //! limited to linear chains over a single pack stream whose coders are each
-//! LZMA2/LZMA, a decode-only byte filter (delta, BCJ), or a general-purpose
-//! coder reused from the shared codec dispatch (Deflate, `BZip2`, Zstd): such a
+//! LZMA2/LZMA, a decode-only byte filter (delta, BCJ), a general-purpose coder
+//! reused from the shared codec dispatch (Deflate, `BZip2`, Zstd), or — under the
+//! `aes` feature, given a password — the AES-256/SHA-256 decryption coder: such a
 //! folder streams normally, while richer graphs (BCJ2, `PPMd`, multi-pack) list
 //! but report `Unsupported` on extraction. Exactly one folder decode chain is live at a
 //! time, so memory stays bounded regardless of folder count. Writers still emit
-//! a single solid LZMA2 folder. AES decode is not yet implemented.
+//! a single solid LZMA2 folder. Each substream's stored CRC-32 is verified after decode,
+//! which also distinguishes a correct 7z AES password from a wrong one.
 
 use std::io::{Read, Seek, SeekFrom, Take, Write};
 
@@ -26,7 +28,7 @@ use crate::codec_read::CodecReader;
 use crate::filter::bcj::{BcjDecoder, BranchKind};
 use crate::filter::delta::DeltaDecoder;
 use crate::pipeline_codec::PipelineCodec;
-use crate::{ReaderEvent, StreamError};
+use crate::{ReaderEvent, SecretBytes, StreamError};
 
 type Result<T> = core::result::Result<T, HeaderError>;
 
@@ -95,6 +97,8 @@ const METHOD_DEFLATE: [u8; 3] = [0x04, 0x01, 0x08];
 const METHOD_BZIP2: [u8; 3] = [0x04, 0x02, 0x02];
 /// Zstandard coder method id (4 bytes), as used by the 7-Zip-zstd fork and `sevenz-rust2`.
 const METHOD_ZSTD: [u8; 4] = [0x04, 0xF7, 0x11, 0x01];
+/// AES-256/SHA-256 encryption coder method id (4 bytes).
+const METHOD_AES256: [u8; 4] = [0x06, 0xF1, 0x07, 0x01];
 
 /// Peak decompression working set for a bzip2 stream at the largest (900 KiB) block size.
 /// libbzip2 documents ~3.7 MiB for `-9` decompression; rounded up. A folder's bzip2 coder is
@@ -138,6 +142,10 @@ enum CoderMethod {
     Lzma { props: [u8; 5] },
     /// A decode-only byte-to-byte filter (delta or BCJ) applied after its inner coder.
     Filter(SevenFilter),
+    /// AES-256/SHA-256 decryption, carrying its parsed (archive-public) salt/IV/work
+    /// factor. The secret key is derived only at decode time from the caller's password.
+    #[cfg(feature = "aes")]
+    Aes(crate::filter::aes7z::AesParams),
     /// A coder whose metadata can be listed but whose payload cannot be decoded.
     Unsupported,
 }
@@ -254,6 +262,8 @@ struct FolderInfo {
     decode_order: Vec<usize>,
     /// Per-substream (per content file) uncompressed sizes, in file order.
     substream_sizes: Vec<u64>,
+    /// Per-substream stored CRC-32 (`None` where the archive defines none), in file order.
+    substream_crcs: Vec<Option<u32>>,
 }
 
 impl FolderInfo {
@@ -273,6 +283,21 @@ impl FolderInfo {
                 .iter()
                 .all(|coder| !matches!(coder.method, CoderMethod::Unsupported))
     }
+
+    /// Whether the folder chains an AES-256/SHA-256 coder (so decoding needs a password).
+    #[cfg(feature = "aes")]
+    fn is_encrypted(&self) -> bool {
+        self.graph
+            .coders
+            .iter()
+            .any(|coder| matches!(coder.method, CoderMethod::Aes(_)))
+    }
+
+    #[cfg(not(feature = "aes"))]
+    #[allow(clippy::unused_self)]
+    fn is_encrypted(&self) -> bool {
+        false
+    }
 }
 
 /// A parsed directory-entry-like record: name, kind, permissions, mtime, and (for content files)
@@ -291,6 +316,8 @@ struct FileRec {
     /// Byte offset of this file's substream within its own folder's decoded output.
     stream_offset: usize,
     size: usize,
+    /// Stored CRC-32 of this file's decoded substream, verified after decode (`None` if absent).
+    crc: Option<u32>,
 }
 
 /// Bounded parser for the 7z next-header metadata.
@@ -407,14 +434,15 @@ impl HeaderParser {
         // a flat list of `(folder_index, size)` pairs, one per substream across every folder in
         // order, is drawn down as content files appear. The per-folder byte offset resets whenever
         // the folder changes. Empty-stream files are directories unless flagged as empty files.
-        let flat: Vec<(usize, u64)> = folders
+        let flat: Vec<(usize, u64, Option<u32>)> = folders
             .iter()
             .enumerate()
             .flat_map(|(index, folder)| {
                 folder
                     .substream_sizes
                     .iter()
-                    .map(move |&size| (index, size))
+                    .zip(folder.substream_crcs.iter())
+                    .map(move |(&size, &crc)| (index, size, crc))
             })
             .collect();
         let mut content_index = 0usize;
@@ -427,10 +455,10 @@ impl HeaderParser {
             let full_mode = modes.get(i).copied().flatten();
             let has_stream = !empty_stream[i];
 
-            let (kind, folder_index, offset, size, is_anti) = if has_stream {
-                let (fi, raw_size) = *flat.get(content_index).ok_or(HeaderError::Malformed(
-                    "7z: content stream index out of range",
-                ))?;
+            let (kind, folder_index, offset, size, is_anti, crc) = if has_stream {
+                let (fi, raw_size, crc) = *flat.get(content_index).ok_or(
+                    HeaderError::Malformed("7z: content stream index out of range"),
+                )?;
                 let size = usize_of(raw_size)?;
                 if current_folder != Some(fi) {
                     running = 0;
@@ -446,7 +474,7 @@ impl HeaderParser {
                 } else {
                     EntryKind::File
                 };
-                (kind, Some(fi), offset, size, false)
+                (kind, Some(fi), offset, size, false, crc)
             } else {
                 let is_empty_file = empty_file.get(empty_index).copied().unwrap_or(false);
                 let is_anti = anti_empty.get(empty_index).copied().unwrap_or(false);
@@ -456,7 +484,7 @@ impl HeaderParser {
                 } else {
                     EntryKind::Dir
                 };
-                (kind, None, 0, 0, is_anti)
+                (kind, None, 0, 0, is_anti, None)
             };
 
             let mode = permission_bits(full_mode, kind);
@@ -476,6 +504,7 @@ impl HeaderParser {
                 folder_index,
                 stream_offset: offset,
                 size,
+                crc,
             });
         }
         Ok(())
@@ -501,6 +530,9 @@ enum SevenStage<R> {
     /// A general-purpose decompression coder (Deflate/BZip2/Zstd) reused from [`PipelineCodec`],
     /// reading the stage below.
     Pipeline(Box<CodecReader<SevenStage<R>, PipelineCodec>>),
+    /// An AES-256/SHA-256 decryption coder reading the stage below.
+    #[cfg(feature = "aes")]
+    Aes(Box<CodecReader<SevenStage<R>, crate::filter::aes7z::AesDecoder>>),
 }
 
 enum SevenInput<R> {
@@ -518,6 +550,8 @@ impl<R: Read> SevenStage<R> {
             Self::Delta(reader) => reader.get_ref().source_ref(),
             Self::Bcj(reader) => reader.get_ref().source_ref(),
             Self::Pipeline(reader) => reader.get_ref().source_ref(),
+            #[cfg(feature = "aes")]
+            Self::Aes(reader) => reader.get_ref().source_ref(),
         }
     }
 
@@ -530,6 +564,8 @@ impl<R: Read> SevenStage<R> {
             Self::Delta(reader) => reader.into_inner().into_source(),
             Self::Bcj(reader) => reader.into_inner().into_source(),
             Self::Pipeline(reader) => reader.into_inner().into_source(),
+            #[cfg(feature = "aes")]
+            Self::Aes(reader) => reader.into_inner().into_source(),
         }
     }
 }
@@ -560,6 +596,8 @@ impl<R: Read> Read for SevenStage<R> {
             Self::Delta(reader) => reader.read(output),
             Self::Bcj(reader) => reader.read(output),
             Self::Pipeline(reader) => reader.read(output),
+            #[cfg(feature = "aes")]
+            Self::Aes(reader) => reader.read(output),
         }
     }
 }
@@ -581,6 +619,8 @@ enum SevenPhase {
 pub(crate) struct SevenZSeekReader<R> {
     input: Option<SevenInput<R>>,
     limits: Limits,
+    /// Zeroizing password for AES folders (`None` when the caller supplied none). Never logged.
+    password: Option<SecretBytes>,
     archive_metadata: Option<ArchiveMetadata>,
     files: Vec<FileRec>,
     folders: Vec<FolderInfo>,
@@ -592,6 +632,12 @@ pub(crate) struct SevenZSeekReader<R> {
     /// Decoded byte position within the currently active folder (reset on every folder switch).
     decoded_position: usize,
     decoded_total: u64,
+    /// Running CRC-32 and the stored digest for the open content entry, present only when the
+    /// entry declares a CRC and a decoder is live. Verified when the entry's data is exhausted.
+    entry_crc: Option<(crate::filter::Crc32, u32)>,
+    /// Whether the active folder contains an AES coder, so a CRC mismatch can be reported as a
+    /// likely wrong password rather than generic corruption.
+    active_folder_encrypted: bool,
 }
 
 impl<R> std::fmt::Debug for SevenZSeekReader<R> {
@@ -607,14 +653,20 @@ impl<R> std::fmt::Debug for SevenZSeekReader<R> {
 }
 
 impl<R: Read + Seek> SevenZSeekReader<R> {
-    pub(crate) fn new(mut input: R, limits: Limits) -> core::result::Result<Self, StreamError> {
-        let (archive_metadata, files, folders) = parse_seek_layout(&mut input, limits)?;
+    pub(crate) fn new(
+        mut input: R,
+        limits: Limits,
+        password: Option<SecretBytes>,
+    ) -> core::result::Result<Self, StreamError> {
+        let (archive_metadata, files, folders) =
+            parse_seek_layout(&mut input, limits, password.as_ref())?;
         validate_seek_layout(&files, &folders, limits)?;
         // Folder decoders are built lazily, one at a time, when the first file of each folder is
         // reached. That keeps exactly one LZMA/LZMA2 workspace resident regardless of folder count.
         Ok(Self {
             input: Some(SevenInput::Source(input)),
             limits,
+            password,
             archive_metadata: Some(archive_metadata),
             files,
             folders,
@@ -624,6 +676,8 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
             event_data: Vec::with_capacity(64 * 1024),
             decoded_position: 0,
             decoded_total: 0,
+            entry_crc: None,
+            active_folder_encrypted: false,
         })
     }
 
@@ -646,6 +700,8 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
                     return Ok(ReaderEvent::Entry(metadata));
                 },
                 SevenPhase::Data { remaining: 0 } => {
+                    // The whole substream has been delivered; the stored CRC-32 (if any) must match.
+                    self.verify_entry_crc()?;
                     self.phase = SevenPhase::EndEntry;
                 },
                 SevenPhase::Data { remaining } => {
@@ -659,6 +715,10 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
                         ));
                     }
                     self.event_data.truncate(count);
+                    // Fold the freshly decoded content into the running CRC (disjoint field borrows).
+                    if let Some((crc, _)) = &mut self.entry_crc {
+                        crc.update(&self.event_data[..count]);
+                    }
                     self.phase = SevenPhase::Data {
                         remaining: remaining - count,
                     };
@@ -692,8 +752,13 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
                             "folder ended while skipping a substream",
                         ));
                     }
+                    // Even a skipped substream is CRC-checked — the bytes are decoded anyway.
+                    if let Some((crc, _)) = &mut self.entry_crc {
+                        crc.update(&scratch[..count]);
+                    }
                     remaining -= count;
                 }
+                self.verify_entry_crc()?;
                 self.phase = SevenPhase::EndEntry;
                 Ok(())
             },
@@ -740,6 +805,15 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         if record.has_stream && has_decoder {
             self.drain_to(record.stream_offset)?;
         }
+        // Arm per-substream CRC verification for this entry's decoded content (drain bytes above are
+        // deliberately excluded). Absent a stored digest, decode proceeds unverified.
+        self.entry_crc = if record.has_stream && has_decoder {
+            record
+                .crc
+                .map(|expected| (crate::filter::Crc32::new(), expected))
+        } else {
+            None
+        };
         let mut link_target = None;
         if record.has_stream && record.kind == EntryKind::Symlink && has_decoder {
             if self
@@ -754,6 +828,10 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
             }
             let mut target = vec![0; record.size];
             self.read_decoded_exact(&mut target)?;
+            if let Some((crc, _)) = &mut self.entry_crc {
+                crc.update(&target);
+            }
+            self.verify_entry_crc()?;
             link_target = Some(ArchivePath::from_encoded(target, PathEncoding::Utf8));
             self.phase = SevenPhase::EndEntry;
         } else if record.has_stream {
@@ -888,6 +966,24 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         Ok(())
     }
 
+    /// Consumes the running per-substream CRC-32 (if armed) and compares it to the stored digest.
+    /// A mismatch on an encrypted folder is reported as a likely wrong password; otherwise as
+    /// generic corruption. Never a no-op silently: a `None` accumulator simply means the archive
+    /// stored no digest to check against.
+    fn verify_entry_crc(&mut self) -> core::result::Result<(), StreamError> {
+        if let Some((crc, expected)) = self.entry_crc.take() {
+            if crc.finalize() != expected {
+                let context = if self.active_folder_encrypted {
+                    "wrong password or corrupt data"
+                } else {
+                    "substream CRC-32 mismatch"
+                };
+                return Err(seven_error(ErrorKind::Integrity, context));
+            }
+        }
+        Ok(())
+    }
+
     /// Verifies that the currently active folder decoded exactly to its declared size and
     /// produced nothing past it. A no-op when no decoder is live (no folder yet, or an
     /// unsupported coder). Called before switching folders and once the last file is consumed.
@@ -940,11 +1036,21 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
             .get(folder_index)
             .ok_or_else(|| seven_error(ErrorKind::Protocol, "folder index out of range"))?;
         let decodable = folder.is_decodable();
+        let encrypted = folder.is_encrypted();
         let pack_offset = folder.pack_offset;
         let pack_size = folder.pack_sizes.first().copied();
+        // Reject a missing password before reclaiming the source, so the raw `R` stays reachable
+        // (via `into_inner`/`source_ref`) after the error. The secret is never touched here.
+        if decodable && encrypted && self.password.is_none() {
+            return Err(seven_error(
+                ErrorKind::Unsupported,
+                "7z AES entry requires a password",
+            ));
+        }
         let mut source = self.take_source()?;
         self.decoded_position = 0;
         self.active_folder = Some(folder_index);
+        self.active_folder_encrypted = encrypted;
         if !decodable {
             self.input = Some(SevenInput::Source(source));
             return Ok(false);
@@ -964,7 +1070,7 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         }
         let take = source.take(size);
         let folder = &self.folders[folder_index];
-        let decoder = build_folder_reader(take, folder, self.limits)?;
+        let decoder = build_folder_reader(take, folder, self.limits, self.password.as_ref())?;
         self.input = Some(SevenInput::Decoder(Box::new(decoder)));
         Ok(true)
     }
@@ -993,6 +1099,7 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
 fn parse_seek_layout(
     input: &mut (impl Read + Seek),
     limits: Limits,
+    password: Option<&SecretBytes>,
 ) -> core::result::Result<(ArchiveMetadata, Vec<FileRec>, Vec<FolderInfo>), StreamError> {
     #![allow(clippy::too_many_lines)]
     let image_length = input.seek(SeekFrom::End(0)).map_err(StreamError::io)?;
@@ -1072,7 +1179,7 @@ fn parse_seek_layout(
                     "encoded-header coder is unsupported",
                 ));
             }
-            decode_seek_header(input, folder, limits, image_length)?
+            decode_seek_header(input, folder, limits, image_length, password)?
         },
         _ => {
             return Err(seven_error(
@@ -1107,6 +1214,7 @@ fn decode_seek_header(
     folder: &FolderInfo,
     limits: Limits,
     image_length: u64,
+    password: Option<&SecretBytes>,
 ) -> core::result::Result<Vec<u8>, StreamError> {
     if limits
         .metadata_bytes()
@@ -1131,7 +1239,7 @@ fn decode_seek_header(
         u64::try_from(pack_size)
             .map_err(|_| seven_error(ErrorKind::Limit, "encoded-header pack size exceeds u64"))?,
     );
-    let mut decoder = build_folder_reader(take, folder, limits)?;
+    let mut decoder = build_folder_reader(take, folder, limits, password)?;
     let length = usize::try_from(folder.unpack_size)
         .map_err(|_| seven_error(ErrorKind::Limit, "decoded header exceeds address space"))?;
     let mut output = vec![0; length];
@@ -1250,6 +1358,7 @@ fn build_folder_reader<R: Read>(
     source: Take<R>,
     folder: &FolderInfo,
     limits: Limits,
+    password: Option<&SecretBytes>,
 ) -> core::result::Result<SevenStage<R>, StreamError> {
     if !folder.is_decodable() {
         return Err(seven_error(
@@ -1266,7 +1375,7 @@ fn build_folder_reader<R: Read>(
             .get(folder.graph.out_base(coder_index))
             .copied()
             .ok_or_else(|| seven_error(ErrorKind::Malformed, "coder output size missing"))?;
-        stage = wrap_coder(stage, coder.method, out_size, limits)?;
+        stage = wrap_coder(stage, coder.method, out_size, limits, password)?;
     }
     Ok(stage)
 }
@@ -1277,6 +1386,7 @@ fn wrap_coder<R: Read>(
     method: CoderMethod,
     unpack_size: u64,
     limits: Limits,
+    #[cfg_attr(not(feature = "aes"), allow(unused_variables))] password: Option<&SecretBytes>,
 ) -> core::result::Result<SevenStage<R>, StreamError> {
     match method {
         CoderMethod::Lzma2 { dict_prop } => {
@@ -1313,6 +1423,19 @@ fn wrap_coder<R: Read>(
                 inner,
                 codec,
                 "7z-pipeline",
+            ))))
+        },
+        #[cfg(feature = "aes")]
+        CoderMethod::Aes(params) => {
+            // A password is mandatory to decode an AES folder. Its absence is a typed
+            // capability error; the secret itself is never placed in any message.
+            let password = password.ok_or_else(|| {
+                seven_error(ErrorKind::Unsupported, "7z AES entry requires a password")
+            })?;
+            let decoder =
+                crate::filter::aes7z::AesDecoder::new(params, unpack_size, password.expose());
+            Ok(SevenStage::Aes(Box::new(CodecReader::new(
+                inner, decoder, "7z-aes",
             ))))
         },
         CoderMethod::Unsupported => Err(seven_error(
@@ -1401,11 +1524,13 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<Vec<FolderInfo>> {
     // One uncompressed size per output stream, flat across every folder in order.
     let mut output_sizes_all: Vec<u64> = Vec::new();
     let mut num_folders = 0usize;
-    // Per folder: whether its UnpackInfo already defined a CRC. Mainstream 7-Zip and `sevenz-rust2`
+    // Per folder: its UnpackInfo-defined CRC (`None` when absent). Mainstream 7-Zip and `sevenz-rust2`
     // do NOT put the folder CRC here — they store it only in SubStreamsInfo — so a single-substream
-    // folder still carries a digest there. Tracking this drives the SubStreamsInfo digest count.
-    let mut folder_has_crc: Vec<bool> = Vec::new();
+    // folder still carries a digest there. Tracking this drives the SubStreamsInfo digest count and
+    // supplies the substream CRC for the single-substream + folder-CRC case.
+    let mut folder_crcs: Vec<Option<u32>> = Vec::new();
     let mut substream_sizes: Option<Vec<Vec<u64>>> = None;
+    let mut substream_crcs: Option<Vec<Vec<Option<u32>>>> = None;
 
     loop {
         match r.u8()? {
@@ -1429,7 +1554,7 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<Vec<FolderInfo>> {
                             pack_sizes = Some(sizes);
                         },
                         K_CRC => {
-                            let _ = read_digests_defined(r, num_pack)?;
+                            let _ = read_digests(r, num_pack)?;
                         },
                         _ => {
                             return Err(HeaderError::Unsupported(
@@ -1470,12 +1595,12 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<Vec<FolderInfo>> {
                 for _ in 0..total_outputs {
                     output_sizes_all.push(r.number()?);
                 }
-                folder_has_crc = vec![false; num_folders];
+                folder_crcs = vec![None; num_folders];
                 loop {
                     match r.u8()? {
                         K_END => break,
                         K_CRC => {
-                            folder_has_crc = read_digests_defined(r, num_folders)?;
+                            folder_crcs = read_digests(r, num_folders)?;
                         },
                         _ => {
                             return Err(HeaderError::Unsupported(
@@ -1488,7 +1613,9 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<Vec<FolderInfo>> {
             K_SUBSTREAMS_INFO => {
                 // SubStreamsInfo needs each folder's final-output (unpack) size.
                 let folder_unpack = folder_unpack_sizes(&graphs, &output_sizes_all)?;
-                substream_sizes = Some(parse_substreams_info(r, &folder_unpack, &folder_has_crc)?);
+                let (sizes, crcs) = parse_substreams_info(r, &folder_unpack, &folder_crcs)?;
+                substream_sizes = Some(sizes);
+                substream_crcs = Some(crcs);
             },
             _ => {
                 return Err(HeaderError::Unsupported(
@@ -1530,6 +1657,17 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<Vec<FolderInfo>> {
             "7z: substream folder-count mismatch",
         ));
     }
+    // Absent SubStreamsInfo: every folder is single-substream, its CRC (if any) taken from the
+    // folder-level digest.
+    let substream_crcs = match substream_crcs {
+        Some(crcs) => crcs,
+        None => folder_crcs.iter().map(|&crc| vec![crc]).collect(),
+    };
+    if substream_crcs.len() != num_folders {
+        return Err(HeaderError::Malformed(
+            "7z: substream crc folder-count mismatch",
+        ));
+    }
 
     let base = SIGNATURE_HEADER_SIZE
         .checked_add(usize_of(pack_pos)?)
@@ -1565,6 +1703,7 @@ fn parse_streams_info(r: &mut ByteReader<'_>) -> Result<Vec<FolderInfo>> {
             output_sizes,
             decode_order,
             substream_sizes: substream_sizes[index].clone(),
+            substream_crcs: substream_crcs[index].clone(),
         });
     }
     Ok(folders)
@@ -1763,6 +1902,21 @@ fn classify_method(codec: &[u8], props: &[u8]) -> Result<CoderMethod> {
         {
             Ok(CoderMethod::Unsupported)
         }
+    } else if codec == METHOD_AES256 {
+        // AES-256/SHA-256 lists on every build but only decodes when the `aes` feature is
+        // compiled in and the caller supplies a password. Properties that name an external
+        // key or an out-of-range work factor parse as `Unsupported` (listable, not decodable).
+        #[cfg(feature = "aes")]
+        {
+            match crate::filter::aes7z::AesParams::parse(props) {
+                Some(params) => Ok(CoderMethod::Aes(params)),
+                None => Ok(CoderMethod::Unsupported),
+            }
+        }
+        #[cfg(not(feature = "aes"))]
+        {
+            Ok(CoderMethod::Unsupported)
+        }
     } else {
         Ok(CoderMethod::Unsupported)
     }
@@ -1881,20 +2035,29 @@ fn visit_coder(
     Ok(())
 }
 
-/// Parses a `SubStreamsInfo` block covering every folder, returning per-folder substream sizes.
+/// Per-folder substream sizes paired with per-folder substream CRC-32s (`None` where undefined),
+/// both indexed `[folder][substream]`.
+type SubStreamTables = (Vec<Vec<u64>>, Vec<Vec<Option<u32>>>);
+
+/// Parses a `SubStreamsInfo` block covering every folder, returning per-folder substream sizes and
+/// per-folder substream CRC-32s (`None` where undefined).
 ///
-/// `folder_unpack[i]` is folder `i`'s uncompressed size and `folder_has_crc[i]` whether its
-/// `UnpackInfo` already defined a CRC. The digest count follows the 7z rule
-/// `numDigests = Σ_folders (numSubstreams(i) == 1 && folderCrcDefined(i) ? 0 : numSubstreams(i))`,
-/// and single-substream folders omit their stored size (it equals the folder size).
+/// `folder_unpack[i]` is folder `i`'s uncompressed size and `folder_crcs[i]` its `UnpackInfo`-level
+/// CRC (if any). The digest count follows the 7z rule
+/// `numDigests = Σ_folders (numSubstreams(i) == 1 && folderCrcDefined(i) ? 0 : numSubstreams(i))`;
+/// a single-substream folder whose CRC is already defined at the folder level reuses that value and
+/// contributes no digest here. Single-substream folders also omit their stored size (it equals the
+/// folder size).
+#[allow(clippy::too_many_lines)]
 fn parse_substreams_info(
     r: &mut ByteReader<'_>,
     folder_unpack: &[u64],
-    folder_has_crc: &[bool],
-) -> Result<Vec<Vec<u64>>> {
+    folder_crcs: &[Option<u32>],
+) -> Result<SubStreamTables> {
     let num_folders = folder_unpack.len();
     let mut counts: Vec<usize> = vec![1; num_folders];
     let mut sizes: Option<Vec<Vec<u64>>> = None;
+    let mut crcs: Option<Vec<Vec<Option<u32>>>> = None;
 
     loop {
         match r.u8()? {
@@ -1944,10 +2107,28 @@ fn parse_substreams_info(
                     .iter()
                     .enumerate()
                     .fold(0usize, |total, (index, &n)| {
-                        let already = n == 1 && folder_has_crc.get(index).copied().unwrap_or(false);
+                        let already = n == 1 && folder_crcs.get(index).copied().flatten().is_some();
                         total.saturating_add(if already { 0 } else { n })
                     });
-                let _ = read_digests_defined(r, unknown)?;
+                let digests = read_digests(r, unknown)?;
+                // Distribute digests over substreams in folder order, reusing the folder-level CRC
+                // for a single-substream folder that carried one.
+                let mut per_folder = Vec::with_capacity(num_folders);
+                let mut next = 0usize;
+                for (index, &n) in counts.iter().enumerate() {
+                    let folder_crc = folder_crcs.get(index).copied().flatten();
+                    if n == 1 && folder_crc.is_some() {
+                        per_folder.push(vec![folder_crc]);
+                    } else {
+                        let mut folder = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            folder.push(digests.get(next).copied().flatten());
+                            next += 1;
+                        }
+                        per_folder.push(folder);
+                    }
+                }
+                crcs = Some(per_folder);
             },
             _ => {
                 return Err(HeaderError::Unsupported(
@@ -1971,17 +2152,38 @@ fn parse_substreams_info(
         }
         per_folder
     };
+    // Absent a SubStreamsInfo kCRC block, a substream's CRC is only known when its folder carried a
+    // single-substream folder-level digest.
+    let crcs = crcs.unwrap_or_else(|| {
+        counts
+            .iter()
+            .enumerate()
+            .map(|(index, &n)| {
+                let folder_crc = folder_crcs.get(index).copied().flatten();
+                if n == 1 && folder_crc.is_some() {
+                    vec![folder_crc]
+                } else {
+                    vec![None; n]
+                }
+            })
+            .collect()
+    });
     for (index, folder_sizes) in sizes.iter().enumerate() {
         if folder_sizes.len() != counts[index] {
             return Err(HeaderError::Malformed("7z: substream count mismatch"));
         }
+        if crcs[index].len() != counts[index] {
+            return Err(HeaderError::Malformed("7z: substream crc count mismatch"));
+        }
     }
-    Ok(sizes)
+    Ok((sizes, crcs))
 }
 
 /// Reads a `Digests` structure (`AllAreDefined` byte + optional bit vector + one CRC per defined
-/// item), returning the per-item "defined" flags after bounds-checking the CRCs.
-fn read_digests_defined(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<bool>> {
+/// item), returning the per-item CRC-32 where defined (`None` otherwise). Retaining the values lets
+/// the reader verify each substream after decode — the check that distinguishes a correct 7z AES
+/// password from a wrong one.
+fn read_digests(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<Option<u32>>> {
     if count == 0 {
         return Ok(Vec::new());
     }
@@ -1996,12 +2198,11 @@ fn read_digests_defined(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<bool
     } else {
         r.bit_vector(count)?
     };
+    let mut out = Vec::with_capacity(count);
     for &is_defined in &defined {
-        if is_defined {
-            let _ = r.u32()?;
-        }
+        out.push(if is_defined { Some(r.u32()?) } else { None });
     }
-    Ok(defined)
+    Ok(out)
 }
 
 /// Parses the `kName` property: an external byte (must be 0) then null-terminated UTF-16LE names.

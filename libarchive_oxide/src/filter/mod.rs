@@ -4,6 +4,8 @@
 
 //! Compression filter implementations and runtime dispatch.
 
+#[cfg(all(feature = "sevenz", feature = "aes"))]
+pub(crate) mod aes7z;
 #[cfg(feature = "sevenz")]
 pub(crate) mod bcj;
 #[cfg(feature = "sevenz")]

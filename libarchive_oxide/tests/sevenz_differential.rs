@@ -424,3 +424,105 @@ fn arca_reads_sevenz_rust2_bzip2() {
 fn arca_reads_sevenz_rust2_zstd() {
     assert_arca_reads_method(EncoderMethod::ZSTD, "zstd");
 }
+
+/// AES-256/SHA-256 (method `06 F1 07 01`) differential coverage. `sevenz-rust2` (with its default
+/// `aes256` feature) produces a password-protected single-coder folder; arca decrypts it through the
+/// coder graph, deriving the key with 7-Zip's own UTF-16LE + SHA-256 KDF, and verifies the stored
+/// per-substream CRC-32 after decode. Gated on arca's `aes` feature.
+#[cfg(feature = "aes")]
+mod aes {
+    use libarchive_oxide::{ReaderEvent, SecretBytes, SeekArchiveReader, StreamError};
+    use libarchive_oxide_core::{ArchiveError, ErrorKind};
+    use sevenz_rust2::encoder_options::AesEncoderOptions;
+
+    use super::*;
+
+    /// Builds a `.7z` whose single content folder is AES-256/SHA-256 encrypted under `password`.
+    /// `encrypt_header` selects between `sevenz-rust2`'s default encrypted next-header (an AES-coded
+    /// `kEncodedHeader`, so even listing needs the password) and a plain header (so the encryption is
+    /// confined to the content folder — the shape that exercises the per-substream CRC check).
+    fn build_aes(password: &str, name: &str, data: &[u8], encrypt_header: bool) -> Vec<u8> {
+        let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
+        w.set_encrypt_header(encrypt_header);
+        let pw: Password = password.into();
+        w.set_content_methods(vec![AesEncoderOptions::new(pw).into()]);
+        w.push_archive_entry(ArchiveEntry::new_file(name), Some(data))
+            .unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    /// Reads the whole (single-entry) archive's content through arca's seek reader with `password`.
+    fn read_aes(bytes: &[u8], password: &str) -> Result<Vec<u8>, StreamError> {
+        let mut reader = SeekArchiveReader::with_password(
+            Cursor::new(bytes.to_vec()),
+            SecretBytes::new(password.as_bytes().to_vec()),
+        )?;
+        let mut content = Vec::new();
+        loop {
+            match reader.next_event()? {
+                ReaderEvent::Data(d) => content.extend_from_slice(d),
+                ReaderEvent::Done => return Ok(content),
+                _ => {},
+            }
+        }
+    }
+
+    /// The correct password (including a non-ASCII code point, to exercise the UTF-16LE encoding)
+    /// decrypts to the original plaintext, matching what `sevenz-rust2` reads back from its own file.
+    /// Uses the default *encrypted* next-header, so this also proves the AES-coded `kEncodedHeader`
+    /// path decodes with the caller's password.
+    #[test]
+    fn correct_password_decodes_encrypted_header_and_content() {
+        let data = mixed_payload();
+        let password = "córrèct-horse-battery-\u{1F510}";
+        let bytes = build_aes(password, "secret.bin", &data, true);
+
+        // The independent producer must read its own archive with the same password.
+        let mut reference =
+            SevenReader::new(Cursor::new(bytes.clone()), Password::from(password)).unwrap();
+        assert_eq!(reference.read_file("secret.bin").unwrap(), data);
+
+        assert_eq!(read_aes(&bytes, password).unwrap(), data);
+    }
+
+    /// A wrong password decrypts the content to garbage of the right length; the stored per-substream
+    /// CRC-32 mismatch is surfaced as a typed `Integrity` error rather than silently returning corrupt
+    /// bytes. A plain header keeps the failure at the content coder (the CRC path), not the header.
+    #[test]
+    fn wrong_password_trips_integrity() {
+        let data = b"top secret payload, not for prying eyes\n".repeat(16);
+        let bytes = build_aes("correct-horse", "s.bin", &data, false);
+
+        // The fixture is sound: the correct password decodes it cleanly.
+        assert_eq!(read_aes(&bytes, "correct-horse").unwrap(), data);
+
+        let error = read_aes(&bytes, "wrong-horse").expect_err("wrong password must fail");
+        assert_eq!(
+            error.archive_error().map(ArchiveError::kind),
+            Some(ErrorKind::Integrity),
+            "wrong 7z AES password must be reported as an integrity failure"
+        );
+    }
+
+    /// Opening a plain-header AES archive without any password lists metadata but reports a typed
+    /// capability error (never a panic, never leaked secrets) when the encrypted content is reached.
+    #[test]
+    fn missing_password_is_unsupported() {
+        let data = b"needs a key to read\n".repeat(8);
+        let bytes = build_aes("pw", "s.bin", &data, false);
+
+        let mut reader = SeekArchiveReader::new(Cursor::new(bytes.clone())).unwrap();
+        let error = loop {
+            match reader.next_event() {
+                Ok(ReaderEvent::Done) => panic!("expected a typed error for the missing password"),
+                Ok(_) => {},
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            error.archive_error().map(ArchiveError::kind),
+            Some(ErrorKind::Unsupported),
+            "a missing 7z AES password must be a typed capability error"
+        );
+    }
+}

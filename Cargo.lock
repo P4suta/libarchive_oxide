@@ -530,6 +530,7 @@ dependencies = [
  "bzip2",
  "cap-fs-ext",
  "cap-std",
+ "cbc",
  "compression-codecs",
  "ctr",
  "flate2",

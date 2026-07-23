@@ -316,7 +316,7 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
             {
                 return Ok(Self {
                     inner: SeekDispatch::SevenZ(Box::new(crate::sevenz::SevenZSeekReader::new(
-                        input, limits,
+                        input, limits, password,
                     )?)),
                 });
             }
