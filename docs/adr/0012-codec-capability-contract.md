@@ -79,7 +79,7 @@ gap must not be mistaken for discharging the obligation to close it.
 
 | Deficit | Where it shows | Why | Resolution path | Tracking |
 |---|---|---|---|---|
-| Portable **streaming** zstd **encode** | ZIP member write method 93 is `native-codecs`-only; portable selection returns a structured `Unsupported` error | `ruzstd` ships only a one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, used for outer-filter *frames* and `create --zstd`); it cannot emit a single ZIP member as a bounded stream without buffering the whole member, which would break the core bounded-memory guarantee. The `native-codecs` `compression-codecs` encoder is a true streaming encoder. | A streaming, single-stream, spec-robust pure-Rust zstd encoder — contributed upstream to `ruzstd` or provided as a dedicated crate the engine consumes. The engine core does not absorb the encoder. | RM-307 (this ADR) → follow-on codec initiative |
+| Portable **streaming** zstd **encode** | ZIP member write method 93 is `native-codecs`-only; portable selection returns a structured `Unsupported` error | `ruzstd` (pinned `0.8.3`, latest as of the RM-309 survey below) offers only `ruzstd::encoding::compress_to_vec` (one-shot, whole output collected into a `Vec`) and `FrameCompressor` (a *pull*-based `set_source(Read)` → `set_drain(Write)` driver whose single blocking `compress()` runs the source to EOF). Both serve outer-filter *frames* and `create --zstd`, where the engine owns the whole `Read`. Neither can be driven by the engine's *push*-based, synchronous ZIP-member write loop (`payload_step` feeds bounded chunks and pulls bounded output per step) without inverting control — i.e. buffering the entire member or spawning a thread — which would break the core bounded-memory guarantee. The `native-codecs` `compression-codecs` encoder is a true push-streaming encoder. | A push-drivable (incremental feed/flush), single-stream, spec-robust pure-Rust zstd encoder — contributed upstream to `ruzstd` or provided as a dedicated crate the engine consumes behind the codec-provider boundary. The engine core does not absorb the encoder. Adoption seam when one lands: open the portable arm of `map_zip_method` (`src/provider.rs`, currently returns the deferred `Unsupported` message for `ZipMethod::Zstd` on `not(native-codecs)`) and add a portable `zstd_step`/finalize path in `src/zip_stream.rs` mirroring the existing `native-codecs` method-93 steps; interop evidence = round-trip against libzstd/`unzip` per ADR-0011 before flipping the support-matrix cell. | RM-307 (this ADR), RM-309 / DEV-123 (survey re-affirmed) → follow-on codec initiative |
 | Deflate64 read and write | ZIP method 9 returns a structured `Unsupported` error and still enumerates | No pure-Rust Deflate64 encoder exists; decoders are scarce and the write direction has effectively no consumer demand. | Feasibility decision (own pure-Rust decoder for read-only, external decoder, or leave unsupported); no encoder is planned. | RM-306 feasibility ADR |
 | 7z **PPMd** decode (method `03 04 01`) | A 7z folder coded with PPMd lists normally; extraction returns a structured `Unsupported` error and enumeration continues | 7z's PPMd7 (variant H) has no wired bounded-memory pure-Rust decoder, and the engine core will not absorb the model. This is a *new decoder deferred*, not a bent guarantee — the coder graph parses, the capability is typed. | Adopt or contribute a pure-Rust PPMd7 decoder consumed behind the codec-provider boundary; read-only, no encoder planned. | RM-303 → follow-on codec initiative |
 | 7z **BCJ2** decode (method `03 03 01 1B`) | A 7z coder graph containing BCJ2 lists normally; extraction returns a structured `Unsupported` error and enumeration continues | BCJ2 is a four-input, multi-stream branch converter that does not fit the one-active-linear-folder decode model that keeps 7z decoding bounded. This is a *multi-stream decode deferred* — the graph resolver already validates its bind pairs; only the decode stage is absent. | Extend the folder decoder with a bounded four-stream BCJ2 junction stage; read-only, no encoder planned. | RM-303 → follow-on decoder slice |
@@ -89,6 +89,38 @@ lz4) has complete pure-Rust read **and** write on the `portable-codecs` profile.
 The two 7z-only entries (PPMd, BCJ2) are read-only-deferred coders behind an
 already-typed capability, not bent guarantees; this table is the entire ledger,
 not a pervasive condition.
+
+### RM-309 portable zstd-encoder survey (2026-07-24, re-affirms the deficit)
+
+RM-309 / DEV-123 re-surveyed the pure-Rust zstd-encoder landscape to test whether
+the "Portable streaming zstd encode" deficit can now be closed. Verdict: **no
+suitable crate exists yet; the deficit stands and the `native-codecs`-only
+method-93 write remains a legitimate tracked interim.** No `src/` change and no
+support-matrix flip in this pass.
+
+- **`ruzstd` `0.8.3`** (pinned in `Cargo.lock`; latest release, published
+  2026-07-12) exposes in `ruzstd::encoding`: `compress` / `compress_to_vec`
+  (one-shot) and `FrameCompressor` (`new`, `set_source(R: Read)`,
+  `set_drain(W: Write)`, `compress()`, take/replace accessors). `FrameCompressor`
+  is *pull*-based — one blocking `compress()` reads the source to EOF — so it fits
+  cases where the engine owns the whole `Read` (outer-filter frames, `create
+  --zstd`) but **cannot** be driven by the ZIP-member writer's *push* loop without
+  buffering the whole member or spawning a thread. Neither is permitted by the
+  bounded-memory / no-dyn / sync core invariants. There is **no** `StreamingEncoder`
+  or incremental feed/flush API in `0.8.3`. (A `StreamingEncoder` name appears in
+  some upstream prose but is not in the published `0.8.3` API surface; if a future
+  release ships a genuine push-drivable encoder, it becomes the adoption vehicle.)
+- **`structured-zstd`** (a `ruzstd` fork adding dictionary support) inherits the
+  same `FrameCompressor` architecture with no push-streaming encoder, and adopting
+  a fork carries a supply-chain/maintenance cost; not suitable.
+- **`zstd` / `zstd-safe`** wrap the C `zstd-sys` library — disqualified from the
+  `portable-codecs` (C/FFI-free) profile by construction; they are effectively the
+  `native-codecs` path already in use.
+
+Resolution path is unchanged and re-affirmed: adopt a push-drivable pure-Rust zstd
+encoder (upstream `ruzstd` contribution or a dedicated crate) behind the
+codec-provider boundary, then open the seam noted in the ledger row. Until then the
+portable ZIP method-93 write stays typed `Unsupported`, per Decision items 2 and 4.
 
 ## Consequences
 
