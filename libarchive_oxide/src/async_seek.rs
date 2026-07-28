@@ -165,7 +165,7 @@ impl Seek for DemandReader {
     }
 }
 
-/// Runtime-neutral async reader for ZIP, 7z, and ISO 9660.
+/// Runtime-neutral async reader for ZIP, 7z, ISO 9660, and UDF.
 #[derive(Debug)]
 pub struct AsyncSeekArchiveReader<R> {
     input: R,

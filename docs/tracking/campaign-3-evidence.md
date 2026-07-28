@@ -41,9 +41,11 @@ change, or versioned release candidate is part of this snapshot.
 | Support-matrix + PROVENANCE ZIP LZMA update | RM-302 | `docs/support-matrix.md`, `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md` | ZIP row adds LZMA to Read and Write; the not-yet-implemented note now lists ONLY Deflate64; PROVENANCE records the committed-fixture escape hatch and the two-independent-codecs honesty note |
 | CAB read-only provider | RM-305 | `libarchive_oxide/src/cab.rs`, `libarchive_oxide-core/src/format.rs`, `libarchive_oxide/src/provider.rs`, `libarchive_oxide/src/seek_stream.rs` | `CabSeekReader`: MSCF header, CFFOLDER/CFFILE/CFDATA tables, Store + MSZIP (the 32 KiB LZ window is carried across a folder's `CFDATA` blocks via a miniz_oxide wrapping ring); QUANTUM/LZX/cross-cabinet/spanning are structured `Unsupported`; registered as a read-only seek-native provider (`FormatId::Cab`, capability decode-only) |
 | XAR read-only provider | RM-305 | `libarchive_oxide/src/xar.rs`, `.../format.rs`, `.../provider.rs`, `.../seek_stream.rs` | `XarSeekReader`: big-endian header, zlib TOC bounded by `metadata_bytes`, a hand-rolled bounded XML pull-scanner over the `<file>` tree, stored + zlib (`x-gzip`) heap data; `x-bzip2`/unknown encodings are structured `Unsupported`; `FormatId::Xar`, decode-only |
-| CAB/XAR interop + adversarial evidence | RM-305 | `libarchive_oxide/tests/interop_cab_meta.rs`, `libarchive_oxide/tests/interop_xar_meta.rs`, `libarchive_oxide/tests/fixtures/{cab,xar}/PROVENANCE.md` | first-party in-code raw builders (independent DEFLATE/zlib via `flat2`) read back through the RM-301 harness; multi-file/nested/empty round trips plus unsupported-method and truncated-header structured-error negatives; a three-lens adversarial review with a verification pass |
+| CAB/XAR interop + adversarial evidence | RM-305 | `libarchive_oxide/tests/interop_cab_meta.rs`, `libarchive_oxide/tests/interop_xar_meta.rs`, `libarchive_oxide/tests/fixtures/{cab,xar}/PROVENANCE.md` | first-party in-code raw container builders using lockfile-resolved `flate2` read back through the RM-301 harness; portable codec independence is not claimed because both sides use the `miniz_oxide` family; multi-file/nested/empty round trips plus unsupported-method and truncated-header structured-error negatives; a three-lens adversarial review with a verification pass |
 | Support-matrix CAB/XAR read-only rows | RM-305 | `docs/support-matrix.md` | CAB and XAR added to the archive-containers table as read-only seek providers; removed from the not-implemented list (RAR5/UDF remain, tracked by RM-306) |
 | RAR5/UDF/Deflate64 feasibility ADR | RM-306 | `docs/adr/0013-rar5-udf-deflate64-feasibility.md`, `docs/support-matrix.md` | Deflate64 read = go (adopt external pure-Rust `deflate64` behind the codec-provider boundary, follow-on slice) / write = won't-do; UDF read-only go (rev 1.02/1.50/2.01, follow-on); RAR5 deferred in its entirety (no clean-room pure-Rust decompressor); codec-deficit ledger + not-yet-implemented prose updated; no `src/` change, no dependency added |
+| ZIP Deflate64 read implementation | RM-306 follow-on | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/tests/interop_zip_deflate64.rs`, `libarchive_oxide/tests/fixtures/zip/{7zip,PROVENANCE.md}`, `xtask/src/main.rs` | method 9 streams through `deflate64` 0.1.12 under `gzip` on portable/native; fixed 64 KiB chunks, CRC/size/extent/no-progress/truncation/bomb checks; official 7-Zip 26.02 fixture exercises a >32 KiB distance; write remains absent/won't-do and package-smoke compile-fail coverage locks the lack of a public `ZipMethod::Deflate64` variant |
+| UDF Phase 1 read implementation | RM-306 follow-on | `libarchive_oxide/src/udf.rs`, `libarchive_oxide/tests/udf.rs`, `fuzz/{fuzz_targets/read_udf.rs,corpus/read_udf/seed.udf}` | read-only seek provider for 1.02/1.50/2.01: VRS/bridge priority, backup anchors, Main→Reserve/continued VDS with prevailing descriptors, Type 1 maps, FSD/root ICB, FE/EFE strategy 4, short/long/inline/chained/multi/sparse allocation, streamed FIDs, OSTA Unicode/timestamps, symlink/hardlink metadata, checked ranges and all applicable archive `Limits`; shared sync/engine/range/futures/Tokio parser and adversarial replay |
 | Metadata-fidelity harness extension | RM-304 | `libarchive_oxide/tests/common/mod.rs` | additive `read_seq_with_arca` (sequential `ArchiveReader`), `MetaShape` (REAL kind + mode/uid/gid/mtime/link_target, no kind folding), `read_meta_seq_with_arca` / `read_meta_seek_with_arca`, `assert_producers_agree_seq`; the content-only `EntryShape` path is unchanged |
 | tar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_tar_meta.rs`, `libarchive_oxide/tests/fixtures/tar/PROVENANCE.md` | 3 producers (arca, `tar@0.4`, first-party raw ustar builder) × 2 consumers (arca sequential reader, `tar@0.4`); mode/uid/gid/mtime and symlink-target fidelity |
 | cpio producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_cpio_meta.rs`, `libarchive_oxide/tests/fixtures/cpio/PROVENANCE.md` | 3 producers (arca `newc`, first-party raw `newc`, first-party raw `odc` — genuinely distinct on-disk framings) × 2 consumers (arca, first-party raw `newc` parser); mode/uid/gid/mtime plus a typed hardlink pair (File payload + Hardlink alias) |
@@ -295,9 +297,10 @@ change, or versioned release candidate is part of this snapshot.
   real archive (`.rar` in the wild is almost always compressed). Recorded as a
   tracked deficit; decode-only / clean-room / nominative-naming constraints are
   fixed for any future work.
-- RM-306 adds no runtime code and no dependency; it updates `docs/support-matrix.md`
-  (deficit ledger + not-yet-implemented prose) and is the RAR5/UDF provenance
-  appendix ADR-0011 reserved.
+- The ADR itself added no runtime code. Its follow-on implementation has now
+  landed `deflate64` 0.1.12 plus the in-tree UDF reader, the corresponding
+  support-matrix cells, provenance records, and `read_udf` fuzz target. RAR5
+  remains deferred exactly as the ADR decided.
 
 ## RM-307
 
@@ -320,9 +323,10 @@ change, or versioned release candidate is part of this snapshot.
   for outer-filter frames and `create --zstd`), which cannot emit a ZIP member as
   a bounded stream without buffering the whole member and breaking the memory
   guarantee, so ZIP method-93 write is `native-codecs` only — the engine refuses
-  the path rather than weaken the guarantee. This and Deflate64 (method 9) are the
-  entire current deficit ledger; every other mainstream codec is complete
-  read+write on portable.
+  the path rather than weaken the guarantee. Deflate64 read is now complete on
+  both profiles and its write direction is a permanent won't-do; the current
+  open codec ledger is portable streaming zstd encode plus the 7z PPMd/BCJ2
+  decode gaps recorded in the support matrix.
 - `docs/support-matrix.md` is refactored to the accountability grid: the ZIP row
   points to a `method × {read,write} × {portable,native}` table where every `—` is
   a data point (a structured `Unsupported`, enumeration continues), plus a
@@ -379,11 +383,12 @@ change, or versioned release candidate is part of this snapshot.
   objects), stream payload in ≤ 64 KiB chunks, and return a structured `StreamError`
   for every malformed/truncated/unsupported/limit case (never a panic/unwrap).
 - Evidence: `tests/interop_cab_meta.rs` and `tests/interop_xar_meta.rs` build valid
-  archives with first-party in-code raw byte builders (independent DEFLATE/zlib via
-  `flat2`, which arca re-inflates with `miniz_oxide` — codec independence), read
+  archives with first-party in-code raw container builders using `flate2`, read
   them back through the RM-301 harness, and assert content round trips over
   multi-file/nested/empty corpora, plus negatives for an unsupported compression
-  method and a truncated/out-of-range header. A three-lens adversarial review
+  method and a truncated/out-of-range header. This proves independent container
+  framing, not codec independence on portable builds: `flate2` and arca's inflater
+  share the `miniz_oxide` implementation family there. A three-lens adversarial review
   (panic/bounds, spec-correctness, malformed-input) with an independent verification
   pass was run over both modules before commit. Per-format `PROVENANCE.md` registers
   the in-code raw builder and documents the external independent producers

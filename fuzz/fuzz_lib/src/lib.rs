@@ -119,6 +119,11 @@ pub fn read_iso(data: &[u8]) {
     drive_seek(data);
 }
 
+/// UDF seek decoder: arbitrary anchors, descriptors, ICBs, and extents must not panic.
+pub fn read_udf(data: &[u8]) {
+    drive_seek(data);
+}
+
 /// Synthesized archive member.
 #[derive(Debug, Clone, Arbitrary)]
 pub struct FuzzEntry {
@@ -828,6 +833,7 @@ pub const TARGETS: &[&str] = &[
     "read_7z",
     "read_7z_graph",
     "read_iso",
+    "read_udf",
     "roundtrip_tar",
     "roundtrip_cpio",
     "roundtrip_ar",
@@ -851,6 +857,7 @@ pub fn run_target(name: &str, data: &[u8]) {
         "read_7z" => read_7z(data),
         "read_7z_graph" => read_7z_graph(data),
         "read_iso" => read_iso(data),
+        "read_udf" => read_udf(data),
         "roundtrip_tar" => roundtrip_tar(&entries_from_bytes(data)),
         "roundtrip_cpio" => roundtrip_cpio(&entries_from_bytes(data)),
         "roundtrip_ar" => roundtrip_ar(&entries_from_bytes(data)),

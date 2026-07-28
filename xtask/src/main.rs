@@ -31,17 +31,24 @@ const BIG_ENDIAN_FEATURES: &str = "libarchive_oxide/portable-codecs,\
 libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,\
 libarchive_oxide/tokio";
 
+const DEFLATE64_WRITE_NEGATIVE: &str = r"use libarchive_oxide::ZipMethod;
+
+fn main() {
+    let _ = ZipMethod::Deflate64;
+}
+";
+
 const PACKAGE_CONSUMER_MAIN: &str = r#"use std::io::Cursor;
 
 use libarchive_oxide::{
     ArchiveEngine, ArchiveReader, CodecCapabilities, CodecProvider, FilesystemAdapter,
     FilesystemAdapterError, FilesystemCapabilities, FilesystemEntry, FilesystemEntryReport,
     FilesystemFinding, FilesystemMaterialization, FormatCapabilities, FormatProvider,
-    ProviderArchiveEncoder, ProviderSet, ReaderEvent,
+    ProviderArchiveEncoder, ProviderSet, ReaderEvent, SeekArchiveReader,
 };
 use libarchive_oxide_core::{
     ArchiveDecoder, ArchiveEncoder, ArchiveError, Codec, CodecStep, DecodeStep, EncodeCommand,
-    EncodeStep, EndOfInput, FilterId, FormatId, Limits, ProbeResult,
+    EncodeStep, EndOfInput, ErrorKind, FilterId, FormatId, Limits, ProbeResult,
 };
 
 struct ExternalDecoder;
@@ -132,6 +139,77 @@ impl FilesystemAdapter for ExternalFilesystem {
     }
 }
 
+fn method9_zip() -> Vec<u8> {
+    let name = b"feature-off.bin";
+    let compressed = [1_u8, 0, 0, 0xff, 0xff];
+    let mut archive = Vec::new();
+    archive.extend_from_slice(b"PK\x03\x04");
+    archive.extend_from_slice(&21_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&9_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(name);
+    archive.extend_from_slice(&compressed);
+
+    let central_offset = archive.len() as u32;
+    archive.extend_from_slice(b"PK\x01\x02");
+    archive.extend_from_slice(&0x031e_u16.to_le_bytes());
+    archive.extend_from_slice(&21_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&9_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(name);
+
+    let central_size = archive.len() as u32 - central_offset;
+    archive.extend_from_slice(b"PK\x05\x06");
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&1_u16.to_le_bytes());
+    archive.extend_from_slice(&1_u16.to_le_bytes());
+    archive.extend_from_slice(&central_size.to_le_bytes());
+    archive.extend_from_slice(&central_offset.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive
+}
+
+fn assert_deflate64_is_listable_without_gzip() {
+    let mut reader =
+        SeekArchiveReader::new(Cursor::new(method9_zip())).expect("method-9 index must be readable");
+    assert!(matches!(
+        reader.next_event().expect("archive metadata"),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    let ReaderEvent::Entry(metadata) = reader.next_event().expect("method-9 entry") else {
+        panic!("method-9 member must enumerate before decoding");
+    };
+    assert_eq!(metadata.path().as_bytes(), b"feature-off.bin");
+    let error = reader
+        .next_event()
+        .expect_err("feature-off method 9 must be Unsupported");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Unsupported)
+    );
+    reader.skip_entry().expect("unsupported entry remains skippable");
+}
+
 fn main() {
     let _filesystem = ExternalFilesystem;
     let _engine = ArchiveEngine::new()
@@ -143,6 +221,7 @@ fn main() {
     let limits = Limits::safe();
     let mut reader = ArchiveReader::with_limits(Cursor::new(Vec::<u8>::new()), limits);
     let _event: Result<ReaderEvent<'_>, _> = reader.next_event();
+    assert_deflate64_is_listable_without_gzip();
 }
 "#;
 
@@ -412,6 +491,49 @@ fn check_packaged_profiles(smoke: &Path) -> Result {
             .into());
         }
     }
+    let feature_off = Command::new(cargo())
+        .current_dir(smoke)
+        .args([
+            "run",
+            "--package",
+            "libarchive_oxide-package-consumer",
+            "--no-default-features",
+        ])
+        .status()?;
+    if !feature_off.success() {
+        return Err(
+            "external consumer failed the no-default-features Deflate64 runtime contract".into(),
+        );
+    }
+    let examples = smoke.join("consumer").join("examples");
+    fs::create_dir_all(&examples)?;
+    fs::write(
+        examples.join("deflate64_write.rs"),
+        DEFLATE64_WRITE_NEGATIVE,
+    )?;
+    let no_write_surface = Command::new(cargo())
+        .current_dir(smoke)
+        .args([
+            "check",
+            "--package",
+            "libarchive_oxide-package-consumer",
+            "--example",
+            "deflate64_write",
+            "--no-default-features",
+            "--features",
+            "portable-codecs",
+        ])
+        .output()?;
+    let no_write_stderr = String::from_utf8_lossy(&no_write_surface.stderr);
+    if no_write_surface.status.success()
+        || !no_write_stderr.contains("named `Deflate64` found for enum `ZipMethod`")
+    {
+        return Err(format!(
+            "packaged Deflate64 write surface did not fail with the expected missing-variant \
+             contract:\n{no_write_stderr}"
+        )
+        .into());
+    }
     let conflict = Command::new(cargo())
         .current_dir(smoke)
         .args([
@@ -428,7 +550,9 @@ fn check_packaged_profiles(smoke: &Path) -> Result {
         return Err("packaged codec profiles did not fail with the documented conflict".into());
     }
     println!(
-        "packaged crates compile in portable and native profiles; their combination fails closed"
+        "packaged crates compile in portable and native profiles; no-default Deflate64 is listable \
+         then Unsupported, Deflate64 has no write-method surface, and the profile combination \
+         fails closed"
     );
     Ok(())
 }
@@ -494,18 +618,26 @@ fn check_codec_policy(root: &Path) -> Result {
         "lz4-sys",
     ];
     for (codec, profiles, required) in [
-        ("gzip", ["gzip", "gzip,async,tokio"], "miniz_oxide"),
-        ("bzip2", ["bzip2", "bzip2,async,tokio"], "libbz2-rs-sys"),
-        ("zstd", ["zstd", "zstd,async,tokio"], "ruzstd"),
-        ("xz", ["xz", "xz,async,tokio"], "lzma-rust2"),
-        ("lz4", ["lz4", "lz4,async,tokio"], "lz4_flex"),
+        (
+            "gzip",
+            ["gzip", "gzip,async,tokio"],
+            &["miniz_oxide", "deflate64"][..],
+        ),
+        (
+            "bzip2",
+            ["bzip2", "bzip2,async,tokio"],
+            &["libbz2-rs-sys"][..],
+        ),
+        ("zstd", ["zstd", "zstd,async,tokio"], &["ruzstd"][..]),
+        ("xz", ["xz", "xz,async,tokio"], &["lzma-rust2"][..]),
+        ("lz4", ["lz4", "lz4,async,tokio"], &["lz4_flex"][..]),
     ] {
         for features in profiles {
             require_dependency_profile(
                 root,
                 &format!("compatible portable {codec} ({features})"),
                 features,
-                &[required],
+                required,
                 PORTABLE_FORBIDDEN,
             )?;
         }
@@ -516,6 +648,7 @@ fn check_codec_policy(root: &Path) -> Result {
         "portable-codecs,aes,sevenz,async,tokio",
         &[
             "miniz_oxide",
+            "deflate64",
             "libbz2-rs-sys",
             "ruzstd",
             "lzma-rust2",
@@ -527,11 +660,19 @@ fn check_codec_policy(root: &Path) -> Result {
         root,
         "maximal native-codecs",
         "native-codecs,aes,sevenz,async,tokio",
-        &["libz-sys", "bzip2-sys", "zstd-sys", "lzma-sys", "lz4-sys"],
+        &[
+            "deflate64",
+            "libz-sys",
+            "bzip2-sys",
+            "zstd-sys",
+            "lzma-sys",
+            "lz4-sys",
+        ],
         &[],
     )?;
     println!(
-        "portable codec graphs exclude C/FFI packages; the explicit native graph selects all five native backends"
+        "portable codec graphs exclude C/FFI packages; both profiles select the pure-Rust \
+         Deflate64 decoder and the explicit native graph selects all five native backends"
     );
     Ok(())
 }

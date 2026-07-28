@@ -21,6 +21,7 @@
 //! identity) — exactly what the fuzzer would flag, but reachable on stable Windows.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -66,7 +67,12 @@ fn adversarial_mutants(seed: &[u8]) -> Vec<Vec<u8>> {
     }
 
     // (1) Truncations: dense for small seeds, strided to at most TRUNC_MAX cuts for large ones.
-    let tstride = len.div_ceil(TRUNC_MAX);
+    // Optical images are necessarily much larger than the compact archive
+    // seeds. Keep their stable-CI replay bounded while still sampling the
+    // complete image (nightly libFuzzer remains the dense mutation gate).
+    let trunc_max = if len > 256 * 1024 { 128 } else { TRUNC_MAX };
+    let smash_max = if len > 256 * 1024 { 256 } else { SMASH_MAX };
+    let tstride = len.div_ceil(trunc_max);
     let mut cut = 0;
     while cut < len {
         out.push(seed[..cut].to_vec());
@@ -74,7 +80,7 @@ fn adversarial_mutants(seed: &[u8]) -> Vec<Vec<u8>> {
     }
 
     // (2) 4-byte field smashes (all-0xFF → giant index; all-0x00 → zero count/size edge cases).
-    let sstride = len.div_ceil(SMASH_MAX);
+    let sstride = len.div_ceil(smash_max);
     let mut pos = 0;
     while pos < len {
         let end = (pos + 4).min(len);
@@ -154,7 +160,7 @@ fn arbitrary_seeds_uphold_invariants() {
         }
     }
 
-    assert_eq!(TARGETS.len(), 18, "all fuzz targets are wired");
+    assert_eq!(TARGETS.len(), 19, "all fuzz targets are wired");
     assert_eq!(runs, TARGETS.len() * LENGTHS.len() * STREAMS);
 }
 
@@ -169,9 +175,21 @@ fn arbitrary_seeds_uphold_invariants() {
 /// and codec seeds are mutated too; their `run_target` bodies keep asserting their identities.
 #[test]
 fn seed_mutants_uphold_invariants() {
+    const READER_TARGETS: &[&str] = &[
+        "read_tar",
+        "read_cpio",
+        "read_ar",
+        "read_zip",
+        "read_7z",
+        "read_7z_graph",
+        "read_iso",
+        "read_udf",
+    ];
+
     let root = corpus_root();
     let mut mutant_runs = 0usize;
     let mut targets_with_seed = 0usize;
+    let mut seeded_targets = BTreeSet::new();
     for &target in TARGETS {
         let dir = root.join(target);
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -192,13 +210,20 @@ fn seed_mutants_uphold_invariants() {
         }
         if had_seed {
             targets_with_seed += 1;
+            seeded_targets.insert(target);
         }
     }
 
-    // Require seeds for all six reader targets.
+    assert_eq!(READER_TARGETS.len(), 8, "all reader targets are enumerated");
+    for target in READER_TARGETS {
+        assert!(
+            seeded_targets.contains(target),
+            "expected a committed valid seed for reader target {target}"
+        );
+    }
     assert!(
-        targets_with_seed >= 6,
-        "expected committed seeds for at least the six read_* targets, saw {targets_with_seed}"
+        seeded_targets.contains("read_udf"),
+        "the UDF deep-parse replay seed is mandatory"
     );
     assert!(mutant_runs > 0, "adversarial mutation produced no runs");
     println!(

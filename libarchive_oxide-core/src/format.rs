@@ -26,6 +26,8 @@ pub enum FormatId {
     SevenZip,
     /// ISO 9660.
     Iso9660,
+    /// Universal Disk Format (read-only).
+    Udf,
     /// Microsoft Cabinet (read-only).
     Cab,
     /// XAR extensible archive (read-only).
@@ -38,6 +40,7 @@ impl FormatId {
     #[must_use]
     pub fn probe(prefix: &[u8]) -> ProbeResult<Self> {
         const ISO_SIGNATURE_END: usize = 16 * 2048 + 6;
+        const UDF_SIGNATURE_END: usize = 17 * 2048 + 6;
 
         for (identifier, signature) in [
             (Self::Zip, b"PK\x03\x04".as_slice()),
@@ -61,7 +64,17 @@ impl FormatId {
             return ProbeResult::Match(Self::Ar);
         }
 
-        if prefix.len() >= ISO_SIGNATURE_END
+        if prefix.len() >= UDF_SIGNATURE_END
+            && prefix[16 * 2048 + 1..16 * 2048 + 6] == *b"BEA01"
+            && matches!(
+                &prefix[17 * 2048 + 1..UDF_SIGNATURE_END],
+                b"NSR02" | b"NSR03"
+            )
+        {
+            return ProbeResult::Match(Self::Udf);
+        }
+        if prefix.len() >= UDF_SIGNATURE_END
+            && prefix.len() >= ISO_SIGNATURE_END
             && prefix[16 * 2048 + 1..ISO_SIGNATURE_END] == *b"CD001"
         {
             return ProbeResult::Match(Self::Iso9660);
@@ -91,8 +104,8 @@ impl FormatId {
                 minimum = minimum.min(candidate);
             }
         }
-        if prefix.len() < ISO_SIGNATURE_END {
-            minimum = minimum.min(ISO_SIGNATURE_END);
+        if prefix.len() < UDF_SIGNATURE_END {
+            minimum = minimum.min(UDF_SIGNATURE_END);
         }
         if minimum == usize::MAX {
             ProbeResult::NoMatch

@@ -20,6 +20,7 @@ cd fuzz
 cargo +nightly fuzz build
 cargo +nightly fuzz run read_tar
 cargo +nightly fuzz run read_zip -- -max_total_time=30
+cargo +nightly fuzz run read_udf -- -max_total_time=30
 ```
 
 Portable replay:

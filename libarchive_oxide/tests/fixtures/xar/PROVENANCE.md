@@ -19,8 +19,8 @@ and arca's seek reader (`read_with_arca`) reconstructs identical
 
 **No binary fixtures are committed for XAR.** All XAR bytes used by the interop
 harness are generated **deterministically, in-code, at test run time** — hermetic,
-no network, no committed blobs, nothing that can rot. The pinned
-`[dev-dependencies]` in `libarchive_oxide/Cargo.toml` (`flat2` for the zlib TOC
+no network, no committed blobs, nothing that can rot. The lockfile-resolved
+`[dev-dependencies]` in `libarchive_oxide/Cargo.toml` (`flate2` for the zlib TOC
 and `x-gzip` heap blobs) are the single source of truth for producer identity;
 when a pin changes, the label strings change with it as a deliberate, reviewed
 edit.
@@ -37,10 +37,11 @@ the reserved location for any future byte-exact external-tool artifact (see
 
 Consumer: `arca` (self, via `read_with_arca` / `SeekArchiveReader`).
 
-The zlib codec used by the builder is pinned in `libarchive_oxide/Cargo.toml`:
+The manifest accepts `flate2` 1.x and the committed `Cargo.lock` currently resolves
+it to 1.1.9:
 
 ```toml
-flat2 = "1"   # zlib (RFC-1950) TOC + x-gzip heap blobs for the raw-xar-builder producer
+flate2 = "1"   # zlib (RFC-1950) TOC + x-gzip heap blobs for the raw-xar-builder producer
 ```
 
 ## Layout produced by `raw-xar-builder`
@@ -81,7 +82,7 @@ flat2 = "1"   # zlib (RFC-1950) TOC + x-gzip heap blobs for the raw-xar-builder 
 ## License / origin
 
 All XAR bytes are produced at test time by first-party code in this repository and
-the pinned `flat2` dev-dependency; no third-party binary artifact is
+the lockfile-resolved `flate2` dev-dependency; no third-party binary artifact is
 redistributed. First-party generators are covered by this repository's
 `MIT OR Apache-2.0` license.
 

@@ -8,8 +8,9 @@
 Safe-Rust archive detection, compression, extraction, and creation over
 [`libarchive_oxide-core`](https://crates.io/crates/libarchive_oxide-core).
 
-The crate supports tar, cpio, ar, ZIP/ZIP64, optional single-folder 7z, and
-ISO 9660 with format-specific limits. Outer filters are gzip, bzip2, zstd, xz,
+The crate supports tar, cpio, ar, ZIP/ZIP64 (including Deflate64 read),
+optional 7z coder graphs, ISO 9660, and read-only UDF 1.02/1.50/2.01 with
+format-specific limits. Outer filters are gzip, bzip2, zstd, xz,
 and LZ4 frame. The crate forbids unsafe code; its default `portable-codecs`
 profile is dependency-gated to C/FFI-free backends across sync and async adapters. See the repository's
 [support matrix](https://github.com/P4suta/libarchive_oxide/blob/main/docs/support-matrix.md)
@@ -68,7 +69,7 @@ See [docs.rs](https://docs.rs/libarchive_oxide) and [`examples`](examples/).
 |---|:---:|---|
 | `portable-codecs` | yes | all five outer codecs through C/FFI-free backends |
 | `native-codecs` | no | all five through native libraries; use with `--no-default-features` |
-| `gzip` | via profile | gzip; portable when selected alone |
+| `gzip` | via profile | gzip plus ZIP Deflate64 read; portable when selected alone |
 | `bzip2` | via profile | bzip2; portable when selected alone |
 | `zstd` | via profile | zstd; portable when selected alone |
 | `xz` | via profile | xz / LZMA2; portable when selected alone |
@@ -91,7 +92,7 @@ and `TokioSeekArchive*`; secure Tokio extraction is provided by
 `TokioExtractor`. Archive-level properties can be supplied before the first
 entry with `set_archive_metadata`.
 
-Immutable remote or application-owned ZIP, 7z, and ISO objects can implement
+Immutable remote or application-owned ZIP, 7z, ISO, and UDF objects can implement
 `RangeSource` or feature-gated `AsyncRangeSource`. The adapters require a
 stable opaque identity, revalidate it around I/O, enforce bounded read-ahead,
 report exact request/byte metrics, and continue to use the same

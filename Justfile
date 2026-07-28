@@ -42,9 +42,16 @@ test:
     cargo test --workspace --no-default-features --features {{portable_features}}
     cargo test --workspace --no-default-features --features {{native_features}}
 
-# Build public documentation for the default portable profile with warnings denied.
+# Build public documentation for both maximal codec profiles with warnings denied.
 doc:
     cargo doc --workspace --no-default-features --features {{portable_features}} --no-deps
+    cargo doc --workspace --no-default-features --features {{native_features}} --no-deps
+
+# Cross-check both maximal profiles on 32-bit Windows.
+check-32-bit-windows:
+    rustup target add i686-pc-windows-msvc
+    cargo check --workspace --all-targets --no-default-features --features {{portable_features}} --target i686-pc-windows-msvc
+    cargo check --workspace --all-targets --no-default-features --features {{native_features}} --target i686-pc-windows-msvc
 
 # Spell-check the repository.
 typos:

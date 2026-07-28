@@ -58,6 +58,7 @@ pub mod spool;
 pub mod stream;
 #[cfg(feature = "tokio")]
 pub mod tokio_stream;
+mod udf;
 mod xar;
 mod zip;
 mod zip_stream;

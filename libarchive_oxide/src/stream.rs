@@ -25,7 +25,7 @@ use crate::provider::{
 use crate::zip::ZipMethod;
 
 const BUFFER: usize = 64 * 1024;
-const DETECTION_MINIMUM: usize = 16 * 2048 + 6;
+const DETECTION_MINIMUM: usize = 17 * 2048 + 6;
 
 /// A caller-driven pipeline event.
 #[derive(Debug)]

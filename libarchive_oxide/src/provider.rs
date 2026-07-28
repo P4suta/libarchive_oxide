@@ -820,7 +820,7 @@ impl BuiltinFormatDecoder {
             FormatId::Tar => BuiltinFormatDecoderInner::Tar(Box::new(TarDecoder::new(limits))),
             FormatId::Cpio => BuiltinFormatDecoderInner::Cpio(Box::new(CpioDecoder::new(limits))),
             FormatId::Ar => BuiltinFormatDecoderInner::Ar(Box::new(ArDecoder::new(limits))),
-            FormatId::Zip | FormatId::SevenZip | FormatId::Iso9660 => {
+            FormatId::Zip | FormatId::SevenZip | FormatId::Iso9660 | FormatId::Udf => {
                 return Err(ArchiveError::new(ErrorKind::Capability)
                     .with_format(format_name(format))
                     .with_context("archive format requires Read + Seek"));
@@ -875,6 +875,11 @@ impl BuiltinFormatEncoder {
             FormatId::Ar => BuiltinFormatEncoderInner::Ar(ArEncoder::new(limits)),
             FormatId::Zip => {
                 BuiltinFormatEncoderInner::Zip(Box::new(ZipStreamEncoder::new(limits)))
+            },
+            FormatId::Udf => {
+                return Err(ArchiveError::new(ErrorKind::Unsupported)
+                    .with_format(format_name(format))
+                    .with_context("UDF writing is not supported"));
             },
             FormatId::SevenZip | FormatId::Iso9660 => {
                 return Err(ArchiveError::new(ErrorKind::Capability)
@@ -1025,8 +1030,8 @@ impl StaticFormatProviders for BuiltinFormatProviders {
                 ProviderCapability::Available(FormatCapabilities::new(true, true, true))
             },
             FormatId::SevenZip => ProviderCapability::Disabled,
-            // CAB and XAR are seek-native READ-ONLY providers: decode yes, encode no.
-            FormatId::Cab | FormatId::Xar => {
+            // UDF, CAB, and XAR are seek-native READ-ONLY providers.
+            FormatId::Udf | FormatId::Cab | FormatId::Xar => {
                 ProviderCapability::Available(FormatCapabilities::new(true, false, true))
             },
             _ => ProviderCapability::Unknown,
@@ -1349,6 +1354,7 @@ pub(crate) const fn format_name(format: FormatId) -> &'static str {
         FormatId::Zip => "zip",
         FormatId::SevenZip => "7z",
         FormatId::Iso9660 => "iso9660",
+        FormatId::Udf => "udf",
         FormatId::Cab => "cab",
         FormatId::Xar => "xar",
         _ => "unknown",

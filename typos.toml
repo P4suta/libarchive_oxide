@@ -39,6 +39,9 @@ mis = "mis"
 [default.extend-identifiers]
 ba = "ba"
 ded = "ded"
+# The Rust DEFLATE/zlib crate name contains a numeric suffix and is tokenized as
+# an identifier rather than an English word.
+flate2 = "flate2"
 
 [files]
 extend-exclude = [
