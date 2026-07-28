@@ -9,7 +9,7 @@
 //! `CFHEADER` (no flags: no reserve area, no prev/next cabinet), the `CFFOLDER`
 //! table, the `CFFILE` table at `coffFiles`, and the per-folder `CFDATA` blocks.
 //! Stored folders carry the payload verbatim; MSZIP folders carry a `'CK'`
-//! prefix plus a raw-DEFLATE stream produced by the independent `flate2` crate.
+//! prefix plus a raw-DEFLATE stream produced through the `flate2` crate.
 //!
 //! The tests assert the `(path, kind, content)` round trip for a multi-file
 //! solid folder (small file, empty file, nested-path file), a single-block and

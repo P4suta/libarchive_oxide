@@ -84,6 +84,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "read_udf"
+path = "fuzz_targets/read_udf.rs"
+test = false
+doc = false
+bench = false
+
 # ── Round-trip targets: synthesized entry set → write → read back → id. ──
 
 [[bin]]

@@ -690,7 +690,7 @@ impl TarDecoder {
             // Empty tar begins with zero blocks, but so do ISO images before
             // their sector-16 descriptor. Runtime detection must defer the
             // ambiguous all-zero prefix long enough to check that signature.
-            const ISO_PROBE: usize = 16 * 2048 + 6;
+            const ISO_PROBE: usize = 17 * 2048 + 6;
             if prefix.len() < ISO_PROBE {
                 ProbeResult::NeedMore { minimum: ISO_PROBE }
             } else {

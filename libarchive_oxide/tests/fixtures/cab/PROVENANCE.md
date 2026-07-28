@@ -15,7 +15,8 @@ reuses the RM-301 harness in `libarchive_oxide/tests/common/mod.rs`).
 **No binary fixtures are committed for CAB.** All CAB bytes used by the test are
 generated **deterministically, in-code, at test run time** — hermetic, no network,
 no committed blobs, nothing that can rot or need re-verification. The raw-DEFLATE
-streams inside MSZIP folders are produced by the pinned `flat2` dev-dependency;
+streams inside MSZIP folders are produced by the lockfile-resolved `flate2`
+dev-dependency;
 everything else (`CFHEADER`, `CFFOLDER`, `CFFILE`, `CFDATA` framing) is hand-laid
 first-party bytes.
 
@@ -28,14 +29,15 @@ the reserved location for any future byte-exact external-tool artifact (see
 | Label | Crate / tool | Version | Independent of arca? | Method | Generation |
 |-------|--------------|---------|----------------------|--------|------------|
 | `raw-cab-builder` | first-party bytes in `tests/interop_cab_meta.rs` | n/a | yes (hand-assembled MSCF container, independent of any CAB library) | Store (NONE) | in-code |
-| `raw-cab-builder + flat2` | `flat2` (raw DEFLATE) inside a first-party MSZIP frame | flat2 1.x | yes (independent DEFLATE codec; arca inflates with `miniz_oxide`) | MSZIP | in-code |
+| `raw-cab-builder + flate2` | `flate2` (raw DEFLATE) inside a first-party MSZIP frame | flate2 1.1.9 (`Cargo.lock`) | container framing only; the portable profile shares the `miniz_oxide` implementation family | MSZIP | in-code |
 
 Consumer: `arca` (self, via `read_with_arca` / `SeekArchiveReader`).
 
-The `flat2` version is pinned in `libarchive_oxide/Cargo.toml`:
+The manifest accepts `flate2` 1.x and the committed `Cargo.lock` currently resolves
+it to 1.1.9:
 
 ```toml
-flat2 = "1"
+flate2 = "1"
 ```
 
 ## Method coverage this slice
@@ -43,7 +45,7 @@ flat2 = "1"
 - **CAB Store (NONE, method 0):** first-party raw builder + arca reader; multi-file
   solid folder (small file, empty file, nested-path file), round-tripped
   `(path, kind, content)`.
-- **CAB MSZIP (method 1):** first-party raw builder driving `flat2` raw DEFLATE
+- **CAB MSZIP (method 1):** first-party raw builder driving `flate2` raw DEFLATE
   + arca reader (`miniz_oxide` inflate). Covered layouts:
   - single-block folder (multi-file solid folder);
   - single block with real LZ77 back-references (repetitive payload);
@@ -54,17 +56,19 @@ flat2 = "1"
   yields `Unsupported`; an out-of-range `coffFiles` and a sub-`CFHEADER`-truncated
   image each yield a structured error.
 
-### DEFLATE-codec independence note
+### DEFLATE-codec evidence boundary
 
 MSZIP is `'CK'` + raw DEFLATE with the LZ77 window carried across a folder's
-blocks. The test's producer compresses with `flat2` (which wraps the C `zlib`
-/ `miniz` family) while arca decompresses with the pure-Rust `miniz_oxide`
-low-level inflate core driven over a 32 KiB power-of-two wrapping ring. These are
-independent DEFLATE implementations, so a shared codec bug cannot mask a framing
-error. The in-code multi-block fixtures deflate each block independently (a
-spec-valid MSZIP producer choice), so they prove correct block concatenation and
-window continuation but not a producer that deliberately emits cross-block
-back-references; that stricter evidence is deferred to the external escape hatch.
+blocks. The producer uses `flate2`; under the portable profile its default Rust
+backend and arca's low-level inflater are different versions/wrappers of the same
+`miniz_oxide` implementation family. The evidence is therefore independent at the
+CAB-container/framing layer, not at the DEFLATE-codec layer, and a shared codec
+defect could mask a codec-only error. The native profile also exercises the zlib
+backend through feature unification. The in-code multi-block fixtures deflate each
+block independently (a spec-valid MSZIP producer choice), so they prove correct
+block concatenation and window continuation but not a producer that deliberately
+emits cross-block back-references; both cross-block and codec-independent evidence
+are deferred to the external escape hatch.
 
 ## Out of scope (structured `Unsupported`)
 
@@ -84,9 +88,10 @@ access — never a panic.
 
 ## License / origin
 
-All CAB bytes are produced at test time by first-party code and the pinned
-`flat2` dev-dependency; no third-party binary artifact is redistributed.
-`flat2` is dual-licensed under `MIT OR Apache-2.0`. First-party generators are
+All CAB bytes are produced at test time by first-party code and the
+lockfile-resolved `flate2` dev-dependency; no third-party binary artifact is
+redistributed.
+`flate2` is dual-licensed under `MIT OR Apache-2.0`. First-party generators are
 covered by this repository's `MIT OR Apache-2.0` license.
 
 ## How to regenerate

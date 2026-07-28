@@ -281,6 +281,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deflate64"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac6b926516df9c60bfa16e107b21086399f8285a44ca9711344b9e553c5146e2"
+
+[[package]]
 name = "derive_arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -534,6 +540,7 @@ dependencies = [
  "cbc",
  "compression-codecs",
  "ctr",
+ "deflate64",
  "flate2",
  "futures-io",
  "futures-lite",

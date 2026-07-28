@@ -24,8 +24,10 @@ kill. **DEV-124 has since landed on `main` (#70)**, so checkbox 9's flaky
 blocker on the axes CI already exercises is resolved *pending durable
 multi-run confirmation* (the acceptance's ≥20 hang-free CI reps); the deterministic
 `async_xz_never_deadlocks_under_slow_source` regression test now guards it. The
-remaining checkbox-9 gaps are structural (no WASI / 32-bit axes), not flaky — see
-the checkbox-9 row below.
+remaining checkbox-9 structural gap is WASI inspection; the 32-bit
+portable/native compile axis is now a required Windows CI job. The covered axes
+still need the acceptance's durable multi-run record — see the checkbox-9 row
+below.
 
 ## Audit method
 
@@ -56,16 +58,17 @@ ADR, or roadmap unit) is named for every verdict.
 
 ### 2. Primary read/write and compatibility read-only format profiles pass their exact matrices — **partial**
 
-- Primary read+write formats (ZIP, 7z, tar, cpio, ar, ISO) and the first
-  read-only compatibility providers (CAB, XAR — RM-305) are implemented and
+- Primary read+write formats (ZIP, 7z, tar, cpio, ar, ISO) and the
+  read-only compatibility providers (CAB, XAR, and UDF Phase 1) are implemented and
   covered by the `test` matrix job (conformance + committed corpus on the
   portable and native profiles across ubuntu/windows/macOS). The grid
   support-matrix (method × read/write × portable/native) landed in RM-307.
-- Not yet complete / not frozen: Deflate64 (method 9) is unimplemented (tracked
-  deficit, RM-306/ADR-0013); RAR5 and UDF are deferred/feasibility-only
-  (ADR-0013); the matrices are still evolving, not declared final. Verdict:
-  **partial** — matrices exist and pass for implemented cells, but coverage is
-  incomplete and unfrozen.
+- Deflate64 method 9 read and UDF Phase 1 (1.02/1.50/2.01) are now implemented
+  and run through the same portable/native and seek-adapter matrices. RAR5
+  remains deliberately deferred and UDF 2.50/2.60 Metadata Partitions remain
+  Phase 2. The matrices are still evolving and are not declared final. Verdict:
+  **partial** — implemented cells pass, but external-producer coverage and
+  matrix freeze remain incomplete.
 
 ### 3. OCI and package conformance profiles pass — **present**
 
@@ -113,8 +116,12 @@ Rust API gate dormant; C ABI not started (RM-310).
   committed liblzma fixture as its sole independent codec. 7z coder-graph depth
   (multi-folder, BCJ/Delta, Deflate/BZip2/Zstd, AES-256) has since landed on
   `main` via RM-303 (#71) with 3-producer differential evidence against
-  `sevenz-rust2`, though PPMd and BCJ2 stay deferred (ADR-0012). Not universal
-  across every format/method. Verdict: **partial**.
+  `sevenz-rust2`, though PPMd and BCJ2 stay deferred (ADR-0012). Deflate64 has
+  one committed official 7-Zip producer but still lacks the Windows Explorer
+  artifact required by ADR-0013. UDF has deterministic first-party conformance
+  images but still lacks mkudffs plus two independently verified producers;
+  xorriso is explicitly ineligible because it does not produce UDF. Not
+  universal across every format/method. Verdict: **partial**.
 
 ### 6. Malformed, fuzz, resource-arithmetic, symlink-race, and decompression-bomb gates pass — **present**
 
@@ -123,7 +130,7 @@ Rust API gate dormant; C ABI not started (RM-310).
   `RUSTFLAGS: -C overflow-checks=yes` keeping malformed length **arithmetic**
   fail-closed (`xtask fuzz-ci`).
 - Decompression bombs bounded by `Limits::decoded_total` throughout (ZIP/7z/CAB/
-  XAR/OCI/package suites; e.g. `*_bomb_is_bounded_by_limits`,
+  XAR/UDF/OCI/package suites; e.g. `*_bomb_is_bounded_by_limits`,
   `decompression_bomb_is_bounded`). Symlink-race / traversal / symlink-escape
   covered by the capability filesystem (ADR-0007) and RM-202 apply tests
   (`plan_rejects_entries_escaping_through_a_layer_symlink`,
@@ -146,14 +153,15 @@ Rust API gate dormant; C ABI not started (RM-310).
   approval mechanism for sustained regressions. Verdict: **partial** — baseline
   data exists; the enforcing gate does not.
 
-### 9. Portable/native, no_std, WASI inspection, big-endian, 32-bit, MSRV, and all-features CI pass — **partial** (DEV-124 blocker)
+### 9. Portable/native, no_std, WASI inspection, big-endian, 32-bit, MSRV, and all-features CI pass — **partial** (WASI and durability gaps)
 
 - Covered by CI: **portable/native** (`test` job runs both profiles across
   ubuntu/windows/macOS), **no_std** (`no_std` job, thumbv7em-none-eabi),
   **big-endian** (`big-endian` job, s390x under qemu), **MSRV** (`msrv` job,
-  core 1.85 / flagship 1.87), and the maximal-features profiles inside `test`.
-- **Absent axes:** there is **no WASI-inspection job** and **no 32-bit target
-  job** in `ci.yml` — those two axes are not started.
+  core 1.85 / flagship 1.87), **32-bit** (`check-32-bit-windows` compiles both
+  maximal profiles for `i686-pc-windows-msvc`), and the maximal-features
+  profiles inside `test`.
+- **Absent axis:** there is **no WASI-inspection job** in `ci.yml`.
 - **DEV-124 blocker (now resolved on `main`):** DEV-78 is blockedBy DEV-124,
   which removed the flaky async/filter codec hang that intermittently timed out
   the `big-endian`, `test (macos-latest)`, and `test (ubuntu-latest)` jobs.
@@ -163,8 +171,9 @@ Rust API gate dormant; C ABI not started (RM-310).
   re-run-the-job (`gh run rerun <id> --failed`) workaround. The covered axes can
   now be declared durably green *once* the acceptance's sustained ≥20 hang-free CI
   reps are recorded; that confirmation is the only remaining item for the covered
-  axes. Verdict: **partial** — the flaky blocker is cleared, but WASI-inspection
-  and 32-bit axes are still not-started and the ≥20-rep durability record is pending.
+  axes. Verdict: **partial** — the flaky blocker is cleared and 32-bit compile
+  coverage is required, but WASI inspection and the ≥20-rep durability record
+  remain pending.
 
 ### 10. At least two release candidates complete all technical gates — **not started**
 
@@ -175,21 +184,23 @@ Rust API gate dormant; C ABI not started (RM-310).
 
 ## Still-open checkboxes (remaining tasks for the gate's true state)
 
-- **Checkbox 2** — format-matrix completeness: Deflate64 (method 9) read still
-  to be wired (RM-306/ADR-0013); RAR5/UDF remain deferred/feasibility-only.
+- **Checkbox 2** — implemented format cells now include Deflate64 read and UDF
+  Phase 1; RAR5 remains deferred by ADR-0013, UDF Phase 2 remains demand-gated,
+  and the overall matrix is not frozen.
 - **Checkbox 4** — C ABI freeze = **RM-310 not started** (no `libarchive_oxide-c`
   crate, no header harness, no ABI snapshot/Miri/ABI-fuzz CI); Rust API
   `semver-checks` gate dormant until a v0.2 baseline exists; support matrix not
   machine-frozen.
 - **Checkbox 5** — three-producer/two-consumer completeness is not yet universal
-  per format/method (ISO/cpio/7z gaps noted).
+  per format/method (ISO/cpio/7z plus Deflate64/UDF gaps noted).
 - **Checkbox 7** — the 10 GiB streaming soak against a documented RSS budget is
   not yet run or gated.
 - **Checkbox 8** — no CI performance-regression gate exists (only Campaign 1
   baseline data).
-- **Checkbox 9** — WASI-inspection and 32-bit CI axes are absent; the DEV-124
-  flaky-hang root fix has landed (#70), so the covered axes now need only the
-  acceptance's sustained ≥20 hang-free CI reps recorded as durable evidence.
+- **Checkbox 9** — the 32-bit portable/native compile axis is now required, but
+  WASI inspection remains absent; the DEV-124 flaky-hang root fix has landed
+  (#70), so the covered axes also need the acceptance's sustained ≥20 hang-free
+  CI reps recorded as durable evidence.
 - **Checkbox 10** — ≥2 release candidates completing all technical gates: not
   started, and downstream of every item above.
 

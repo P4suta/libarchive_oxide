@@ -39,7 +39,7 @@ pub trait AsyncRangeSource {
     async fn read_range(&mut self, offset: u64, output: &mut [u8]) -> io::Result<usize>;
 }
 
-/// Async range reader for ZIP, 7z, and ISO 9660.
+/// Async range reader for ZIP, 7z, ISO 9660, and UDF.
 #[derive(Debug)]
 pub struct AsyncRangeArchiveReader<S: AsyncRangeSource> {
     source: S,

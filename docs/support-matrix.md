@@ -11,9 +11,10 @@ scheme, metadata field, or producer quirk is accepted.
 | tar | sequential | v7, ustar, pax, GNU | yes | none | pax extensions and GNU sparse; known-size entry creation |
 | cpio | sequential | binary little/big endian, odc, newc, crc | yes | none | known-size entry creation |
 | ar | sequential | GNU and BSD | yes | none | thin members are reported as external references and are never materialized automatically |
-| ZIP/ZIP64 | seek or streaming | see [ZIP compression methods](#zip-compression-methods) grid | see grid | optional WinZip AES-256 AE-2; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode path/comment, and extended/NTFS/Info-ZIP-UX timestamp extras are interpreted as typed metadata; Info-ZIP Unix uid/gid are surfaced when recorded in the central directory (as arca writes them) and synthesized on write; unknown extras are preserved verbatim |
+| ZIP/ZIP64 | seek; bounded payload events | see [ZIP compression methods](#zip-compression-methods) grid | see grid | optional WinZip AES-256 AE-2 for Store/Deflate; AES-wrapped Deflate64 is structured `Unsupported`; ZipCrypto not enabled by default | descriptors, ZIP64, Unicode path/comment, and extended/NTFS/Info-ZIP-UX timestamp extras are interpreted as typed metadata; Info-ZIP Unix uid/gid are surfaced when recorded in the central directory (as arca writes them) and synthesized on write; unknown extras are preserved verbatim |
 | 7z | seek | LZMA, LZMA2, Delta, BCJ (x86/PPC/IA64/ARM/ARMT/SPARC/ARM64/RISC-V), Deflate, BZip2, Zstandard; multi-folder and general coder graphs; plain and encoded headers | yes | AES-256 (SHA-256 KDF) | optional `sevenz`; one active folder decoder (bounded); PPMd and BCJ2 are structured `Unsupported` — see [deficits](#codec-capability-deficits) |
-| ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | UDF and continuation-area coverage are not complete |
+| ISO 9660 | seek | ISO 9660, Rock Ridge, Joliet | yes | none | continuation-area coverage is not complete |
+| UDF | seek | read-only Phase 1: 1.02, 1.50, 2.01 on 2048-byte optical images | no (read-only) | none | Main/Reserve and continued VDS with prevailing descriptors; FE/EFE strategy 4; short/long/inline allocation, allocation-extent chains, multi-extent/sparse data; OSTA Unicode; uid/gid, permissions (including setuid/setgid/sticky), link count, unique ID/inode and timestamps; symlinks/hardlinks; bounded inline raw EAs are preserved. Revisions 2.50/2.60, Metadata/Sparable/Virtual maps, VAT, named/system streams, continued File Set Descriptor sequences, transformed or multi-version ICBs, external EA ICBs, non-CS0 charsets, extended ADs, and named filesystem-root symlink components are structured `Unsupported` |
 | CAB | seek | read-only (MSCF): Store and MSZIP folders | no (read-only) | none | QUANTUM/LZX folders and cross-cabinet spanning are structured `Unsupported`; the MSZIP window is carried across a folder's `CFDATA` blocks |
 | XAR | seek | read-only: stored and zlib (`x-gzip`) data | no (read-only) | none | zlib-XML TOC; `x-bzip2` and other data encodings are structured `Unsupported` |
 
@@ -29,7 +30,7 @@ that are a *tracked deficit* rather than a permanent limit are listed under
 |---|---|:---:|:---:|:---:|:---:|---|
 | Store | 0 | ✓ | ✓ | ✓ | ✓ | — |
 | Deflate | 8 | ✓ | ✓ | ✓ | ✓ | — |
-| Deflate64 | 9 | — | — | — | — | — |
+| Deflate64 | 9 | ✓ | ✓ | — | — | `gzip` (read) |
 | BZip2 | 12 | ✓ | ✓ | ✓ | ✓ | `bzip2` |
 | LZMA | 14 | ✓ | ✓ | ✓ | ✓ | `xz` |
 | Zstandard | 93 | ✓ | ✓ | — | ✓ | `zstd` (read) / `native-codecs` (write) |
@@ -40,11 +41,12 @@ ZIP-LZMA header and an end-of-stream marker (general-purpose bit 1) and reads bo
 the end-marker and known-size conventions. Zstandard read is pure-Rust on both
 profiles (`ruzstd` / `compression-codecs`); Zstandard *write* is `native-codecs`
 only — see the deficit table for why, and note this is a tracked debt, not a
-resting state. Deflate64 (method 9) is not yet implemented in either direction; per
-[ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md) the read path is decided
-(adopt the external pure-Rust `deflate64` decoder behind the codec-provider
-boundary, landing in a follow-on slice) and write is a retired won't-do (no
-pure-Rust encoder exists). Traditional ZipCrypto is not enabled by default.
+resting state. Deflate64 (method 9) read uses the same pure-Rust `deflate64`
+decoder on both profiles with a fixed 64 KiB history window; size, CRC, truncation,
+no-progress, and decoded-total checks remain in the ZIP seek state machine.
+Deflate64 write is a retired won't-do under
+[ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md): no reusable encoder
+exists and no write API is exposed. Traditional ZipCrypto is not enabled by default.
 
 7z now reads the general coder graph: multi-folder archives, chained BCJ/Delta
 filters over LZMA/LZMA2, and Deflate/BZip2/Zstandard coders, plus AES-256/SHA-256
@@ -70,18 +72,21 @@ read+write on portable.
 | Deficit | Surfaces as | Why | Resolution path | Tracking |
 |---|---|---|---|---|
 | Portable **streaming** zstd encode | ZIP write method 93 on `portable-codecs` → structured `Unsupported`; `native-codecs` write works | `ruzstd` ships only a one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, used for outer-filter frames and `create --zstd`). It cannot emit a single ZIP member as a bounded stream without buffering the whole member, which would break the core bounded-memory guarantee. The engine refuses the path rather than weaken the guarantee. | A streaming, single-stream pure-Rust zstd encoder — upstream to `ruzstd` or a dedicated crate the engine consumes. | RM-307 → follow-on codec initiative |
-| Deflate64 (method 9) | ZIP method 9 read/write → structured `Unsupported` (not yet implemented) | Read: a mature pure-Rust decoder (`deflate64`) exists but is not yet wired. Write: no pure-Rust encoder exists and demand is effectively nil (matches libarchive). | Read: adopt the external `deflate64` decoder behind the codec-provider boundary in a follow-on slice. Write: **won't-do**, retired per [ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md). | RM-306 / ADR-0013 |
 | 7z **PPMd** (method `03 04 01`) | a folder whose coder is PPMd lists normally; reaching its payload returns a structured `Unsupported` | 7z uses the PPMd variant H (PPMd7) model; no bounded-memory pure-Rust decoder is wired, and the engine will not absorb one into its core. | Adopt or contribute a pure-Rust PPMd7 decoder behind the codec-provider boundary, consumed like the other coders; no encoder is planned (read-only, matching libarchive). | RM-303 → follow-on codec initiative |
 | 7z **BCJ2** (method `03 03 01 1B`) | a folder whose coder graph contains BCJ2 lists normally; reaching its payload returns a structured `Unsupported` | BCJ2 is a four-input branch converter (main + two call/jump streams + a range-coder control stream); it is inherently multi-stream and does not fit the one-active-linear-folder decode model that keeps memory bounded. | Extend the folder decoder with a bounded BCJ2 four-stream junction stage (the graph parser already resolves the bind pairs); no encoder is planned. | RM-303 → follow-on decoder slice |
 
-CAB and XAR are implemented as read-only seek-native providers (see the archive
-containers table above). RAR5 and UDF read scope is resolved by
-[ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md): UDF is a scoped read-only
-go (revisions 1.02/1.50/2.01 first, activated from the shared Volume Recognition
-Sequence), pending its implementation slice; RAR5 read is feasible in principle,
-but the provider is deferred in its entirety until a clean-room pure-Rust
-decompressor exists, because `.rar` archives in the wild are almost always
-compressed.
+CAB, XAR, and UDF Phase 1 are implemented as read-only seek-native providers
+(see the archive-containers table above). RAR5 read scope remains resolved but
+deferred under [ADR-0013](adr/0013-rar5-udf-deflate64-feasibility.md) until a
+clean-room pure-Rust decompressor exists, because `.rar` archives in the wild are
+almost always compressed.
+
+### Permanent won't-do decisions
+
+| Surface | Contract | Reason |
+|---|---|---|
+| ZIP Deflate64 write | no encoder and no public `ZipMethod::Deflate64` request surface; method 9 creation is unavailable | No reusable Deflate64 encoder exists and write demand is negligible; read-only support is complete on both profiles per ADR-0013. |
+| UDF write | `FormatCapabilities { decode: true, encode: false, seek: true }`; sequential/seek writers and both `ArchiveEngine` creation routes return structured `Unsupported` | Phase 1 is intentionally read-only; adding an optical filesystem authoring stack is outside the archive-reader scope. |
 
 ## Outer compression filters
 

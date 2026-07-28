@@ -134,7 +134,7 @@ impl<R: AsyncRead + Unpin> TokioArchiveReader<R> {
     }
 }
 
-/// Tokio reader for ZIP, 7z, and ISO 9660 sources with async seek capability.
+/// Tokio reader for ZIP, 7z, ISO 9660, and UDF sources with async seek capability.
 #[derive(Debug)]
 pub struct TokioSeekArchiveReader<R>(AsyncSeekArchiveReader<TokioIo<R>>);
 

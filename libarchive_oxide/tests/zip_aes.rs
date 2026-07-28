@@ -24,7 +24,7 @@ use cap_std::fs::Dir;
 use libarchive_oxide::{
     ArchiveWriter, Extractor, ReaderEvent, SecretBytes, SeekArchiveReader, StreamError, ZipMethod,
 };
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, ErrorKind, Limits};
 use zip::write::SimpleFileOptions;
 use zip::{AesMode, ZipArchive};
 
@@ -64,6 +64,23 @@ fn read_first_with_password(bytes: &[u8], password: &[u8]) -> Result<Vec<u8>, St
     }
 }
 
+fn set_aes_real_method(extra: &mut [u8], method: u16) {
+    let mut cursor = 0;
+    while cursor + 4 <= extra.len() {
+        let id = u16::from_le_bytes([extra[cursor], extra[cursor + 1]]);
+        let length = usize::from(u16::from_le_bytes([extra[cursor + 2], extra[cursor + 3]]));
+        let end = cursor + 4 + length;
+        assert!(end <= extra.len(), "truncated AES test extra field");
+        if id == 0x9901 {
+            assert_eq!(length, 7);
+            extra[cursor + 9..cursor + 11].copy_from_slice(&method.to_le_bytes());
+            return;
+        }
+        cursor = end;
+    }
+    panic!("AES test archive is missing its 0x9901 extra field");
+}
+
 #[test]
 fn arca_roundtrip_deflate_and_store() {
     let payload = b"secret payload ".repeat(64);
@@ -74,6 +91,63 @@ fn arca_roundtrip_deflate_and_store() {
         let got = read_first_with_password(&z, PASSWORD).unwrap();
         assert_eq!(got, payload);
     }
+}
+
+#[test]
+fn aes_wrapped_deflate64_remains_structured_unsupported() {
+    let mut archive = arca_aes(b"secret.txt", b"top secret", ZipMethod::Store);
+    let local_name_length = usize::from(u16::from_le_bytes([archive[26], archive[27]]));
+    let local_extra_length = usize::from(u16::from_le_bytes([archive[28], archive[29]]));
+    let local_extra_start = 30 + local_name_length;
+    set_aes_real_method(
+        &mut archive[local_extra_start..local_extra_start + local_extra_length],
+        9,
+    );
+
+    let central = archive
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .unwrap();
+    let central_name_length = usize::from(u16::from_le_bytes([
+        archive[central + 28],
+        archive[central + 29],
+    ]));
+    let central_extra_length = usize::from(u16::from_le_bytes([
+        archive[central + 30],
+        archive[central + 31],
+    ]));
+    let central_extra_start = central + 46 + central_name_length;
+    set_aes_real_method(
+        &mut archive[central_extra_start..central_extra_start + central_extra_length],
+        9,
+    );
+
+    let error = read_first_with_password(&archive, PASSWORD).unwrap_err();
+    assert_eq!(
+        error.archive_error().unwrap().kind(),
+        ErrorKind::Unsupported
+    );
+
+    let error = read_first_with_password(&archive, b"wrong password").unwrap_err();
+    assert_eq!(
+        error.archive_error().unwrap().kind(),
+        ErrorKind::Unsupported
+    );
+
+    let mut reader = SeekArchiveReader::new(Cursor::new(archive)).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::Entry(_)
+    ));
+    let error = reader.next_event().unwrap_err();
+    assert_eq!(
+        error.archive_error().unwrap().kind(),
+        ErrorKind::Unsupported
+    );
 }
 
 #[test]

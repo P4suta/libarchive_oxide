@@ -4,6 +4,12 @@
 - Date: 2026-07-23
 - Tracks: RM-306 / DEV-112 (epic RM-300)
 
+Implementation note (2026-07-28): the follow-on Deflate64 read and UDF Phase 1
+providers described by this decision have landed. Deflate64 write remains a
+permanent won't-do, UDF Phase 2 remains deferred, and RAR5 remains deferred.
+The decision-time wording below is retained as the record of the feasibility
+gate; the current support cells are maintained in `docs/support-matrix.md`.
+
 ## Context
 
 The Modern Archive Profile (see [modern-replacement.md](../modern-replacement.md))
@@ -83,12 +89,16 @@ descriptors resolving extents, with descriptor-tag CRC/checksum validation and
 OSTA-compressed Unicode dstrings. Complexity is roughly 2–4× ISO 9660 but remains
 bounded and `unsafe`-free. Crucially, UDF-bridge discs share the Volume
 Recognition Sequence that arca's ISO 9660 detection already parses, so UDF
-activates from the same entry point. Producer diversity is healthy — mkudffs /
-udftools (GPL-2.0), `xorriso -as mkisofs -udf` (GPLv3+), plus ImgBurn / macOS
-`hdiutil` / Windows `format /fs:UDF` — so the ≥3-producer rule is satisfiable with
-genuinely independent producers. Pure-Rust prior art exists as oracles, not
-dependencies: `hadris-udf` (MIT, read-only UDF 1.02, no_std) and bdinfo-rs's
-read-only UDF 2.50 reader.
+activates from the same entry point. `mkudffs` / udftools (GPL-2.0) is one known
+external producer; two additional independent authoring tools and exact
+reproducible commands still need verification. GNU
+[xorriso](https://www.gnu.org/software/xorriso/) is explicitly excluded because
+its own documentation says that it does not produce UDF filesystems. Candidate
+sources such as ImgBurn, macOS `hdiutil`, or a Windows-formatted image may be
+accepted only after their actual UDF authoring path and fixture provenance are
+verified. Pure-Rust prior art exists as oracles, not dependencies:
+`hadris-udf` (MIT, read-only UDF 1.02, no_std) and bdinfo-rs's read-only UDF
+2.50 reader.
 
 ### Deflate64 (ZIP method 9)
 
@@ -105,30 +115,30 @@ engine consumes, write as a typed `Unsupported`.
 
 ## Decision
 
-1. **Deflate64 read: GO, via the external pure-Rust `deflate64` decoder — as a
-   follow-on implementation unit.** ZIP method 9 read is resolved *in principle*
-   by consuming the `deflate64` crate as a pinned dependency **behind the
+1. **Deflate64 read: GO, via the external pure-Rust `deflate64` decoder;
+   completed by the follow-on implementation unit.** ZIP method 9 read consumes
+   the `deflate64` crate as a pinned dependency **behind the
    codec-provider boundary**, on both the `portable-codecs` and `native-codecs`
    profiles (the crate is pure Rust, so it satisfies the C-free portable profile).
    This is ADR-0012's sanctioned resolution path verbatim; the engine core keeps
    `#![forbid(unsafe_code)]`, static dispatch, and bounded-memory decode (64 KiB
    window). arca does **not** write its own Deflate64 decoder and does **not**
-   shell out to a CLI. Because RM-306 is a feasibility ADR, the wiring lands as a
-   separate implementation slice, at which point the support-matrix method-9 read
-   cells flip to `✓`.
+   shell out to a CLI. RM-306 approved the work as a separate implementation
+   slice; that slice has landed and the support-matrix method-9 read cells are
+   now `✓`.
 
 2. **Deflate64 write: NO-GO, retired as won't-do.** No pure-Rust encoder exists
-   and write demand is nil. ZIP method 9 write remains a structured
-   `ErrorKind::Unsupported` that still enumerates, matching libarchive. This
-   **supersedes** the "Deflate64 (read + write)" deficit in ADR-0012's ledger: the
-   read half has a decided resolution path (adopt the external decoder), and the
-   write half is reclassified from "feasibility-pending" to a closed won't-do with
-   no encoder planned.
+   and write demand is nil. The public ZIP writer intentionally exposes no
+   `ZipMethod::Deflate64` variant, so method 9 creation is unavailable rather
+   than a requestable encoder path. This **supersedes** the "Deflate64 (read +
+   write)" deficit in ADR-0012's ledger: the read half has a decided resolution
+   path (adopt the external decoder), and the write half is reclassified from
+   "feasibility-pending" to a closed won't-do with no encoder planned.
 
-3. **UDF: GO, scoped read-only, in-tree pure-Rust — as a follow-on implementation
-   unit.** A read-only UDF provider is approved, to be activated from the existing
-   Volume Recognition Sequence entry point that already serves ISO 9660 (so
-   UDF-bridge discs need no new probe). **Phase 1 scope** (the primary read
+3. **UDF: GO, scoped read-only, in-tree pure-Rust; Phase 1 completed by the
+   follow-on implementation unit.** The read-only UDF provider activates from
+   the existing Volume Recognition Sequence entry point that already serves ISO
+   9660 (so UDF-bridge discs need no new probe). **Phase 1 scope** (the primary read
    surface, covering DVD-ROM/Video and virtually all UDF-bridge optical images):
    revisions **1.02, 1.50, 2.01**; AVDP discovery at sector 256 with N and N−256
    fallbacks; Main/Reserve VDS walk (Primary VD, Partition Descriptor, Logical
@@ -175,19 +185,22 @@ engine consumes, write as a typed `Unsupported`.
    version, exact command line, capture date, SHA-256, upstream license and
    redistribution note), regenerable byte-for-byte. Fixtures are test **inputs**
    only, never linked into the shipped crate, and a tool's output bytes are not a
-   derivative work of the tool, so committing GPL-tool output (mkudffs / xorriso) or
-   7-Zip / Windows output to an MIT/Apache-2.0 repo is sound. Payload content is
+   derivative work of the tool, so committing GPL-tool output (for example,
+   mkudffs) or 7-Zip / Windows output to an MIT/Apache-2.0 repo is sound.
+   Payload content is
    self-authored/synthetic to avoid third-party content copyright, and
    non-deterministic fields (timestamps, volume IDs/UUIDs) are pinned in every
    generation command (`mkudffs --uuid/--vid/--utf8`) so regeneration is
-   byte-reproducible. These fixtures land with each provider's implementation slice,
-   not with this ADR.
-   - **UDF:** ≥3 genuinely independent producers — mkudffs / udftools (GPL-2.0),
-     `xorriso -as mkisofs -udf` (GPLv3+), plus one of ImgBurn / macOS `hdiutil` /
-     Windows `format /fs:UDF` — cleanly satisfying the ≥3-producer rule, with the
-     crate's own reader as one consumer and `hadris-udf` / bdinfo-rs as cross-check
-     oracles. The third producer choice is an implementation-time decision recorded
-     in the UDF `PROVENANCE.md`.
+   byte-reproducible. Verifiable fixtures land when their producers are
+   available; unavailable producer evidence remains explicitly open in the
+   format `PROVENANCE.md` and RM-300/RM-400 rather than being replaced with an
+   unverifiable blob.
+   - **UDF:** ≥3 genuinely independent, verified UDF producers. mkudffs /
+     udftools (GPL-2.0) is the first candidate; two further producers, their
+     exact commands, and redistribution terms remain to be selected and
+     verified. xorriso cannot count because it does not produce UDF. The
+     crate's own reader is one consumer, with `hadris-udf` / bdinfo-rs as
+     potential cross-check oracles.
    - **Deflate64:** committed method-9 `.zip` fixtures produced by 7-Zip and by
      Windows Explorer (large-archive path), with the `deflate64` crate serving as
      the decode cross-check.
@@ -200,43 +213,41 @@ engine consumes, write as a typed `Unsupported`.
 
 ## Consequences
 
-**Support matrix** ([support-matrix.md](../support-matrix.md)) changes made now
-(decision-only, since no provider lands with this ADR): the codec-deficit ledger's
-"Deflate64 (read + write)" row is replaced by a write-only **won't-do** row that
-also records the decided read resolution path (adopt the external `deflate64`
-decoder in a follow-on slice); and the "RAR5, CAB, XAR, and UDF are not currently
-implemented" prose is updated to record the resolved scope — UDF is a scoped
-read-only go pending implementation, RAR5 is deferred in its entirety pending a
-clean-room decompressor, and CAB/XAR remain under RM-305. The ZIP methods grid's
-Deflate64 read cells stay `—` until the `deflate64` wiring actually lands, and the
-UDF container row is added when the UDF provider lands; the matrix continues to
-describe implementation, not intention.
+**Support matrix** ([support-matrix.md](../support-matrix.md)): the original
+decision-only edit reclassified Deflate64 write as a **won't-do** and kept the
+read cells pending. The completed follow-on now marks method-9 read `✓` on both
+profiles and adds the read-only UDF Phase 1 container row. RAR5 remains deferred;
+the matrix continues to describe implementation, not intention.
 
-**Tracked deficits.** *Reclassified:* ADR-0012's Deflate64 deficit — read has a
-decided resolution path (external decoder, follow-on slice), write is a closed
-won't-do. *Opened / carried:* (a) Deflate64 read implementation (adopt `deflate64`
-behind the codec-provider boundary); (b) the UDF read-only provider (Phase 1
-scope above); (c) RAR5 read-only support, resolution path = a clean-room,
-forbid(unsafe), independently-provenanced pure-Rust RAR5 decompressor behind the
-codec-provider boundary, with no provider built until it exists; (d) UDF Phase 2
-(2.50/2.60 Metadata Partition, named streams), gated on demand; (e) the UDF
-generic-RAND IP caveat as a low-but-nonzero tracked risk. Each carries a resolution
-path per ADR-0012's model, so honest disclosure never becomes a resting state.
+**Tracked deficits.** *Completed:* Deflate64 read through the external decoder
+and the UDF Phase 1 read-only provider. Deflate64 write remains a closed
+won't-do. *Opened / carried:* (a) RAR5 read-only support, resolution path = a
+clean-room, forbid(unsafe), independently-provenanced pure-Rust RAR5
+decompressor behind the codec-provider boundary, with no provider built until
+it exists; (b) UDF Phase 2 (2.50/2.60 Metadata Partition, named streams), gated
+on demand; (c) the UDF generic-RAND IP caveat as a low-but-nonzero tracked risk.
+Each carries a resolution path per ADR-0012's model, so honest disclosure never
+becomes a resting state.
 
 **Out of scope and staying so:** any RAR compressor or RAR5 *creation* path
 (bright-line prohibition); any Deflate64 encoder; UDF write, VAT / sequential CD-R,
-sparable partition maps, and encryption. These are typed `Unsupported`, never
-silent gaps, and enumeration continues across them.
+sparable partition maps, and encryption. UDF's out-of-scope paths are typed
+`Unsupported`, never silent gaps, and enumeration continues across them.
+Deflate64 creation instead has no public writer method to request: the API
+intentionally exposes no `ZipMethod::Deflate64` variant.
 
-**Interop verification** for every `go` item, when implemented, runs through the
-RM-301 harness with provenance recorded in each format's `PROVENANCE.md` per
-ADR-0011: UDF against ≥3 independent producers; Deflate64 read against 7-Zip- and
-Windows-produced fixtures with the `deflate64` crate as cross-check. Provenance for
-these formats is hereby the appendix that ADR-0011 reserved for RM-306.
+**Interop verification** for completed `go` items runs through the RM-301
+harness with provenance recorded in each format's `PROVENANCE.md` per ADR-0011.
+Deflate64 currently has the committed official 7-Zip fixture; its Windows
+producer remains open. UDF currently has deterministic first-party conformance
+images; mkudffs and two further independently verified producers remain open,
+with xorriso explicitly ineligible. These formats' provenance registries are
+the appendix that ADR-0011 reserved for RM-306 and do not claim that the
+≥3-producer gate is complete.
 
-**Net.** RM-306 is resolved decisively and honestly: Deflate64 read gets a decided
-external-decoder path and its write deficit is formally retired; UDF is a bounded
-read-only go pending its implementation slice; and RAR5 is deferred in its entirety
+**Net.** RM-306 is resolved decisively and honestly: Deflate64 read uses the
+external decoder and its write deficit is formally retired; UDF Phase 1 is a
+bounded read-only implementation; and RAR5 is deferred in its entirety
 — truthful about the one thing that is genuinely not feasible in-tree today,
 proprietary RAR5 decompression — rather than shipping a metadata-only provider that
 would read almost no real archive. The clean-room, decode-only, nominative-naming

@@ -37,7 +37,7 @@ use crate::{
     StreamError,
 };
 
-const FORMAT_PROBE_BYTES: usize = 16 * 2048 + 6;
+const FORMAT_PROBE_BYTES: usize = 17 * 2048 + 6;
 const DIGEST_BUFFER_BYTES: usize = 64 * 1024;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 

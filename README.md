@@ -19,9 +19,10 @@ an explicit native performance profile is also available. See [Codec backends](#
 | tar | sequential v7/ustar/pax/GNU | sequential | known-size entries; GNU sparse supported |
 | cpio | sequential binary/odc/newc/crc | sequential | known-size entries |
 | ar | sequential GNU/BSD | sequential | thin references are identified, never followed |
-| ZIP/ZIP64 | seek or streaming, Store/Deflate/BZip2/Zstandard/LZMA | streaming with descriptors (Zstandard write is native-codecs only) | optional WinZip AES; no Deflate64 method yet |
-| 7z | seek, LZMA/LZMA2 | seek | optional `sevenz`; single folder; no general coder graph |
-| ISO 9660 | seek, Rock Ridge/Joliet | seek | no UDF |
+| ZIP/ZIP64 | seek, Store/Deflate/Deflate64/BZip2/Zstandard/LZMA; bounded payload events | streaming with descriptors (Zstandard write is native-codecs only; Deflate64 is not a write-method option) | optional WinZip AES for Store/Deflate; AES-wrapped Deflate64 is `Unsupported` |
+| 7z | seek, LZMA/LZMA2/Deflate/BZip2/Zstandard with BCJ/Delta graphs | seek | optional `sevenz`; PPMd/BCJ2 are read-side `Unsupported` |
+| ISO 9660 | seek, Rock Ridge/Joliet | seek | continuation areas remain limited |
+| UDF | seek, read-only 1.02/1.50/2.01 | none | 2048-byte optical images; 2.50/2.60 Metadata Partitions deferred |
 
 | Outer compression | Decode | Encode | Current backend note |
 |---|:---:|:---:|---|
@@ -120,7 +121,7 @@ fn list(input: impl Read) -> Result<(), Box<dyn std::error::Error>> {
 |---|:---:|---|
 | `portable-codecs` | yes | all five outer codecs through C/FFI-free backends |
 | `native-codecs` | no | all five outer codecs through native libraries; requires `--no-default-features` |
-| `gzip` | via profile | gzip; portable when selected alone |
+| `gzip` | via profile | gzip plus ZIP Deflate64 read; portable when selected alone |
 | `bzip2` | via profile | bzip2; portable when selected alone |
 | `zstd` | via profile | zstd; portable when selected alone |
 | `xz` | via profile | xz; portable when selected alone |

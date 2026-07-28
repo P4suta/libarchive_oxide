@@ -14,6 +14,8 @@ use libarchive_oxide_core::{
 use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
+#[cfg(feature = "gzip")]
+use deflate64::{InflateResult, InflaterManaged};
 #[cfg(feature = "zstd")]
 use libarchive_oxide_core::filter::FilterId;
 #[cfg(feature = "zstd")]
@@ -33,6 +35,33 @@ const ISO_DESCRIPTOR_START: u64 = 16;
 const ISO_MAX_DESCRIPTORS: u64 = 64;
 const ISO_DIRECTORY_RECORD_BASE: usize = 33;
 const ISO_DIRECTORY_FLAG: u8 = 0x02;
+
+#[cfg(feature = "gzip")]
+fn inflate64_extent_step(
+    state: &mut InflaterManaged,
+    input: &[u8],
+    compressed_unread: u64,
+    output: &mut [u8],
+) -> InflateResult {
+    if compressed_unread != 0 || input.is_empty() {
+        return state.inflate(input, output);
+    }
+
+    // Keep the final declared byte out of the decoder's look-ahead. If the
+    // stream finishes without it, that full byte is trailing data. A zero
+    // progress result is safe to retry with the complete slice because the
+    // first call consumed and emitted nothing.
+    let result = state.inflate(&input[..input.len() - 1], output);
+    if result.data_error
+        || state.finished()
+        || result.bytes_consumed != 0
+        || result.bytes_written != 0
+    {
+        result
+    } else {
+        state.inflate(input, output)
+    }
+}
 
 #[cfg(feature = "aes")]
 struct ZipAesDecoder {
@@ -160,6 +189,18 @@ enum ZipBody {
         expected_size: u64,
         end_offset: u64,
     },
+    #[cfg(feature = "gzip")]
+    Deflate64 {
+        compressed_unread: u64,
+        compressed: Vec<u8>,
+        compressed_start: usize,
+        inflate: Box<InflaterManaged>,
+        expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
     #[cfg(feature = "bzip2")]
     Bzip2 {
         compressed_unread: u64,
@@ -230,6 +271,8 @@ impl std::fmt::Debug for ZipBody {
             Self::Idle => "Idle",
             Self::Stored { .. } => "Stored",
             Self::Deflate { .. } => "Deflate",
+            #[cfg(feature = "gzip")]
+            Self::Deflate64 { .. } => "Deflate64",
             #[cfg(feature = "bzip2")]
             Self::Bzip2 { .. } => "Bzip2",
             #[cfg(feature = "zstd")]
@@ -252,6 +295,7 @@ impl std::fmt::Debug for ZipBody {
 #[derive(Debug)]
 enum SeekDispatch<R> {
     Indexed(Box<IndexedArchiveReader<R>>),
+    Udf(Box<crate::udf::UdfSeekReader<R>>),
     #[cfg(feature = "sevenz")]
     SevenZ(Box<crate::sevenz::SevenZSeekReader<R>>),
     Cab(Box<crate::cab::CabSeekReader<R>>),
@@ -260,7 +304,7 @@ enum SeekDispatch<R> {
 
 /// Seek-capable archive reader.
 ///
-/// ZIP central directories, 7z file/folder metadata, and ISO directory
+/// ZIP central directories, 7z file/folder metadata, and ISO/UDF directory
 /// indexes are retained within the configured metadata budget. File payloads
 /// are streamed from their extents or solid-folder decoder.
 #[derive(Debug)]
@@ -329,6 +373,11 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
                 ));
             }
         }
+        if crate::udf::probe_vrs(&mut input)? {
+            return Ok(Self {
+                inner: SeekDispatch::Udf(Box::new(crate::udf::UdfSeekReader::new(input, limits)?)),
+            });
+        }
         Ok(Self {
             inner: SeekDispatch::Indexed(Box::new(IndexedArchiveReader::with_options(
                 input, limits, password,
@@ -340,6 +389,7 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
     pub fn next_event(&mut self) -> Result<ReaderEvent<'_>, StreamError> {
         match &mut self.inner {
             SeekDispatch::Indexed(reader) => reader.next_event(),
+            SeekDispatch::Udf(reader) => reader.next_event(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.next_event(),
             SeekDispatch::Cab(reader) => reader.next_event(),
@@ -351,6 +401,7 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
     pub fn skip_entry(&mut self) -> Result<(), StreamError> {
         match &mut self.inner {
             SeekDispatch::Indexed(reader) => reader.skip_entry(),
+            SeekDispatch::Udf(reader) => reader.skip_entry(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.skip_entry(),
             SeekDispatch::Cab(reader) => reader.skip_entry(),
@@ -363,6 +414,7 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
     pub const fn format(&self) -> FormatId {
         match &self.inner {
             SeekDispatch::Indexed(reader) => reader.format(),
+            SeekDispatch::Udf(_) => FormatId::Udf,
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(_) => FormatId::SevenZip,
             SeekDispatch::Cab(_) => FormatId::Cab,
@@ -375,6 +427,7 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
     pub fn into_inner(self) -> R {
         match self.inner {
             SeekDispatch::Indexed(reader) => reader.into_inner(),
+            SeekDispatch::Udf(reader) => reader.into_inner(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.into_inner(),
             SeekDispatch::Cab(reader) => reader.into_inner(),
@@ -385,6 +438,7 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
     pub(crate) fn source_ref(&self) -> &R {
         match &self.inner {
             SeekDispatch::Indexed(reader) => reader.source_ref(),
+            SeekDispatch::Udf(reader) => reader.source_ref(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.source_ref(),
             SeekDispatch::Cab(reader) => reader.source_ref(),
@@ -441,6 +495,13 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
             FormatId::Iso9660 => SeekWriterDispatch::Iso(Box::new(
                 crate::iso_stream::IsoSeekWriter::new(output, limits)?,
             )),
+            FormatId::Udf => {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("udf")
+                        .with_context("UDF write is not supported"),
+                ));
+            },
             _ => {
                 return Err(StreamError::archive(
                     ArchiveError::new(ErrorKind::Unsupported)
@@ -760,6 +821,172 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                     .with_context("deflate decoder failed"),
                             ));
                         },
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
+                #[cfg(feature = "gzip")]
+                ZipBody::Deflate64 {
+                    compressed_unread,
+                    compressed,
+                    compressed_start,
+                    inflate: state,
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    if *compressed_start == compressed.len() && *compressed_unread != 0 {
+                        let count = usize::try_from((*compressed_unread).min(BUFFER as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context(
+                                            "Deflate64 compressed read size exceeds address space",
+                                        ),
+                                )
+                            })?;
+                        compressed.resize(count, 0);
+                        self.input.read_exact(compressed).map_err(StreamError::io)?;
+                        *compressed_unread -= count as u64;
+                        *compressed_start = 0;
+                    }
+                    self.event_data.resize(BUFFER, 0);
+                    let result = inflate64_extent_step(
+                        state,
+                        &compressed[*compressed_start..],
+                        *compressed_unread,
+                        &mut self.event_data,
+                    );
+                    *compressed_start += result.bytes_consumed;
+                    self.event_data.truncate(result.bytes_written);
+                    if result.data_error || state.errored() {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Malformed)
+                                .with_format("zip")
+                                .with_context("Deflate64 decoder rejected the bitstream"),
+                        ));
+                    }
+                    crc.update(&self.event_data);
+                    *produced = produced
+                        .checked_add(result.bytes_written as u64)
+                        .ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("Deflate64 output count overflow"),
+                            )
+                        })?;
+                    if *produced > *expected_size {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Integrity)
+                                .with_format("zip")
+                                .with_context("Deflate64 payload exceeds declared size"),
+                        ));
+                    }
+                    let next_total = self
+                        .decoded_total
+                        .checked_add(result.bytes_written as u64)
+                        .ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("decoded total overflow"),
+                            )
+                        })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    if state.finished() {
+                        if *compressed_start != compressed.len() || *compressed_unread != 0 {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context(
+                                        "Deflate64 stream ended before its compressed extent",
+                                    ),
+                            ));
+                        }
+                        if *produced != *expected_size {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context(
+                                        "Deflate64 size does not match central directory",
+                                    ),
+                            ));
+                        }
+                        if crc.finalize() != *expected_crc {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("Deflate64 entry CRC32 mismatch"),
+                            ));
+                        }
+                        self.body = ZipBody::EndEntry;
+                    } else if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                        if *compressed_unread == 0 {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Malformed)
+                                    .with_format("zip")
+                                    .with_context("truncated Deflate64 stream"),
+                            ));
+                        }
+                        let retained = compressed.len().saturating_sub(*compressed_start);
+                        compressed.copy_within(*compressed_start.., 0);
+                        compressed.truncate(retained);
+                        let available = BUFFER.checked_sub(retained).ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Malformed)
+                                    .with_format("zip")
+                                    .with_context("Deflate64 decoder made no progress"),
+                            )
+                        })?;
+                        if available == 0 {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Malformed)
+                                    .with_format("zip")
+                                    .with_context("Deflate64 decoder made no progress"),
+                            ));
+                        }
+                        let count = usize::try_from((*compressed_unread).min(available as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context(
+                                            "Deflate64 compressed read size exceeds address space",
+                                        ),
+                                )
+                            })?;
+                        let old_len = compressed.len();
+                        compressed.resize(
+                            old_len.checked_add(count).ok_or_else(|| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context("Deflate64 input buffer length overflow"),
+                                )
+                            })?,
+                            0,
+                        );
+                        self.input
+                            .read_exact(&mut compressed[old_len..])
+                            .map_err(StreamError::io)?;
+                        *compressed_unread -= count as u64;
+                        *compressed_start = 0;
                     }
                     if !self.event_data.is_empty() {
                         return Ok(ReaderEvent::Data(&self.event_data));
@@ -1273,6 +1500,8 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
             | ZipBody::Deflate { end_offset, .. }
             | ZipBody::Unsupported { end_offset, .. }
             | ZipBody::Raw { end_offset, .. } => end_offset,
+            #[cfg(feature = "gzip")]
+            ZipBody::Deflate64 { end_offset, .. } => end_offset,
             #[cfg(feature = "bzip2")]
             ZipBody::Bzip2 { end_offset, .. } => end_offset,
             #[cfg(feature = "zstd")]
@@ -1410,6 +1639,18 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                     expected_size: entry.uncompressed_size,
                     end_offset,
                 },
+                #[cfg(feature = "gzip")]
+                9 => ZipBody::Deflate64 {
+                    compressed_unread: entry.compressed_size,
+                    compressed: Vec::with_capacity(BUFFER),
+                    compressed_start: 0,
+                    inflate: Box::new(InflaterManaged::new()),
+                    expected_crc: entry.crc32,
+                    crc: Crc32::new(),
+                    produced: 0,
+                    expected_size: entry.uncompressed_size,
+                    end_offset,
+                },
                 #[cfg(feature = "bzip2")]
                 12 => ZipBody::Bzip2 {
                     compressed_unread: entry.compressed_size,
@@ -1524,6 +1765,20 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
 
     #[cfg(feature = "aes")]
     fn prepare_aes_body(&mut self, entry: &ZipIndex, end_offset: u64) -> Result<(), StreamError> {
+        match entry.aes_real_method {
+            Some(0 | 8) => {},
+            Some(method) => {
+                self.body = ZipBody::Unsupported { method, end_offset };
+                return Ok(());
+            },
+            None => {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("zip")
+                        .with_context("WinZip AES method is missing"),
+                ));
+            },
+        }
         if entry.aes_strength != Some(3) {
             return Err(StreamError::archive(
                 ArchiveError::new(ErrorKind::Unsupported)
@@ -1570,14 +1825,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 expected_size: entry.uncompressed_size,
                 end_offset,
             },
-            Some(method) => ZipBody::Unsupported { method, end_offset },
-            None => {
-                return Err(StreamError::archive(
-                    ArchiveError::new(ErrorKind::Malformed)
-                        .with_format("zip")
-                        .with_context("WinZip AES method is missing"),
-                ));
-            },
+            Some(_) | None => unreachable!("AES method was validated before key derivation"),
         };
         Ok(())
     }
@@ -2436,6 +2684,7 @@ fn format_name(format: FormatId) -> &'static str {
         FormatId::Zip => "zip",
         FormatId::SevenZip => "7z",
         FormatId::Iso9660 => "iso9660",
+        FormatId::Udf => "udf",
         _ => "archive",
     }
 }
@@ -2708,7 +2957,7 @@ fn parse_zip_index<R: Read + Seek>(
             aes_strength,
         });
     }
-    hydrate_zip_symlink_targets(input, &mut entries, limits)?;
+    hydrate_zip_symlink_targets(input, &mut entries, limits, &mut metadata_used)?;
     Ok((archive_metadata, entries))
 }
 
@@ -2758,6 +3007,7 @@ fn hydrate_zip_symlink_targets<R: Read + Seek>(
     input: &mut R,
     entries: &mut [ZipIndex],
     limits: Limits,
+    metadata_used: &mut usize,
 ) -> Result<(), StreamError> {
     for entry in entries
         .iter_mut()
@@ -2781,9 +3031,45 @@ fn hydrate_zip_symlink_targets<R: Read + Seek>(
                     .with_context("ZIP symbolic-link target exceeds path limit"),
             ));
         }
+        if zip_metadata_method_supported(entry.method) {
+            let projected = metadata_used.checked_add(target_len).ok_or_else(|| {
+                StreamError::archive(
+                    ArchiveError::new(ErrorKind::Limit)
+                        .with_format("zip")
+                        .with_context("ZIP symbolic-link metadata accounting overflow"),
+                )
+            })?;
+            if limits
+                .metadata_bytes()
+                .is_some_and(|limit| projected > limit)
+            {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Limit)
+                        .with_format("zip")
+                        .with_context("ZIP symbolic-link targets exceed metadata limit"),
+                ));
+            }
+        }
         let Some(target) = read_zip_metadata_payload(input, entry, target_len)? else {
             continue;
         };
+        *metadata_used = metadata_used.checked_add(target.len()).ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("zip")
+                    .with_context("ZIP symbolic-link metadata accounting overflow"),
+            )
+        })?;
+        if limits
+            .metadata_bytes()
+            .is_some_and(|limit| *metadata_used > limit)
+        {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("zip")
+                    .with_context("ZIP symbolic-link targets exceed metadata limit"),
+            ));
+        }
         let encoding = if core::str::from_utf8(&target).is_ok() {
             PathEncoding::Utf8
         } else {
@@ -2797,6 +3083,10 @@ fn hydrate_zip_symlink_targets<R: Read + Seek>(
             .build();
     }
     Ok(())
+}
+
+fn zip_metadata_method_supported(method: u16) -> bool {
+    matches!(method, 0 | 8) || cfg!(feature = "gzip") && method == 9
 }
 
 fn read_zip_metadata_payload<R: Read + Seek>(
@@ -2862,6 +3152,8 @@ fn read_zip_metadata_payload<R: Read + Seek>(
             target
         },
         8 => inflate_zip_metadata_payload(input, entry, expected_size)?,
+        #[cfg(feature = "gzip")]
+        9 => inflate64_zip_metadata_payload(input, entry, expected_size)?,
         _ => return Ok(None),
     };
     let mut crc = Crc32::new();
@@ -2874,6 +3166,138 @@ fn read_zip_metadata_payload<R: Read + Seek>(
         ));
     }
     Ok(Some(target))
+}
+
+#[cfg(feature = "gzip")]
+#[allow(clippy::too_many_lines)]
+fn inflate64_zip_metadata_payload<R: Read>(
+    input: &mut R,
+    entry: &ZipIndex,
+    expected_size: usize,
+) -> Result<Vec<u8>, StreamError> {
+    let mut compressed_remaining = entry.compressed_size;
+    let mut compressed = Vec::with_capacity(BUFFER);
+    let mut compressed_start = 0;
+    let mut state = InflaterManaged::new();
+    let mut output = Vec::with_capacity(expected_size);
+    let mut scratch = vec![0_u8; BUFFER];
+    loop {
+        if compressed_start == compressed.len() && compressed_remaining != 0 {
+            let count = usize::try_from(compressed_remaining.min(BUFFER as u64)).map_err(|_| {
+                StreamError::archive(
+                    ArchiveError::new(ErrorKind::Limit)
+                        .with_format("zip")
+                        .with_context(
+                            "compressed Deflate64 symbolic-link payload exceeds address space",
+                        ),
+                )
+            })?;
+            compressed.resize(count, 0);
+            input.read_exact(&mut compressed).map_err(StreamError::io)?;
+            compressed_remaining -= count as u64;
+            compressed_start = 0;
+        }
+
+        let result = inflate64_extent_step(
+            &mut state,
+            &compressed[compressed_start..],
+            compressed_remaining,
+            &mut scratch,
+        );
+        compressed_start += result.bytes_consumed;
+        if result.data_error || state.errored() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context("invalid symbolic-link Deflate64 payload"),
+            ));
+        }
+        if output
+            .len()
+            .checked_add(result.bytes_written)
+            .is_none_or(|size| size > expected_size)
+        {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Integrity)
+                    .with_format("zip")
+                    .with_context("Deflate64 symbolic-link target exceeds declared size"),
+            ));
+        }
+        output.extend_from_slice(&scratch[..result.bytes_written]);
+
+        if state.finished() {
+            if compressed_start != compressed.len() || compressed_remaining != 0 {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Integrity)
+                        .with_format("zip")
+                        .with_context(
+                            "Deflate64 symbolic-link stream ended before its compressed extent",
+                        ),
+                ));
+            }
+            if output.len() != expected_size {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Integrity)
+                        .with_format("zip")
+                        .with_context("Deflate64 symbolic-link target size is inconsistent"),
+                ));
+            }
+            return Ok(output);
+        }
+
+        if result.bytes_consumed == 0 && result.bytes_written == 0 {
+            if compressed_remaining == 0 {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("zip")
+                        .with_context("truncated symbolic-link Deflate64 payload"),
+                ));
+            }
+            let retained = compressed.len().saturating_sub(compressed_start);
+            compressed.copy_within(compressed_start.., 0);
+            compressed.truncate(retained);
+            let available = BUFFER.checked_sub(retained).ok_or_else(|| {
+                StreamError::archive(
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("zip")
+                        .with_context("symbolic-link Deflate64 decoder made no progress"),
+                )
+            })?;
+            if available == 0 {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("zip")
+                        .with_context("symbolic-link Deflate64 decoder made no progress"),
+                ));
+            }
+            let count =
+                usize::try_from(compressed_remaining.min(available as u64)).map_err(|_| {
+                    StreamError::archive(
+                        ArchiveError::new(ErrorKind::Limit)
+                            .with_format("zip")
+                            .with_context(
+                                "compressed Deflate64 symbolic-link payload exceeds address space",
+                            ),
+                    )
+                })?;
+            let old_len = compressed.len();
+            compressed.resize(
+                old_len.checked_add(count).ok_or_else(|| {
+                    StreamError::archive(
+                        ArchiveError::new(ErrorKind::Limit)
+                            .with_format("zip")
+                            .with_context("Deflate64 symbolic-link input buffer length overflow"),
+                    )
+                })?,
+                0,
+            );
+            input
+                .read_exact(&mut compressed[old_len..])
+                .map_err(StreamError::io)?;
+            compressed_remaining -= count as u64;
+            compressed_start = 0;
+        }
+    }
 }
 
 fn inflate_zip_metadata_payload<R: Read>(
