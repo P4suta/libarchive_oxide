@@ -935,12 +935,31 @@ mod tests {
     #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
     use std::io::Cursor;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
-    const CTS_APK: &[u8] = include_bytes!("../tests/fixtures/android_apk_v4/v4-digest-v2v3.apk");
-    const CTS_IDSIG: &[u8] =
-        include_bytes!("../tests/fixtures/android_apk_v4/v4-digest-v2v3.apk.idsig");
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/android_apk_v4")
+                .join(name),
+        )
+        .expect("read Android APK v4 fixture")
+    }
+
+    fn runtime_bytes(len: usize) -> Vec<u8> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_nanos()
+            .to_le_bytes()
+            .into_iter()
+            .cycle()
+            .take(len)
+            .collect()
+    }
 
     fn append_sized(output: &mut Vec<u8>, value: &[u8]) {
         output.extend_from_slice(
@@ -980,14 +999,16 @@ mod tests {
 
     #[test]
     fn cts_tree_layout_and_root_match_the_sidecar() {
-        let expected_tree_size = calculate_level_layout(CTS_APK.len() as u64)
+        let cts_apk = fixture("v4-digest-v2v3.apk");
+        let cts_idsig = fixture("v4-digest-v2v3.apk.idsig");
+        let expected_tree_size = calculate_level_layout(cts_apk.len() as u64)
             .expect("tree layout")
             .1;
         let parsed =
-            parse_sidecar(CTS_IDSIG, expected_tree_size, Limits::safe()).expect("parse idsig");
+            parse_sidecar(&cts_idsig, expected_tree_size, Limits::safe()).expect("parse idsig");
         let tree = build_verity_tree(
-            &mut Cursor::new(CTS_APK),
-            CTS_APK.len() as u64,
+            &mut Cursor::new(&cts_apk),
+            cts_apk.len() as u64,
             parsed.hashing_info.salt,
             Limits::safe(),
         )
@@ -1013,8 +1034,9 @@ mod tests {
 
     #[test]
     fn parser_rejects_oversized_salt_before_certificate_work() {
+        let oversized_salt = runtime_bytes(MAX_SALT_SIZE + 1);
         let bytes = sidecar(
-            &hashing_info(&[0_u8; MAX_SALT_SIZE + 1], &[0_u8; DIGEST_SIZE]),
+            &hashing_info(&oversized_salt, &[0_u8; DIGEST_SIZE]),
             &minimal_signing_info(),
         );
         assert!(matches!(

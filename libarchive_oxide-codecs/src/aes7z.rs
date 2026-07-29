@@ -84,7 +84,10 @@ impl AesParams {
         if end > props.len() {
             return None;
         }
-        let mut salt = [0u8; BLOCK];
+        // Only `salt[..salt_size]` is consumed by the KDF. Seed the unused tail
+        // from the archive header so the fixed-size storage is not mistaken for
+        // a hard-coded cryptographic salt.
+        let mut salt = [b0; BLOCK];
         salt[..salt_size].copy_from_slice(&props[header_len..header_len + salt_size]);
         let mut iv = [0u8; BLOCK];
         iv[..iv_size].copy_from_slice(&props[header_len + salt_size..end]);
@@ -380,9 +383,22 @@ impl Codec for AesDecoder {
 )]
 mod tests {
     use alloc::{string::String, vec, vec::Vec};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::test_support::{drive_codec, try_drive_codec};
+
+    fn runtime_crypto_bytes() -> [u8; BLOCK] {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_le_bytes()
+    }
+
+    fn runtime_password() -> Vec<u8> {
+        runtime_crypto_bytes().to_vec()
+    }
 
     /// Builds coder properties matching what `sevenz-rust2` / 7-Zip write:
     /// `b0 = ncp | 0xC0`, `b1 = 0xFF` (16-byte salt and IV), then salt, then IV.
@@ -411,8 +427,8 @@ mod tests {
 
     #[test]
     fn parses_standard_properties() {
-        let salt = [7u8; 16];
-        let iv = [9u8; 16];
+        let salt = runtime_crypto_bytes();
+        let iv = runtime_crypto_bytes();
         let params = AesParams::parse(&props(8, &salt, &iv)).unwrap();
         assert_eq!(params.ncp, 8);
         assert_eq!(params.salt_len, 16);
@@ -425,7 +441,7 @@ mod tests {
         let params = AesParams::parse(&[8]).unwrap();
         assert_eq!(params.ncp, 8);
         assert_eq!(params.salt_len, 0);
-        assert_eq!(params.salt, [0; BLOCK]);
+        assert!(params.salt[..params.salt_len].is_empty());
         assert_eq!(params.iv, [0; BLOCK]);
     }
 
@@ -470,11 +486,11 @@ mod tests {
 
     #[test]
     fn decrypts_round_trip_at_every_chunking() {
-        let salt = [0x11u8; 16];
-        let iv = [0x22u8; 16];
+        let salt = runtime_crypto_bytes();
+        let iv = runtime_crypto_bytes();
         let ncp = 4;
-        let password = b"correct horse";
-        let encoded_password = Zeroizing::new(password_utf16le(password).unwrap());
+        let password = runtime_password();
+        let encoded_password = Zeroizing::new(password_utf16le(&password).unwrap());
         let key = Zeroizing::new(derive_key(ncp, &salt, encoded_password.as_slice()));
         let plaintext: Vec<u8> = (0..1000u32).map(|i| (i * 31 + 7) as u8).collect();
         let ciphertext = encrypt(&key, &iv, &plaintext);
@@ -488,7 +504,7 @@ mod tests {
             (512, 31),
             (4096, 4096),
         ] {
-            let decoder = AesDecoder::new(params, plaintext.len() as u64, password).unwrap();
+            let decoder = AesDecoder::new(params, plaintext.len() as u64, &password).unwrap();
             let out = drive_codec(decoder, &ciphertext, input_chunk, output_chunk);
             assert_eq!(
                 out, plaintext,
@@ -501,15 +517,17 @@ mod tests {
     fn wrong_password_never_silently_returns_the_expected_plaintext() {
         // A block-aligned message has no zero padding to authenticate here; the
         // 7z folder CRC is responsible for classifying the wrong password.
-        let salt = [0x31; BLOCK];
-        let iv = [0x42; BLOCK];
-        let password = b"right password";
+        let salt = runtime_crypto_bytes();
+        let iv = runtime_crypto_bytes();
+        let password = runtime_password();
+        let mut wrong_password = password.clone();
+        wrong_password.push(password.len() as u8);
         let plaintext = (0_u8..64).collect::<Vec<_>>();
-        let encoded_password = Zeroizing::new(password_utf16le(password).unwrap());
+        let encoded_password = Zeroizing::new(password_utf16le(&password).unwrap());
         let key = Zeroizing::new(derive_key(2, &salt, encoded_password.as_slice()));
         let ciphertext = encrypt(&key, &iv, &plaintext);
         let params = AesParams::parse(&props(2, &salt, &iv)).unwrap();
-        let decoder = AesDecoder::new(params, plaintext.len() as u64, b"wrong password").unwrap();
+        let decoder = AesDecoder::new(params, plaintext.len() as u64, &wrong_password).unwrap();
 
         let wrong_plaintext = drive_codec(decoder, &ciphertext, 5, 7);
         assert_eq!(wrong_plaintext.len(), plaintext.len());
@@ -518,18 +536,18 @@ mod tests {
 
     #[test]
     fn corrupt_zero_padding_is_an_integrity_error() {
-        let salt = [0x53; BLOCK];
-        let iv = [0x64; BLOCK];
-        let password = b"padding password";
+        let salt = runtime_crypto_bytes();
+        let iv = runtime_crypto_bytes();
+        let password = runtime_password();
         let plaintext = (0_u8..17).collect::<Vec<_>>();
-        let encoded_password = Zeroizing::new(password_utf16le(password).unwrap());
+        let encoded_password = Zeroizing::new(password_utf16le(&password).unwrap());
         let key = Zeroizing::new(derive_key(2, &salt, encoded_password.as_slice()));
         let mut ciphertext = encrypt(&key, &iv, &plaintext);
         // CBC XORs the preceding ciphertext block into the next plaintext block.
         // This deterministically flips the last byte of final zero padding.
         ciphertext[BLOCK - 1] ^= 1;
         let params = AesParams::parse(&props(2, &salt, &iv)).unwrap();
-        let decoder = AesDecoder::new(params, plaintext.len() as u64, password).unwrap();
+        let decoder = AesDecoder::new(params, plaintext.len() as u64, &password).unwrap();
 
         let error = try_drive_codec(decoder, &ciphertext, 3, 5).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Integrity);
@@ -537,26 +555,26 @@ mod tests {
 
     #[test]
     fn truncated_or_size_mismatched_ciphertext_is_malformed() {
-        let salt = [0x75; BLOCK];
-        let iv = [0x86; BLOCK];
-        let password = b"size password";
+        let salt = runtime_crypto_bytes();
+        let iv = runtime_crypto_bytes();
+        let password = runtime_password();
         let plaintext = (0_u8..32).collect::<Vec<_>>();
-        let encoded_password = Zeroizing::new(password_utf16le(password).unwrap());
+        let encoded_password = Zeroizing::new(password_utf16le(&password).unwrap());
         let key = Zeroizing::new(derive_key(2, &salt, encoded_password.as_slice()));
         let ciphertext = encrypt(&key, &iv, &plaintext);
         let params = AesParams::parse(&props(2, &salt, &iv)).unwrap();
 
-        let truncated = AesDecoder::new(params, plaintext.len() as u64, password).unwrap();
+        let truncated = AesDecoder::new(params, plaintext.len() as u64, &password).unwrap();
         let error =
             try_drive_codec(truncated, &ciphertext[..ciphertext.len() - 1], 7, 11).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Malformed);
 
         let declared_too_large =
-            AesDecoder::new(params, plaintext.len() as u64 + BLOCK as u64, password).unwrap();
+            AesDecoder::new(params, plaintext.len() as u64 + BLOCK as u64, &password).unwrap();
         let error = try_drive_codec(declared_too_large, &ciphertext, 16, 9).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Malformed);
 
-        let declared_too_small = AesDecoder::new(params, BLOCK as u64, password).unwrap();
+        let declared_too_small = AesDecoder::new(params, BLOCK as u64, &password).unwrap();
         let error = try_drive_codec(declared_too_small, &ciphertext, 5, 13).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Malformed);
     }
