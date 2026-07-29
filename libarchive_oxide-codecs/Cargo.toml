@@ -47,7 +47,7 @@ zeroize = { version = "1.8.2", default-features = false, features = ["alloc"], o
 
 [dev-dependencies]
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib"] }
-lzma-rust2 = "0.16.5"
+lzma-rust2 = "0.18.0"
 
 [lints]
 workspace = true
