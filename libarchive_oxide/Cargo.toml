@@ -126,7 +126,7 @@ bzip2 = { version = "0.6.1", optional = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib"], optional = true }
 xz-codec = { package = "xz2", version = "0.1.7", optional = true }
 # Shared by xz and 7z.
-lzma-rust2 = { version = "0.16.5", default-features = false, features = ["std"], optional = true }
+lzma-rust2 = { version = "0.18.0", default-features = false, features = ["std"], optional = true }
 # PPMd7 (variant H) with the 7z range coder. The adapter validates the archive
 # properties and codec-memory budget before this dependency allocates its model.
 ppmd-rust = { version = "1.4.0", optional = true }
@@ -171,7 +171,7 @@ flate2 = "1"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
 # Independent liblz4 consumer used only to validate our Pure-Rust writer output.
 lz4-codec = { package = "lz4", version = "1.28.1" }
-lzma-rust2 = "0.16.5"
+lzma-rust2 = "0.18.0"
 # Independent liblzma producer/consumer used only for XZ interoperability tests.
 xz-codec = { package = "xz2", version = "0.1.7" }
 zstd-codec = { package = "zstd", version = "0.13.3" }
