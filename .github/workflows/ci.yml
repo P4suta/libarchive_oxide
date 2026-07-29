@@ -308,7 +308,9 @@ jobs:
   fuzz:
     name: fuzz (nightly, build + short run)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The 27-target inventory receives 30 seconds per portable target and 10
+    # seconds per native target (18 minutes total) after two complete builds.
+    timeout-minutes: 30
     env:
       # cargo-binstall distributes cargo-fuzz as a musl-linked executable. Explicitly select the
       # runner's GNU target so cargo-fuzz does not mistake its own build target for the fuzz target;
