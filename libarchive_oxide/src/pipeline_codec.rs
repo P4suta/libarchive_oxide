@@ -4,7 +4,16 @@
 
 //! Private static dispatch for caller-driven outer codecs.
 
-#[cfg(feature = "async")]
+#[cfg(all(
+    feature = "async",
+    any(
+        feature = "zstd",
+        feature = "xz",
+        feature = "lz4",
+        feature = "compress",
+        feature = "lzip"
+    )
+))]
 use std::task::Waker;
 
 use libarchive_oxide_core::filter::FilterId;
@@ -14,58 +23,150 @@ use libarchive_oxide_core::{ArchiveError, Codec, CodecStep, EndOfInput, ErrorKin
 use crate::backend_codec::ExternalDecoder;
 #[cfg(feature = "native-codecs")]
 use crate::backend_codec::NativeXzDecoder;
-#[cfg(not(feature = "native-codecs"))]
+use crate::capability::{Backend, BackendPreference};
 use crate::filter::gzip::GzipDecoder;
 
 #[derive(Debug)]
 pub(crate) enum PipelineCodec {
+    GzipPortable(Box<GzipDecoder>),
     #[cfg(feature = "native-codecs")]
-    Gzip(ExternalDecoder<compression_codecs::GzipDecoder>),
-    #[cfg(not(feature = "native-codecs"))]
-    Gzip(Box<GzipDecoder>),
+    GzipNative(ExternalDecoder<compression_codecs::GzipDecoder>),
     /// Raw DEFLATE (no gzip framing) — the 7z Deflate coder. Backed by the same
     /// `miniz_oxide` raw-inflate core the gzip decoder sits on.
     #[cfg(feature = "sevenz")]
     Deflate(Box<crate::filter::gzip::RawInflateDecoder>),
     #[cfg(feature = "bzip2")]
     Bzip2(ExternalDecoder<compression_codecs::BzDecoder>),
+    #[cfg(feature = "zstd")]
+    ZstdPortable(Box<crate::filter::zstd::ZstdDecoder>),
     #[cfg(all(feature = "zstd", feature = "native-codecs"))]
-    Zstd(ExternalDecoder<compression_codecs::ZstdDecoder>),
-    #[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
-    Zstd(Box<crate::filter::zstd::ZstdDecoder>),
+    ZstdNative(ExternalDecoder<compression_codecs::ZstdDecoder>),
+    #[cfg(feature = "xz")]
+    XzPortable(Box<crate::filter::xz::XzDecoder>),
     #[cfg(all(feature = "xz", feature = "native-codecs"))]
-    Xz(NativeXzDecoder),
-    #[cfg(all(feature = "xz", not(feature = "native-codecs")))]
-    Xz(Box<crate::filter::xz::XzDecoder>),
+    XzNative(NativeXzDecoder),
+    #[cfg(feature = "lz4")]
+    Lz4Portable(Box<crate::filter::lz4::Lz4Decoder>),
     #[cfg(all(feature = "lz4", feature = "native-codecs"))]
-    Lz4(ExternalDecoder<compression_codecs::Lz4Decoder>),
-    #[cfg(all(feature = "lz4", not(feature = "native-codecs")))]
-    Lz4(Box<crate::filter::lz4::Lz4Decoder>),
+    Lz4Native(ExternalDecoder<compression_codecs::Lz4Decoder>),
+    #[cfg(feature = "compress")]
+    Compress(Box<libarchive_oxide_codecs::lzw::CompressDecoder>),
+    #[cfg(feature = "lzip")]
+    Lzip(Box<crate::filter::lzip::LzipDecoder>),
 }
 
 impl PipelineCodec {
+    #[cfg(any(feature = "zstd", feature = "sevenz"))]
     pub(crate) fn new(filter: FilterId, limits: Limits) -> Result<Self, ArchiveError> {
+        Self::with_backend(filter, limits, BackendPreference::Auto)
+    }
+
+    fn with_zstd_backend(
+        limits: Limits,
+        preference: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
+        #[cfg(feature = "zstd")]
+        {
+            match preference.resolve()? {
+                Backend::Portable => Ok(Self::ZstdPortable(Box::new(
+                    crate::filter::zstd::ZstdDecoder::with_limits(limits),
+                ))),
+                Backend::Native => {
+                    #[cfg(feature = "native-codecs")]
+                    return Ok(Self::ZstdNative(ExternalDecoder::new(
+                        native_zstd_decoder(limits)?,
+                        FilterId::Zstd,
+                    )));
+                    #[cfg(not(feature = "native-codecs"))]
+                    return Err(disabled_backend(FilterId::Zstd, "native"));
+                },
+            }
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            let _ = (limits, preference);
+            Err(disabled(FilterId::Zstd))
+        }
+    }
+
+    fn with_xz_backend(
+        limits: Limits,
+        preference: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
+        #[cfg(feature = "xz")]
+        {
+            match preference.resolve()? {
+                Backend::Portable => crate::filter::xz::XzDecoder::new(limits)
+                    .map(Box::new)
+                    .map(Self::XzPortable),
+                Backend::Native => {
+                    #[cfg(feature = "native-codecs")]
+                    return NativeXzDecoder::new(limits.codec_memory()).map(Self::XzNative);
+                    #[cfg(not(feature = "native-codecs"))]
+                    return Err(disabled_backend(FilterId::Xz, "native"));
+                },
+            }
+        }
+        #[cfg(not(feature = "xz"))]
+        {
+            let _ = (limits, preference);
+            Err(disabled(FilterId::Xz))
+        }
+    }
+
+    fn with_lz4_backend(
+        limits: Limits,
+        preference: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
+        #[cfg(feature = "lz4")]
+        {
+            match preference.resolve()? {
+                Backend::Portable => Ok(Self::Lz4Portable(Box::new(
+                    crate::filter::lz4::Lz4Decoder::with_limits(limits),
+                ))),
+                Backend::Native => {
+                    #[cfg(feature = "native-codecs")]
+                    return Ok(Self::Lz4Native(ExternalDecoder::new(
+                        compression_codecs::Lz4Decoder::new(),
+                        FilterId::Lz4,
+                    )));
+                    #[cfg(not(feature = "native-codecs"))]
+                    return Err(disabled_backend(FilterId::Lz4, "native"));
+                },
+            }
+        }
+        #[cfg(not(feature = "lz4"))]
+        {
+            let _ = (limits, preference);
+            Err(disabled(FilterId::Lz4))
+        }
+    }
+
+    pub(crate) fn with_backend(
+        filter: FilterId,
+        limits: Limits,
+        preference: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
         match filter {
-            FilterId::Gzip => {
-                #[cfg(feature = "native-codecs")]
-                {
-                    Ok(Self::Gzip(ExternalDecoder::new(
+            FilterId::Gzip => match preference.resolve()? {
+                Backend::Portable => Ok(Self::GzipPortable(Box::new(GzipDecoder::new(limits)))),
+                Backend::Native => {
+                    #[cfg(feature = "native-codecs")]
+                    return Ok(Self::GzipNative(ExternalDecoder::new(
                         compression_codecs::GzipDecoder::new(),
                         filter,
-                    )))
-                }
-                #[cfg(not(feature = "native-codecs"))]
-                {
-                    Ok(Self::Gzip(Box::new(GzipDecoder::new(limits))))
-                }
+                    )));
+                    #[cfg(not(feature = "native-codecs"))]
+                    return Err(disabled_backend(filter, "native"));
+                },
             },
             #[cfg(feature = "sevenz")]
-            FilterId::Deflate => Ok(Self::Deflate(Box::new(
-                crate::filter::gzip::RawInflateDecoder::new(limits),
-            ))),
+            FilterId::Deflate => crate::filter::gzip::RawInflateDecoder::with_limits(limits)
+                .map(|decoder| Self::Deflate(Box::new(decoder))),
             FilterId::Bzip2 => {
                 #[cfg(feature = "bzip2")]
                 {
+                    let _ = preference.resolve()?;
                     Ok(Self::Bzip2(ExternalDecoder::new(
                         compression_codecs::BzDecoder::new(),
                         filter,
@@ -76,51 +177,42 @@ impl PipelineCodec {
                     Err(disabled(filter))
                 }
             },
-            FilterId::Zstd => {
-                #[cfg(all(feature = "zstd", feature = "native-codecs"))]
+            FilterId::Zstd => Self::with_zstd_backend(limits, preference),
+            FilterId::Xz => Self::with_xz_backend(limits, preference),
+            FilterId::Lz4 => Self::with_lz4_backend(limits, preference),
+            FilterId::Compress => {
+                #[cfg(feature = "compress")]
                 {
-                    let decoder = native_zstd_decoder(limits)?;
-                    Ok(Self::Zstd(ExternalDecoder::new(decoder, filter)))
-                }
-                #[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
-                {
-                    Ok(Self::Zstd(Box::default()))
-                }
-                #[cfg(not(feature = "zstd"))]
-                {
-                    Err(disabled(filter))
-                }
-            },
-            FilterId::Xz => {
-                #[cfg(all(feature = "xz", feature = "native-codecs"))]
-                {
-                    NativeXzDecoder::new(limits.codec_memory()).map(Self::Xz)
-                }
-                #[cfg(all(feature = "xz", not(feature = "native-codecs")))]
-                {
-                    crate::filter::xz::XzDecoder::new(limits)
+                    if matches!(preference, BackendPreference::Native) {
+                        return Err(ArchiveError::new(ErrorKind::Capability)
+                            .with_format("compress")
+                            .with_context("the Unix compress/LZW filter has no native backend"));
+                    }
+                    libarchive_oxide_codecs::lzw::CompressDecoder::with_limits(limits)
                         .map(Box::new)
-                        .map(Self::Xz)
+                        .map(Self::Compress)
                 }
-                #[cfg(not(feature = "xz"))]
+                #[cfg(not(feature = "compress"))]
                 {
+                    let _ = (limits, preference);
                     Err(disabled(filter))
                 }
             },
-            FilterId::Lz4 => {
-                #[cfg(all(feature = "lz4", feature = "native-codecs"))]
+            FilterId::Lzip => {
+                #[cfg(feature = "lzip")]
                 {
-                    Ok(Self::Lz4(ExternalDecoder::new(
-                        compression_codecs::Lz4Decoder::new(),
-                        filter,
-                    )))
+                    if matches!(preference, BackendPreference::Native) {
+                        return Err(ArchiveError::new(ErrorKind::Capability)
+                            .with_format("lzip")
+                            .with_context("the lzip filter has no native backend"));
+                    }
+                    crate::filter::lzip::LzipDecoder::new(limits)
+                        .map(Box::new)
+                        .map(Self::Lzip)
                 }
-                #[cfg(all(feature = "lz4", not(feature = "native-codecs")))]
+                #[cfg(not(feature = "lzip"))]
                 {
-                    Ok(Self::Lz4(Box::default()))
-                }
-                #[cfg(not(feature = "lz4"))]
-                {
+                    let _ = (limits, preference);
                     Err(disabled(filter))
                 }
             },
@@ -137,29 +229,47 @@ impl PipelineCodec {
         end: EndOfInput,
     ) -> Result<CodecStep, ArchiveError> {
         match self {
+            Self::GzipPortable(codec) => codec.process(input, output, end),
             #[cfg(feature = "native-codecs")]
-            Self::Gzip(codec) => codec.process(input, output, end),
-            #[cfg(not(feature = "native-codecs"))]
-            Self::Gzip(codec) => codec.process(input, output, end),
+            Self::GzipNative(codec) => codec.process(input, output, end),
             #[cfg(feature = "sevenz")]
             Self::Deflate(codec) => codec.process(input, output, end),
             #[cfg(feature = "bzip2")]
             Self::Bzip2(codec) => codec.process(input, output, end),
             #[cfg(feature = "zstd")]
-            Self::Zstd(codec) => codec.process(input, output, end),
+            Self::ZstdPortable(codec) => codec.process(input, output, end),
+            #[cfg(all(feature = "zstd", feature = "native-codecs"))]
+            Self::ZstdNative(codec) => codec.process(input, output, end),
             #[cfg(feature = "xz")]
-            Self::Xz(codec) => codec.process(input, output, end),
+            Self::XzPortable(codec) => codec.process(input, output, end),
+            #[cfg(all(feature = "xz", feature = "native-codecs"))]
+            Self::XzNative(codec) => codec.process(input, output, end),
             #[cfg(feature = "lz4")]
-            Self::Lz4(codec) => codec.process(input, output, end),
+            Self::Lz4Portable(codec) => codec.process(input, output, end),
+            #[cfg(all(feature = "lz4", feature = "native-codecs"))]
+            Self::Lz4Native(codec) => codec.process(input, output, end),
+            #[cfg(feature = "compress")]
+            Self::Compress(codec) => codec.process(input, output, end),
+            #[cfg(feature = "lzip")]
+            Self::Lzip(codec) => codec.process(input, output, end),
         }
     }
 
     /// Non-blocking mirror of [`process`](Self::process) for async adapters.
     ///
-    /// Every variant inherits the blocking-delegating default except `Xz`,
-    /// which overrides [`Codec::poll_process`] to avoid parking the executor
-    /// thread on its worker channel.
-    #[cfg(feature = "async")]
+    /// Every variant inherits the blocking-delegating default except the `Xz`
+    /// and lzip worker bridges, which override [`Codec::poll_process`] to avoid
+    /// parking the executor thread on a worker channel.
+    #[cfg(all(
+        feature = "async",
+        any(
+            feature = "zstd",
+            feature = "xz",
+            feature = "lz4",
+            feature = "compress",
+            feature = "lzip"
+        )
+    ))]
     pub(crate) fn poll_process(
         &mut self,
         input: &[u8],
@@ -168,20 +278,29 @@ impl PipelineCodec {
         waker: &Waker,
     ) -> Result<Option<CodecStep>, ArchiveError> {
         match self {
+            Self::GzipPortable(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "native-codecs")]
-            Self::Gzip(codec) => codec.poll_process(input, output, end, waker),
-            #[cfg(not(feature = "native-codecs"))]
-            Self::Gzip(codec) => codec.poll_process(input, output, end, waker),
+            Self::GzipNative(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "sevenz")]
             Self::Deflate(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "bzip2")]
             Self::Bzip2(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "zstd")]
-            Self::Zstd(codec) => codec.poll_process(input, output, end, waker),
+            Self::ZstdPortable(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(all(feature = "zstd", feature = "native-codecs"))]
+            Self::ZstdNative(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "xz")]
-            Self::Xz(codec) => codec.poll_process(input, output, end, waker),
+            Self::XzPortable(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(all(feature = "xz", feature = "native-codecs"))]
+            Self::XzNative(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "lz4")]
-            Self::Lz4(codec) => codec.poll_process(input, output, end, waker),
+            Self::Lz4Portable(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(all(feature = "lz4", feature = "native-codecs"))]
+            Self::Lz4Native(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "compress")]
+            Self::Compress(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "lzip")]
+            Self::Lzip(codec) => codec.poll_process(input, output, end, waker),
         }
     }
 }
@@ -222,14 +341,14 @@ fn disabled(filter: FilterId) -> ArchiveError {
         .with_context("outer filter support is disabled")
 }
 
-const fn filter_name(filter: FilterId) -> &'static str {
-    match filter {
-        FilterId::Gzip => "gzip",
-        FilterId::Deflate => "deflate",
-        FilterId::Bzip2 => "bzip2",
-        FilterId::Zstd => "zstd",
-        FilterId::Xz => "xz",
-        FilterId::Lz4 => "lz4",
-        _ => "unknown",
-    }
+#[cfg(not(feature = "native-codecs"))]
+fn disabled_backend(filter: FilterId, backend: &str) -> ArchiveError {
+    ArchiveError::new(ErrorKind::Capability)
+        .with_format(filter_name(filter))
+        .with_context(format!("requested {backend} codec backend is not compiled"))
+}
+
+fn filter_name(filter: FilterId) -> &'static str {
+    libarchive_oxide_core::capability::filter_capability(filter)
+        .map_or("unknown", |record| record.name())
 }

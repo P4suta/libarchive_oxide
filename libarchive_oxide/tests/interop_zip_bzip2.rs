@@ -2,13 +2,13 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! ZIP BZip2 (method 12) interoperability evidence (RM-302).
+//! ZIP `BZip2` (method 12) interoperability evidence (RM-302).
 //!
 //! Reuses the RM-301 harness (`tests/common/mod.rs`) to prove method 12 with THREE independent
 //! producers (arca's ZIP writer, the `zip` crate, and a first-party raw-ZIP builder that stores a
 //! raw `.bz2` stream produced by the `bzip2` crate directly) and TWO consumers (arca's seek reader
 //! and the `zip` crate). Content equality is byte-level; the `zip` consumer additionally exposes
-//! the BZip2 codec for method evidence.
+//! the `BZip2` codec for method evidence.
 //!
 //! Whole file is gated on the `bzip2` feature.
 #![cfg(feature = "bzip2")]

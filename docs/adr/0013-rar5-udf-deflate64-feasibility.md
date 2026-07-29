@@ -4,11 +4,20 @@
 - Date: 2026-07-23
 - Tracks: RM-306 / DEV-112 (epic RM-300)
 
-Implementation note (2026-07-28): the follow-on Deflate64 read and UDF Phase 1
-providers described by this decision have landed. Deflate64 write remains a
-permanent won't-do, UDF Phase 2 remains deferred, and RAR5 remains deferred.
-The decision-time wording below is retained as the record of the feasibility
-gate; the current support cells are maintained in `docs/support-matrix.md`.
+Implementation note (2026-07-29): the follow-on Deflate64 read and bounded UDF
+read provider described by this decision have landed. UDF now follows
+continued File Set Descriptor sequences and reads UDF 2.01 named and system
+streams, with default file-set-zero selection, FID identity/order checks,
+role-correct Stream/metadata flags, EFE Object Size validation, and ECMA-167
+extended allocation descriptors (including sparse and continued extents), plus
+bounded external Extended Attribute ICB spaces. Follow-on slices added UDF
+2.50/2.60 Metadata Partition translation/mirror recovery, UDF 1.50/2.00+
+Virtual Partition/VAT translation, and UDF 1.50+ Sparable Partition packet
+remapping with redundant-table sequence selection and Metadata-over-Sparable
+composition. Deflate64 write remains a permanent won't-do; UDF write remains
+out of scope; RAR5 remains deferred. The
+decision-time wording below is retained as the record of the feasibility gate;
+the current support cells are maintained in `docs/support-matrix.md`.
 
 ## Context
 
@@ -146,11 +155,14 @@ engine consumes, write as a typed `Unsupported`.
    and checksum validation; File Set Descriptor → root ICB; File Entry and Extended
    File Entry (strategy type 4); short and long allocation descriptors including
    embedded/inline data; directory File Identifier Descriptors; OSTA-compressed
-   Unicode (8/16-bit) dstrings and UDF timestamps. **Phase 2, deferred and gated on
-   demand:** UDF 2.50/2.60 Metadata Partition Map (required for Blu-ray/BD-ROM) and
-   named streams. **Explicitly out of scope:** all write support; Virtual
-   Allocation Table / sequential CD-R; sparable partition maps; extended-attribute-
-   heavy paths; any encryption (UDF defines none). `hadris-udf` and bdinfo-rs are
+   Unicode (8/16-bit) dstrings and UDF timestamps. **Completed follow-on
+   slices:** UDF 2.01 named/system streams, UDF 2.50/2.60 Metadata Partition
+   Maps (required for Blu-ray/BD-ROM), including allocation-unit mapping,
+   Metadata File/Mirror ICBs, optional bitmap validation, and bounded
+   primary-to-mirror recovery; UDF 1.50/2.00+ Virtual Partition/VAT reads; and
+   UDF 1.50+ Sparable Partition reads, including Metadata-over-Sparable.
+   **Still out of scope:** UDF creation/sequential-media write and any
+   encryption (UDF defines none). `hadris-udf` and bdinfo-rs are
    interop oracles, **never dependencies** — the codec-purity / tracking-debt
    principle favors an in-tree implementation with its own bounded fixtures. The
    generic RAND patent caveat is recorded as a low-but-nonzero **tracked IP risk**,
@@ -216,23 +228,30 @@ engine consumes, write as a typed `Unsupported`.
 **Support matrix** ([support-matrix.md](../support-matrix.md)): the original
 decision-only edit reclassified Deflate64 write as a **won't-do** and kept the
 read cells pending. The completed follow-on now marks method-9 read `✓` on both
-profiles and adds the read-only UDF Phase 1 container row. RAR5 remains deferred;
-the matrix continues to describe implementation, not intention.
+profiles and adds the read-only UDF container row. Continued File Set
+Descriptors, UDF 2.01 streams, and 2.50/2.60 Metadata Partitions do not change
+the format-level direction cell.
+RAR5 remains deferred; the matrix continues to describe implementation, not
+intention.
 
 **Tracked deficits.** *Completed:* Deflate64 read through the external decoder
-and the UDF Phase 1 read-only provider. Deflate64 write remains a closed
-won't-do. *Opened / carried:* (a) RAR5 read-only support, resolution path = a
+and the bounded UDF read-only provider, including continued File Set
+Descriptors, UDF 2.01 named/system streams, extended allocation descriptors,
+external Extended Attribute ICB spaces, and UDF 2.50/2.60 Metadata Partition
+Maps with bounded mirror recovery, UDF Virtual/VAT translation, and UDF
+Sparable packet remapping. Deflate64 write remains a closed
+won't-do. *Opened / carried:*
+(a) RAR5 read-only support, resolution path = a
 clean-room, forbid(unsafe), independently-provenanced pure-Rust RAR5
 decompressor behind the codec-provider boundary, with no provider built until
-it exists; (b) UDF Phase 2 (2.50/2.60 Metadata Partition, named streams), gated
-on demand; (c) the UDF generic-RAND IP caveat as a low-but-nonzero tracked risk.
-Each carries a resolution path per ADR-0012's model, so honest disclosure never
-becomes a resting state.
+it exists; (b) the UDF generic-RAND IP caveat
+as a low-but-nonzero tracked risk. Each carries a resolution path per
+ADR-0012's model, so honest disclosure never becomes a resting state.
 
 **Out of scope and staying so:** any RAR compressor or RAR5 *creation* path
-(bright-line prohibition); any Deflate64 encoder; UDF write, VAT / sequential CD-R,
-sparable partition maps, and encryption. UDF's out-of-scope paths are typed
-`Unsupported`, never silent gaps, and enumeration continues across them.
+(bright-line prohibition); any Deflate64 encoder; UDF creation/sequential-media
+write and encryption. UDF's out-of-scope paths are not exposed as half-working
+writer APIs.
 Deflate64 creation instead has no public writer method to request: the API
 intentionally exposes no `ZipMethod::Deflate64` variant.
 
@@ -240,14 +259,19 @@ intentionally exposes no `ZipMethod::Deflate64` variant.
 harness with provenance recorded in each format's `PROVENANCE.md` per ADR-0011.
 Deflate64 currently has the committed official 7-Zip fixture; its Windows
 producer remains open. UDF currently has deterministic first-party conformance
-images; mkudffs and two further independently verified producers remain open,
-with xorriso explicitly ineligible. These formats' provenance registries are
+images plus one committed `mkudffs` 2.3 Sparable image; two further independently
+verified producers remain open, with xorriso explicitly ineligible. These
+formats' provenance registries are
 the appendix that ADR-0011 reserved for RM-306 and do not claim that the
 ≥3-producer gate is complete.
 
 **Net.** RM-306 is resolved decisively and honestly: Deflate64 read uses the
-external decoder and its write deficit is formally retired; UDF Phase 1 is a
-bounded read-only implementation; and RAR5 is deferred in its entirety
+external decoder and its write deficit is formally retired; UDF has a bounded
+read-only implementation, including continued File Set Descriptors and UDF
+2.01 named/system streams, extended allocation descriptors, and external
+Extended Attribute ICB spaces, UDF 2.50/2.60 Metadata Partition Maps,
+Virtual/VAT translation, and Sparable packet remapping; and
+RAR5 is deferred in its entirety
 — truthful about the one thing that is genuinely not feasible in-tree today,
 proprietary RAR5 decompression — rather than shipping a metadata-only provider that
 would read almost no real archive. The clean-room, decode-only, nominative-naming

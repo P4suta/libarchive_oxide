@@ -21,23 +21,27 @@ version = 2
 confidence-threshold = 0.93
 allow = [
     "MIT",
+    # ppmd-rust is dual MIT-0 OR CC0-1.0; accept the attribution-compatible
+    # MIT-0 branch used by the bounded 7z PPMd7 adapter.
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "bzip2-1.0.6",
-    "BSL-1.0",
+    # ring and its untrusted parser dependency use the short permissive ISC
+    # license for their bounded CMS signature-verification implementation.
     "ISC",
-    "Unicode-DFS-2016",
+    # cryptographic-message-syntax and x509-certificate use MPL-2.0. They are
+    # unmodified, library-only CMS/X.509 adapters behind libarchive_oxide-package's
+    # bounded offline verification boundary; the optional HTTP feature is disabled.
+    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
-    "CC0-1.0",
-    "MPL-2.0",
 ]
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 # Applies only to workspace path dependencies.
 allow-wildcard-paths = true
@@ -45,7 +49,23 @@ highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 deny = [{ name = "openssl" }, { name = "openssl-sys" }]
-skip-tree = []
+skip = [
+    # cap-std 4 pulls io-lifetimes v2 through fs-set-times while its current
+    # io-extras path uses v3. Both are internal compatibility layers.
+    { crate = "io-lifetimes@2.0.4", reason = "transitive cap-std compatibility split; no workspace crate uses this API" },
+    # x509-certificate 0.25 still uses the stable DER 0.7 / const-oid 0.9
+    # family, while digest 0.11 has moved to const-oid 0.10.
+    { crate = "const-oid@0.9.6", reason = "bounded CMS/X.509 parser is on DER 0.7 while the workspace digest family independently uses const-oid 0.10" },
+    # ring 0.17 intentionally retains getrandom 0.2 for its audited platform
+    # entropy boundary; build tooling and current archive dependencies use 0.4.
+    { crate = "getrandom@0.2.17", reason = "ring entropy compatibility line is independent of the workspace getrandom 0.4 consumers" },
+]
+skip-tree = [
+    # The cap-std/tempfile Windows dependency graph spans three windows-sys
+    # release lines. These target bindings do not coexist in one API surface
+    # and are expected to converge only when their upstream crates do.
+    { crate = "windows-sys", reason = "foundational target bindings versioned independently by cap-std and tempfile transitive dependencies" },
+]
 
 [sources]
 unknown-registry = "deny"

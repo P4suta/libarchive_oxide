@@ -4,7 +4,8 @@
 
 #![no_main]
 
-//! Thin libFuzzer shim for the bounded UDF seek-reader invariant.
+//! Thin libFuzzer shim for bounded UDF seek parsing, including Metadata and
+//! Virtual/VAT Partitions.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

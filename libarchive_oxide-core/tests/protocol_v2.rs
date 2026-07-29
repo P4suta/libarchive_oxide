@@ -8,10 +8,10 @@
 use alloc::vec::Vec;
 
 use libarchive_oxide_core::{
-    ArDecoder, ArEncoder, ArchiveDecoder, ArchiveEncoder, ArchivePath, CodecStatus, CodecStep,
-    CpioDecoder, CpioDialect, CpioEncoder, DecodeEvent, Device, EncodeCommand, EncodeStatus,
-    EndOfInput, EntryKind, EntryMetadata, ErrorKind, FilterId, FormatId, Limits, ProbeResult,
-    TarDecoder, TarEncoder, Timestamp,
+    ArDecoder, ArEncoder, ArchiveDecoder, ArchiveEncoder, ArchivePath, Checksum, CodecStatus,
+    CodecStep, CpioDecoder, CpioDialect, CpioEncoder, DecodeEvent, Device, EncodeCommand,
+    EncodeStatus, EndOfInput, EntryKind, EntryMetadata, ErrorKind, FilterId, FormatId, Limits,
+    ProbeResult, TarDecoder, TarEncoder, Timestamp,
 };
 
 extern crate alloc;
@@ -308,17 +308,11 @@ fn tar_decoder_types_pax_metadata_and_materializes_sparse_holes() {
     );
     assert_eq!(
         metadata.times().modified,
-        Some(Timestamp {
-            secs: 1_700_000_000,
-            nanos: 500_000_000,
-        })
+        Some(Timestamp::new(1_700_000_000, 500_000_000).expect("valid timestamp"))
     );
     assert_eq!(
         metadata.times().changed,
-        Some(Timestamp {
-            secs: -2,
-            nanos: 500_000_000,
-        })
+        Some(Timestamp::new(-2, 500_000_000).expect("valid timestamp"))
     );
     assert_eq!(metadata.sparse_extents().len(), 2);
     assert_eq!(
@@ -372,6 +366,10 @@ fn format_and_filter_probes_share_the_incremental_contract() {
     assert_eq!(
         FilterId::probe(&[0x1f, 0x8b]),
         ProbeResult::Match(FilterId::Gzip)
+    );
+    assert_eq!(
+        FilterId::probe(&[0x1f, 0x9d]),
+        ProbeResult::Match(FilterId::Compress)
     );
     for prefix in [b"B".as_slice(), b"BZ", b"BZh"] {
         assert!(matches!(
@@ -585,7 +583,7 @@ fn cpio_encoder_roundtrips_every_supported_dialect() {
                 .size(Some(body.len() as u64))
                 .inode_and_links(Some(42), Some(1))
                 .devices(Some(Device { major: 0, minor: 7 }), None)
-                .checksum((dialect == CpioDialect::Crc).then(|| checksum.to_be_bytes().to_vec()))
+                .checksum((dialect == CpioDialect::Crc).then(|| Checksum::cpio_sum32(checksum)))
                 .build();
         let archive = encode_cpio_entries_with(
             CpioEncoder::with_dialect(Limits::default(), dialect),
@@ -601,7 +599,10 @@ fn cpio_encoder_roundtrips_every_supported_dialect() {
         assert_eq!(entries[0].1, body, "{dialect:?}");
         if dialect == CpioDialect::Crc {
             assert_eq!(
-                entries[0].0.checksum(),
+                entries[0]
+                    .0
+                    .checksum()
+                    .map(libarchive_oxide_core::Checksum::as_bytes),
                 Some(checksum.to_be_bytes().as_slice())
             );
         }

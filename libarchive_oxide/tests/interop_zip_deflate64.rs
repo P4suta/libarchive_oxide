@@ -13,10 +13,8 @@
 
 use std::io::Cursor;
 
-use libarchive_oxide::{
-    ReaderEvent, SeekArchiveReader,
-    libarchive_oxide_core::{EntryKind, ErrorKind, Limits},
-};
+use libarchive_oxide::{ReaderEvent, SeekArchiveReader};
+use libarchive_oxide_core::{EntryKind, ErrorKind, Limits};
 
 const REGULAR_ATTRIBUTES: u32 = 0o100_644_u32 << 16;
 
@@ -102,7 +100,7 @@ fn method9_zip(data: &[u8]) -> Vec<u8> {
     )
 }
 
-fn read_all(bytes: Vec<u8>, limits: Limits) -> Result<Vec<u8>, libarchive_oxide::StreamError> {
+fn read_all(bytes: Vec<u8>, limits: Limits) -> Result<Vec<u8>, libarchive_oxide::Error> {
     let mut reader = SeekArchiveReader::with_limits(Cursor::new(bytes), limits)?;
     let mut output = Vec::new();
     loop {

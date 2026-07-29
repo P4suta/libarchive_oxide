@@ -12,8 +12,24 @@ use async_compression::futures::bufread::GzipDecoder;
 use async_compression::futures::write::GzipEncoder;
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use libarchive_oxide_core::filter::FilterId;
-use libarchive_oxide_core::{ArchiveError, CodecStatus, EndOfInput, ErrorKind, Limits};
+use libarchive_oxide_core::{ArchiveError, ErrorKind, Limits};
+#[cfg(any(
+    feature = "zstd",
+    feature = "xz",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
+use libarchive_oxide_core::{CodecStatus, EndOfInput};
 
+use crate::BackendPreference;
+#[cfg(any(
+    feature = "zstd",
+    feature = "xz",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
 use crate::pipeline_codec::PipelineCodec;
 
 const PREFIX: usize = 6;
@@ -106,6 +122,13 @@ fn codec_error(error: io::Error) -> io::Error {
     io::Error::new(kind, error)
 }
 
+#[cfg(any(
+    feature = "zstd",
+    feature = "xz",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
 fn archive_codec_error(error: ArchiveError) -> io::Error {
     let kind = match error.kind() {
         ErrorKind::Limit => io::ErrorKind::OutOfMemory,
@@ -190,6 +213,13 @@ impl<R: AsyncRead + Unpin> AsyncBufRead for Buffered<R> {
 type FilterInput<R> = Buffered<PrefixReader<R>>;
 
 #[derive(Debug)]
+#[cfg(any(
+    feature = "zstd",
+    feature = "xz",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
 struct AsyncCodecReader<R> {
     input: R,
     codec: PipelineCodec,
@@ -200,11 +230,24 @@ struct AsyncCodecReader<R> {
     done: bool,
 }
 
+#[cfg(any(
+    feature = "zstd",
+    feature = "xz",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
 impl<R> AsyncCodecReader<R> {
-    fn new(input: R, filter: FilterId, limits: Limits) -> io::Result<Self> {
+    fn new(
+        input: R,
+        filter: FilterId,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> io::Result<Self> {
         Ok(Self {
             input,
-            codec: PipelineCodec::new(filter, limits).map_err(archive_codec_error)?,
+            codec: PipelineCodec::with_backend(filter, limits, backend)
+                .map_err(archive_codec_error)?,
             compressed: vec![0; BUFFER],
             start: 0,
             end: 0,
@@ -218,6 +261,13 @@ impl<R> AsyncCodecReader<R> {
     }
 }
 
+#[cfg(any(
+    feature = "zstd",
+    feature = "xz",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
 impl<R: AsyncRead + Unpin> AsyncRead for AsyncCodecReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -300,7 +350,7 @@ enum ReaderInner<R> {
         eof: bool,
     },
     Plain(FilterInput<R>),
-    Gzip(GzipDecoder<FilterInput<R>>),
+    Gzip(Box<GzipDecoder<FilterInput<R>>>),
     #[cfg(feature = "bzip2")]
     Bzip2(async_compression::futures::bufread::BzDecoder<FilterInput<R>>),
     #[cfg(feature = "zstd")]
@@ -309,6 +359,10 @@ enum ReaderInner<R> {
     Xz(Box<AsyncCodecReader<FilterInput<R>>>),
     #[cfg(feature = "lz4")]
     Lz4(Box<AsyncCodecReader<FilterInput<R>>>),
+    #[cfg(feature = "compress")]
+    Compress(Box<AsyncCodecReader<FilterInput<R>>>),
+    #[cfg(feature = "lzip")]
+    Lzip(Box<AsyncCodecReader<FilterInput<R>>>),
     Finished {
         input: FilterInput<R>,
         filter: FilterId,
@@ -323,11 +377,34 @@ pub(crate) struct AsyncFilterReader<R> {
     inner: ReaderInner<R>,
     decoded: u64,
     decoded_limit: Option<u64>,
+    #[cfg(any(
+        feature = "zstd",
+        feature = "xz",
+        feature = "lz4",
+        feature = "compress",
+        feature = "lzip"
+    ))]
     limits: Limits,
+    #[cfg(any(
+        feature = "zstd",
+        feature = "xz",
+        feature = "lz4",
+        feature = "compress",
+        feature = "lzip"
+    ))]
+    backend: BackendPreference,
 }
 
 impl<R> AsyncFilterReader<R> {
-    pub(crate) fn new(input: R, limits: Limits) -> Self {
+    pub(crate) fn with_backend(input: R, limits: Limits, backend: BackendPreference) -> Self {
+        #[cfg(not(any(
+            feature = "zstd",
+            feature = "xz",
+            feature = "lz4",
+            feature = "compress",
+            feature = "lzip"
+        )))]
+        let _ = backend;
         Self {
             inner: ReaderInner::Detecting {
                 input: Some(input),
@@ -337,27 +414,51 @@ impl<R> AsyncFilterReader<R> {
             },
             decoded: 0,
             decoded_limit: limits.decoded_total(),
+            #[cfg(any(
+                feature = "zstd",
+                feature = "xz",
+                feature = "lz4",
+                feature = "compress",
+                feature = "lzip"
+            ))]
             limits,
+            #[cfg(any(
+                feature = "zstd",
+                feature = "xz",
+                feature = "lz4",
+                feature = "compress",
+                feature = "lzip"
+            ))]
+            backend,
         }
     }
 
-    #[allow(clippy::expect_used)]
-    pub(crate) fn into_inner(self) -> R {
+    pub(crate) fn into_inner(self) -> Result<R, ArchiveError> {
         match self.inner {
-            ReaderInner::Detecting { input, .. } | ReaderInner::Failed(input) => {
-                input.expect("async filter reader always owns its input")
+            ReaderInner::Detecting {
+                input: Some(input), ..
+            }
+            | ReaderInner::Failed(Some(input)) => Ok(input),
+            ReaderInner::Detecting { input: None, .. } | ReaderInner::Failed(None) => {
+                Err(ArchiveError::new(ErrorKind::Protocol).with_context(
+                    "async filter input is unavailable after codec initialization failed",
+                ))
             },
-            ReaderInner::Plain(input) => input.into_inner().into_inner(),
-            ReaderInner::Gzip(input) => input.into_inner().into_inner().into_inner(),
+            ReaderInner::Plain(input) => Ok(input.into_inner().into_inner()),
+            ReaderInner::Gzip(input) => Ok((*input).into_inner().into_inner().into_inner()),
             #[cfg(feature = "bzip2")]
-            ReaderInner::Bzip2(input) => input.into_inner().into_inner().into_inner(),
+            ReaderInner::Bzip2(input) => Ok(input.into_inner().into_inner().into_inner()),
             #[cfg(feature = "zstd")]
-            ReaderInner::Zstd(input) => (*input).into_inner().into_inner().into_inner(),
+            ReaderInner::Zstd(input) => Ok((*input).into_inner().into_inner().into_inner()),
             #[cfg(feature = "xz")]
-            ReaderInner::Xz(input) => (*input).into_inner().into_inner().into_inner(),
+            ReaderInner::Xz(input) => Ok((*input).into_inner().into_inner().into_inner()),
             #[cfg(feature = "lz4")]
-            ReaderInner::Lz4(input) => (*input).into_inner().into_inner().into_inner(),
-            ReaderInner::Finished { input, .. } => input.into_inner().into_inner(),
+            ReaderInner::Lz4(input) => Ok((*input).into_inner().into_inner().into_inner()),
+            #[cfg(feature = "compress")]
+            ReaderInner::Compress(input) => Ok((*input).into_inner().into_inner().into_inner()),
+            #[cfg(feature = "lzip")]
+            ReaderInner::Lzip(input) => Ok((*input).into_inner().into_inner().into_inner()),
+            ReaderInner::Finished { input, .. } => Ok(input.into_inner().into_inner()),
         }
     }
 }
@@ -401,11 +502,49 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
             physical_read: u64::try_from(length).unwrap_or(u64::MAX),
         });
         let available = &saved_prefix[..length];
-        if available.starts_with(&[0x1f, 0x8b]) {
+        if available.starts_with(b"LZIP") {
+            #[cfg(feature = "lzip")]
+            {
+                buffered.input.wrap_source_errors = true;
+                self.inner = ReaderInner::Lzip(Box::new(AsyncCodecReader::new(
+                    buffered,
+                    FilterId::Lzip,
+                    self.limits,
+                    self.backend,
+                )?));
+            }
+            #[cfg(not(feature = "lzip"))]
+            {
+                self.inner = ReaderInner::Failed(Some(buffered.into_inner().into_inner()));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "lzip filter is not enabled",
+                )));
+            }
+        } else if available.starts_with(&[0x1f, 0x8b]) {
             buffered.input.wrap_source_errors = true;
             let mut decoder = GzipDecoder::new(buffered);
             decoder.multiple_members(true);
-            self.inner = ReaderInner::Gzip(decoder);
+            self.inner = ReaderInner::Gzip(Box::new(decoder));
+        } else if available.starts_with(&[0x1f, 0x9d]) {
+            #[cfg(feature = "compress")]
+            {
+                buffered.input.wrap_source_errors = true;
+                self.inner = ReaderInner::Compress(Box::new(AsyncCodecReader::new(
+                    buffered,
+                    FilterId::Compress,
+                    self.limits,
+                    self.backend,
+                )?));
+            }
+            #[cfg(not(feature = "compress"))]
+            {
+                self.inner = ReaderInner::Failed(Some(buffered.into_inner().into_inner()));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "compress/LZW filter is not enabled",
+                )));
+            }
         } else if available.starts_with(b"BZh") {
             #[cfg(feature = "bzip2")]
             {
@@ -430,6 +569,7 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
                     buffered,
                     FilterId::Zstd,
                     self.limits,
+                    self.backend,
                 )?));
             }
             #[cfg(not(feature = "zstd"))]
@@ -448,6 +588,7 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
                     buffered,
                     FilterId::Xz,
                     self.limits,
+                    self.backend,
                 )?));
             }
             #[cfg(not(feature = "xz"))]
@@ -466,6 +607,7 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
                     buffered,
                     FilterId::Lz4,
                     self.limits,
+                    self.backend,
                 )?));
             }
             #[cfg(not(feature = "lz4"))]
@@ -511,6 +653,14 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
                 ReaderInner::Lz4(input) => {
                     (codec_poll(Pin::new(input).poll_read(cx, output)), true)
                 },
+                #[cfg(feature = "compress")]
+                ReaderInner::Compress(input) => {
+                    (codec_poll(Pin::new(input).poll_read(cx, output)), true)
+                },
+                #[cfg(feature = "lzip")]
+                ReaderInner::Lzip(input) => {
+                    (codec_poll(Pin::new(input).poll_read(cx, output)), true)
+                },
                 ReaderInner::Finished { input, filter } => {
                     let mut probe = [0_u8; 1];
                     let result = codec_poll(Pin::new(&mut *input).poll_read(cx, &mut probe));
@@ -543,7 +693,7 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
             if filtered && matches!(result, Poll::Ready(Ok(0))) {
                 let previous = core::mem::replace(&mut self.inner, ReaderInner::Failed(None));
                 let (input, filter) = match previous {
-                    ReaderInner::Gzip(input) => (input.into_inner(), FilterId::Gzip),
+                    ReaderInner::Gzip(input) => ((*input).into_inner(), FilterId::Gzip),
                     #[cfg(feature = "bzip2")]
                     ReaderInner::Bzip2(input) => (input.into_inner(), FilterId::Bzip2),
                     #[cfg(feature = "zstd")]
@@ -552,6 +702,10 @@ impl<R: AsyncRead + Unpin> AsyncFilterReader<R> {
                     ReaderInner::Xz(input) => ((*input).into_inner(), FilterId::Xz),
                     #[cfg(feature = "lz4")]
                     ReaderInner::Lz4(input) => ((*input).into_inner(), FilterId::Lz4),
+                    #[cfg(feature = "compress")]
+                    ReaderInner::Compress(input) => ((*input).into_inner(), FilterId::Compress),
+                    #[cfg(feature = "lzip")]
+                    ReaderInner::Lzip(input) => ((*input).into_inner(), FilterId::Lzip),
                     _ => {
                         return Poll::Ready(Err(io::Error::other(
                             "async filter state changed while checking trailing data",
@@ -622,11 +776,12 @@ pub(crate) struct AsyncFrameEncoder<W> {
     pending_position: usize,
     wrote_frame: bool,
     closed: bool,
+    backend: BackendPreference,
 }
 
 #[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 impl<W> AsyncFrameEncoder<W> {
-    fn new(output: W, filter: FilterId) -> Self {
+    fn new(output: W, filter: FilterId, backend: BackendPreference) -> Self {
         Self {
             output,
             filter,
@@ -635,6 +790,7 @@ impl<W> AsyncFrameEncoder<W> {
             pending_position: 0,
             wrote_frame: false,
             closed: false,
+            backend,
         }
     }
 
@@ -644,7 +800,11 @@ impl<W> AsyncFrameEncoder<W> {
 
     fn encode_frame(&mut self) -> io::Result<()> {
         debug_assert_eq!(self.pending_position, self.pending.len());
-        self.pending = crate::filtered_io::encode_profile_frame(self.filter, &self.input)?;
+        self.pending = crate::filtered_io::encode_profile_frame_with_backend(
+            self.filter,
+            &self.input,
+            self.backend,
+        )?;
         self.pending_position = 0;
         self.input.clear();
         self.wrote_frame = true;
@@ -700,8 +860,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for AsyncFrameEncoder<W> {
             Poll::Pending => return Poll::Pending,
         }
         if this.input.len() == BUFFER {
-            if let Err(error) = this.encode_frame() {
-                return Poll::Ready(Err(error));
+            match this.encode_frame() {
+                Ok(()) => {},
+                Err(error) => return Poll::Ready(Err(error)),
             }
             match this.poll_drain(cx) {
                 Poll::Ready(Ok(())) => {},
@@ -711,20 +872,21 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for AsyncFrameEncoder<W> {
         }
         let consumed = (BUFFER - this.input.len()).min(bytes.len());
         this.input.extend_from_slice(&bytes[..consumed]);
-        if this.input.len() == BUFFER {
-            if let Err(error) = this.encode_frame() {
-                return Poll::Ready(Err(error));
-            }
+        if this.input.len() == BUFFER
+            && let Err(error) = this.encode_frame()
+        {
+            return Poll::Ready(Err(error));
         }
         Poll::Ready(Ok(consumed))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.pending_position == this.pending.len() && !this.input.is_empty() {
-            if let Err(error) = this.encode_frame() {
-                return Poll::Ready(Err(error));
-            }
+        if this.pending_position == this.pending.len()
+            && !this.input.is_empty()
+            && let Err(error) = this.encode_frame()
+        {
+            return Poll::Ready(Err(error));
         }
         match this.poll_drain(cx) {
             Poll::Ready(Ok(())) => Pin::new(&mut this.output).poll_flush(cx),
@@ -739,10 +901,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for AsyncFrameEncoder<W> {
         }
         if this.pending_position == this.pending.len()
             && (!this.input.is_empty() || !this.wrote_frame)
+            && let Err(error) = this.encode_frame()
         {
-            if let Err(error) = this.encode_frame() {
-                return Poll::Ready(Err(error));
-            }
+            return Poll::Ready(Err(error));
         }
         match this.poll_drain(cx) {
             Poll::Ready(Ok(())) => match Pin::new(&mut this.output).poll_close(cx) {
@@ -772,26 +933,39 @@ pub(crate) enum AsyncFilterWriter<W> {
 }
 
 impl<W> AsyncFilterWriter<W> {
-    pub(crate) fn new(
+    pub(crate) fn with_backend(
         output: W,
         filter: Option<FilterId>,
+        backend: BackendPreference,
     ) -> Result<Self, libarchive_oxide_core::ArchiveError>
     where
         W: AsyncWrite,
     {
+        backend.resolve()?;
         let writer = match filter {
             None => Self::Plain(output),
+            Some(FilterId::Lzip) => {
+                return Err(libarchive_oxide_core::ArchiveError::new(
+                    libarchive_oxide_core::ErrorKind::Capability,
+                )
+                .with_format("lzip")
+                .with_context("lzip filter is read-only"));
+            },
             Some(FilterId::Gzip) => Self::Gzip(GzipEncoder::new(output)),
             #[cfg(feature = "bzip2")]
             Some(FilterId::Bzip2) => {
                 Self::Bzip2(async_compression::futures::write::BzEncoder::new(output))
             },
             #[cfg(feature = "zstd")]
-            Some(FilterId::Zstd) => Self::Zstd(AsyncFrameEncoder::new(output, FilterId::Zstd)),
+            Some(FilterId::Zstd) => {
+                Self::Zstd(AsyncFrameEncoder::new(output, FilterId::Zstd, backend))
+            },
             #[cfg(feature = "xz")]
-            Some(FilterId::Xz) => Self::Xz(AsyncFrameEncoder::new(output, FilterId::Xz)),
+            Some(FilterId::Xz) => Self::Xz(AsyncFrameEncoder::new(output, FilterId::Xz, backend)),
             #[cfg(feature = "lz4")]
-            Some(FilterId::Lz4) => Self::Lz4(AsyncFrameEncoder::new(output, FilterId::Lz4)),
+            Some(FilterId::Lz4) => {
+                Self::Lz4(AsyncFrameEncoder::new(output, FilterId::Lz4, backend))
+            },
             Some(_) => {
                 return Err(libarchive_oxide_core::ArchiveError::new(
                     libarchive_oxide_core::ErrorKind::Capability,
@@ -872,5 +1046,40 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for AsyncFilterWriter<W> {
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.get_mut().poll_finish(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_async_filter_input_is_a_protocol_error() {
+        let reader = AsyncFilterReader {
+            inner: ReaderInner::<Vec<u8>>::Failed(None),
+            decoded: 0,
+            decoded_limit: None,
+            #[cfg(any(
+                feature = "zstd",
+                feature = "xz",
+                feature = "lz4",
+                feature = "compress",
+                feature = "lzip"
+            ))]
+            limits: Limits::safe(),
+            #[cfg(any(
+                feature = "zstd",
+                feature = "xz",
+                feature = "lz4",
+                feature = "compress",
+                feature = "lzip"
+            ))]
+            backend: BackendPreference::Auto,
+        };
+
+        assert!(matches!(
+            reader.into_inner(),
+            Err(error) if error.kind() == ErrorKind::Protocol
+        ));
     }
 }

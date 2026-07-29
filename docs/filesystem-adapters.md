@@ -4,7 +4,11 @@
 boundary. The session verifies plan identity and replay state, rewinds the same
 immutable input snapshot, and drives one concrete `FilesystemAdapter` value.
 The existing `ArchiveSession::apply(plan, cap_std::fs::Dir)` API remains a
-shortcut that constructs `CapStdFilesystemAdapter`.
+shortcut that constructs `CapStdFilesystemAdapter`. There is no direct
+reader-to-filesystem extractor: every public application path requires the
+opaque plan produced by `ArchiveSession::plan`. `FilesystemEntry` construction
+is crate-private, so the adapter contract cannot be used as an alternate public
+archive-to-filesystem dispatch path.
 
 ## Division of responsibility
 
@@ -12,6 +16,8 @@ The shared engine driver retains the security-sensitive archive work:
 
 - entry/path/nesting limits and checked entry accounting;
 - archive-path normalization and traversal/absolute/drive rejection;
+- whole-plan destination preflight before adapter startup, including duplicate
+  host identity rejection;
 - policy gates for overwrite, links, and special files;
 - session-local hardlink ordering;
 - parser/codec state and bounded payload chunks; and
@@ -22,6 +28,15 @@ and optional link target are normalized relative paths. The adapter still owns
 filesystem resolution and must not follow untrusted intermediate links.
 Adapters are compile-time values; the contract needs no global registry,
 trait-object dispatch, ambient path, or dynamic plugin ABI.
+
+`DestinationKey` preserves byte-exact, case-sensitive identities on Unix. On
+Windows it rejects reserved DOS devices, alternate-data-stream and other
+forbidden syntax, and trailing dot/space aliases, then compares each component
+using NFC-normalized case-insensitive identity. Consequently `foo`/`FOO` and
+NFC/NFD spellings are classified as `DestinationCollision` during planning,
+before `begin_session` or any payload write. The opaque, single-use plan is the
+authoritative path/collision decision; apply binds every replayed metadata
+record to it and does not recompute another destination identity.
 
 The call order is:
 
@@ -63,8 +78,11 @@ detailed findings.
 It creates regular files as unique `create_new` siblings, applies metadata to
 the open handle where supported, synchronizes the handle, then publishes by
 rename (overwrite) or hardlink (no-overwrite). Commit failure removes the
-sibling and does not replace or create the destination. Parent directories and
-previously created directories are reopened without following symlinks.
+sibling and does not replace or create the destination. Parent directories are
+resolved one component at a time without following symlinks. The resulting
+directory handle is retained from preparation through publication, so a
+concurrent rename-and-symlink ancestor swap cannot redirect the temporary file,
+destination, link, or special-file operation.
 
 The Linux reference path implements:
 
@@ -87,7 +105,10 @@ enables them, even when the adapter reports platform support.
 
 The external adapter tests cover normalized paths, missing finding detection,
 typed OS errors, identity mismatch before adapter dispatch, unsafe paths,
-destination races, and atomic publication. Linux tests additionally verify
+destination races, atomic publication, and a deterministic Unix ancestor-swap
+attack between payload write and commit. Windows tests additionally cover
+case and Unicode-normalization collisions, trailing dots/spaces, reserved
+devices, ADS syntax, and temporary-sibling cleanup on refusal. Linux tests verify
 mode/time/xattr/ACL/numeric ownership, sparse logical bytes, and allocated block
 usage. The published-package smoke consumer implements `FilesystemAdapter`
 using only public APIs.

@@ -7,8 +7,9 @@
 
 use std::io::{Cursor, Read, Write};
 
+use libarchive_oxide::advanced::{Pipeline, PipelineEvent};
 use libarchive_oxide::filter::gzip::GzipEncoder;
-use libarchive_oxide::{ArchiveReader, ArchiveWriter, Pipeline, PipelineEvent, ReaderEvent};
+use libarchive_oxide::{ArchiveReader, ArchiveWriter, ReaderEvent};
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
     ArchiveMetadata, ArchivePath, Codec, CodecStatus, EndOfInput, EntryKind, EntryMetadata,
@@ -34,6 +35,110 @@ fn tar_bytes() -> Vec<u8> {
     writer.finish().unwrap()
 }
 
+#[cfg(not(feature = "bzip2"))]
+#[test]
+fn failed_filter_initialization_returns_an_error_instead_of_panicking_on_recovery() {
+    let mut reader = ArchiveReader::open(Cursor::new(b"BZh-disabled-filter".to_vec()));
+    assert!(reader.next_event().is_err());
+
+    let error = reader
+        .into_inner()
+        .expect_err("the constructor consumed the source before reporting the disabled codec");
+    assert_eq!(error.kind(), libarchive_oxide_core::ErrorKind::Protocol);
+}
+
+#[test]
+fn entry_read_and_write_adapters_form_the_high_level_streaming_path() {
+    let body: Vec<u8> = (0_u8..=251).cycle().take(200_000).collect();
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("body.bin"))
+        .size(Some(body.len() as u64))
+        .build();
+    let mut writer = ArchiveWriter::create(Vec::new());
+    {
+        let mut entry = writer.start_entry_writer(&metadata).unwrap();
+        for chunk in body.chunks(997) {
+            entry.write_all(chunk).unwrap();
+        }
+        entry.finish().unwrap();
+    }
+    let encoded = writer.finish().unwrap();
+
+    let mut reader = ArchiveReader::open(Cursor::new(encoded.clone()));
+    let mut entry = reader.next_entry().unwrap().expect("one entry");
+    assert_eq!(entry.metadata().path().as_bytes(), b"body.bin");
+    let mut decoded = Vec::new();
+    let mut small = [0_u8; 113];
+    loop {
+        let read = entry.read(&mut small).unwrap();
+        if read == 0 {
+            break;
+        }
+        decoded.extend_from_slice(&small[..read]);
+    }
+    assert_eq!(decoded, body);
+    drop(entry);
+    assert!(reader.next_entry().unwrap().is_none());
+
+    let mut reader = ArchiveReader::open(Cursor::new(encoded));
+    let mut entry = reader.next_entry().unwrap().expect("one entry");
+    let mut one = [0_u8; 1];
+    entry.read_exact(&mut one).unwrap();
+    drop(entry);
+    assert_eq!(
+        reader
+            .next_entry()
+            .unwrap_err()
+            .archive_error()
+            .expect("protocol error")
+            .kind(),
+        libarchive_oxide_core::ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn writer_rejects_invalid_metadata_before_producing_output() {
+    let invalid = EntryMetadata::builder(EntryKind::Symlink, ArchivePath::from_utf8("link"))
+        .size(Some(0))
+        .build();
+    let mut writer = ArchiveWriter::new(Vec::new());
+    let error = writer
+        .start_entry(&invalid)
+        .expect_err("missing link target must be rejected");
+    assert_eq!(error.kind(), libarchive_oxide_core::ErrorKind::Malformed);
+    assert!(
+        writer.abort().expect("abort writer").is_empty(),
+        "validation must happen before the first output byte"
+    );
+}
+
+#[derive(Debug)]
+struct RejectWrites;
+
+impl Write for RejectWrites {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("injected writer failure"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn unified_error_preserves_io_kind_and_source() {
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("file"))
+        .size(Some(0))
+        .try_build()
+        .expect("valid metadata");
+    let mut writer = ArchiveWriter::new(RejectWrites);
+    let error = writer
+        .start_entry(&metadata)
+        .expect_err("injected output error");
+    assert_eq!(error.kind(), libarchive_oxide_core::ErrorKind::Io);
+    assert!(error.io_error().is_some());
+    assert!(std::error::Error::source(&error).is_some());
+}
+
 fn gzip_bytes(plain: &[u8]) -> Vec<u8> {
     let mut encoder = GzipEncoder::new(Limits::default());
     let mut out = Vec::new();
@@ -54,10 +159,17 @@ fn filter_bytes(plain: &[u8], filter: FilterId) -> Vec<u8> {
     match filter {
         FilterId::Gzip => gzip_bytes(plain),
         FilterId::Bzip2 => {
-            let mut writer =
-                bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
-            writer.write_all(plain).unwrap();
-            writer.finish().unwrap()
+            #[cfg(feature = "bzip2")]
+            {
+                let mut writer =
+                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+                writer.write_all(plain).unwrap();
+                writer.finish().unwrap()
+            }
+            #[cfg(not(feature = "bzip2"))]
+            {
+                panic!("bzip2 test fixture requested without the bzip2 feature")
+            }
         },
         FilterId::Zstd => zstd_codec::stream::encode_all(Cursor::new(plain), 3).unwrap(),
         FilterId::Xz => {
@@ -74,6 +186,14 @@ fn filter_bytes(plain: &[u8], filter: FilterId) -> Vec<u8> {
         },
         _ => panic!("unknown test filter"),
     }
+}
+
+/// Outer filters available in the current additive feature set.
+fn enabled_outer_filters() -> Vec<FilterId> {
+    [FilterId::Gzip, FilterId::Zstd, FilterId::Xz, FilterId::Lz4]
+        .into_iter()
+        .chain(cfg!(feature = "bzip2").then_some(FilterId::Bzip2))
+        .collect()
 }
 
 fn collect(input: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -226,21 +346,23 @@ fn nested_filter_depth_is_bounded_and_composes_statically() {
         (b"dir/b.txt".to_vec(), b"bravo".to_vec()),
     ];
     let mut nested = tar_bytes();
-    for filter in [
-        FilterId::Gzip,
-        FilterId::Bzip2,
-        FilterId::Zstd,
-        FilterId::Xz,
-    ] {
-        nested = filter_bytes(&nested, filter);
+    let filters: Vec<_> = enabled_outer_filters()
+        .into_iter()
+        .filter(|filter| *filter != FilterId::Lz4)
+        .collect();
+    for filter in &filters {
+        nested = filter_bytes(&nested, *filter);
     }
     assert_eq!(collect(nested.clone()), expected);
 
-    let limits = Limits::default().with_filter_depth(Some(3));
+    let rejected_depth = filters.len().saturating_sub(1);
+    let limits = Limits::default().with_filter_depth(Some(rejected_depth));
     let mut reader = ArchiveReader::with_limits(Cursor::new(nested), limits);
     loop {
         match reader.next_event() {
-            Ok(ReaderEvent::Done) => panic!("four filters bypassed a depth-three limit"),
+            Ok(ReaderEvent::Done) => {
+                panic!("nested filters bypassed the configured depth limit")
+            },
             Ok(_) => {},
             Err(error) => {
                 assert_eq!(
@@ -263,35 +385,31 @@ fn caller_driven_pipeline_composes_every_codec_at_one_byte_boundaries() {
         (b"dir/b.txt".to_vec(), b"bravo".to_vec()),
     ];
     let mut nested = tar_bytes();
-    for filter in [
-        FilterId::Gzip,
-        FilterId::Bzip2,
-        FilterId::Zstd,
-        FilterId::Xz,
-        FilterId::Lz4,
-    ] {
-        nested = filter_bytes(&nested, filter);
+    let filters = enabled_outer_filters();
+    for filter in &filters {
+        nested = filter_bytes(&nested, *filter);
     }
     assert_eq!(
-        collect_pipeline(&nested, Limits::default().with_filter_depth(Some(5))).unwrap(),
+        collect_pipeline(
+            &nested,
+            Limits::default().with_filter_depth(Some(filters.len()))
+        )
+        .unwrap(),
         expected
     );
 
-    let error =
-        collect_pipeline(&nested, Limits::default().with_filter_depth(Some(4))).unwrap_err();
+    let error = collect_pipeline(
+        &nested,
+        Limits::default().with_filter_depth(Some(filters.len().saturating_sub(1))),
+    )
+    .unwrap_err();
     assert_eq!(error.kind(), libarchive_oxide_core::ErrorKind::Limit);
 }
 
 #[test]
 fn caller_driven_pipeline_validates_concatenated_members_and_trailing_data() {
     let tar = tar_bytes();
-    for filter in [
-        FilterId::Gzip,
-        FilterId::Bzip2,
-        FilterId::Zstd,
-        FilterId::Xz,
-        FilterId::Lz4,
-    ] {
+    for filter in enabled_outer_filters() {
         let split = tar.len() / 2;
         let mut members = filter_bytes(&tar[..split], filter);
         if filter == FilterId::Xz {
@@ -317,6 +435,7 @@ fn caller_driven_pipeline_validates_concatenated_members_and_trailing_data() {
 }
 
 #[test]
+#[cfg(feature = "bzip2")]
 fn caller_driven_pipeline_rejects_bzip2_crc_failure_and_truncation() {
     let tar = tar_bytes();
     let mut corrupt = filter_bytes(&tar, FilterId::Bzip2);
@@ -694,28 +813,13 @@ fn tar_writer_roundtrips_typed_pax_and_sparse_data_without_spooling() {
             group: Some(b"staff".to_vec()),
         })
         .times(EntryTimes {
-            modified: Some(Timestamp {
-                secs: 1_700_000_000,
-                nanos: 500_000_000,
-            }),
-            accessed: Some(Timestamp {
-                secs: 1_700_000_001,
-                nanos: 250_000_000,
-            }),
-            changed: Some(Timestamp {
-                secs: -2,
-                nanos: 500_000_000,
-            }),
+            modified: Some(Timestamp::new(1_700_000_000, 500_000_000).expect("valid timestamp")),
+            accessed: Some(Timestamp::new(1_700_000_001, 250_000_000).expect("valid timestamp")),
+            changed: Some(Timestamp::new(-2, 500_000_000).expect("valid timestamp")),
             created: None,
         })
-        .sparse_extent(SparseExtent {
-            offset: 2,
-            length: 3,
-        })
-        .sparse_extent(SparseExtent {
-            offset: 8,
-            length: 2,
-        })
+        .sparse_extent(SparseExtent::new(2, 3).expect("valid sparse extent"))
+        .sparse_extent(SparseExtent::new(8, 2).expect("valid sparse extent"))
         .xattr(b"user.demo".to_vec(), b"value".to_vec())
         .acl(b"user::rw-".to_vec())
         .extension(Extension::new(
@@ -763,10 +867,7 @@ fn tar_writer_roundtrips_typed_pax_and_sparse_data_without_spooling() {
     );
     assert_eq!(
         decoded_metadata.times().changed,
-        Some(Timestamp {
-            secs: -2,
-            nanos: 500_000_000,
-        })
+        Some(Timestamp::new(-2, 500_000_000).expect("valid timestamp"))
     );
     assert!(decoded_metadata.extensions().iter().any(|extension| {
         extension.key() == b"vendor.unknown" && extension.value() == b"preserve-me"

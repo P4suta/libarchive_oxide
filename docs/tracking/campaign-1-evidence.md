@@ -30,8 +30,9 @@ version change, or versioned release candidate is part of this snapshot.
   ranges, compile-time providers, and capability-reporting filesystems.
 - `engine`, `providers`, `range_source`, and `filesystem_adapter` cover
   collected and event inspection limits, plan replay/mismatch, shared parser
-  state, adapter capability queries, partial failure, destination races, and
-  atomic publication.
+  state, adapter capability queries, partial failure, destination races,
+  whole-plan Windows case/NFC alias rejection, reserved/ADS/trailing-name
+  refusal, and atomic publication without temporary-file leakage.
 - The Linux reference test restores mode, timestamps, xattrs, POSIX ACLs, and
   sparse layout; link behavior and unsafe paths have dedicated extraction and
   adapter tests.
@@ -39,8 +40,8 @@ version change, or versioned release candidate is part of this snapshot.
 
 ## RM-110
 
-- ADR-0005 and `codec-profiles.md` define mutually exclusive default portable
-  and explicit native profiles.
+- ADR-0014 and `codec-profiles.md` define additive default portable and explicit
+  native profiles; ADR-0005 records the superseded mutual-exclusion design.
 - `xtask codec-policy` rejects native codec packages in the portable graph and
   requires all five native backends in the native graph.
 - Both profiles run the same sync, Pipeline, futures, Tokio, CLI,
@@ -69,7 +70,7 @@ version change, or versioned release candidate is part of this snapshot.
   fidelity test.
 - Host portable/native workspace Clippy and Linux-target library Clippy pass
   with warnings denied. Lefthook runs both before every Rust commit.
-- Rustfmt, rustdoc, MSRV 1.85/1.87, no-std core, semver checks, package smoke,
+- Rustfmt, rustdoc, workspace MSRV 1.88, no-std core/codecs, semver checks, package smoke,
   codec/dependency policy, cargo-deny, REUSE, typos, and actionlint pass.
 - PRs #49, #50, and #51 are the immutable remote evidence for the
   Linux/macOS/Windows matrix, nightly panic-abort/libFuzzer campaign,

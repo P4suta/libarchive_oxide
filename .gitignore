@@ -3,6 +3,7 @@
 **/*.rs.bk
 *.pdb
 *.tmp
+libarchive_oxide-cli/src/bin/*.rs.retired
 # Cargo.lock is committed: the workspace ships bins (libarchive_oxide-cli), and the
 # exact dependency graph is part of the reproducible build.
 

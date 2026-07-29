@@ -208,10 +208,7 @@ fn arca_ar_meta() -> Vec<u8> {
         ..Owner::default()
     })
     .times(EntryTimes {
-        modified: Some(Timestamp {
-            secs: MTIME,
-            nanos: 0,
-        }),
+        modified: Some(Timestamp::from_seconds(MTIME)),
         ..EntryTimes::default()
     })
     .build();

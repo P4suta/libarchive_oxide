@@ -8,17 +8,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Write};
+use std::sync::{Arc, OnceLock};
 
 use arbitrary::Arbitrary;
+use libarchive_oxide::advanced::{
+    CabVolumeReader, MemoryReadAt, ReadAt, SourceIdentity, SourceLimits, VolumeId, VolumeResolver,
+    VolumeSet,
+};
 use libarchive_oxide::filter::crc32;
 use libarchive_oxide::filter::gzip::{GzipDecoder, GzipEncoder};
 use libarchive_oxide::{
-    ArchiveReader, ArchiveWriter, FilterReader, ReaderEvent, SeekArchiveReader, SeekArchiveWriter,
-    StreamError,
+    ArchiveEngine, ArchiveReader, ArchiveWriter, Error, FilterReader, Policy, ReaderEvent,
+    SeekArchiveReader, SeekArchiveWriter,
 };
+use libarchive_oxide_codecs::{lz4::Lz4Decoder, lzw::CompressDecoder};
 use libarchive_oxide_core::{
     ArchiveError, ArchivePath, Codec, CodecStatus, EndOfInput, EntryKind, EntryMetadata, ErrorKind,
     FormatId, Limits,
+};
+use libarchive_oxide_package::{
+    AlpineRsaPublicKey, AppPackageProfile, PackageVerifier, ZipPackageProfile,
 };
 
 const MAX_ENTRIES: usize = 200_000;
@@ -29,6 +38,12 @@ const LZMA2_DICT: u32 = 8 * 1024 * 1024;
 const MAX_ROUNDTRIP_ENTRIES: usize = 48;
 const MAX_NAME_LEN: usize = 40;
 const MAX_ROUNDTRIP_DATA: usize = 4096;
+const ALPINE_KEY_ID: &[u8] = b"alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub";
+const CAB_VOLUME_FRAME_MAGIC: &[u8; 5] = b"OXCV\x01";
+const MAX_CAB_FUZZ_VOLUMES: usize = 16;
+const ALPINE_PUBLIC_KEY: &[u8] = include_bytes!(
+    "../../../libarchive_oxide-package/tests/fixtures/alpine_apk_v2/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub"
+);
 
 fn fuzz_limits() -> Limits {
     Limits::default()
@@ -89,9 +104,60 @@ fn drive_seek(data: &[u8]) {
     }
 }
 
-/// tar decoder: arbitrary bytes and chunk boundaries must not panic.
+fn drive_explicit_raw(data: &[u8]) {
+    let Ok(mut reader) =
+        ArchiveReader::with_format_and_limits(Cursor::new(data), FormatId::Raw, fuzz_limits())
+    else {
+        return;
+    };
+    let mut events = 0usize;
+    let mut payload = 0u64;
+    loop {
+        match reader.next_event() {
+            Ok(ReaderEvent::Entry(metadata)) => {
+                let _ = metadata.path().as_bytes();
+                events = events.saturating_add(1);
+            },
+            Ok(ReaderEvent::Data(bytes)) => {
+                payload = payload.saturating_add(bytes.len() as u64);
+            },
+            Ok(ReaderEvent::Done) | Err(_) => return,
+            Ok(ReaderEvent::ArchiveMetadata(_) | ReaderEvent::EndEntry) => {},
+            Ok(_) => return,
+        }
+        if events > 1 || payload > MAX_TOTAL_BYTES {
+            return;
+        }
+    }
+}
+
+fn drive_warc(data: &[u8]) {
+    let Ok(mut explicit) =
+        ArchiveReader::with_format_and_limits(Cursor::new(data), FormatId::Warc, fuzz_limits())
+    else {
+        return;
+    };
+    while !matches!(explicit.next_event(), Ok(ReaderEvent::Done) | Err(_)) {}
+
+    // Keep every existing read_tar corpus seed useful for the WARC deep path
+    // without adding another libFuzzer target: arbitrary bytes become a
+    // bounded, correctly framed content block, while the explicit pass above
+    // still exercises malformed headers and trailers.
+    let mut framed = format!(
+        "WARC/1.1\r\nWARC-Type: resource\r\nContent-Length: {}\r\n\r\n",
+        data.len()
+    )
+    .into_bytes();
+    framed.extend_from_slice(data);
+    framed.extend_from_slice(b"\r\n\r\n");
+    drive_sequential(&framed);
+}
+
+/// Tar/WARC auto-detection plus explicit raw/WARC decoding must not panic.
 pub fn read_tar(data: &[u8]) {
     drive_sequential(data);
+    drive_explicit_raw(data);
+    drive_warc(data);
 }
 
 /// cpio decoder: arbitrary bytes and chunk boundaries must not panic.
@@ -111,7 +177,37 @@ pub fn read_zip(data: &[u8]) {
 
 /// 7z seek decoder: arbitrary indexes and coder metadata must not panic.
 pub fn read_7z(data: &[u8]) {
-    drive_seek(data);
+    if let Some(decoded) = decode_hex_corpus_seed(data) {
+        drive_seek(&decoded);
+    } else {
+        drive_seek(data);
+    }
+}
+
+/// Lets text-only patches carry exact binary archive seeds. Ordinary fuzzer input is passed
+/// through unchanged; only an even-length ASCII `hex:` corpus record is decoded.
+fn decode_hex_corpus_seed(data: &[u8]) -> Option<Vec<u8>> {
+    let hex = data.strip_prefix(b"hex:")?;
+    let hex = hex.strip_suffix(b"\n").unwrap_or(hex);
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        decoded.push((high << 4) | low);
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// ISO seek decoder: arbitrary volume and directory records must not panic.
@@ -119,9 +215,311 @@ pub fn read_iso(data: &[u8]) {
     drive_seek(data);
 }
 
-/// UDF seek decoder: arbitrary anchors, descriptors, ICBs, and extents must not panic.
+/// UDF seek decoder: arbitrary anchors, physical/metadata/virtual maps, VATs, ICBs, and
+/// extents must remain bounded and panic-free.
 pub fn read_udf(data: &[u8]) {
     drive_seek(data);
+}
+
+struct CabFuzzVolumeResolver {
+    volumes: BTreeMap<VolumeId, Arc<dyn ReadAt>>,
+}
+
+impl VolumeResolver for CabFuzzVolumeResolver {
+    fn resolve(&self, volume: VolumeId) -> std::io::Result<Option<Arc<dyn ReadAt>>> {
+        Ok(self.volumes.get(&volume).cloned())
+    }
+}
+
+/// Parses the stable multi-volume corpus envelope:
+/// `OXCV 01`, one-byte volume count, then repeated little-endian `u32` length
+/// and exact volume bytes. Malformed envelopes fall back to ordinary single-CAB
+/// fuzzing so every input still exercises a parser.
+fn framed_cab_volumes(data: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut remaining = data.strip_prefix(CAB_VOLUME_FRAME_MAGIC)?;
+    let (&count, rest) = remaining.split_first()?;
+    let count = usize::from(count);
+    if !(1..=MAX_CAB_FUZZ_VOLUMES).contains(&count) {
+        return None;
+    }
+    remaining = rest;
+    let mut volumes = Vec::new();
+    volumes.try_reserve_exact(count).ok()?;
+    for _ in 0..count {
+        let length_bytes = remaining.get(..4)?;
+        let length = usize::try_from(u32::from_le_bytes(length_bytes.try_into().ok()?)).ok()?;
+        remaining = remaining.get(4..)?;
+        let volume = remaining.get(..length)?;
+        volumes.push(volume);
+        remaining = remaining.get(length..)?;
+    }
+    remaining.is_empty().then_some(volumes)
+}
+
+fn cab_fuzz_source(index: usize, bytes: &[u8]) -> Option<Arc<dyn ReadAt>> {
+    let identity = SourceIdentity::try_new(format!("fuzz-cab-volume-{index}").into_bytes()).ok()?;
+    Some(Arc::new(MemoryReadAt::new(bytes.to_vec(), identity)))
+}
+
+fn drive_cab_volumes(volumes: &[&[u8]]) {
+    let Some(primary_bytes) = volumes.first() else {
+        return;
+    };
+    let Some(primary) = cab_fuzz_source(0, primary_bytes) else {
+        return;
+    };
+    let mut resolved = BTreeMap::new();
+    for (index, bytes) in volumes.iter().enumerate().skip(1) {
+        let Ok(volume_index) = u32::try_from(index) else {
+            return;
+        };
+        let Some(source) = cab_fuzz_source(index, bytes) else {
+            return;
+        };
+        resolved.insert(VolumeId::new(volume_index), source);
+    }
+    let resolver = Arc::new(CabFuzzVolumeResolver { volumes: resolved });
+    let Ok(source) = VolumeSet::new(primary, resolver, SourceLimits::safe()) else {
+        return;
+    };
+    let Ok(mut reader) = CabVolumeReader::with_limits(&source, fuzz_limits()) else {
+        return;
+    };
+    let mut events = 0_usize;
+    let mut payload = 0_u64;
+    loop {
+        match reader.next_event() {
+            Ok(ReaderEvent::Entry(metadata)) => {
+                let _ = metadata.path().as_bytes();
+                events = events.saturating_add(1);
+            },
+            Ok(ReaderEvent::Data(bytes)) => {
+                payload = payload.saturating_add(bytes.len() as u64);
+            },
+            Ok(ReaderEvent::Done) | Err(_) => return,
+            Ok(ReaderEvent::ArchiveMetadata(_) | ReaderEvent::EndEntry) => {},
+            Ok(_) => return,
+        }
+        if events > MAX_ENTRIES || payload > MAX_TOTAL_BYTES {
+            return;
+        }
+    }
+}
+
+/// CAB single/volume-set decoders: arbitrary tables, continuation chains, and
+/// CFDATA blocks must remain bounded and panic-free.
+pub fn read_cab(data: &[u8]) {
+    let decoded = decode_hex_corpus_seed(data);
+    let bytes = decoded.as_deref().unwrap_or(data);
+    if let Some(volumes) = framed_cab_volumes(bytes) {
+        drive_cab_volumes(&volumes);
+    } else {
+        drive_seek(bytes);
+    }
+}
+
+/// XAR seek decoder: arbitrary headers, XML TOCs, extents, and codecs must not panic.
+pub fn read_xar(data: &[u8]) {
+    if let Some(decoded) = decode_hex_corpus_seed(data) {
+        drive_seek(&decoded);
+    } else {
+        drive_seek(data);
+    }
+}
+
+/// RPM structure, payload-integrity, and nested archive validation must stay bounded and panic-free.
+pub fn package_rpm(data: &[u8]) {
+    let bytes = decode_hex_corpus_seed(data).unwrap_or_else(|| data.to_vec());
+    let _report = PackageVerifier::default()
+        .with_limits(fuzz_limits())
+        .rpm(Cursor::new(bytes));
+}
+
+/// Alpine concatenated-gzip/tar validation must stay bounded and panic-free.
+pub fn package_alpine(data: &[u8]) {
+    static KEY: OnceLock<Option<AlpineRsaPublicKey>> = OnceLock::new();
+    let bytes = decode_hex_corpus_seed(data).unwrap_or_else(|| data.to_vec());
+    let mut verifier = PackageVerifier::default().with_limits(fuzz_limits());
+    if let Some(key) = KEY
+        .get_or_init(|| {
+            AlpineRsaPublicKey::from_pem(ALPINE_KEY_ID.to_vec(), ALPINE_PUBLIC_KEY).ok()
+        })
+        .clone()
+    {
+        verifier = verifier.with_alpine_rsa_public_key(key);
+    }
+    let _report = verifier.alpine_apk(Cursor::new(bytes));
+}
+
+/// ZIP ecosystem integrity validation across all profiles must stay bounded and panic-free.
+pub fn package_zip(data: &[u8]) {
+    let decoded = decode_hex_corpus_seed(data);
+    let input = decoded.as_deref().unwrap_or(data);
+    let (selector, bytes) = input
+        .split_first()
+        .map_or((0, input), |(head, tail)| (*head, tail));
+    let profile = match selector % 4 {
+        0 => ZipPackageProfile::Jar,
+        1 => ZipPackageProfile::NuGet,
+        2 => ZipPackageProfile::Wheel,
+        _ => ZipPackageProfile::Epub,
+    };
+    let _report = PackageVerifier::default()
+        .with_limits(fuzz_limits())
+        .zip(profile, Cursor::new(bytes));
+}
+
+const CTS_APK_V4: &[u8] = include_bytes!(
+    "../../../libarchive_oxide-package/tests/fixtures/android_apk_v4/v4-digest-v2v3.apk"
+);
+const CTS_APK_V4_IDSIG: &[u8] = include_bytes!(
+    "../../../libarchive_oxide-package/tests/fixtures/android_apk_v4/v4-digest-v2v3.apk.idsig"
+);
+
+/// APK, IPA, MSIX, and explicit APK-v4 sidecar validators must reject hostile
+/// signing blocks and metadata without panics.
+pub fn package_app(data: &[u8]) {
+    let decoded = decode_hex_corpus_seed(data);
+    let input = decoded.as_deref().unwrap_or(data);
+    if let Some((&0xfe, mutations)) = input.split_first() {
+        let mut idsig = CTS_APK_V4_IDSIG.to_vec();
+        for mutation in mutations.chunks_exact(5).take(64) {
+            let Some(offset_bytes) = mutation.get(..4) else {
+                continue;
+            };
+            let Ok(offset) = <[u8; 4]>::try_from(offset_bytes) else {
+                continue;
+            };
+            let offset = usize::try_from(u32::from_le_bytes(offset)).unwrap_or(usize::MAX);
+            let Some(mask) = mutation.get(4).copied() else {
+                continue;
+            };
+            if let Some(byte) = idsig.get_mut(offset % CTS_APK_V4_IDSIG.len()) {
+                *byte ^= mask;
+            }
+        }
+        let _report = PackageVerifier::default()
+            .with_limits(fuzz_limits())
+            .android_apk_with_v4_sidecar(Cursor::new(CTS_APK_V4), Cursor::new(idsig));
+        return;
+    }
+    if let Some((&0xff, envelope)) = input.split_first() {
+        let Some(length_bytes) = envelope.get(..4) else {
+            return;
+        };
+        let Ok(length_bytes) = <[u8; 4]>::try_from(length_bytes) else {
+            return;
+        };
+        let apk_length = usize::try_from(u32::from_le_bytes(length_bytes)).unwrap_or(usize::MAX);
+        let Some(payload) = envelope.get(4..) else {
+            return;
+        };
+        let split = apk_length.min(payload.len());
+        let (apk, idsig) = payload.split_at(split);
+        let _report = PackageVerifier::default()
+            .with_limits(fuzz_limits())
+            .android_apk_with_v4_sidecar(Cursor::new(apk), Cursor::new(idsig));
+        return;
+    }
+    let (selector, bytes) = if input.starts_with(b"PK") {
+        let selector = if input
+            .windows(b"AppxBlockMap.xml".len())
+            .any(|window| window == b"AppxBlockMap.xml")
+        {
+            2
+        } else if input
+            .windows(b"Payload/".len())
+            .any(|window| window == b"Payload/")
+        {
+            1
+        } else {
+            0
+        };
+        (selector, input)
+    } else {
+        input
+            .split_first()
+            .map_or((0, input), |(head, tail)| (*head, tail))
+    };
+    let profile = match selector % 3 {
+        0 => AppPackageProfile::AndroidApk,
+        1 => AppPackageProfile::Ipa,
+        _ => AppPackageProfile::Msix,
+    };
+    let _report = PackageVerifier::default()
+        .with_limits(fuzz_limits())
+        .app(profile, Cursor::new(bytes));
+}
+
+/// Safe-extraction planning must classify arbitrary platform/path spellings without escape or panic.
+pub fn extraction_plan(data: &[u8]) {
+    let mut name = data
+        .iter()
+        .copied()
+        .take(96)
+        .map(|byte| if byte == 0 { b'_' } else { byte })
+        .collect::<Vec<_>>();
+    while matches!(name.last(), Some(b'\r' | b'\n')) {
+        name.pop();
+    }
+    if name.is_empty() {
+        name.extend_from_slice(b"entry");
+    }
+    let selector = name[0] % 4;
+    let mut alias = match selector {
+        0 => name
+            .iter()
+            .map(|byte| byte.to_ascii_uppercase())
+            .collect::<Vec<_>>(),
+        1 => {
+            let mut candidate = name.clone();
+            candidate.push(b'.');
+            candidate
+        },
+        2 => {
+            let mut candidate = name.clone();
+            candidate.push(b' ');
+            candidate
+        },
+        _ => b"cafe\xcc\x81.txt".to_vec(),
+    };
+    if selector == 3 {
+        name = "café.txt".as_bytes().to_vec();
+    }
+    alias.truncate(96);
+    let body = data.iter().copied().rev().take(512).collect::<Vec<_>>();
+    let Ok(mut writer) =
+        ArchiveWriter::with_format_and_limits(Vec::new(), FormatId::Tar, fuzz_limits())
+    else {
+        return;
+    };
+    for path in [name, alias] {
+        let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_bytes(path))
+            .size(Some(body.len() as u64))
+            .mode(Some(0o644))
+            .build();
+        if writer.start_entry(&metadata).is_err()
+            || writer.write_data(&body).is_err()
+            || writer.end_entry().is_err()
+        {
+            return;
+        }
+    }
+    let Ok(archive) = writer.finish() else {
+        return;
+    };
+    let Ok(mut session) = ArchiveEngine::new()
+        .with_limits(fuzz_limits())
+        .with_spool_limits(64 * 1024, 2 * 1024 * 1024)
+        .prepare(Cursor::new(archive))
+    else {
+        return;
+    };
+    if let Ok(plan) = session.plan(Policy::safe()) {
+        for entry in plan.entries() {
+            let _ = (entry.descriptor(), entry.disposition());
+        }
+    }
 }
 
 /// Synthesized archive member.
@@ -371,6 +769,17 @@ pub fn codec_gzip(data: &[u8]) {
     }
 }
 
+/// Unix `compress(1)` LZW protocol target with bounded dictionary and output.
+pub fn codec_lzw(data: &[u8]) {
+    let decoded = decode_hex_corpus_seed(data);
+    let input = decoded.as_deref().unwrap_or(data);
+    filtered_decode_no_panic(input);
+    let Ok(decoder) = CompressDecoder::with_limits(fuzz_limits()) else {
+        return;
+    };
+    codec_decode_no_panic(decoder, input);
+}
+
 fn filtered_decode_no_panic(data: &[u8]) {
     let Ok(reader) = FilterReader::with_limits(Cursor::new(data), fuzz_limits()) else {
         return;
@@ -393,9 +802,44 @@ pub fn codec_xz(data: &[u8]) {
     filtered_decode_no_panic(data);
 }
 
-/// LZ4 incremental filter target.
+/// Strict lzip member parser and bounded LZMA filter target.
+pub fn codec_lzip(data: &[u8]) {
+    let decoded = decode_hex_corpus_seed(data);
+    filtered_decode_no_panic(decoded.as_deref().unwrap_or(data));
+}
+
+/// LZ4 filter and direct sans-I/O progress-contract target.
 pub fn codec_lz4(data: &[u8]) {
     filtered_decode_no_panic(data);
+    let mut codec = Lz4Decoder::with_limits(fuzz_limits());
+    let mut input = data;
+    let mut output = [0_u8; 257];
+    let mut total = 0usize;
+    loop {
+        let Ok(step) = codec.process(input, &mut output, EndOfInput::End) else {
+            return;
+        };
+        if step.consumed > input.len() || step.produced > output.len() {
+            panic!("LZ4 codec reported out-of-range progress");
+        }
+        if step.status == CodecStatus::NeedInput && step.consumed != input.len() {
+            panic!("LZ4 codec requested input while supplied bytes remained");
+        }
+        if step.status == CodecStatus::NeedOutput && step.produced != output.len() {
+            panic!("LZ4 codec requested output before filling the supplied buffer");
+        }
+        if step.status == CodecStatus::Done && step.consumed != input.len() {
+            panic!("LZ4 codec completed while supplied bytes remained");
+        }
+        input = &input[step.consumed..];
+        total = total.saturating_add(step.produced);
+        if total > CODEC_CAP || matches!(step.status, CodecStatus::Done) {
+            return;
+        }
+        if step.consumed == 0 && step.produced == 0 {
+            return;
+        }
+    }
 }
 
 fn read_capped<R: Read>(mut reader: R, cap: usize) -> Option<Vec<u8>> {
@@ -487,8 +931,8 @@ const GRAPH_METHOD_IDS: &[&[u8]] = &[
     &[0x04, 0x02, 0x02],       // BZip2
     &[0x04, 0xF7, 0x11, 0x01], // Zstd
     &[0x06, 0xF1, 0x07, 0x01], // AES-256
-    &[0x03, 0x04, 0x01],       // PPMd (deferred → Unsupported)
-    &[0x03, 0x03, 0x01, 0x1B], // BCJ2 (multi-stream, deferred → Unsupported)
+    &[0x03, 0x04, 0x01],       // PPMd7 (bounded decode)
+    &[0x03, 0x03, 0x01, 0x1B], // BCJ2 (bounded four-stream decode)
     &[0x00],                   // Copy / unknown
 ];
 
@@ -776,7 +1220,7 @@ fn pool_index(pool: &[u8], k: usize, modulus: usize) -> usize {
 
 /// Asserts a 7z read failure is a *typed* archive error of an expected kind — the RM-303 contract
 /// that a hostile coder graph never panics, never leaks an untyped error, and never silently lies.
-fn assert_graph_typed(error: &StreamError) {
+fn assert_graph_typed(error: &Error) {
     match error.archive_error().map(ArchiveError::kind) {
         Some(
             ErrorKind::Malformed | ErrorKind::Unsupported | ErrorKind::Integrity | ErrorKind::Limit,
@@ -824,7 +1268,8 @@ pub fn read_7z_graph(data: &[u8]) {
     }
 }
 
-/// All portable fuzz targets.
+/// All stable replay targets; every entry except `codec_lzip` also has a
+/// libFuzzer shim.
 pub const TARGETS: &[&str] = &[
     "read_tar",
     "read_cpio",
@@ -834,17 +1279,26 @@ pub const TARGETS: &[&str] = &[
     "read_7z_graph",
     "read_iso",
     "read_udf",
+    "read_cab",
+    "read_xar",
     "roundtrip_tar",
     "roundtrip_cpio",
     "roundtrip_ar",
     "roundtrip_7z",
     "roundtrip_iso",
     "codec_gzip",
+    "codec_lzw",
     "codec_bzip2",
     "codec_zstd",
     "codec_xz",
+    "codec_lzip",
     "codec_lz4",
     "codec_lzma2",
+    "package_rpm",
+    "package_alpine",
+    "package_zip",
+    "package_app",
+    "extraction_plan",
 ];
 
 /// Runs a portable fuzz target.
@@ -858,17 +1312,26 @@ pub fn run_target(name: &str, data: &[u8]) {
         "read_7z_graph" => read_7z_graph(data),
         "read_iso" => read_iso(data),
         "read_udf" => read_udf(data),
+        "read_cab" => read_cab(data),
+        "read_xar" => read_xar(data),
         "roundtrip_tar" => roundtrip_tar(&entries_from_bytes(data)),
         "roundtrip_cpio" => roundtrip_cpio(&entries_from_bytes(data)),
         "roundtrip_ar" => roundtrip_ar(&entries_from_bytes(data)),
         "roundtrip_7z" => roundtrip_7z(&entries_from_bytes(data)),
         "roundtrip_iso" => roundtrip_iso(&entries_from_bytes(data)),
         "codec_gzip" => codec_gzip(data),
+        "codec_lzw" => codec_lzw(data),
         "codec_bzip2" => codec_bzip2(data),
         "codec_zstd" => codec_zstd(data),
         "codec_xz" => codec_xz(data),
+        "codec_lzip" => codec_lzip(data),
         "codec_lz4" => codec_lz4(data),
         "codec_lzma2" => codec_lzma2(data),
+        "package_rpm" => package_rpm(data),
+        "package_alpine" => package_alpine(data),
+        "package_zip" => package_zip(data),
+        "package_app" => package_app(data),
+        "extraction_plan" => extraction_plan(data),
         _ => {},
     }
 }

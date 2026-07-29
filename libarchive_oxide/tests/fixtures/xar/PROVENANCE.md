@@ -53,9 +53,10 @@ flate2 = "1"   # zlib (RFC-1950) TOC + x-gzip heap blobs for the raw-xar-builder
   Each regular file has a `<data>` child declaring `<length>` (decoded),
   `<offset>` (heap-relative), `<size>` (stored), and an
   `<encoding style="…"/>`. A `<creation-time>` element is present and ignored.
-- **Heap:** STORED blobs are copied verbatim; `x-gzip` blobs are zlib streams,
-  placed at the declared offsets. Blobs are addressed only by offset/size (never
-  positional), matching XAR's unordered/shared-heap model.
+- **Heap:** STORED blobs are copied verbatim; `x-gzip` blobs are zlib streams and
+  `x-bzip2` blobs are independently encoded bzip2 streams, placed at the declared
+  offsets. Blobs are addressed only by offset/size (never positional), matching
+  XAR's unordered/shared-heap model.
 
 ## Case coverage this slice
 
@@ -63,6 +64,11 @@ flate2 = "1"   # zlib (RFC-1950) TOC + x-gzip heap blobs for the raw-xar-builder
   small STORED file, larger zlib (`x-gzip`) file, empty file (no `<data>`),
   nested directory + file-in-subdir. arca reads each back to byte-identical
   content, dir before its children.
+- **BZip2 interop and adversarial coverage
+  (`xar_bzip2_streams_and_enforces_integrity_and_memory_limits`):** a bzip2 stream
+  produced independently through the `bzip2` crate is decoded incrementally by
+  arca. The case covers large and empty members, corrupt input, an incorrect
+  declared decoded length, and a codec-memory limit below the decoder workspace.
 - **Negative — unsupported encoding (`xar_unsupported_encoding_errors`):** a
   `<data>` with `style="application/x-lzma"` yields a structured
   `ErrorKind::Unsupported` (format `"xar"`) at read time.

@@ -15,6 +15,7 @@ use libarchive_oxide_core::{
     EntryMetadata, ErrorKind, FormatId, Limits,
 };
 
+use crate::BackendPreference;
 #[cfg(feature = "aes")]
 use crate::SecretBytes;
 use crate::async_filter::{AsyncFilterReader, AsyncFilterWriter};
@@ -45,24 +46,26 @@ enum AsyncReaderInput<R> {
 }
 
 impl<R: AsyncRead + Unpin> AsyncReaderInput<R> {
-    fn new(input: R, limits: Limits) -> Self {
+    fn new(input: R, limits: Limits, backend: BackendPreference) -> Self {
         let depth = limits.filter_depth().unwrap_or(4).min(4);
         if depth == 0 {
             return Self::Plain(input);
         }
-        let one = AsyncFilterReader::new(input, limits);
+        let one = AsyncFilterReader::with_backend(input, limits, backend);
         if depth == 1 {
             return Self::One(Box::new(one));
         }
-        let two = AsyncFilterReader::new(one, limits);
+        let two = AsyncFilterReader::with_backend(one, limits, backend);
         if depth == 2 {
             return Self::Two(Box::new(two));
         }
-        let three = AsyncFilterReader::new(two, limits);
+        let three = AsyncFilterReader::with_backend(two, limits, backend);
         if depth == 3 {
             return Self::Three(Box::new(three));
         }
-        Self::Four(Box::new(AsyncFilterReader::new(three, limits)))
+        Self::Four(Box::new(AsyncFilterReader::with_backend(
+            three, limits, backend,
+        )))
     }
 
     fn poll_read(
@@ -79,13 +82,17 @@ impl<R: AsyncRead + Unpin> AsyncReaderInput<R> {
         }
     }
 
-    fn into_inner(self) -> R {
+    fn into_inner(self) -> Result<R, ArchiveError> {
         match self {
-            Self::Plain(input) => input,
+            Self::Plain(input) => Ok(input),
             Self::One(input) => (*input).into_inner(),
-            Self::Two(input) => (*input).into_inner().into_inner(),
-            Self::Three(input) => (*input).into_inner().into_inner().into_inner(),
-            Self::Four(input) => (*input).into_inner().into_inner().into_inner().into_inner(),
+            Self::Two(input) => (*input).into_inner()?.into_inner(),
+            Self::Three(input) => (*input).into_inner()?.into_inner()?.into_inner(),
+            Self::Four(input) => (*input)
+                .into_inner()?
+                .into_inner()?
+                .into_inner()?
+                .into_inner(),
         }
     }
 }
@@ -100,12 +107,65 @@ impl<R: AsyncRead + Unpin> AsyncArchiveReader<R> {
     /// Creates a reader with explicit resource limits.
     #[must_use]
     pub fn with_limits(reader: R, limits: Limits) -> Self {
+        Self::with_backend(reader, limits, BackendPreference::Auto)
+    }
+
+    /// Creates a reader with explicit limits and codec backend preference.
+    #[must_use]
+    pub fn with_backend(reader: R, limits: Limits, backend: BackendPreference) -> Self {
         Self {
-            reader: AsyncReaderInput::new(reader, limits),
-            pipeline: Pipeline::after_filter_adapters(limits),
+            reader: AsyncReaderInput::new(reader, limits, backend),
+            pipeline: Pipeline::after_filter_adapters_with_backend(limits, backend),
             read_buffer: vec![0; BUFFER],
             event_data: Vec::with_capacity(BUFFER),
         }
+    }
+
+    /// Creates an asynchronous reader for an explicit sequential format.
+    ///
+    /// This is required for signatureless formats such as [`FormatId::Raw`].
+    /// Outer compression filters remain auto-detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the format is unknown, disabled, write-only, or
+    /// requires seekable input.
+    pub fn with_format(reader: R, format: FormatId) -> Result<Self, ArchiveError> {
+        Self::with_format_and_limits(reader, format, Limits::default())
+    }
+
+    /// Creates an explicit-format asynchronous reader with custom limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the format cannot be decoded by the sequential
+    /// built-in provider.
+    pub fn with_format_and_limits(
+        reader: R,
+        format: FormatId,
+        limits: Limits,
+    ) -> Result<Self, ArchiveError> {
+        Self::with_backend_and_format(reader, format, limits, BackendPreference::Auto)
+    }
+
+    /// Creates an explicit-format asynchronous reader and selects a codec backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the format cannot be decoded by the sequential
+    /// built-in provider.
+    pub fn with_backend_and_format(
+        reader: R,
+        format: FormatId,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
+        Ok(Self {
+            reader: AsyncReaderInput::new(reader, limits, backend),
+            pipeline: Pipeline::after_filter_adapters_with_format(limits, backend, format)?,
+            read_buffer: vec![0; BUFFER],
+            event_data: Vec::with_capacity(BUFFER),
+        })
     }
 
     /// Produces the next structural event with bounded backpressure.
@@ -173,9 +233,13 @@ impl<R: AsyncRead + Unpin> AsyncArchiveReader<R> {
         }
     }
 
-    /// Returns the wrapped asynchronous input.
-    #[must_use]
-    pub fn into_inner(self) -> R {
+    /// Returns the wrapped asynchronous input when ownership is recoverable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error if codec construction failed after consuming
+    /// ownership of an inner adapter.
+    pub fn into_inner(self) -> Result<R, ArchiveError> {
         self.reader.into_inner()
     }
 
@@ -235,9 +299,20 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveWriter<W> {
 
     /// Creates a sequential asynchronous ZIP writer with an explicit method.
     pub fn with_zip_method(output: W, method: ZipMethod, limits: Limits) -> Self {
+        Self::with_zip_method_and_backend(output, method, limits, BackendPreference::Auto)
+    }
+
+    /// Creates an asynchronous ZIP writer with an explicit codec backend.
+    #[must_use]
+    pub fn with_zip_method_and_backend(
+        output: W,
+        method: ZipMethod,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
         Self {
             output: AsyncFilterWriter::Plain(output),
-            encoder: RuntimeEncoder::zip(limits, method),
+            encoder: RuntimeEncoder::zip_with_backend(limits, method, backend),
             format: FormatId::Zip,
             buffer: vec![0; BUFFER],
             failed: false,
@@ -263,9 +338,28 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveWriter<W> {
         password: SecretBytes,
         limits: Limits,
     ) -> Self {
+        Self::with_zip_password_and_backend(
+            output,
+            method,
+            password,
+            limits,
+            BackendPreference::Auto,
+        )
+    }
+
+    /// Creates an encrypted asynchronous ZIP writer with a codec backend.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zip_password_and_backend(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
         Self {
             output: AsyncFilterWriter::Plain(output),
-            encoder: RuntimeEncoder::encrypted_zip(limits, method, password),
+            encoder: RuntimeEncoder::encrypted_zip_with_backend(limits, method, password, backend),
             format: FormatId::Zip,
             buffer: vec![0; BUFFER],
             failed: false,
@@ -279,9 +373,20 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveWriter<W> {
         filter: Option<FilterId>,
         limits: Limits,
     ) -> Result<Self, ArchiveError> {
+        Self::with_filter_and_backend(output, format, filter, limits, BackendPreference::Auto)
+    }
+
+    /// Creates an asynchronous writer with an outer filter and codec backend.
+    pub fn with_filter_and_backend(
+        output: W,
+        format: FormatId,
+        filter: Option<FilterId>,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
         Ok(Self {
-            output: AsyncFilterWriter::new(output, filter)?,
-            encoder: RuntimeEncoder::sequential(format, limits)?,
+            output: AsyncFilterWriter::with_backend(output, filter, backend)?,
+            encoder: RuntimeEncoder::sequential_with_backend(format, limits, backend)?,
             format,
             buffer: vec![0; BUFFER],
             failed: false,
@@ -349,6 +454,7 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveWriter<W> {
     /// Begins an entry. Tar requires a declared size.
     pub async fn start_entry(&mut self, metadata: &EntryMetadata) -> Result<(), StreamError> {
         self.ensure_live()?;
+        metadata.validate().map_err(StreamError::archive)?;
         loop {
             let step = self
                 .encoder

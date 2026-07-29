@@ -316,17 +316,27 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
         self.validate_identifiers(&order)?;
 
         for &directory in &order {
-            let primary = layout_length(&self.build_directory_records(directory, false)?);
-            let joliet = layout_length(&self.build_directory_records(directory, true)?);
+            let primary = layout_length(&self.build_directory_records(directory, false, None)?);
+            let joliet = layout_length(&self.build_directory_records(directory, true, None)?);
             self.nodes[directory].primary_size = u32::try_from(primary)
                 .map_err(|_| iso_error(ErrorKind::Limit, "ISO directory extent exceeds u32"))?;
             self.nodes[directory].joliet_size = u32::try_from(joliet)
                 .map_err(|_| iso_error(ErrorKind::Limit, "Joliet directory extent exceeds u32"))?;
         }
 
+        let mut continuation_probe = SuspContinuationArea::new(0);
+        for &directory in &order {
+            self.build_directory_records(directory, false, Some(&mut continuation_probe))?;
+        }
+        let continuation_size = continuation_probe.bytes.len();
         let primary_path_size = self.path_table_size(&order, false);
         let joliet_path_size = self.path_table_size(&order, true);
-        self.check_final_metadata_size(&order, primary_path_size, joliet_path_size)?;
+        self.check_final_metadata_size(
+            &order,
+            primary_path_size,
+            joliet_path_size,
+            continuation_size,
+        )?;
 
         let mut lba = self.current_lba()?;
         let primary_l_path = lba;
@@ -345,6 +355,8 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
                     .map_err(|_| iso_error(ErrorKind::Limit, "directory size exceeds usize"))?,
             )?;
         }
+        let continuation_lba = lba;
+        lba = advance_lba(lba, continuation_size)?;
         for &directory in &order {
             self.nodes[directory].joliet_lba = lba;
             lba = advance_lba(
@@ -363,13 +375,24 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
         self.write_padded_region(&joliet_l)?;
         let joliet_m = self.build_path_table(&order, true, true)?;
         self.write_padded_region(&joliet_m)?;
+        let mut continuations = SuspContinuationArea::new(continuation_lba);
         for &directory in &order {
-            let records = self.build_directory_records(directory, false)?;
+            let records =
+                self.build_directory_records(directory, false, Some(&mut continuations))?;
             let extent = layout_records(&records);
             self.output.write_all(&extent).map_err(StreamError::io)?;
         }
+        if continuations.bytes.len() != continuation_size {
+            return Err(iso_error(
+                ErrorKind::Protocol,
+                "ISO continuation layout changed between planning and emission",
+            ));
+        }
+        if !continuations.bytes.is_empty() {
+            self.write_padded_region(&continuations.bytes)?;
+        }
         for &directory in &order {
-            let records = self.build_directory_records(directory, true)?;
+            let records = self.build_directory_records(directory, true, None)?;
             let extent = layout_records(&records);
             self.output.write_all(&extent).map_err(StreamError::io)?;
         }
@@ -629,13 +652,7 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
                 validate_identifier(&self.directory_identifier(directory, joliet))?;
                 for child in self.sorted_children(directory) {
                     validate_identifier(&self.child_identifier(child, joliet))?;
-                    let record = self.directory_record_for_child(child, joliet)?;
-                    if record.len() > usize::from(u8::MAX) {
-                        return Err(iso_error(
-                            ErrorKind::Unsupported,
-                            "ISO directory record requires an unsupported continuation area",
-                        ));
-                    }
+                    self.directory_record_for_child(child, joliet, None)?;
                 }
             }
         }
@@ -646,6 +663,7 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
         &self,
         directory: usize,
         joliet: bool,
+        mut continuations: Option<&mut SuspContinuationArea>,
     ) -> Result<Vec<Vec<u8>>, StreamError> {
         let mut records = Vec::new();
         let (own_lba, own_size) = self.directory_extent(directory, joliet);
@@ -654,13 +672,14 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
         } else {
             self.rock_ridge_system_use(directory, directory == 0, true)?
         };
-        records.push(directory_record(
+        records.push(continued_directory_record(
             &[0],
             own_lba,
             own_size,
             true,
             self.recording_time(directory),
             &own_system_use,
+            continuations.as_deref_mut(),
         )?);
         let parent = self.nodes[directory].parent;
         let (parent_lba, parent_size) = self.directory_extent(parent, joliet);
@@ -673,7 +692,11 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
             &[],
         )?);
         for child in self.sorted_children(directory) {
-            records.push(self.directory_record_for_child(child, joliet)?);
+            records.push(self.directory_record_for_child(
+                child,
+                joliet,
+                continuations.as_deref_mut(),
+            )?);
         }
         Ok(records)
     }
@@ -682,6 +705,7 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
         &self,
         child: usize,
         joliet: bool,
+        continuation: Option<&mut SuspContinuationArea>,
     ) -> Result<Vec<u8>, StreamError> {
         let node = &self.nodes[child];
         let identifier = self.child_identifier(child, joliet);
@@ -695,13 +719,14 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
         } else {
             self.rock_ridge_system_use(child, false, false)?
         };
-        directory_record(
+        continued_directory_record(
             &identifier,
             lba,
             size,
             node.is_directory(),
             self.recording_time(child),
             &system_use,
+            continuation,
         )
     }
 
@@ -735,9 +760,7 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
         }
         push_susp_field(&mut fields, *b"RR", &[rr_flags])?;
         if !dot_record {
-            let mut name = vec![0];
-            name.extend_from_slice(&node.name);
-            push_susp_field(&mut fields, *b"NM", &name)?;
+            push_nm_fields(&mut fields, &node.name)?;
         }
         let metadata = node.metadata.as_ref();
         let mode = full_mode(node.kind, metadata.and_then(EntryMetadata::mode));
@@ -782,8 +805,7 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
             let target = metadata
                 .and_then(EntryMetadata::link_target)
                 .ok_or_else(|| iso_error(ErrorKind::Protocol, "ISO symlink target is missing"))?;
-            let sl = symbolic_link_value(target.as_bytes())?;
-            push_susp_field(&mut fields, *b"SL", &sl)?;
+            push_symbolic_link_fields(&mut fields, target.as_bytes())?;
         }
         if let Some(metadata) = metadata {
             if let Some(tf) = timestamp_field(metadata.times()) {
@@ -903,6 +925,7 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
         order: &[usize],
         primary_path_size: usize,
         joliet_path_size: usize,
+        continuation_size: usize,
     ) -> Result<(), StreamError> {
         let directory_bytes = order.iter().try_fold(0_usize, |total, &directory| {
             total
@@ -911,10 +934,19 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
                     value.checked_add(usize::try_from(self.nodes[directory].joliet_size).ok()?)
                 })
         });
+        let continuation_bytes = if continuation_size == 0 {
+            0
+        } else {
+            continuation_size
+                .div_ceil(SECTOR)
+                .checked_mul(SECTOR)
+                .ok_or_else(|| iso_error(ErrorKind::Limit, "ISO continuation size overflow"))?
+        };
         let total = primary_path_size
             .checked_mul(2)
             .and_then(|value| value.checked_add(joliet_path_size.checked_mul(2)?))
             .and_then(|value| value.checked_add(directory_bytes?))
+            .and_then(|value| value.checked_add(continuation_bytes))
             .ok_or_else(|| iso_error(ErrorKind::Limit, "ISO final metadata size overflow"))?;
         if self
             .limits
@@ -1055,6 +1087,39 @@ fn archive_metadata_cost(metadata: &ArchiveMetadata) -> Result<usize, StreamErro
     Ok(cost)
 }
 
+struct SuspContinuationArea {
+    base_lba: u32,
+    bytes: Vec<u8>,
+}
+
+impl SuspContinuationArea {
+    const fn new(base_lba: u32) -> Self {
+        Self {
+            base_lba,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<Vec<u8>, StreamError> {
+        let absolute_offset = self.bytes.len();
+        let block_delta = u32::try_from(absolute_offset / SECTOR)
+            .map_err(|_| iso_error(ErrorKind::Limit, "ISO continuation LBA exceeds u32"))?;
+        let block = self
+            .base_lba
+            .checked_add(block_delta)
+            .ok_or_else(|| iso_error(ErrorKind::Limit, "ISO continuation LBA overflow"))?;
+        let offset = u32::try_from(absolute_offset % SECTOR)
+            .map_err(|_| iso_error(ErrorKind::Limit, "ISO continuation offset exceeds u32"))?;
+        let length = u32::try_from(bytes.len())
+            .map_err(|_| iso_error(ErrorKind::Limit, "ISO continuation length exceeds u32"))?;
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| iso_error(ErrorKind::Limit, "ISO continuation allocation failed"))?;
+        self.bytes.extend_from_slice(bytes);
+        continuation_field(block, offset, length)
+    }
+}
+
 fn directory_record(
     identifier: &[u8],
     lba: u32,
@@ -1063,21 +1128,76 @@ fn directory_record(
     recording_time: [u8; 7],
     system_use: &[u8],
 ) -> Result<Vec<u8>, StreamError> {
+    continued_directory_record(
+        identifier,
+        lba,
+        size,
+        directory,
+        recording_time,
+        system_use,
+        None,
+    )
+}
+
+fn continued_directory_record(
+    identifier: &[u8],
+    lba: u32,
+    size: u32,
+    directory: bool,
+    recording_time: [u8; 7],
+    system_use: &[u8],
+    continuation: Option<&mut SuspContinuationArea>,
+) -> Result<Vec<u8>, StreamError> {
     let identifier_end = DIRECTORY_RECORD_BASE
         .checked_add(identifier.len())
         .ok_or_else(|| iso_error(ErrorKind::Limit, "ISO directory record length overflow"))?;
     let system_use_start = identifier_end
         .checked_add(usize::from(identifier.len().is_multiple_of(2)))
         .ok_or_else(|| iso_error(ErrorKind::Limit, "ISO directory record length overflow"))?;
-    let length = system_use_start
-        .checked_add(system_use.len())
-        .ok_or_else(|| iso_error(ErrorKind::Limit, "ISO directory record length overflow"))?;
-    let record_length = u8::try_from(length).map_err(|_| {
-        iso_error(
+    if system_use_start > usize::from(u8::MAX) {
+        return Err(iso_error(
             ErrorKind::Unsupported,
-            "ISO directory record requires an unsupported continuation area",
-        )
-    })?;
+            "ISO identifier leaves no room in its directory record",
+        ));
+    }
+    let available = usize::from(u8::MAX) - system_use_start;
+    let record_system_use = if system_use.len() <= available {
+        system_use.to_vec()
+    } else {
+        let inline_capacity = available.checked_sub(28).ok_or_else(|| {
+            iso_error(
+                ErrorKind::Unsupported,
+                "ISO identifier leaves no room for a continuation entry",
+            )
+        })?;
+        let inline = susp_field_prefix(system_use, inline_capacity)?;
+        let continued = system_use.get(inline..).ok_or_else(|| {
+            iso_error(
+                ErrorKind::Malformed,
+                "ISO continuation split exceeds system-use data",
+            )
+        })?;
+        let ce = if let Some(area) = continuation {
+            area.append(continued)?
+        } else {
+            continuation_field(
+                0,
+                0,
+                u32::try_from(continued.len()).map_err(|_| {
+                    iso_error(ErrorKind::Limit, "ISO continuation length exceeds u32")
+                })?,
+            )?
+        };
+        let mut fields = Vec::with_capacity(inline + ce.len());
+        fields.extend_from_slice(&system_use[..inline]);
+        fields.extend_from_slice(&ce);
+        fields
+    };
+    let length = system_use_start
+        .checked_add(record_system_use.len())
+        .ok_or_else(|| iso_error(ErrorKind::Limit, "ISO directory record length overflow"))?;
+    let record_length = u8::try_from(length)
+        .map_err(|_| iso_error(ErrorKind::Limit, "ISO directory record exceeds u8"))?;
     let mut record = vec![0_u8; length];
     record[0] = record_length;
     record[2..10].copy_from_slice(&both_endian_u32(lba));
@@ -1088,8 +1208,50 @@ fn directory_record(
     record[32] = u8::try_from(identifier.len())
         .map_err(|_| iso_error(ErrorKind::Unsupported, "ISO identifier exceeds u8"))?;
     record[DIRECTORY_RECORD_BASE..identifier_end].copy_from_slice(identifier);
-    record[system_use_start..].copy_from_slice(system_use);
+    record[system_use_start..].copy_from_slice(&record_system_use);
     Ok(record)
+}
+
+fn susp_field_prefix(system_use: &[u8], maximum: usize) -> Result<usize, StreamError> {
+    let mut cursor = 0;
+    while cursor < system_use.len() {
+        let length = usize::from(*system_use.get(cursor + 2).ok_or_else(|| {
+            iso_error(
+                ErrorKind::Malformed,
+                "truncated ISO system-use field header",
+            )
+        })?);
+        if length < 4 {
+            return Err(iso_error(
+                ErrorKind::Malformed,
+                "invalid ISO system-use field length",
+            ));
+        }
+        let end = cursor
+            .checked_add(length)
+            .ok_or_else(|| iso_error(ErrorKind::Limit, "ISO system-use length overflow"))?;
+        if end > system_use.len() {
+            return Err(iso_error(
+                ErrorKind::Malformed,
+                "ISO system-use field exceeds its data",
+            ));
+        }
+        if end > maximum {
+            break;
+        }
+        cursor = end;
+    }
+    Ok(cursor)
+}
+
+fn continuation_field(block: u32, offset: u32, length: u32) -> Result<Vec<u8>, StreamError> {
+    let mut value = Vec::with_capacity(24);
+    value.extend_from_slice(&both_endian_u32(block));
+    value.extend_from_slice(&both_endian_u32(offset));
+    value.extend_from_slice(&both_endian_u32(length));
+    let mut field = Vec::with_capacity(28);
+    push_susp_field(&mut field, *b"CE", &value)?;
+    Ok(field)
 }
 
 fn layout_length(records: &[Vec<u8>]) -> usize {
@@ -1253,11 +1415,26 @@ fn push_susp_field(
     Ok(())
 }
 
+fn push_nm_fields(output: &mut Vec<u8>, name: &[u8]) -> Result<(), StreamError> {
+    if name.is_empty() {
+        return push_susp_field(output, *b"NM", &[0]);
+    }
+    let chunks = name.chunks(250);
+    let count = chunks.len();
+    for (index, chunk) in chunks.enumerate() {
+        let mut value = Vec::with_capacity(chunk.len() + 1);
+        value.push(u8::from(index + 1 != count));
+        value.extend_from_slice(chunk);
+        push_susp_field(output, *b"NM", &value)?;
+    }
+    Ok(())
+}
+
 fn append_raw_system_use(output: &mut Vec<u8>, extension: &Extension) -> Result<(), StreamError> {
     if extension.namespace() != "iso-system-use"
         || matches!(
             extension.key(),
-            b"SP" | b"RR" | b"NM" | b"PX" | b"PN" | b"SL" | b"TF"
+            b"SP" | b"RR" | b"NM" | b"PX" | b"PN" | b"SL" | b"TF" | b"CE" | b"ST"
         )
     {
         return Ok(());
@@ -1276,32 +1453,61 @@ fn append_raw_system_use(output: &mut Vec<u8>, extension: &Extension) -> Result<
     push_susp_field(output, [extension.key()[0], extension.key()[1]], value)
 }
 
-fn symbolic_link_value(target: &[u8]) -> Result<Vec<u8>, StreamError> {
-    let mut value = vec![0];
+fn push_symbolic_link_fields(output: &mut Vec<u8>, target: &[u8]) -> Result<(), StreamError> {
+    let mut components = Vec::new();
     let absolute = target.starts_with(b"/");
     if absolute {
-        value.extend_from_slice(&[0x08, 0]);
+        components.push(vec![0x08, 0]);
     }
     for component in target
         .split(|byte| *byte == b'/')
         .filter(|part| !part.is_empty())
     {
-        match component {
-            b"." => value.extend_from_slice(&[0x02, 0]),
-            b".." => value.extend_from_slice(&[0x04, 0]),
+        let encoded = match component {
+            b"." => vec![0x02, 0],
+            b".." => vec![0x04, 0],
             _ => {
-                value.push(0);
-                value.push(u8::try_from(component.len()).map_err(|_| {
+                let length = u8::try_from(component.len()).map_err(|_| {
                     iso_error(
                         ErrorKind::Unsupported,
                         "Rock Ridge symlink component exceeds u8",
                     )
-                })?);
-                value.extend_from_slice(component);
+                })?;
+                if component.len() > 248 {
+                    return Err(iso_error(
+                        ErrorKind::Unsupported,
+                        "Rock Ridge symlink component requires component continuation",
+                    ));
+                }
+                let mut encoded = Vec::with_capacity(component.len() + 2);
+                encoded.extend_from_slice(&[0, length]);
+                encoded.extend_from_slice(component);
+                encoded
             },
-        }
+        };
+        components.push(encoded);
     }
-    Ok(value)
+    let mut groups = vec![Vec::new()];
+    for component in components {
+        let current = groups.last_mut().ok_or_else(|| {
+            iso_error(ErrorKind::Protocol, "Rock Ridge symlink group disappeared")
+        })?;
+        if !current.is_empty() && current.len() + component.len() > 250 {
+            groups.push(Vec::new());
+        }
+        groups
+            .last_mut()
+            .ok_or_else(|| iso_error(ErrorKind::Protocol, "Rock Ridge symlink group disappeared"))?
+            .extend_from_slice(&component);
+    }
+    let count = groups.len();
+    for (index, group) in groups.into_iter().enumerate() {
+        let mut value = Vec::with_capacity(group.len() + 1);
+        value.push(u8::from(index + 1 != count));
+        value.extend_from_slice(&group);
+        push_susp_field(output, *b"SL", &value)?;
+    }
+    Ok(())
 }
 
 fn timestamp_field(times: libarchive_oxide_core::EntryTimes) -> Option<Vec<u8>> {
@@ -1332,7 +1538,7 @@ fn long_timestamp(timestamp: Timestamp) -> Option<[u8; 17]> {
     if !(0..=9999).contains(&year) {
         return None;
     }
-    let hundredths = timestamp.nanos / 10_000_000;
+    let hundredths = timestamp.nanoseconds() / 10_000_000;
     let text = format!("{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}{hundredths:02}");
     let mut encoded = [0_u8; 17];
     encoded[..16].copy_from_slice(text.as_bytes());
@@ -1356,11 +1562,11 @@ fn short_timestamp(timestamp: Timestamp) -> Option<[u8; 7]> {
 }
 
 fn timestamp_parts(timestamp: Timestamp) -> Option<(i32, u8, u8, u8, u8, u8)> {
-    if timestamp.nanos >= 1_000_000_000 {
+    if timestamp.nanoseconds() >= 1_000_000_000 {
         return None;
     }
-    let days = timestamp.secs.div_euclid(86_400);
-    let seconds = timestamp.secs.rem_euclid(86_400);
+    let days = timestamp.seconds().div_euclid(86_400);
+    let seconds = timestamp.seconds().rem_euclid(86_400);
     let shifted = days.checked_add(719_468)?;
     let era = shifted.div_euclid(146_097);
     let day_of_era = shifted - era * 146_097;

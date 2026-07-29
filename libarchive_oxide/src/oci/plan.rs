@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Owner};
 
 use super::digest::LayerDigests;
-use crate::engine::Policy;
-use crate::path::{sanitize, sanitize_archive_path};
+use crate::extraction::Policy;
+use crate::path::{DestinationClaims, DestinationKey, sanitize, sanitize_archive_path};
 
 /// The whiteout prefix that marks a deletion entry.
 const WHITEOUT_PREFIX: &[u8] = b".wh.";
@@ -307,9 +307,9 @@ pub(crate) struct OciLayerPlanner<'a, M: OwnershipMapper> {
     policy: Policy,
     mapper: &'a M,
     operations: Vec<OciPlanOperation>,
-    claimed: BTreeSet<PathBuf>,
-    committed_files: BTreeSet<PathBuf>,
-    symlinks: BTreeSet<PathBuf>,
+    claimed: DestinationClaims,
+    committed_files: BTreeSet<DestinationKey>,
+    symlinks: BTreeSet<DestinationKey>,
 }
 
 impl<'a, M: OwnershipMapper> OciLayerPlanner<'a, M> {
@@ -318,7 +318,7 @@ impl<'a, M: OwnershipMapper> OciLayerPlanner<'a, M> {
             policy,
             mapper,
             operations: Vec::new(),
-            claimed: BTreeSet::new(),
+            claimed: DestinationClaims::default(),
             committed_files: BTreeSet::new(),
             symlinks: BTreeSet::new(),
         }
@@ -367,13 +367,14 @@ impl<'a, M: OwnershipMapper> OciLayerPlanner<'a, M> {
         }) {
             return reject(path, OciRejection::UnsupportedKind);
         }
-        let Some(destination) = sanitize_archive_path(&path) else {
+        let Some(destination_key) = DestinationKey::from_archive_path(&path) else {
             return reject(path, OciRejection::UnsafePath);
         };
+        let destination = destination_key.path().to_path_buf();
         if self.escapes_symlink(&destination) {
             return reject(path, OciRejection::SymlinkEscape);
         }
-        if !self.claimed.insert(destination.clone()) {
+        if !self.claimed.claim(&destination_key, metadata.kind()) {
             return reject(path, OciRejection::Duplicate);
         }
         let link_target = match self.link_target(&metadata) {
@@ -386,10 +387,10 @@ impl<'a, M: OwnershipMapper> OciLayerPlanner<'a, M> {
 
         match metadata.kind() {
             EntryKind::File | EntryKind::Hardlink => {
-                self.committed_files.insert(destination.clone());
+                self.committed_files.insert(destination_key.clone());
             },
             EntryKind::Symlink => {
-                self.symlinks.insert(destination.clone());
+                self.symlinks.insert(destination_key);
             },
             _ => {},
         }
@@ -429,10 +430,10 @@ impl<'a, M: OwnershipMapper> OciLayerPlanner<'a, M> {
                 }
                 let target = metadata
                     .link_target()
-                    .and_then(sanitize_archive_path)
+                    .and_then(DestinationKey::from_archive_path)
                     .ok_or(OciRejection::UnsafeLinkTarget)?;
-                if self.committed_files.contains(&target) {
-                    Ok(Some(target))
+                if let Some(committed_target) = self.committed_files.get(&target) {
+                    Ok(Some(committed_target.path().to_path_buf()))
                 } else {
                     Err(OciRejection::UnsafeLinkTarget)
                 }
@@ -460,7 +461,9 @@ impl<'a, M: OwnershipMapper> OciLayerPlanner<'a, M> {
             if prefix.as_path() == destination {
                 break;
             }
-            if self.symlinks.contains(&prefix) {
+            if DestinationKey::from_relative_path(prefix.clone())
+                .is_some_and(|key| self.symlinks.contains(&key))
+            {
                 return true;
             }
         }

@@ -16,8 +16,9 @@ binding.
 - private-field `EntryMetadata`, raw `ArchivePath`, `ArchiveMetadata`, and
   namespaced extension preservation
 - finite-by-default `Limits` and context-rich `ArchiveError`
-- incremental tar, cpio, and ar decoders/encoders, including newc/crc/odc and
-  binary LE/BE cpio plus typed hardlink normalization
+- incremental tar, cpio, and ar decoders/encoders plus a read-only WARC
+  1.0/1.1 decoder, including newc/crc/odc and binary LE/BE cpio plus typed
+  hardlink normalization
 - opaque format identifiers for adapter-side static dispatch
 
 Use [`libarchive_oxide`](https://crates.io/crates/libarchive_oxide) for codecs,
@@ -30,7 +31,7 @@ filesystem extraction.
 |---|:---:|---|
 | `std` | no | reserved standard-library adapters |
 
-MSRV: Rust 1.85.
+MSRV: Rust 1.88.
 
 ## License
 

@@ -7,13 +7,12 @@
 //!
 //! An OCI image layer is an immutable blob addressed by digest. Object stores
 //! and HTTP servers can serve any sub-range of such a blob, which is exactly the
-//! shape the [`RangeSource`] contract expects. This example shows how to bridge
+//! shape the object-safe [`ReadAt`] contract expects. This example shows how to bridge
 //! *any* ranged-fetch mechanism to the OCI layer engine without embedding a
 //! single HTTP client or cloud SDK.
 //!
 //! The bridge is one generic type, [`FetchRange`], parameterized over a fetch
-//! closure `FnMut(offset, len) -> io::Result<Vec<u8>>`. Static dispatch only:
-//! there are no trait objects. The closure is where a real deployment would call
+//! closure `Fn(offset, len) -> io::Result<Vec<u8>>`. The closure is where a real deployment would call
 //! its transport of choice. The transport is injected, never depended upon:
 //!
 //! * **HTTP / HTTPS** — issue `GET` with header `Range: bytes=<a>-<b>` and read
@@ -38,15 +37,14 @@
 
 use std::io;
 
-use libarchive_oxide::libarchive_oxide_core::{
-    ArchivePath, EntryKind, EntryMetadata, FilterId, FormatId,
-};
+use libarchive_oxide::advanced::{RangeReader, ReadAt, SourceIdentity, SourceIdentityError};
 use libarchive_oxide::{
     ArchiveEngine, CreateOptions, IdentityOwnership, LayerDigests, OciLayerApplier, OciLayerEngine,
-    Policy, RangeReader, RangeSource, SourceIdentity,
+    Policy,
 };
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FilterId, FormatId};
 
-/// An immutable [`RangeSource`] backed by an injected ranged-fetch closure.
+/// An immutable [`ReadAt`] backed by an injected ranged-fetch closure.
 ///
 /// `F` performs one ranged read: given a byte `offset` and a maximum length, it
 /// returns the bytes actually available at that offset. Returning fewer bytes
@@ -61,7 +59,7 @@ struct FetchRange<F> {
 
 impl<F> FetchRange<F>
 where
-    F: FnMut(u64, usize) -> io::Result<Vec<u8>>,
+    F: Fn(u64, usize) -> io::Result<Vec<u8>> + Send + Sync,
 {
     /// Builds a range source of `length` bytes with an opaque `identity`.
     fn new(length: u64, identity: SourceIdentity, fetch: F) -> Self {
@@ -73,9 +71,9 @@ where
     }
 }
 
-impl<F> RangeSource for FetchRange<F>
+impl<F> ReadAt for FetchRange<F>
 where
-    F: FnMut(u64, usize) -> io::Result<Vec<u8>>,
+    F: Fn(u64, usize) -> io::Result<Vec<u8>> + Send + Sync,
 {
     fn len(&self) -> u64 {
         self.length
@@ -85,7 +83,7 @@ where
         &self.identity
     }
 
-    fn read_range(&mut self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {
             return Ok(0);
         }
@@ -98,14 +96,35 @@ where
     }
 }
 
+type RangeFetch = Box<dyn Fn(u64, usize) -> io::Result<Vec<u8>> + Send + Sync>;
+type RangeSource = FetchRange<RangeFetch>;
+
 /// Formats an inclusive HTTP byte-range value, e.g. `bytes=0-1023`.
 ///
 /// Every adapter here shares this value; the protocols differ only in which
 /// header or request field carries it. `len` is always at least one because
 /// [`RangeReader`] never issues an empty fetch.
-fn byte_range_value(offset: u64, len: usize) -> String {
-    let last = offset + len as u64 - 1;
-    format!("bytes={offset}-{last}")
+fn byte_range_value(offset: u64, len: usize) -> io::Result<String> {
+    let len = u64::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "range length exceeds u64"))?;
+    let last = offset
+        .checked_add(len)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range arithmetic overflow"))?;
+    Ok(format!("bytes={offset}-{last}"))
+}
+
+fn transport_range_source<T>(
+    length: u64,
+    identity: &[u8],
+    transport: T,
+) -> Result<RangeSource, SourceIdentityError>
+where
+    T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
+{
+    let identity = SourceIdentity::try_new(identity.to_vec())?;
+    let fetch: RangeFetch = Box::new(move |offset, len| transport(&byte_range_value(offset, len)?));
+    Ok(FetchRange::new(length, identity, fetch))
 }
 
 /// Range source over an **HTTP/HTTPS** endpoint that honors `Range: bytes=`.
@@ -117,15 +136,12 @@ fn byte_range_value(offset: u64, len: usize) -> String {
 fn http_range_source<T>(
     length: u64,
     etag: &[u8],
-    mut transport: T,
-) -> FetchRange<impl FnMut(u64, usize) -> io::Result<Vec<u8>>>
+    transport: T,
+) -> Result<RangeSource, SourceIdentityError>
 where
-    T: FnMut(&str) -> io::Result<Vec<u8>>,
+    T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
-    let identity = SourceIdentity::new(etag.to_vec());
-    FetchRange::new(length, identity, move |offset, len| {
-        transport(&byte_range_value(offset, len))
-    })
+    transport_range_source(length, etag, transport)
 }
 
 /// Range source over an **Amazon S3** object via `GetObject`.
@@ -137,15 +153,12 @@ where
 fn s3_range_source<T>(
     length: u64,
     version_id: &[u8],
-    mut transport: T,
-) -> FetchRange<impl FnMut(u64, usize) -> io::Result<Vec<u8>>>
+    transport: T,
+) -> Result<RangeSource, SourceIdentityError>
 where
-    T: FnMut(&str) -> io::Result<Vec<u8>>,
+    T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
-    let identity = SourceIdentity::new(version_id.to_vec());
-    FetchRange::new(length, identity, move |offset, len| {
-        transport(&byte_range_value(offset, len))
-    })
+    transport_range_source(length, version_id, transport)
 }
 
 /// Range source over **Google Cloud Storage** media downloads.
@@ -157,15 +170,12 @@ where
 fn gcs_range_source<T>(
     length: u64,
     generation: &[u8],
-    mut transport: T,
-) -> FetchRange<impl FnMut(u64, usize) -> io::Result<Vec<u8>>>
+    transport: T,
+) -> Result<RangeSource, SourceIdentityError>
 where
-    T: FnMut(&str) -> io::Result<Vec<u8>>,
+    T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
-    let identity = SourceIdentity::new(generation.to_vec());
-    FetchRange::new(length, identity, move |offset, len| {
-        transport(&byte_range_value(offset, len))
-    })
+    transport_range_source(length, generation, transport)
 }
 
 /// Range source over **Azure Blob Storage** via `Get Blob`.
@@ -176,15 +186,12 @@ where
 fn azure_range_source<T>(
     length: u64,
     etag: &[u8],
-    mut transport: T,
-) -> FetchRange<impl FnMut(u64, usize) -> io::Result<Vec<u8>>>
+    transport: T,
+) -> Result<RangeSource, SourceIdentityError>
 where
-    T: FnMut(&str) -> io::Result<Vec<u8>>,
+    T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
-    let identity = SourceIdentity::new(etag.to_vec());
-    FetchRange::new(length, identity, move |offset, len| {
-        transport(&byte_range_value(offset, len))
-    })
+    transport_range_source(length, etag, transport)
 }
 
 /// Serves a `bytes=<a>-<b>` range from an in-memory blob.
@@ -238,12 +245,9 @@ fn build_demo_layer() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 /// Streams every entry from a range-backed layer and returns its digests.
-fn inspect<S: RangeSource>(
-    source: S,
-    label: &str,
-) -> Result<LayerDigests, Box<dyn std::error::Error>> {
+fn inspect<S: ReadAt>(source: S, label: &str) -> Result<LayerDigests, Box<dyn std::error::Error>> {
     // `RangeReader` gives the engine a `Read` view over the ranged source.
-    let reader = RangeReader::new(source);
+    let reader = RangeReader::new(source)?;
     let mut session = OciLayerEngine::new().open(reader)?;
     println!("--- {label} ---");
     while let Some(entry) = session.next_entry()? {
@@ -271,25 +275,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http = http_range_source(length, b"\"etag-http-v1\"", {
         let blob = blob.clone();
         move |range| serve_range(&blob, range)
-    });
+    })?;
     let http_digests = inspect(http, "HTTP Range")?;
 
     let s3 = s3_range_source(length, b"s3-version-id-abc123", {
         let blob = blob.clone();
         move |range| serve_range(&blob, range)
-    });
+    })?;
     let s3_digests = inspect(s3, "Amazon S3 GetObject")?;
 
     let gcs = gcs_range_source(length, b"1699999999000001", {
         let blob = blob.clone();
         move |range| serve_range(&blob, range)
-    });
+    })?;
     let gcs_digests = inspect(gcs, "Google Cloud Storage")?;
 
     let azure = azure_range_source(length, b"0x8DABCDEF0123456", {
         let blob = blob.clone();
         move |range| serve_range(&blob, range)
-    });
+    })?;
     let azure_digests = inspect(azure, "Azure Blob Storage")?;
 
     // Every adapter reads the identical bytes, so every digest pair must match.
@@ -304,8 +308,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let planning_source = s3_range_source(length, b"s3-version-id-abc123", {
         let blob = blob.clone();
         move |range| serve_range(&blob, range)
-    });
-    let mut applier = OciLayerApplier::new(RangeReader::new(planning_source));
+    })?;
+    let mut applier = OciLayerApplier::new(RangeReader::new(planning_source)?);
     let plan = applier.plan(http_digests, Policy::safe(), &IdentityOwnership)?;
     println!(
         "planned {} operation(s) from the range-backed blob (no filesystem touched)",

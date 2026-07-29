@@ -8,11 +8,14 @@
 //! TOC into bounded UTF-8 XML, walks the `<file>` tree with a hand-rolled bounded
 //! pull-scanner (no DOM, no XML crate), and streams heap payloads per file in
 //! `<= 64 KiB` chunks. Supported data encodings: `application/octet-stream`
-//! (stored) and `application/x-gzip` (zlib RFC-1950). Every other encoding, and
-//! `application/x-bzip2`, surface a structured `Unsupported` error at read time.
+//! (stored), `application/x-gzip` (zlib RFC-1950), and feature-gated
+//! `application/x-bzip2`. Every other encoding surfaces a structured
+//! `Unsupported` error at read time.
 
 use std::io::{Read, Seek, SeekFrom};
 
+#[cfg(feature = "bzip2")]
+use bzip2::{Decompress as Bzip2Decompress, Status as Bzip2Status};
 use libarchive_oxide_core::{
     ArchiveError, ArchiveMetadata, ArchivePath, EntryKind, EntryMetadata, EntryTimes, ErrorKind,
     Limits, Owner, PathEncoding, Timestamp,
@@ -30,6 +33,9 @@ const MIN_HEADER: u16 = 28;
 const BUFFER: usize = 64 * 1024;
 /// Cap on `<file>` element nesting depth.
 const MAX_DEPTH: usize = 256;
+/// Approximate maximum workspace of libbz2's small-memory decoder.
+#[cfg(feature = "bzip2")]
+const BZIP2_SMALL_MEMORY: usize = 2_300 * 1024;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Error helper
@@ -54,6 +60,8 @@ enum XarEncoding {
     Stored,
     /// `application/x-gzip`: a zlib (RFC-1950) stream — the XAR default.
     Zlib,
+    /// `application/x-bzip2`.
+    Bzip2,
     /// A recognized-but-unsupported or unknown encoding style.
     Unsupported,
 }
@@ -88,6 +96,16 @@ struct XarFile {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Streaming heap-payload decoder for the currently-open entry.
+#[cfg(feature = "bzip2")]
+struct Bzip2Payload {
+    comp_remaining: u64,
+    decoder: Box<Bzip2Decompress>,
+    input: Vec<u8>,
+    input_pos: usize,
+    input_len: usize,
+    finished: bool,
+}
+
 enum Payload {
     /// Copy `remaining` bytes straight from the heap.
     Stored { remaining: u64 },
@@ -100,6 +118,9 @@ enum Payload {
         in_len: usize,
         finished: bool,
     },
+    /// Incremental bzip2 stream, compiled only when the codec is enabled.
+    #[cfg(feature = "bzip2")]
+    Bzip2(Bzip2Payload),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,13 +191,13 @@ impl<R: Read + Seek> XarSeekReader<R> {
             .ok_or_else(|| xar_error(ErrorKind::Malformed, "xar TOC region beyond end of file"))?;
 
         // Bound the decoded TOC by the metadata budget before inflating.
-        if let Some(maximum) = limits.metadata_bytes() {
-            if toc_uncomp > maximum as u64 {
-                return Err(xar_error(
-                    ErrorKind::Limit,
-                    "xar TOC exceeds metadata limit",
-                ));
-            }
+        if let Some(maximum) = limits.metadata_bytes()
+            && toc_uncomp > maximum as u64
+        {
+            return Err(xar_error(
+                ErrorKind::Limit,
+                "xar TOC exceeds metadata limit",
+            ));
         }
         let toc_uncomp_usize = usize::try_from(toc_uncomp)
             .map_err(|_| xar_error(ErrorKind::Limit, "xar TOC exceeds address space"))?;
@@ -220,6 +241,7 @@ impl<R: Read + Seek> XarSeekReader<R> {
                     return Ok(ReaderEvent::Entry(metadata));
                 },
                 XarPhase::Data { remaining: 0 } => {
+                    self.finish_payload()?;
                     self.payload = None;
                     self.phase = XarPhase::EndEntry;
                 },
@@ -271,6 +293,7 @@ impl<R: Read + Seek> XarSeekReader<R> {
                     }
                     remaining -= count as u64;
                 }
+                self.finish_payload()?;
                 self.payload = None;
                 self.phase = XarPhase::EndEntry;
                 Ok(())
@@ -323,10 +346,11 @@ impl<R: Read + Seek> XarSeekReader<R> {
         let link_target = record
             .link_target
             .clone()
-            .map(|target| ArchivePath::from_encoded(target, PathEncoding::Utf8));
+            .map(|target| ArchivePath::try_from_encoded(target, PathEncoding::Utf8))
+            .transpose()?;
         let builder = EntryMetadata::builder(
             record.kind,
-            ArchivePath::from_encoded(record.path.clone(), PathEncoding::Utf8),
+            ArchivePath::try_from_encoded(record.path.clone(), PathEncoding::Utf8)?,
         )
         .size(size)
         .mode(record.mode)
@@ -354,17 +378,16 @@ impl<R: Read + Seek> XarSeekReader<R> {
         let _ = blob_end;
 
         // decoded-total budget.
-        if let Some(maximum) = self.limits.decoded_total() {
-            if self
+        if let Some(maximum) = self.limits.decoded_total()
+            && self
                 .decoded_total
                 .checked_add(data.length)
                 .is_none_or(|total| total > maximum)
-            {
-                return Err(xar_error(
-                    ErrorKind::Limit,
-                    "xar decoded total exceeds limit",
-                ));
-            }
+        {
+            return Err(xar_error(
+                ErrorKind::Limit,
+                "xar decoded total exceeds limit",
+            ));
         }
 
         match data.encoding {
@@ -381,12 +404,8 @@ impl<R: Read + Seek> XarSeekReader<R> {
                 self.payload = Some(Payload::Stored {
                     remaining: data.stored_size,
                 });
-                self.phase = if data.length == 0 {
-                    XarPhase::EndEntry
-                } else {
-                    XarPhase::Data {
-                        remaining: data.length,
-                    }
+                self.phase = XarPhase::Data {
+                    remaining: data.length,
                 };
             },
             XarEncoding::Zlib => {
@@ -401,18 +420,69 @@ impl<R: Read + Seek> XarSeekReader<R> {
                     in_len: 0,
                     finished: false,
                 });
-                self.phase = if data.length == 0 {
-                    XarPhase::EndEntry
-                } else {
-                    XarPhase::Data {
-                        remaining: data.length,
-                    }
+                self.phase = XarPhase::Data {
+                    remaining: data.length,
                 };
+            },
+            XarEncoding::Bzip2 => {
+                #[cfg(feature = "bzip2")]
+                {
+                    self.begin_bzip2_payload(blob_start, data)?;
+                }
+                #[cfg(not(feature = "bzip2"))]
+                {
+                    self.payload = None;
+                    self.phase = XarPhase::Unsupported;
+                }
             },
             XarEncoding::Unsupported => {
                 self.payload = None;
                 self.phase = XarPhase::Unsupported;
             },
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "bzip2")]
+    fn begin_bzip2_payload(
+        &mut self,
+        blob_start: u64,
+        data: XarData,
+    ) -> core::result::Result<(), StreamError> {
+        if self
+            .limits
+            .codec_memory()
+            .is_some_and(|maximum| maximum < BZIP2_SMALL_MEMORY)
+        {
+            return Err(xar_error(
+                ErrorKind::Limit,
+                "xar bzip2 workspace exceeds codec memory limit",
+            ));
+        }
+        self.input
+            .seek(SeekFrom::Start(blob_start))
+            .map_err(StreamError::io)?;
+        self.payload = Some(Payload::Bzip2(Bzip2Payload {
+            comp_remaining: data.stored_size,
+            decoder: Box::new(Bzip2Decompress::new(true)),
+            input: vec![0_u8; BUFFER],
+            input_pos: 0,
+            input_len: 0,
+            finished: false,
+        }));
+        self.phase = XarPhase::Data {
+            remaining: data.length,
+        };
+        Ok(())
+    }
+
+    fn finish_payload(&mut self) -> core::result::Result<(), StreamError> {
+        let mut extra = [0_u8; 1];
+        if read_payload(&mut self.input, self.payload.as_mut(), &mut extra)? != 0 {
+            return Err(xar_error(
+                ErrorKind::Integrity,
+                "xar payload expands beyond its declared length",
+            ));
         }
         Ok(())
     }
@@ -566,6 +636,88 @@ fn read_payload<R: Read>(
                 }
             }
         },
+        #[cfg(feature = "bzip2")]
+        Payload::Bzip2(state) => read_bzip2_payload(input, state, out),
+    }
+}
+
+#[cfg(feature = "bzip2")]
+fn read_bzip2_payload<R: Read>(
+    input: &mut R,
+    state: &mut Bzip2Payload,
+    out: &mut [u8],
+) -> core::result::Result<usize, StreamError> {
+    loop {
+        if state.finished {
+            return Ok(0);
+        }
+        if state.input_pos == state.input_len && state.comp_remaining > 0 {
+            let want = usize::try_from(state.comp_remaining)
+                .unwrap_or(usize::MAX)
+                .min(state.input.len());
+            let count = input
+                .read(&mut state.input[..want])
+                .map_err(StreamError::io)?;
+            if count == 0 {
+                return Err(xar_error(
+                    ErrorKind::Malformed,
+                    "xar heap ended before the bzip2 blob",
+                ));
+            }
+            state.input_pos = 0;
+            state.input_len = count;
+            state.comp_remaining -= count as u64;
+        }
+
+        let before_in = state.decoder.total_in();
+        let before_out = state.decoder.total_out();
+        let status = state
+            .decoder
+            .decompress(&state.input[state.input_pos..state.input_len], out)
+            .map_err(|_| {
+                xar_error(
+                    ErrorKind::Integrity,
+                    "xar bzip2 payload or checksum is invalid",
+                )
+            })?;
+        let consumed = usize::try_from(state.decoder.total_in() - before_in)
+            .map_err(|_| xar_error(ErrorKind::Limit, "xar bzip2 input count overflow"))?;
+        let produced = usize::try_from(state.decoder.total_out() - before_out)
+            .map_err(|_| xar_error(ErrorKind::Limit, "xar bzip2 output count overflow"))?;
+        state.input_pos += consumed;
+
+        match status {
+            Bzip2Status::StreamEnd => {
+                if state.comp_remaining != 0 || state.input_pos != state.input_len {
+                    return Err(xar_error(
+                        ErrorKind::Malformed,
+                        "xar bzip2 stream ended before its declared heap blob",
+                    ));
+                }
+                state.finished = true;
+                return Ok(produced);
+            },
+            Bzip2Status::MemNeeded => {
+                return Err(xar_error(
+                    ErrorKind::Limit,
+                    "xar bzip2 decoder requires more memory",
+                ));
+            },
+            _ if produced != 0 => return Ok(produced),
+            _ if consumed == 0 && state.input_pos != state.input_len => {
+                return Err(xar_error(
+                    ErrorKind::Protocol,
+                    "xar bzip2 decoder made no progress",
+                ));
+            },
+            _ if state.input_pos == state.input_len && state.comp_remaining == 0 => {
+                return Err(xar_error(
+                    ErrorKind::Malformed,
+                    "xar bzip2 blob ended without stream end",
+                ));
+            },
+            _ => {},
+        }
     }
 }
 
@@ -887,21 +1039,21 @@ fn finalize_frame(
         _ => name.to_vec(),
     };
 
-    if let Some(maximum) = limits.path_bytes() {
-        if path.len() > maximum {
-            return Err(xar_error(
-                ErrorKind::Limit,
-                "xar path exceeds configured limit",
-            ));
-        }
+    if let Some(maximum) = limits.path_bytes()
+        && path.len() > maximum
+    {
+        return Err(xar_error(
+            ErrorKind::Limit,
+            "xar path exceeds configured limit",
+        ));
     }
-    if let Some(maximum) = limits.entries() {
-        if files.len() as u64 >= maximum {
-            return Err(xar_error(
-                ErrorKind::Limit,
-                "xar entry count exceeds configured limit",
-            ));
-        }
+    if let Some(maximum) = limits.entries()
+        && files.len() as u64 >= maximum
+    {
+        return Err(xar_error(
+            ErrorKind::Limit,
+            "xar entry count exceeds configured limit",
+        ));
     }
 
     let data = if kind == EntryKind::File && last.has_data {
@@ -910,13 +1062,13 @@ fn finalize_frame(
         let offset = last
             .offset
             .ok_or_else(|| xar_error(ErrorKind::Malformed, "xar data without an offset"))?;
-        if let Some(maximum) = limits.entry_bytes() {
-            if length > maximum {
-                return Err(xar_error(
-                    ErrorKind::Limit,
-                    "xar entry size exceeds configured limit",
-                ));
-            }
+        if let Some(maximum) = limits.entry_bytes()
+            && length > maximum
+        {
+            return Err(xar_error(
+                ErrorKind::Limit,
+                "xar entry size exceeds configured limit",
+            ));
         }
         Some(XarData {
             encoding: last.encoding.unwrap_or(XarEncoding::Stored),
@@ -1105,6 +1257,7 @@ fn classify_encoding(style: &[u8]) -> XarEncoding {
     match style {
         b"application/octet-stream" => XarEncoding::Stored,
         b"application/x-gzip" => XarEncoding::Zlib,
+        b"application/x-bzip2" => XarEncoding::Bzip2,
         _ => XarEncoding::Unsupported,
     }
 }
@@ -1164,11 +1317,11 @@ fn parse_iso8601(bytes: &[u8]) -> Option<Timestamp> {
     }
     let year = i64::try_from(parse_u64(&bytes[0..4])?).ok()?;
     let month = i64::try_from(parse_u64(&bytes[5..7])?).ok()?;
-    let day = i64::try_from(parse_u64(&bytes[8..10])?).ok()?;
+    let day_of_month = i64::try_from(parse_u64(&bytes[8..10])?).ok()?;
     let hour = i64::try_from(parse_u64(&bytes[11..13])?).ok()?;
     let minute = i64::try_from(parse_u64(&bytes[14..16])?).ok()?;
     let second = i64::try_from(parse_u64(&bytes[17..19])?).ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day_of_month) {
         return None;
     }
     // Howard Hinnant's days_from_civil.
@@ -1176,13 +1329,13 @@ fn parse_iso8601(bytes: &[u8]) -> Option<Timestamp> {
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
     let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let day_of_year = (153 * mp + 2) / 5 + day_of_month - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + day_of_year;
     let days = era * 146_097 + doe - 719_468;
     let secs = days
         .checked_mul(86_400)?
         .checked_add(hour * 3600 + minute * 60 + second)?;
-    Some(Timestamp { secs, nanos: 0 })
+    Some(Timestamp::from_seconds(secs))
 }
 
 /// Decodes the five standard XML entities; leaves unknown `&…;` runs literal.

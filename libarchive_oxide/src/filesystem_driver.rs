@@ -6,20 +6,20 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
-use std::path::PathBuf;
 
 use libarchive_oxide_core::{
     ArchiveError, ArchivePath, EntryKind, EntryMetadata, ErrorKind, Limits,
 };
 
-use crate::extractor::{
-    EntryOutcome, EntryOutcomeKind, ExtractionPolicy, ExtractionReport, RejectionReason,
+use crate::engine::{PlanDisposition, PlannedEntry};
+use crate::extraction::{
+    EntryOutcome, EntryOutcomeKind, ExtractionReport, Policy, RejectionReason,
 };
 use crate::filesystem::{
     FilesystemAdapter, FilesystemCapabilities, FilesystemEntry, FilesystemFinding,
     FilesystemFindingKind, FilesystemMaterialization, FilesystemOperation,
 };
-use crate::path::sanitize_archive_path;
+use crate::path::DestinationKey;
 use crate::provider::{StaticCodecProviders, StaticFormatProviders};
 use crate::{ArchiveReader, ReaderEvent, SeekArchiveReader, StreamError};
 
@@ -31,38 +31,41 @@ pub(crate) struct AdapterExtraction {
 struct CurrentEntry {
     path: ArchivePath,
     kind: EntryKind,
+    destination: Option<DestinationKey>,
     materializing: bool,
     direct_outcome: Option<EntryOutcomeKind>,
     requests: Vec<FilesystemOperation>,
 }
-enum Preflight<T> {
-    Ready(T),
-    Rejected,
-}
 
-struct AdapterDriver<'a, A: FilesystemAdapter> {
-    adapter: &'a mut A,
-    policy: ExtractionPolicy,
+struct AdapterDriver<'adapter, 'plan, A: FilesystemAdapter> {
+    adapter: &'adapter mut A,
+    planned: &'plan [PlannedEntry],
+    policy: Policy,
     limits: Limits,
     capabilities: FilesystemCapabilities,
     extraction: ExtractionReport,
     findings: Vec<FilesystemFinding>,
     expected: Vec<(ArchivePath, FilesystemOperation)>,
-    committed_files: BTreeSet<PathBuf>,
+    committed_files: BTreeSet<DestinationKey>,
     current: Option<CurrentEntry>,
     entries_seen: u64,
 }
 
-impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
+impl<'adapter, 'plan, A: FilesystemAdapter> AdapterDriver<'adapter, 'plan, A> {
     fn new(
-        adapter: &'a mut A,
-        policy: ExtractionPolicy,
+        adapter: &'adapter mut A,
+        policy: Policy,
         limits: Limits,
+        planned: &'plan [PlannedEntry],
     ) -> Result<Self, StreamError> {
+        // Destination identities and collisions were fixed by
+        // `ArchiveSession::plan`; this driver binds replayed metadata to those
+        // opaque entries instead of deriving a second filesystem path.
         let capabilities = adapter.capabilities();
         adapter.begin_session().map_err(adapter_error)?;
         Ok(Self {
             adapter,
+            planned,
             policy,
             limits,
             capabilities,
@@ -81,7 +84,18 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
                 "entry began before the preceding entry ended",
             ));
         }
+        let planned_index = usize::try_from(self.entries_seen)
+            .map_err(|_| protocol_error("planned entry index exceeds the host range"))?;
         self.observe_entry(metadata)?;
+        let planned = self
+            .planned
+            .get(planned_index)
+            .ok_or_else(|| protocol_error("archive contains an entry absent from its plan"))?;
+        if planned.descriptor().metadata() != metadata {
+            return Err(protocol_error(
+                "archive entry metadata differs from the preflighted plan",
+            ));
+        }
         let path = metadata.path().clone();
         let requests = requested_operations(metadata);
         self.expected.extend(
@@ -90,14 +104,46 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
                 .cloned()
                 .map(|operation| (path.clone(), operation)),
         );
-        let destination = match self.destination_for(metadata, &requests) {
-            Preflight::Ready(destination) => destination,
-            Preflight::Rejected => return Ok(()),
-        };
-        let link_target = match self.link_target_for(metadata, &requests) {
-            Preflight::Ready(target) => target,
-            Preflight::Rejected => return Ok(()),
-        };
+        match planned.disposition() {
+            PlanDisposition::Skip => {
+                self.findings.push(FilesystemFinding::applied(
+                    path.clone(),
+                    FilesystemOperation::Entry,
+                ));
+                self.current = Some(CurrentEntry {
+                    path,
+                    kind: metadata.kind(),
+                    destination: None,
+                    materializing: false,
+                    direct_outcome: Some(EntryOutcomeKind::Skipped),
+                    requests,
+                });
+                return Ok(());
+            },
+            PlanDisposition::Reject(reason) => {
+                self.reject(metadata, &requests, reason, rejection_detail(reason));
+                return Ok(());
+            },
+            PlanDisposition::Materialize => {},
+        }
+        let destination = planned
+            .destination()
+            .ok_or_else(|| protocol_error("materializing plan entry has no destination"))?
+            .clone();
+        let link_target = planned.link_target().cloned();
+        if metadata.kind() == EntryKind::Hardlink
+            && link_target
+                .as_ref()
+                .is_none_or(|target| !self.committed_files.contains(target))
+        {
+            self.reject(
+                metadata,
+                &requests,
+                RejectionReason::UnsafeLinkTarget,
+                "hard-link target was not committed earlier in this apply session",
+            );
+            return Ok(());
+        }
         if !self.entry_kind_allowed(metadata, &requests) {
             return Ok(());
         }
@@ -113,145 +159,20 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
         self.adapter
             .begin_entry(FilesystemEntry::new(
                 metadata,
-                &destination,
-                link_target.as_deref(),
-                self.policy.overwrites(),
+                destination.path(),
+                link_target.as_ref().map(DestinationKey::path),
+                self.policy.overwrite(),
             ))
             .map_err(adapter_error)?;
         self.current = Some(CurrentEntry {
             path,
             kind: metadata.kind(),
+            destination: Some(destination),
             materializing: true,
             direct_outcome: None,
             requests,
         });
         Ok(())
-    }
-
-    fn destination_for(
-        &mut self,
-        metadata: &EntryMetadata,
-        requests: &[FilesystemOperation],
-    ) -> Preflight<PathBuf> {
-        let path = metadata.path().clone();
-        if metadata.extensions().iter().any(|extension| {
-            extension.namespace() == "ar-thin" && extension.key() == b"external-reference"
-        }) {
-            self.reject(
-                metadata,
-                requests,
-                RejectionReason::ExternalReference,
-                "external archive references are never materialized",
-            );
-            return Preflight::Rejected;
-        }
-        if metadata.kind() == EntryKind::Dir && matches!(path.as_bytes(), b"." | b"./") {
-            self.findings.push(FilesystemFinding::applied(
-                path.clone(),
-                FilesystemOperation::Entry,
-            ));
-            self.current = Some(CurrentEntry {
-                path,
-                kind: metadata.kind(),
-                materializing: false,
-                direct_outcome: Some(EntryOutcomeKind::Skipped),
-                requests: requests.to_vec(),
-            });
-            return Preflight::Rejected;
-        }
-        if let Some(destination) = sanitize_archive_path(&path) {
-            Preflight::Ready(destination)
-        } else {
-            self.reject(
-                metadata,
-                requests,
-                RejectionReason::UnsafePath,
-                "archive path is unsafe or cannot be represented",
-            );
-            Preflight::Rejected
-        }
-    }
-
-    fn link_target_for(
-        &mut self,
-        metadata: &EntryMetadata,
-        requests: &[FilesystemOperation],
-    ) -> Preflight<Option<PathBuf>> {
-        match metadata.kind() {
-            EntryKind::Symlink => {
-                if !self.policy.symlinks() {
-                    self.reject(
-                        metadata,
-                        requests,
-                        RejectionReason::EntryKind,
-                        "symbolic-link restoration is disabled by policy",
-                    );
-                    return Preflight::Rejected;
-                }
-                if !self.capabilities.symlinks() {
-                    self.reject(
-                        metadata,
-                        requests,
-                        RejectionReason::UnsupportedRestore,
-                        "filesystem adapter does not support symbolic links",
-                    );
-                    return Preflight::Rejected;
-                }
-                if let Some(target) = metadata.link_target().and_then(sanitize_archive_path) {
-                    Preflight::Ready(Some(target))
-                } else {
-                    self.reject(
-                        metadata,
-                        requests,
-                        RejectionReason::UnsafeLinkTarget,
-                        "symbolic-link target is absent or unsafe",
-                    );
-                    Preflight::Rejected
-                }
-            },
-            EntryKind::Hardlink => self.hardlink_target_for(metadata, requests),
-            _ => Preflight::Ready(None),
-        }
-    }
-
-    fn hardlink_target_for(
-        &mut self,
-        metadata: &EntryMetadata,
-        requests: &[FilesystemOperation],
-    ) -> Preflight<Option<PathBuf>> {
-        if !self.policy.hardlinks() {
-            self.reject(
-                metadata,
-                requests,
-                RejectionReason::EntryKind,
-                "hard-link restoration is disabled by policy",
-            );
-            return Preflight::Rejected;
-        }
-        if !self.capabilities.hardlinks() {
-            self.reject(
-                metadata,
-                requests,
-                RejectionReason::UnsupportedRestore,
-                "filesystem adapter does not support hard links",
-            );
-            return Preflight::Rejected;
-        }
-        if let Some(target) = metadata
-            .link_target()
-            .and_then(sanitize_archive_path)
-            .filter(|target| self.committed_files.contains(target))
-        {
-            Preflight::Ready(Some(target))
-        } else {
-            self.reject(
-                metadata,
-                requests,
-                RejectionReason::UnsafeLinkTarget,
-                "hard-link target was not committed earlier in this session",
-            );
-            Preflight::Rejected
-        }
     }
 
     fn entry_kind_allowed(
@@ -264,14 +185,6 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
                 RejectionReason::UnsupportedRestore,
                 "filesystem adapter cannot atomically publish regular files",
             )),
-            EntryKind::Char | EntryKind::Block | EntryKind::Fifo | EntryKind::Socket
-                if !self.policy.special_files() =>
-            {
-                Some((
-                    RejectionReason::EntryKind,
-                    "special-file restoration is disabled by policy",
-                ))
-            },
             EntryKind::Char | EntryKind::Block | EntryKind::Fifo | EntryKind::Socket
                 if !self.capabilities.special_files() =>
             {
@@ -312,6 +225,7 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
         self.current = Some(CurrentEntry {
             path,
             kind: metadata.kind(),
+            destination: None,
             materializing: false,
             direct_outcome: Some(EntryOutcomeKind::Rejected(reason)),
             requests: requests.to_vec(),
@@ -347,8 +261,8 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
         let outcome = match materialization {
             FilesystemMaterialization::File if current.kind == EntryKind::File => {
                 self.committed_files
-                    .insert(sanitize_archive_path(&current.path).ok_or_else(|| {
-                        protocol_error("adapter completed a file whose path became invalid")
+                    .insert(current.destination.clone().ok_or_else(|| {
+                        protocol_error("adapter completed a file without a validated destination")
                     })?);
                 EntryOutcomeKind::File
             },
@@ -360,8 +274,10 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
             },
             FilesystemMaterialization::Hardlink if current.kind == EntryKind::Hardlink => {
                 self.committed_files
-                    .insert(sanitize_archive_path(&current.path).ok_or_else(|| {
-                        protocol_error("adapter completed a hard link whose path became invalid")
+                    .insert(current.destination.clone().ok_or_else(|| {
+                        protocol_error(
+                            "adapter completed a hard link without a validated destination",
+                        )
                     })?);
                 EntryOutcomeKind::Hardlink
             },
@@ -417,6 +333,13 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
         if self.adapter.capabilities() != self.capabilities {
             return Err(protocol_error(
                 "filesystem adapter capabilities changed during an apply session",
+            ));
+        }
+        let observed = usize::try_from(self.entries_seen)
+            .map_err(|_| protocol_error("observed entry count exceeds the host range"))?;
+        if observed != self.planned.len() {
+            return Err(protocol_error(
+                "archive ended before every preflighted plan entry was observed",
             ));
         }
         let mut deferred = self.adapter.finish_session().map_err(adapter_error)?;
@@ -490,11 +413,12 @@ impl<'a, A: FilesystemAdapter> AdapterDriver<'a, A> {
     }
 }
 
-pub(crate) fn extract_registered_with_adapter<R, F, C, A>(
+pub(crate) fn apply_registered_plan<R, F, C, A>(
     reader: &mut ArchiveReader<R, F, C>,
     adapter: &mut A,
-    policy: ExtractionPolicy,
+    policy: Policy,
     limits: Limits,
+    planned: &[PlannedEntry],
 ) -> Result<AdapterExtraction, StreamError>
 where
     R: Read,
@@ -502,7 +426,7 @@ where
     C: StaticCodecProviders,
     A: FilesystemAdapter,
 {
-    let mut driver = AdapterDriver::new(adapter, policy, limits)?;
+    let mut driver = AdapterDriver::new(adapter, policy, limits, planned)?;
     loop {
         let event = match reader.next_event() {
             Ok(event) => event,
@@ -521,17 +445,18 @@ where
     }
 }
 
-pub(crate) fn extract_seek_with_adapter<R, A>(
+pub(crate) fn apply_seek_plan<R, A>(
     reader: &mut SeekArchiveReader<R>,
     adapter: &mut A,
-    policy: ExtractionPolicy,
+    policy: Policy,
     limits: Limits,
+    planned: &[PlannedEntry],
 ) -> Result<AdapterExtraction, StreamError>
 where
     R: Read + Seek,
     A: FilesystemAdapter,
 {
-    let mut driver = AdapterDriver::new(adapter, policy, limits)?;
+    let mut driver = AdapterDriver::new(adapter, policy, limits, planned)?;
     loop {
         let event = match reader.next_event() {
             Ok(event) => event,
@@ -547,6 +472,23 @@ where
             ReaderEvent::EndEntry => driver.end_entry()?,
             ReaderEvent::Done => return driver.finish(),
         }
+    }
+}
+
+const fn rejection_detail(reason: RejectionReason) -> &'static str {
+    match reason {
+        RejectionReason::UnsafePath => "archive path is unsafe or cannot be represented",
+        RejectionReason::DestinationCollision => {
+            "another archive entry already claims this host destination"
+        },
+        RejectionReason::DestinationExists => "destination already exists",
+        RejectionReason::EntryKind => "entry kind is disabled by extraction policy",
+        RejectionReason::UnsafeLinkTarget => "link target is absent, unsafe, or uncommitted",
+        RejectionReason::ExternalReference => "external archive references are never materialized",
+        RejectionReason::UnsupportedRestore => {
+            "requested entry restoration is unsupported on this platform"
+        },
+        RejectionReason::FilesystemError => "filesystem adapter refused the entry",
     }
 }
 

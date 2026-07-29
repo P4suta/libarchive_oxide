@@ -790,8 +790,8 @@ impl TarDecoder {
         }
         while self.sparse.get(self.sparse_index).is_some_and(|extent| {
             extent
-                .offset
-                .checked_add(extent.length)
+                .offset()
+                .checked_add(extent.length())
                 .is_some_and(|end| self.logical_position == end)
         }) {
             self.sparse_index += 1;
@@ -799,7 +799,7 @@ impl TarDecoder {
         let next_data = self
             .sparse
             .get(self.sparse_index)
-            .map_or(self.logical_size, |extent| extent.offset);
+            .map_or(self.logical_size, |extent| extent.offset());
         if self.logical_position < next_data {
             if output.is_empty() {
                 return Ok(Some(DecodeStep {
@@ -824,11 +824,14 @@ impl TarDecoder {
             }));
         }
         if let Some(extent) = self.sparse.get(self.sparse_index) {
-            let end = extent.offset.checked_add(extent.length).ok_or_else(|| {
-                ArchiveError::new(ErrorKind::Malformed)
-                    .with_format("tar")
-                    .with_context("sparse extent overflow")
-            })?;
+            let end = extent
+                .offset()
+                .checked_add(extent.length())
+                .ok_or_else(|| {
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("tar")
+                        .with_context("sparse extent overflow")
+                })?;
             let remaining = end.saturating_sub(self.logical_position);
             self.source
                 .set_payload_chunk_limit(usize::try_from(remaining).unwrap_or(usize::MAX));
@@ -981,11 +984,14 @@ impl ArchiveDecoder for TarDecoder {
                             .with_format("tar")
                             .with_context("sparse payload exceeds declared extents")
                     })?;
-                    let end = extent.offset.checked_add(extent.length).ok_or_else(|| {
-                        ArchiveError::new(ErrorKind::Malformed)
-                            .with_format("tar")
-                            .with_context("sparse extent overflow")
-                    })?;
+                    let end = extent
+                        .offset()
+                        .checked_add(extent.length())
+                        .ok_or_else(|| {
+                            ArchiveError::new(ErrorKind::Malformed)
+                                .with_format("tar")
+                                .with_context("sparse extent overflow")
+                        })?;
                     let next = self
                         .logical_position
                         .checked_add(data.len() as u64)
@@ -994,7 +1000,7 @@ impl ArchiveDecoder for TarDecoder {
                                 .with_format("tar")
                                 .with_context("sparse logical position overflow")
                         })?;
-                    if self.logical_position < extent.offset || next > end {
+                    if self.logical_position < extent.offset() || next > end {
                         return Err(ArchiveError::new(ErrorKind::Malformed)
                             .with_format("tar")
                             .with_context("sparse payload does not match extent map"));
@@ -1141,13 +1147,13 @@ impl TarEncoder {
             push_pax_record(&mut records, extension.key(), extension.value())
                 .map_err(|error| ArchiveError::from(error).with_format("tar"))?;
         }
-        if let Some(comment) = metadata.comment() {
-            if !metadata.extensions().iter().any(|extension| {
+        if let Some(comment) = metadata.comment().filter(|_| {
+            !metadata.extensions().iter().any(|extension| {
                 extension.namespace() == "pax" && extension.key() == b"LIBARCHIVE.comment"
-            }) {
-                push_pax_record(&mut records, b"LIBARCHIVE.comment", comment)
-                    .map_err(|error| ArchiveError::from(error).with_format("tar"))?;
-            }
+            })
+        }) {
+            push_pax_record(&mut records, b"LIBARCHIVE.comment", comment)
+                .map_err(|error| ArchiveError::from(error).with_format("tar"))?;
         }
         if !records.is_empty() {
             write_pax_header(&mut self.pending, &records, b'g')
@@ -1270,7 +1276,7 @@ impl ArchiveEncoder for TarEncoder {
                 let is_sparse = !sparse.is_empty();
                 let stored_size = if is_sparse {
                     let stored = sparse.iter().try_fold(0_u64, |total, extent| {
-                        total.checked_add(extent.length).ok_or_else(|| {
+                        total.checked_add(extent.length()).ok_or_else(|| {
                             ArchiveError::new(ErrorKind::Limit)
                                 .with_format("tar")
                                 .with_context("sparse stored size overflow")
@@ -1475,10 +1481,7 @@ fn parse_source_header(
     let mtime = pending.mtime.or(global.mtime).or_else(|| {
         parse_numeric(field(hdr, F_MTIME))
             .ok()
-            .map(|secs| Timestamp {
-                secs: i64::try_from(secs).unwrap_or(i64::MAX),
-                nanos: 0,
-            })
+            .map(|secs| Timestamp::from_seconds(i64::try_from(secs).unwrap_or(i64::MAX)))
     });
 
     let uid = pending
@@ -1738,10 +1741,10 @@ fn pax_sparse_extents(
                 let Some(offset) = offset.take() else {
                     return Err(Error::Malformed("GNU sparse length without offset"));
                 };
-                pairs.push(SparseExtent {
-                    offset,
-                    length: ascii_decimal_u64(value.as_ref())?,
-                });
+                pairs.push(
+                    SparseExtent::new(offset, ascii_decimal_u64(value.as_ref())?)
+                        .map_err(|_| Error::Malformed("invalid GNU sparse extent"))?,
+                );
             },
             _ => {},
         }
@@ -1756,10 +1759,13 @@ fn pax_sparse_extents(
             let length = fields
                 .next()
                 .ok_or(Error::Malformed("GNU sparse map has an odd field count"))?;
-            pairs.push(SparseExtent {
-                offset: ascii_decimal_u64(trim_ascii_space(offset))?,
-                length: ascii_decimal_u64(trim_ascii_space(length))?,
-            });
+            pairs.push(
+                SparseExtent::new(
+                    ascii_decimal_u64(trim_ascii_space(offset))?,
+                    ascii_decimal_u64(trim_ascii_space(length))?,
+                )
+                .map_err(|_| Error::Malformed("invalid GNU sparse extent"))?,
+            );
         }
     }
     Ok(pairs)
@@ -1781,10 +1787,10 @@ fn parse_gnu_sparse_descriptors(
         let sparse_offset = parse_numeric(&descriptor[..12])?;
         let length = parse_numeric(&descriptor[12..])?;
         if length != 0 {
-            extents.push(SparseExtent {
-                offset: sparse_offset,
-                length,
-            });
+            extents.push(
+                SparseExtent::new(sparse_offset, length)
+                    .map_err(|_| Error::Malformed("invalid GNU sparse extent"))?,
+            );
         }
     }
     Ok(extents)
@@ -1799,17 +1805,17 @@ fn validate_sparse_extents(
     let mut stored = 0_u64;
     for extent in extents {
         let end = extent
-            .offset
-            .checked_add(extent.length)
+            .offset()
+            .checked_add(extent.length())
             .ok_or(Error::Malformed("GNU sparse extent overflow"))?;
-        if extent.offset < previous_end || end > logical_size {
+        if extent.offset() < previous_end || end > logical_size {
             return Err(Error::Malformed(
                 "GNU sparse extents overlap or exceed logical size",
             ));
         }
         previous_end = end;
         stored = stored
-            .checked_add(extent.length)
+            .checked_add(extent.length())
             .ok_or(Error::Malformed("GNU sparse stored size overflow"))?;
     }
     if stored != stored_size {
@@ -1929,7 +1935,7 @@ fn parse_pax_time(value: &[u8]) -> Result<Timestamp> {
     } else {
         (magnitude, nanos)
     };
-    Ok(Timestamp { secs, nanos })
+    Timestamp::new(secs, nanos).map_err(|_| Error::Malformed("invalid PAX timestamp"))
 }
 
 // ── Writer helpers (dual of the reader's field parsing) ────────────────────────────────────────
@@ -2006,9 +2012,9 @@ fn write_v2_header(
             if index != 0 {
                 map.push(',');
             }
-            map.push_str(&extent.offset.to_string());
+            map.push_str(&extent.offset().to_string());
             map.push(',');
-            map.push_str(&extent.length.to_string());
+            map.push_str(&extent.length().to_string());
         }
         push_pax_record(&mut pax, b"GNU.sparse.map", map.as_bytes())?;
         push_pax_record(
@@ -2035,11 +2041,13 @@ fn write_v2_header(
     if let Some(group) = metadata.owner().group.as_deref() {
         copy_field(&mut header[F_GNAME.0..F_GNAME.1], group);
     }
-    if matches!(metadata.kind(), EntryKind::Char | EntryKind::Block) {
-        if let Some(device) = metadata.referenced_device() {
-            put_octal(&mut header[F_DEVMAJOR.0..F_DEVMAJOR.1], device.major)?;
-            put_octal(&mut header[F_DEVMINOR.0..F_DEVMINOR.1], device.minor)?;
-        }
+    let referenced_device = match metadata.kind() {
+        EntryKind::Char | EntryKind::Block => metadata.referenced_device(),
+        _ => None,
+    };
+    if let Some(device) = referenced_device {
+        put_octal(&mut header[F_DEVMAJOR.0..F_DEVMAJOR.1], device.major)?;
+        put_octal(&mut header[F_DEVMINOR.0..F_DEVMINOR.1], device.minor)?;
     }
     let header: &mut [u8; BLOCK] = header
         .try_into()
@@ -2059,8 +2067,8 @@ fn write_sparse_data(
     while consumed < input.len() {
         while extents.get(*sparse_index).is_some_and(|extent| {
             extent
-                .offset
-                .checked_add(extent.length)
+                .offset()
+                .checked_add(extent.length())
                 .is_some_and(|end| *logical_position == end)
         }) {
             *sparse_index += 1;
@@ -2075,8 +2083,8 @@ fn write_sparse_data(
             consumed += count;
             break;
         };
-        if *logical_position < extent.offset {
-            let hole = extent.offset - *logical_position;
+        if *logical_position < extent.offset() {
+            let hole = extent.offset() - *logical_position;
             let count =
                 usize::try_from(hole.min((input.len() - consumed) as u64)).map_err(|_| {
                     ArchiveError::new(ErrorKind::Limit)
@@ -2090,11 +2098,14 @@ fn write_sparse_data(
         if produced == output.len() {
             break;
         }
-        let end = extent.offset.checked_add(extent.length).ok_or_else(|| {
-            ArchiveError::new(ErrorKind::Malformed)
-                .with_format("tar")
-                .with_context("sparse extent overflow")
-        })?;
+        let end = extent
+            .offset()
+            .checked_add(extent.length())
+            .ok_or_else(|| {
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("tar")
+                    .with_context("sparse extent overflow")
+            })?;
         let remaining = end.saturating_sub(*logical_position);
         let count = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
@@ -2157,15 +2168,15 @@ fn write_pax_header(sink: &mut Vec<u8>, records: &[u8], typeflag: u8) -> Result<
 }
 
 fn format_pax_timestamp(timestamp: Timestamp) -> String {
-    if timestamp.nanos == 0 {
-        return timestamp.secs.to_string();
+    if timestamp.nanoseconds() == 0 {
+        return timestamp.seconds().to_string();
     }
-    if timestamp.secs < 0 {
-        let integral = timestamp.secs.saturating_add(1).saturating_neg();
-        let fraction = 1_000_000_000 - timestamp.nanos;
+    if timestamp.seconds() < 0 {
+        let integral = timestamp.seconds().saturating_add(1).saturating_neg();
+        let fraction = 1_000_000_000 - timestamp.nanoseconds();
         alloc::format!("-{integral}.{fraction:09}")
     } else {
-        alloc::format!("{}.{:09}", timestamp.secs, timestamp.nanos)
+        alloc::format!("{}.{:09}", timestamp.seconds(), timestamp.nanoseconds())
     }
 }
 
@@ -2183,10 +2194,8 @@ fn write_header(sink: &mut Vec<u8>, meta: HeaderView<'_>) -> Result<()> {
     if meta.path.len() > 100 {
         write_gnu_ext(sink, b'L', meta.path)?;
     }
-    if let Some(link) = meta.link_target {
-        if link.len() > 100 {
-            write_gnu_ext(sink, b'K', link)?;
-        }
+    if let Some(link) = meta.link_target.filter(|link| link.len() > 100) {
+        write_gnu_ext(sink, b'K', link)?;
     }
 
     let mut h = [0u8; BLOCK];
@@ -2198,7 +2207,7 @@ fn write_header(sink: &mut Vec<u8>, meta: HeaderView<'_>) -> Result<()> {
     put_octal(&mut h[F_SIZE.0..F_SIZE.1], meta.size)?;
     let mtime = meta
         .modified
-        .map_or(0, |t| u64::try_from(t.secs.max(0)).unwrap_or(0));
+        .map_or(0, |t| u64::try_from(t.seconds().max(0)).unwrap_or(0));
     put_octal(&mut h[F_MTIME.0..F_MTIME.1], mtime)?;
     h[O_TYPEFLAG] = typeflag;
     if let Some(link) = meta.link_target {
@@ -2337,8 +2346,8 @@ mod tests {
     #[test]
     fn pax_time_fractional() {
         let t = parse_pax_time(b"1700000000.5").unwrap();
-        assert_eq!(t.secs, 1_700_000_000);
-        assert_eq!(t.nanos, 500_000_000);
+        assert_eq!(t.seconds(), 1_700_000_000);
+        assert_eq!(t.nanoseconds(), 500_000_000);
     }
 
     #[test]

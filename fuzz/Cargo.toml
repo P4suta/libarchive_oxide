@@ -14,7 +14,7 @@ name = "libarchive_oxide-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [package.metadata]
 cargo-fuzz = true
@@ -91,6 +91,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "read_cab"
+path = "fuzz_targets/read_cab.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_xar"
+path = "fuzz_targets/read_xar.rs"
+test = false
+doc = false
+bench = false
+
 # ── Round-trip targets: synthesized entry set → write → read back → id. ──
 
 [[bin]]
@@ -144,6 +158,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "codec_lzw"
+path = "fuzz_targets/codec_lzw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "codec_zstd"
 path = "fuzz_targets/codec_zstd.rs"
 test = false
@@ -167,6 +188,43 @@ bench = false
 [[bin]]
 name = "codec_lzma2"
 path = "fuzz_targets/codec_lzma2.rs"
+test = false
+doc = false
+bench = false
+
+# ── Package targets: arbitrary containers → bounded structure/integrity verification. ──
+
+[[bin]]
+name = "package_rpm"
+path = "fuzz_targets/package_rpm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "package_alpine"
+path = "fuzz_targets/package_alpine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "package_zip"
+path = "fuzz_targets/package_zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "package_app"
+path = "fuzz_targets/package_app.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extraction_plan"
+path = "fuzz_targets/extraction_plan.rs"
 test = false
 doc = false
 bench = false

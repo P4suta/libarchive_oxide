@@ -10,12 +10,10 @@
 
 use std::io::{Cursor, Read};
 
-use libarchive_oxide::libarchive_oxide_core::{
-    ArchivePath, EntryKind, EntryMetadata, EntryTimes, Owner, Timestamp,
-};
 use libarchive_oxide::{
     FilterReader, LayerDigests, OciLayerBuilder, OciLayerEngine, OciLayerFilter,
 };
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, EntryTimes, Owner, Timestamp};
 use sha2::{Digest, Sha256};
 
 /// Reference SHA-256 over a byte slice.
@@ -85,10 +83,7 @@ fn fixture(filter: OciLayerFilter) -> OciLayerBuilder {
                 0o644,
                 Some(0),
                 Some(0),
-                Some(Timestamp {
-                    secs: 1_700_000_000,
-                    nanos: 0,
-                }),
+                Some(Timestamp::from_seconds(1_700_000_000)),
             ),
             b"oxide-node\n".to_vec(),
         )
@@ -206,10 +201,7 @@ fn metadata_is_emitted_as_specified() {
         group: None,
     })
     .times(EntryTimes {
-        modified: Some(Timestamp {
-            secs: 1_650_000_000,
-            nanos: 0,
-        }),
+        modified: Some(Timestamp::from_seconds(1_650_000_000)),
         accessed: None,
         changed: None,
         created: None,

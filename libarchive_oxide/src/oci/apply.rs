@@ -27,7 +27,7 @@ use super::plan::{
     OciLayerPlan, OciLayerPlanner, OciMaterialize, OciPlanOperation, OciRemoval, OwnershipMapper,
     is_structural_skip,
 };
-use crate::engine::Policy;
+use crate::extraction::Policy;
 use crate::filesystem::{
     FilesystemAdapter, FilesystemEntry, FilesystemFinding, FilesystemMaterialization,
     FilesystemOperation, FilesystemRemoval,

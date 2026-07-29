@@ -64,8 +64,10 @@ the overlay markers.
   filter always yield byte-identical blobs and identical digests, and a built
   layer reads back through `OciLayerSession` with matching digests.
 
-A range-source adapter example and a full 10 GiB soak are deliberately out of
-scope for the read/apply units above and are deferred separately (RM-204).
+A range-source adapter example and a full 10 GiB soak were deliberately out of
+scope for the read/apply units above and tracked as follow-ons (RM-204). Both
+have since landed; the soak is a required tar/gzip/xz/zstd CI gate with a
+128 MiB peak-RSS ceiling.
 Deterministic layer creation is no longer out of scope: it is provided by RM-203
 per the decision above. The `oxarchive oci` CLI (RM-205) does not extend this
 decision: it
@@ -84,10 +86,10 @@ committing. Because verification precedes any adapter call, a tampered or
 truncated layer can never partially mutate the destination.
 
 Because the engine and applier are generic over `Read` (and `Read + Seek`), a
-`RangeReader` over any `RangeSource` feeds them directly, so a remote layer blob
+`RangeReader` over any `ReadAt` feeds them directly, so a remote layer blob
 served through ranged fetches (HTTP `Range`, S3/GCS/Azure object reads) can be
 read, digested, and planned with no registry, authentication, or cloud SDK
-dependency — the transport is injected at the `RangeSource` seam (see RM-204).
+dependency — the transport is injected at the `ReadAt` seam (see RM-204).
 
 The applier requires a seekable blob so it can rewind between the verify and
 apply passes; a purely streaming apply is not offered here. Ownership landing is

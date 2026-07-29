@@ -11,16 +11,17 @@ use compression_codecs::Encode;
 #[cfg(feature = "native-codecs")]
 use compression_codecs::core::util::PartialBuffer;
 use libarchive_oxide_core::{
-    ArchiveEncoder, ArchiveError, ArchiveMetadata, EncodeCommand, EncodeStatus, EncodeStep,
-    EntryKind, EntryMetadata, EntryTimes, ErrorKind, Limits, Owner, PathEncoding, Timestamp,
+    ArchiveEncoder, ArchiveError, ArchiveMetadata, Codec, CodecStatus, EncodeCommand, EncodeStatus,
+    EncodeStep, EndOfInput, EntryKind, EntryMetadata, EntryTimes, ErrorKind, Limits, Owner,
+    PathEncoding, Timestamp,
 };
-use miniz_oxide::deflate::core::{CompressorOxide, create_comp_flags_from_zip_params};
-use miniz_oxide::deflate::stream::deflate;
-use miniz_oxide::{MZError, MZFlush, MZStatus};
 
+#[cfg(feature = "zstd")]
+use crate::Backend;
+use crate::BackendPreference;
 #[cfg(feature = "aes")]
 use crate::SecretBytes;
-use crate::filter::gzip::Crc32;
+use crate::filter::gzip::{Crc32, RawDeflateEncoder};
 
 const LOCAL_SIGNATURE: u32 = 0x0403_4b50;
 const CENTRAL_SIGNATURE: u32 = 0x0201_4b50;
@@ -47,7 +48,7 @@ pub(crate) enum StreamZipMethod {
     Deflate,
     #[cfg(feature = "bzip2")]
     Bzip2,
-    #[cfg(feature = "native-codecs")]
+    #[cfg(feature = "zstd")]
     Zstd,
     #[cfg(feature = "xz")]
     Lzma,
@@ -92,8 +93,83 @@ impl std::io::Write for VecSink {
 ///
 /// Pinned so interop byte comparisons stay stable across `compression-codecs`
 /// patch releases; consumers compare decoded content, not compressed bytes.
-#[cfg(feature = "native-codecs")]
+#[cfg(all(feature = "zstd", feature = "native-codecs"))]
 const ZIP_ZSTD_LEVEL: i32 = 3;
+
+#[cfg(feature = "zstd")]
+enum ZipZstdEncoder {
+    Portable(Box<crate::filter::zstd::ZstdEncoder>),
+    #[cfg(feature = "native-codecs")]
+    Native(compression_codecs::ZstdEncoder),
+}
+
+#[cfg(feature = "zstd")]
+impl ZipZstdEncoder {
+    fn new(backend: Backend, limits: Limits) -> Result<Self, ArchiveError> {
+        match backend {
+            Backend::Portable => crate::filter::zstd::ZstdEncoder::with_limits(limits)
+                .map(Box::new)
+                .map(Self::Portable),
+            Backend::Native => {
+                #[cfg(feature = "native-codecs")]
+                {
+                    Ok(Self::Native(compression_codecs::ZstdEncoder::new(
+                        ZIP_ZSTD_LEVEL,
+                    )))
+                }
+                #[cfg(not(feature = "native-codecs"))]
+                {
+                    Err(ArchiveError::new(ErrorKind::Capability)
+                        .with_format("zip")
+                        .with_context("native ZIP zstd encoder is not compiled"))
+                }
+            },
+        }
+    }
+
+    fn encode(&mut self, data: &[u8], output: &mut [u8]) -> Result<(usize, usize), ArchiveError> {
+        match self {
+            Self::Portable(encoder) => {
+                let step = encoder
+                    .process(data, output, EndOfInput::More)?
+                    .validate(data.len(), output.len())?;
+                Ok((step.consumed, step.produced))
+            },
+            #[cfg(feature = "native-codecs")]
+            Self::Native(encoder) => {
+                let mut source = PartialBuffer::new(data);
+                let mut destination = PartialBuffer::new(output);
+                encoder.encode(&mut source, &mut destination).map_err(|_| {
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("zip")
+                        .with_context("ZIP zstd encoder failed")
+                })?;
+                Ok((source.written_len(), destination.written_len()))
+            },
+        }
+    }
+
+    fn finish(&mut self, output: &mut [u8]) -> Result<(usize, bool), ArchiveError> {
+        match self {
+            Self::Portable(encoder) => {
+                let step = encoder
+                    .process(&[], output, EndOfInput::End)?
+                    .validate(0, output.len())?;
+                Ok((step.produced, step.status == CodecStatus::Done))
+            },
+            #[cfg(feature = "native-codecs")]
+            Self::Native(encoder) => {
+                let mut destination = PartialBuffer::new(output);
+                let done = encoder.finish(&mut destination).map_err(|_| {
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("zip")
+                        .with_context("ZIP zstd finalization failed")
+                })?;
+                Ok((destination.written_len(), done))
+            },
+        }
+    }
+}
 
 #[derive(Debug)]
 struct CentralRecord {
@@ -196,11 +272,11 @@ struct OpenEntry {
     dos_time: u16,
     dos_date: u16,
     zip64_size: bool,
-    compressor: Option<Box<CompressorOxide>>,
+    compressor: Option<RawDeflateEncoder>,
     #[cfg(feature = "bzip2")]
     bz_compress: Option<Compress>,
-    #[cfg(feature = "native-codecs")]
-    zstd: Option<compression_codecs::ZstdEncoder>,
+    #[cfg(feature = "zstd")]
+    zstd: Option<ZipZstdEncoder>,
     #[cfg(feature = "xz")]
     lzma: Option<lzma_rust2::LzmaWriter<VecSink>>,
     #[cfg(feature = "xz")]
@@ -238,6 +314,8 @@ enum Phase {
 #[derive(Debug)]
 pub(crate) struct ZipStreamEncoder {
     limits: Limits,
+    #[cfg(feature = "zstd")]
+    backend: BackendPreference,
     method: StreamZipMethod,
     phase: Phase,
     records: Vec<CentralRecord>,
@@ -247,21 +325,22 @@ pub(crate) struct ZipStreamEncoder {
     pending: Vec<u8>,
     pending_start: usize,
     archive_comment: Vec<u8>,
-    /// Structured error raised at first entry-open when a requested method is
-    /// unavailable in this build profile (e.g. Zstandard write on portable).
-    deferred_unsupported: Option<&'static str>,
     #[cfg(feature = "aes")]
     password: Option<SecretBytes>,
 }
 
 impl ZipStreamEncoder {
-    pub(crate) fn new(limits: Limits) -> Self {
-        Self::with_method(limits, StreamZipMethod::Deflate)
-    }
-
-    pub(crate) fn with_method(limits: Limits, method: StreamZipMethod) -> Self {
+    pub(crate) fn with_method_and_backend(
+        limits: Limits,
+        method: StreamZipMethod,
+        backend: BackendPreference,
+    ) -> Self {
+        #[cfg(not(feature = "zstd"))]
+        let _ = backend;
         Self {
             limits,
+            #[cfg(feature = "zstd")]
+            backend,
             method,
             phase: Phase::Ready,
             records: Vec::new(),
@@ -271,17 +350,9 @@ impl ZipStreamEncoder {
             pending: Vec::new(),
             pending_start: 0,
             archive_comment: Vec::new(),
-            deferred_unsupported: None,
             #[cfg(feature = "aes")]
             password: None,
         }
-    }
-
-    /// Records a structured Unsupported error to be surfaced at the first
-    /// entry-open. Used when a requested compression method has no encoder in
-    /// the current build profile (e.g. ZIP Zstandard write on portable-codecs).
-    pub(crate) const fn set_deferred_unsupported(&mut self, message: &'static str) {
-        self.deferred_unsupported = Some(message);
     }
 
     pub(crate) fn set_archive_metadata(
@@ -321,12 +392,13 @@ impl ZipStreamEncoder {
     }
 
     #[cfg(feature = "aes")]
-    pub(crate) fn with_password(
+    pub(crate) fn with_password_and_backend(
         limits: Limits,
         method: StreamZipMethod,
         password: SecretBytes,
+        backend: BackendPreference,
     ) -> Self {
-        let mut encoder = Self::with_method(limits, method);
+        let mut encoder = Self::with_method_and_backend(limits, method, backend);
         encoder.password = Some(password);
         encoder
     }
@@ -372,11 +444,6 @@ impl ZipStreamEncoder {
 
     #[allow(clippy::too_many_lines)]
     fn begin_entry(&mut self, metadata: &EntryMetadata) -> Result<(), ArchiveError> {
-        if let Some(message) = self.deferred_unsupported {
-            return Err(ArchiveError::new(ErrorKind::Unsupported)
-                .with_format("zip")
-                .with_context(message));
-        }
         if !matches!(self.phase, Phase::Ready) {
             return Err(Self::error(
                 ErrorKind::Protocol,
@@ -516,7 +583,7 @@ impl ZipStreamEncoder {
             match self.method {
                 #[cfg(feature = "bzip2")]
                 StreamZipMethod::Bzip2 => 12,
-                #[cfg(feature = "native-codecs")]
+                #[cfg(feature = "zstd")]
                 StreamZipMethod::Zstd => 93,
                 #[cfg(feature = "xz")]
                 StreamZipMethod::Lzma => 14,
@@ -605,15 +672,19 @@ impl ZipStreamEncoder {
             local.extend_from_slice(&framing);
         }
         self.queue(local)?;
-        let compressor = (payload_method == 8).then(|| {
-            let flags = create_comp_flags_from_zip_params(6, 0, 0);
-            Box::new(CompressorOxide::new(flags))
-        });
+        let compressor = if payload_method == 8 {
+            Some(RawDeflateEncoder::with_limits(self.limits)?)
+        } else {
+            None
+        };
         #[cfg(feature = "bzip2")]
         let bz_compress = (payload_method == 12).then(|| Compress::new(Compression::new(6), 0));
-        #[cfg(feature = "native-codecs")]
-        let zstd =
-            (payload_method == 93).then(|| compression_codecs::ZstdEncoder::new(ZIP_ZSTD_LEVEL));
+        #[cfg(feature = "zstd")]
+        let zstd = if payload_method == 93 {
+            Some(ZipZstdEncoder::new(self.backend.resolve()?, self.limits)?)
+        } else {
+            None
+        };
         // LZMA: preload the sink with the 9-byte ZIP-LZMA header, then wrap it
         // in a raw-LZMA1 writer (no container) that emits an EOS marker. The
         // header becomes the first bytes of the member payload.
@@ -655,7 +726,7 @@ impl ZipStreamEncoder {
             compressor,
             #[cfg(feature = "bzip2")]
             bz_compress,
-            #[cfg(feature = "native-codecs")]
+            #[cfg(feature = "zstd")]
             zstd,
             #[cfg(feature = "xz")]
             lzma,
@@ -694,17 +765,16 @@ impl ZipStreamEncoder {
             .compressor
             .as_mut()
             .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP deflate state is missing"))?;
-        let result = deflate(compressor, data, output, MZFlush::None);
-        match result.status {
-            Ok(MZStatus::StreamEnd) => Err(Self::error(
+        let step = compressor.process(data, output, EndOfInput::More)?;
+        match step.status {
+            CodecStatus::Done => Err(Self::error(
                 ErrorKind::Protocol,
                 "ZIP deflate ended before end-entry",
             )),
-            Ok(_) => Ok((result.bytes_consumed, result.bytes_written)),
-            Err(MZError::Buf) if output.is_empty() => Ok((0, 0)),
-            Err(_) => Err(Self::error(
-                ErrorKind::Malformed,
-                "ZIP deflate encoder failed",
+            CodecStatus::NeedInput | CodecStatus::NeedOutput => Ok((step.consumed, step.produced)),
+            _ => Err(Self::error(
+                ErrorKind::Protocol,
+                "ZIP deflate encoder returned an unknown status",
             )),
         }
     }
@@ -731,9 +801,9 @@ impl ZipStreamEncoder {
         Ok((consumed, produced))
     }
 
-    // Zstandard may buffer input internally and emit zero output for small
-    // members; a `(consumed, 0)` result is normal back-pressure, not an error.
-    #[cfg(feature = "native-codecs")]
+    // A native Zstandard encoder may buffer input internally and emit zero
+    // output for small members; `(consumed, 0)` is valid back-pressure.
+    #[cfg(feature = "zstd")]
     fn zstd_step(
         entry: &mut OpenEntry,
         data: &[u8],
@@ -743,12 +813,7 @@ impl ZipStreamEncoder {
             .zstd
             .as_mut()
             .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP zstd state is missing"))?;
-        let mut source = PartialBuffer::new(data);
-        let mut destination = PartialBuffer::new(output);
-        encoder
-            .encode(&mut source, &mut destination)
-            .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP zstd encoder failed"))?;
-        Ok((source.written_len(), destination.written_len()))
+        encoder.encode(data, output)
     }
 
     // LZMA drives a pull-free sink: `write_all` consumes ALL input (filling the
@@ -791,7 +856,7 @@ impl ZipStreamEncoder {
         if entry.payload_method == 12 {
             return Self::bzip2_step(entry, data, output);
         }
-        #[cfg(feature = "native-codecs")]
+        #[cfg(feature = "zstd")]
         if entry.payload_method == 93 {
             return Self::zstd_step(entry, data, output);
         }
@@ -899,17 +964,13 @@ impl ZipStreamEncoder {
                 )),
             };
         }
-        #[cfg(feature = "native-codecs")]
+        #[cfg(feature = "zstd")]
         if entry.payload_method == 93 {
             let encoder = entry
                 .zstd
                 .as_mut()
                 .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP zstd state is missing"))?;
-            let mut destination = PartialBuffer::new(output);
-            let done = encoder
-                .finish(&mut destination)
-                .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP zstd finalization failed"))?;
-            return Ok((destination.written_len(), done));
+            return encoder.finish(output);
         }
         #[cfg(feature = "xz")]
         if entry.payload_method == 14 {
@@ -933,6 +994,12 @@ impl ZipStreamEncoder {
             let n = drain_into(&mut entry.lzma_tail, output);
             return Ok((n, entry.lzma_tail.is_empty()));
         }
+        if entry.payload_method != 0 {
+            return Err(Self::error(
+                ErrorKind::Protocol,
+                "ZIP entry has no finalizer for its payload method",
+            ));
+        }
         Ok((0, true))
     }
 
@@ -949,39 +1016,38 @@ impl ZipStreamEncoder {
                 .compressor
                 .as_mut()
                 .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP deflate state is missing"))?;
-            let result = deflate(compressor, &[], output, MZFlush::Finish);
+            let step = compressor.process(&[], output, EndOfInput::End)?;
             #[cfg(feature = "aes")]
             if let Some(aes) = &mut entry.aes {
-                aes.encrypt(&mut output[..result.bytes_written]);
+                aes.encrypt(&mut output[..step.produced]);
             }
             entry.compressed_size = entry
                 .compressed_size
-                .checked_add(result.bytes_written as u64)
+                .checked_add(step.produced as u64)
                 .ok_or_else(|| Self::error(ErrorKind::Limit, "ZIP compressed size overflow"))?;
             self.offset = self
                 .offset
-                .checked_add(result.bytes_written as u64)
+                .checked_add(step.produced as u64)
                 .ok_or_else(|| Self::error(ErrorKind::Limit, "ZIP archive offset overflow"))?;
-            match result.status {
-                Ok(MZStatus::StreamEnd) => result.bytes_written,
-                Ok(_) => {
+            match step.status {
+                CodecStatus::Done => step.produced,
+                CodecStatus::NeedOutput => {
                     return Ok(EncodeStep {
                         consumed: 0,
-                        produced: result.bytes_written,
+                        produced: step.produced,
                         status: EncodeStatus::NeedOutput,
                     });
                 },
-                Err(MZError::Buf) if output.is_empty() => {
-                    return Ok(EncodeStep {
-                        consumed: 0,
-                        produced: 0,
-                        status: EncodeStatus::NeedOutput,
-                    });
-                },
-                Err(_) => {
+                CodecStatus::NeedInput => {
                     return Err(Self::error(
-                        ErrorKind::Malformed,
-                        "ZIP deflate finalization failed",
+                        ErrorKind::Protocol,
+                        "ZIP deflate requested input while finalizing",
+                    ));
+                },
+                _ => {
+                    return Err(Self::error(
+                        ErrorKind::Protocol,
+                        "ZIP deflate returned an unknown final status",
                     ));
                 },
             }
@@ -1368,7 +1434,7 @@ fn external_attributes(kind: EntryKind, mode: u32) -> u32 {
 fn dos_datetime(timestamp: Option<Timestamp>) -> (u16, u16) {
     const DOS_EPOCH: i64 = 315_532_800;
     let seconds = match timestamp {
-        Some(value) if value.secs >= DOS_EPOCH => value.secs,
+        Some(value) if value.seconds() >= DOS_EPOCH => value.seconds(),
         _ => return (0, 0x21),
     };
     let days = seconds.div_euclid(86_400);
@@ -1465,11 +1531,11 @@ fn push_extended_timestamp(output: &mut Vec<u8>, times: EntryTimes) {
         (0x02, times.accessed),
         (0x04, times.changed),
     ] {
-        if let Some(timestamp) = timestamp {
-            if let Ok(seconds) = i32::try_from(timestamp.secs) {
-                flags |= bit;
-                body.extend_from_slice(&seconds.to_le_bytes());
-            }
+        if let Some(timestamp) = timestamp
+            && let Ok(seconds) = i32::try_from(timestamp.seconds())
+        {
+            flags |= bit;
+            body.extend_from_slice(&seconds.to_le_bytes());
         }
     }
     if flags == 0 {
@@ -1538,6 +1604,22 @@ fn field_u32(value: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{U16_SENTINEL, zip64_extra_reserve};
+
+    #[test]
+    fn every_built_in_zip_method_has_a_capability_record() {
+        use libarchive_oxide_core::{FormatId, MethodId};
+
+        for code in [0, 8, 9, 12, 14, 93, 99] {
+            assert!(
+                libarchive_oxide_core::capability::method_capability(
+                    FormatId::Zip,
+                    MethodId::Numeric(code),
+                )
+                .is_some(),
+                "missing capability record for ZIP method {code}"
+            );
+        }
+    }
 
     #[test]
     fn zip64_extra_reserve_covers_every_field_combination() {

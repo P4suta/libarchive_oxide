@@ -141,7 +141,7 @@ version change, or versioned release candidate is part of this snapshot.
 ## RM-204
 
 - ADR-0009 records that the layer engine and applier are generic over `Read`
-  (and `Read + Seek`), so a `RangeReader` over any `RangeSource` feeds them with
+  (and `Read + Seek`), so a `RangeReader` over any `ReadAt` feeds them with
   no new parser. RM-204 exercises exactly that path: a remote layer blob served
   through ranged fetches is read, digested, and planned with no registry
   networking, authentication, or cloud SDK dependency.
@@ -165,7 +165,7 @@ version change, or versioned release candidate is part of this snapshot.
   reader reassembles the blob across fetch boundaries with every fetch strictly
   inside the source; and `read_range_returns_exact_bytes_at_each_offset` checks
   start, mid-window, final-byte, and at-length (zero bytes) reads.
-- No crate dependency is added: the adapters reuse the existing `RangeSource`,
+- No crate dependency is added: the adapters reuse the existing `ReadAt`,
   `RangeReader`, `SourceIdentity`, and `oci` surface only. The absence of any
   HTTP or cloud SDK is the point of the unit — the transport lives entirely in
   the caller-supplied closure.
@@ -440,9 +440,11 @@ version change, or versioned release candidate is part of this snapshot.
 ## Out of scope for this slice
 
 Deterministic layer creation landed as RM-203, the `oxarchive oci` CLI subcommand
-as RM-205, and the SDK-free range adapter example as RM-204. Only a full 10 GiB
-soak remains out of scope for the RM-200 slices. The remote matrix, nightly fuzz,
-big-endian, and CodeQL gates remain required before the RM-200 epic can close.
+as RM-205, and the SDK-free range adapter example as RM-204. A full 10 GiB soak
+was outside the original RM-200 slices; the follow-on `streaming-soak` required
+CI job now covers logical tar/gzip/xz/zstd inputs with a 128 MiB peak-RSS gate.
+The remote matrix, nightly fuzz, big-endian, and CodeQL gates remain required
+before the RM-200 epic can close.
 
 For the RM-210 package-validator epic, RM-211 lands the framework and the Debian
 `.deb` profile, RM-212 adds the RPM profile, RM-213 adds the ZIP-container
@@ -450,7 +452,64 @@ profiles (JAR, NuGet, Wheel, EPUB), RM-214 adds the OS/app profiles
 (Android APK, iOS IPA, Windows MSIX) with bounded APK signing-scheme detection,
 and RM-215 adds the `oxarchive package validate` CLI surface over those same
 validators with no re-implemented validation logic. Cryptographic signature
-*verification* and digest checking (as
-opposed to APK/MSIX signature-scheme *detection*, which RM-214 adds as
-informational findings) are out of scope for every package profile. Remote
+*verification* and digest checking were outside those original structural
+slices. The post-slice authenticity continuation below records implemented
+cryptographic checks and the remaining explicitly unevaluated ecosystems. Remote
 checks and reaching `main` remain required before the RM-210 epic can close.
+
+## Post-slice package-authenticity continuation
+
+The original RM-214/215 slice intentionally stopped at signing-scheme
+detection. The current continuation now verifies Android APK v2/v3 Signing
+Blocks instead of leaving them `not-evaluated`: RSA-PSS, RSA-PKCS#1, and
+P-256/P-384 ECDSA-with-SHA-256 signed-data are checked against the embedded
+certificate, and SHA-256/SHA-512 APK content digests are streamed in the
+specified 1 MiB chunks with the EOCD central-directory offset rewritten to the
+Signing Block start. Structure, integrity, signature validity, and offline
+trust remain separate verdicts. Authenticated v1
+`X-Android-APK-Signed` declarations prevent stripping a required v2/v3 block.
+v3 proof-of-rotation verifies bounded certificate/signature/algorithm
+continuity through the active signer. v3/v3.1 targeted signers enforce SDK
+ranges, development overlaps, lineage extension, and rotation-min-SDK
+stripping protection. Standard and fs-verity digest records may coexist; the
+4 KiB salted tree is streamed under the shared limits. Per-signer signature
+records follow AOSP's platform-introduction map and every selected
+signature-algorithm winner is verified. Only digest kinds requested by those
+winners are integrity inputs; unselected kinds are ignored. The official
+coexistence fixture also gates a standard-signature-only mutation while its
+fs-verity signature remains valid. The verifier deliberately does not claim
+complete SDK-range installability until binary manifest SDK parsing is present.
+
+Evidence is `package_android_signature` (16 official-AOSP positive,
+tamper/malformed/strip, trust, algorithm-boundary, and resource cases),
+`package_android_rotation` (6 official v3/v3.1 positive, wrong-key, tamper,
+cycle/duplicate, stripping, SDK-boundary, fs-verity, trust-separation, and
+resource cases), `package_app` (22 structure cases), and `package_cli` (23
+JSON/exit/trust cases). Direct official AOSP v2, v3, v3.1 positive, and v3.1
+wrong-lineage APKs are committed to `package_app` fuzz corpus; pristine and
+four-shard adversarial stable replay are gated. DSA,
+ECDSA-with-SHA-512/P-521, out-of-backend RSA sizes, unknown lineage algorithms,
+and binary-manifest installability remain explicit unsupported or unclaimed
+capabilities rather than successful detection.
+
+The next authenticity slice verifies MSIX/APPX package integrity independently
+of signature presence. `msix_blockmap` parses the Microsoft 2010 block-map
+vocabulary without a DOM, accepts only explicitly declared ignorable extension
+namespaces, and enforces metadata, nesting, path, entry-count, decoded-total,
+and per-entry limits. It requires an exact one-to-one mapping for every package
+file except the defined footprint exclusions, requires `AppxManifest.xml`,
+checks `Size`, `LfhSize`, compressed `Block Size` totals, and streams SHA-256
+over exact 64-KiB uncompressed blocks through `SeekArchiveReader`.
+
+Evidence is `package_msix_blockmap`: two byte-exact Microsoft
+`microsoft/msix-packaging` fixtures at commit
+`efeb9dad695a200c2beaddcba54a52c8320bd135`, including a deflated multi-block
+APPX, plus synthetic stored two-block, tamper, size/LFH, missing/extra,
+duplicate/traversal, exact block-count, ignorable-extension, hostile XML,
+unsupported-algorithm/vocabulary, nesting, and metadata-limit cases. The
+Microsoft 2015/2017 encrypted or delta vocabularies remain typed
+`unsupported`.
+The official compact MSIX is also committed to the `package_app` fuzz corpus
+and the CLI contract fixture. `AppxSignature.p7x` is deliberately
+`not-evaluated`; this slice makes no cryptographic signature or issuer-trust
+claim.

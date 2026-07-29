@@ -33,11 +33,19 @@ described below (`python-lzma/lzma-basic.zip` and
 | `raw-zip-builder` | first-party bytes in `tests/interop_foundation.rs` | n/a | yes (independent of both arca and the `zip` crate; hand-written local-header + central-directory layout) | Store (+ Deflate via `flate2`) | in-code |
 | `python-lzma` | `CPython zipfile`/`liblzma` | CPython 3.14.6 (MSC v.1944 x64) | yes (independent liblzma reference) | LZMA (14) | committed blob (`python-lzma/lzma-basic.zip`) |
 | `7zip-26.02` | official 7-Zip Extra `7za.exe` | 26.02 x64 (2026-06-25) | yes | Deflate64 (9) | committed blob (`7zip/deflate64.zip`) |
+| `raw-aes-deflate64-builder` | first-party ZIP/AE-2 builder over RustCrypto + stored Deflate64 blocks | workspace lockfile | container/crypto construction is independent of the reader state machine; not an independent Deflate64 codec | WinZip AES-256 AE-2 + Deflate64 (99 → 9) | in-code (`tests/zip_aes.rs`) |
 
 Store, Deflate, and LZMA consumers: `arca` (self, via `read_with_arca`) and
 `zip@8.6.0` (the `zip` crate, via `ZipArchive::by_index`). The committed
 Deflate64 fixture is consumed only by `arca`; the `zip` crate does not expose a
 method-9 decoder.
+
+The AES+Deflate64 composition fixture is also consumed only by arca. Its
+Deflate64 payload uses specification-level stored blocks, while the AE-2
+framing/key derivation is constructed directly with RustCrypto primitives.
+Independent AES interoperability for Store/Deflate is covered separately in
+`tests/zip_aes.rs` against `zip@8.6.0`; no claim of a second Deflate64 decoder
+is made.
 
 The `zip` crate version is pinned in `libarchive_oxide/Cargo.toml`:
 

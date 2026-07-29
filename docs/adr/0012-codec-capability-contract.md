@@ -37,8 +37,8 @@ gap must not be mistaken for discharging the obligation to close it.
    and to report precisely what it has.
 
 2. **Core invariants are codec-independent and never bend to a codec.** The
-   crate keeps `#![forbid(unsafe_code)]`; dispatch stays static (no trait-object
-   registry, the `no-dyn` gate); the `portable-codecs` profile stays C/FFI-free
+   crate keeps `#![forbid(unsafe_code)]`; provider dispatch uses the bounded,
+   application-owned registry from ADR-0015; the `portable-codecs` profile stays C/FFI-free
    by dependency-graph proof (RM-400); reads and writes stay bounded in memory
    regardless of payload size; and the public API shape is fixed independent of
    which codecs a build enables. A codec that cannot meet a core guarantee is
@@ -77,64 +77,96 @@ gap must not be mistaken for discharging the obligation to close it.
 
 ### Current tracked deficits
 
-| Deficit | Where it shows | Why | Resolution path | Tracking |
-|---|---|---|---|---|
-| Portable **streaming** zstd **encode** | ZIP member write method 93 is `native-codecs`-only; portable selection returns a structured `Unsupported` error | `ruzstd` (pinned `0.8.3`, latest as of the RM-309 survey below) offers only `ruzstd::encoding::compress_to_vec` (one-shot, whole output collected into a `Vec`) and `FrameCompressor` (a *pull*-based `set_source(Read)` → `set_drain(Write)` driver whose single blocking `compress()` runs the source to EOF). Both serve outer-filter *frames* and `create --zstd`, where the engine owns the whole `Read`. Neither can be driven by the engine's *push*-based, synchronous ZIP-member write loop (`payload_step` feeds bounded chunks and pulls bounded output per step) without inverting control — i.e. buffering the entire member or spawning a thread — which would break the core bounded-memory guarantee. The `native-codecs` `compression-codecs` encoder is a true push-streaming encoder. | A push-drivable (incremental feed/flush), single-stream, spec-robust pure-Rust zstd encoder — contributed upstream to `ruzstd` or provided as a dedicated crate the engine consumes behind the codec-provider boundary. The engine core does not absorb the encoder. Adoption seam when one lands: open the portable arm of `map_zip_method` (`src/provider.rs`, currently returns the deferred `Unsupported` message for `ZipMethod::Zstd` on `not(native-codecs)`) and add a portable `zstd_step`/finalize path in `src/zip_stream.rs` mirroring the existing `native-codecs` method-93 steps; interop evidence = round-trip against libzstd/`unzip` per ADR-0011 before flipping the support-matrix cell. | RM-307 (this ADR), RM-309 / DEV-123 (survey re-affirmed) → follow-on codec initiative |
-| 7z **PPMd** decode (method `03 04 01`) | A 7z folder coded with PPMd lists normally; extraction returns a structured `Unsupported` error and enumeration continues | 7z's PPMd7 (variant H) has no wired bounded-memory pure-Rust decoder, and the engine core will not absorb the model. This is a *new decoder deferred*, not a bent guarantee — the coder graph parses, the capability is typed. | Adopt or contribute a pure-Rust PPMd7 decoder consumed behind the codec-provider boundary; read-only, no encoder planned. | RM-303 → follow-on codec initiative |
-| 7z **BCJ2** decode (method `03 03 01 1B`) | A 7z coder graph containing BCJ2 lists normally; extraction returns a structured `Unsupported` error and enumeration continues | BCJ2 is a four-input, multi-stream branch converter that does not fit the one-active-linear-folder decode model that keeps 7z decoding bounded. This is a *multi-stream decode deferred* — the graph resolver already validates its bind pairs; only the decode stage is absent. | Extend the folder decoder with a bounded four-stream BCJ2 junction stage; read-only, no encoder planned. | RM-303 → follow-on decoder slice |
+There is no open Tier-1 codec deficit in this campaign. Permanent writer
+exclusions (RAR, UDF, Deflate64, and Quantum) are product-scope decisions, not
+partially exposed runtime capabilities.
 
-Every mainstream compression codec used by the engine (deflate, bzip2, xz/LZMA,
-lz4) has complete pure-Rust read **and** write on the `portable-codecs` profile.
+Every mainstream compression codec used by the engine (deflate, bzip2, zstd,
+xz/LZMA, lz4) has complete pure-Rust read **and** write on the
+`portable-codecs` profile.
 Deflate64 read is complete on both profiles; ADR-0013 classifies its unavailable
 write direction as a permanent won't-do rather than an open codec deficit.
-The two 7z-only entries (PPMd, BCJ2) are read-only-deferred coders behind an
-already-typed capability, not bent guarantees; this table is the entire ledger,
-not a pervasive condition.
+The 7z and CAB read-method ledgers no longer have deferred decoders.
 
-### RM-309 portable zstd-encoder survey (2026-07-24, re-affirms the deficit)
+CAB LZX method 3 was resolved on 2026-07-29. ADR-0018 records why a
+chunk-framed audited `lzxd` fork replaced the originally proposed `compcol`
+adapter after independent makecab evidence exposed missing CFDATA word
+realignment.
 
-RM-309 / DEV-123 re-surveyed the pure-Rust zstd-encoder landscape to test whether
-the "Portable streaming zstd encode" deficit can now be closed. Verdict: **no
-suitable crate exists yet; the deficit stands and the `native-codecs`-only
-method-93 write remains a legitimate tracked interim.** No `src/` change and no
-support-matrix flip in this pass.
+CAB Quantum method 2 was resolved on 2026-07-29. ADR-0019 records the bounded
+folder-state adapter over `compcol` 0.6.8, the independent 16-CFDATA libmspack
+fixture, and the workspace-wide Rust 1.88 MSRV required by the upstream safety
+fix.
 
-- **`ruzstd` `0.8.3`** (pinned in `Cargo.lock`; latest release, published
-  2026-07-12) exposes in `ruzstd::encoding`: `compress` / `compress_to_vec`
-  (one-shot) and `FrameCompressor` (`new`, `set_source(R: Read)`,
-  `set_drain(W: Write)`, `compress()`, take/replace accessors). `FrameCompressor`
-  is *pull*-based — one blocking `compress()` reads the source to EOF — so it fits
-  cases where the engine owns the whole `Read` (outer-filter frames, `create
-  --zstd`) but **cannot** be driven by the ZIP-member writer's *push* loop without
-  buffering the whole member or spawning a thread. Neither is permitted by the
-  bounded-memory / no-dyn / sync core invariants. There is **no** `StreamingEncoder`
-  or incremental feed/flush API in `0.8.3`. (A `StreamingEncoder` name appears in
-  some upstream prose but is not in the published `0.8.3` API surface; if a future
-  release ships a genuine push-drivable encoder, it becomes the adoption vehicle.)
-- **`structured-zstd`** (a `ruzstd` fork adding dictionary support) inherits the
-  same `FrameCompressor` architecture with no push-streaming encoder, and adopting
-  a fork carries a supply-chain/maintenance cost; not suitable.
-- **`zstd` / `zstd-safe`** wrap the C `zstd-sys` library — disqualified from the
-  `portable-codecs` (C/FFI-free) profile by construction; they are effectively the
-  `native-codecs` path already in use.
+The legacy Unix `compress(1)` filter now has a bounded portable read path over
+`compcol` LZW, including sync/async public archive readers, resource limits,
+independent `compress` and bsdtar fixtures, and fuzz replay. Its writer remains
+an explicit non-Tier-1 completeness debt and is absent from creation APIs; the
+typed capability ledger advertises read only.
 
-Resolution path is unchanged and re-affirmed: adopt a push-drivable pure-Rust zstd
-encoder (upstream `ruzstd` contribution or a dedicated crate) behind the
-codec-provider boundary, then open the seam noted in the ledger row. Until then the
-portable ZIP method-93 write stays typed `Unsupported`, per Decision items 2 and 4.
+### 7z BCJ2 resolution (2026-07-28)
+
+BCJ2 read is closed with a bounded four-input junction over
+`lzma-rust2::filter::bcj2::Bcj2Reader`. Each packed input is an independently
+positioned extent over one shared seekable archive source, so suspending among
+main/call/jump/range-control streams does not spool any complete stream or
+folder. Supported single-input coders can feed each branch and an optional
+linear tail.
+
+The parser requires the exact four-input/one-output shape and rejects BCJ2
+properties. Before constructing the graph, it sums the junction's four 256 KiB
+windows with every live branch/tail dictionary or workspace and applies
+`Limits::codec_memory`; decoded-size and CRC gates remain in the common folder
+path. Interoperability uses `compcol` 0.6.8 as an independent stream splitter
+and oracle, `sevenz-rust2` 0.21.3 as an independent 7z graph consumer, and
+arca under seven-byte short reads. Corrupt range-control and undersized-memory
+tests plus a committed `read_7z` seed cover the principal failure paths. BCJ2
+writing is intentionally absent.
+
+### 7z PPMd7 resolution (2026-07-28)
+
+The PPMd deficit is closed by a thin streaming adapter over `ppmd-rust` 1.4.0.
+The container parser validates the five PPMd7 properties (model order plus
+little-endian model memory) before construction, and `Limits::codec_memory`
+rejects an oversized model before allocation.
+
+7z PPMd7 streams normally omit an end marker. The decoder stage is therefore
+bounded structurally by the folder's declared output size; it never probes for
+another decoded symbol after that boundary. Existing folder-size and CRC checks
+still reject early EOF and corrupt output. An independent `sevenz-rust2`
+producer and consumer cover interoperability, while malformed range
+initialization, property limits, model-memory limits, and the committed
+`read_7z` fuzz seed cover the failure surface. PPMd writing remains
+intentionally absent from the public writer API.
+
+### Portable ZIP Zstandard resolution (2026-07-28)
+
+The earlier survey correctly found that `ruzstd` 0.8.3 exposes a pull-to-EOF
+`FrameCompressor`, not a suspendable push encoder. The deficit is now closed
+without whole-entry buffering or a worker thread: the portable ZIP writer emits
+a single standards-compliant Zstandard frame made of raw blocks.
+
+- The state machine retains at most one 1 KiB block, advertises the matching
+  minimum Zstandard window, and rejects a `codec_memory` budget smaller than
+  its fixed one-block state before entry bytes reach the destination.
+- Native builds retain the level-3 `compression-codecs` encoder. When both
+  profiles are compiled, `BackendPreference::{Portable, Native}` selects either
+  implementation at runtime.
+- Portable output is decoded independently by `zip` and libzstd. Tests cover
+  multi-megabyte chunked input, empty files, codec-memory failure, both runtime
+  backends, corruption/truncation, and decoded-output limits.
 
 ## Consequences
 
 The engine's guarantees — no `unsafe`, static dispatch, C-free portable profile,
 bounded streaming, stable API — are now explicitly *load-bearing invariants* that
 a codec's state can never override; a codec either meets a path's contract or is
-typed as unsupported for it. The support matrix becomes a grid where the two
-current deficits are visible data points with named paths, not warts and not
-silent read-only settling. Because a relegation to `native-codecs` is defined as
-a tracked debt with a path back to portable parity, "portable can't write zstd
-yet" is a liability the roadmap owns, not an excuse the library rests on — which
-is precisely the distinction between an incomplete-but-honest wrapper and a
-Modern Replacement that is closing on completeness. New codecs and methods inherit
-this contract: land the capability honestly, express any gap as a typed
-capability, and record the deficit with its resolution path rather than letting
-the ecosystem's current shape define the engine's.
+typed as unsupported for it. The support matrix becomes a grid where the
+remaining deficits are visible data points with named paths, not warts and not
+silent read-only settling. Closing portable ZIP Zstandard with bounded raw
+blocks demonstrates the rule: wire-format validity, memory bounds, runtime
+backend choice, and independent interoperability matter more than depending on
+a nominal encoder API. New codecs and methods inherit this contract: land the
+capability honestly, express any gap as a typed capability, and record the
+deficit with its resolution path rather than letting the ecosystem's current
+shape define the engine's.

@@ -16,7 +16,8 @@ maintainer approval.
 - [x] Maintain libFuzzer targets.
 - [x] Commit seed corpora.
 - [x] Replay portable fuzz invariants in normal CI.
-- [ ] Add and locally validate `project.yaml`, `Dockerfile`, and `build.sh`.
+- [x] Add the proposed `project.yaml`, `Dockerfile`, and `build.sh` bundle.
+- [ ] Validate the bundle with the official OSS-Fuzz container helpers.
 - [ ] Submit the OSS-Fuzz onboarding PR.
 - [ ] Verify the first ClusterFuzz run.
 - [ ] Connect findings to the private reporting process.
@@ -38,11 +39,17 @@ Triage:
 
 ## `no_std` codecs
 
-Status: unplanned.
+Status: implemented and required CI gate.
 
-- [ ] Evaluate pure-Rust `no_std` codec implementations.
-- [ ] Prototype gzip behind a disabled-by-default feature.
-- [ ] Preserve the zero-dependency default core.
+- [x] Keep validated values and sans-I/O protocols in the zero-dependency
+  `libarchive_oxide-core` (`no_std + alloc`).
+- [x] Keep portable codec state machines in
+  `libarchive_oxide-codecs` (`no_std + alloc`) with additive per-codec
+  features.
+- [x] Compile every portable codec on `thumbv7em-none-eabi` with warnings
+  denied in required CI.
+- [x] Keep std I/O, archive containers, and filesystem policy in
+  `libarchive_oxide`.
 
 ## Examples
 

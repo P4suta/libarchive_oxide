@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 
 use futures_io::AsyncRead;
 use futures_lite::future::block_on;
+use libarchive_oxide::advanced::Pipeline;
 use libarchive_oxide::filter::gzip::GzipEncoder;
 use libarchive_oxide::{
-    ArchiveReader, ArchiveWriter, AsyncArchiveReader, AsyncArchiveWriter, FilterReader, Pipeline,
-    ReaderEvent,
+    ArchiveReader, ArchiveWriter, AsyncArchiveReader, AsyncArchiveWriter, FilterReader, ReaderEvent,
 };
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
@@ -59,10 +59,20 @@ fn compress(plain: &[u8], filter: FilterId) -> std::io::Result<Vec<u8>> {
             }
         },
         FilterId::Bzip2 => {
-            let mut writer =
-                bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
-            writer.write_all(plain)?;
-            writer.finish()
+            #[cfg(feature = "bzip2")]
+            {
+                let mut writer =
+                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+                writer.write_all(plain)?;
+                writer.finish()
+            }
+            #[cfg(not(feature = "bzip2"))]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "bzip2 feature is disabled",
+                ))
+            }
         },
         FilterId::Zstd => zstd_codec::stream::encode_all(Cursor::new(plain), 3),
         FilterId::Xz => {

@@ -35,6 +35,11 @@ ded = "ded"
 pn = "pn"
 # `mis-` is a valid English prefix (mis-decode, mis-read), not a misspelling.
 mis = "mis"
+# Microsoft ships the CAB extraction utility as `extrac32.exe`; typos splits
+# its numeric suffix before checking the word.
+extrac = "extrac"
+# `café` is intentionally written with a Unicode escape in path-policy tests.
+caf = "caf"
 
 [default.extend-identifiers]
 ba = "ba"
@@ -42,6 +47,8 @@ ded = "ded"
 # The Rust DEFLATE/zlib crate name contains a numeric suffix and is tokenized as
 # an identifier rather than an English word.
 flate2 = "flate2"
+extrac = "extrac"
+caf = "caf"
 
 [files]
 extend-exclude = [
@@ -71,7 +78,20 @@ extend-glob = [
     "*.zst",
     "*.xz",
     "*.lz4",
+    "*.lzip",
     "*.bin",
+    "*.cab",
+    "*.udf",
+    "*.xar",
+    "*.rpm",
+    "*.deb",
+    "*.apk",
+    "*.appx",
+    "*.msix",
+    "*.nupkg",
+    "*.idsig",
+    "*.b64",
+    "*.pub",
 ]
 check-file = false
 

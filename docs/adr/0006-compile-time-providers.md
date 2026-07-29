@@ -1,6 +1,6 @@
 # ADR-0006: compile-time provider chains
 
-- Status: accepted
+- Status: superseded by ADR-0015
 - Date: 2026-07-20
 - Tracks: RM-103 / issue #46
 
@@ -49,3 +49,7 @@ also retain the exact registered chain used by the first read.
 - Downstream providers must obey caller-driven buffering and progress rules;
   the shared pipeline validates them at the trust boundary.
 - Dynamic discovery and a stable plugin ABI remain out of scope.
+
+ADR-0015 replaces generic cons-list registration with an application-owned
+object-safe registry. A stable plugin ABI and process-global mutable
+registration remain out of scope.

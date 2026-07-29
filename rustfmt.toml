@@ -4,8 +4,8 @@
 
 # rustfmt configuration. Pinned to what the committed tree already follows, so
 # `cargo fmt --check` stays clean and no reformatting churn lands with this file.
-# The workspace is edition 2021 (MSRV is kept as low as the code allows; edition
-# 2024 would force MSRV >= 1.85), so rustfmt runs in the 2021 style.
+# Keep the committed rustfmt style stable independently of the Rust language
+# edition selected by each Cargo manifest.
 edition = "2021"
 max_width = 100
 hard_tabs = false

@@ -30,6 +30,8 @@ the reserved location for any future byte-exact external-tool artifact (see
 |-------|--------------|---------|----------------------|--------|------------|
 | `arca` | `libarchive_oxide` | workspace | no (self / system under test) | LZMA2 | in-code (`SeekArchiveWriter`) |
 | `sevenz-rust2@0.21.3` | `sevenz-rust2` | 0.21.3 | yes | LZMA2 | in-code (`SevenWriter`), feature `sevenz` |
+| `sevenz-rust2@0.21.3-ppmd7` | `sevenz-rust2` | 0.21.3 | yes | PPMd7 read fixture | in-code (`SevenWriter` + `PpmdOptions`), feature `sevenz` |
+| `compcol@0.6.8-bcj2` | `compcol` | 0.6.8 | yes | BCJ2 stream split/oracle | in-code (`bcj2::encode`/`decode` + spec-level 7z wrapper), feature `sevenz` |
 
 Consumers: `arca` (self, via `read_with_arca`) and `sevenz-rust2@0.21.3`
 (via `SevenReader::new` + `Password::empty()`), both under feature `sevenz`.
@@ -38,12 +40,19 @@ The `sevenz-rust2` version is pinned in `libarchive_oxide/Cargo.toml`:
 
 ```toml
 sevenz-rust2 = "0.21.3"
+compcol = { version = "0.6.8", default-features = false, features = ["bcj2"] }
 ```
 
 ## Method coverage this slice
 
 - **7z LZMA2**: 2 producers (`arca` + `sevenz-rust2@0.21.3`),
   2 consumers (`arca` + `sevenz-rust2@0.21.3`), under feature `sevenz`.
+- **7z PPMd7**: 1 independent producer (`sevenz-rust2@0.21.3`) and
+  2 consumers (`arca` + `sevenz-rust2@0.21.3`), plus property, corruption,
+  codec-memory, and fuzz-corpus regression coverage under feature `sevenz`.
+- **7z BCJ2**: 1 independent stream producer/oracle (`compcol@0.6.8`),
+  2 container consumers (`arca` + `sevenz-rust2@0.21.3`), plus seven-byte
+  short-read, corruption, aggregate codec-memory, and fuzz-corpus coverage.
 
 ## Spec reference
 
@@ -51,13 +60,18 @@ sevenz-rust2 = "0.21.3"
   (`DOC/7zFormat.txt`).
 - LZMA2 codec: the LZMA2 chunked wrapper over the LZMA algorithm as specified by
   the LZMA SDK.
+- PPMd7 codec: variant H with the 7z range coder and a container-declared
+  uncompressed-size boundary.
+- BCJ2 codec: four streams (main/call/jump/range-control), exact declared
+  output boundary, and method id `03 03 01 1B`.
 
 ## License / origin
 
-All 7z bytes are produced at test time by the pinned dev-dependency `sevenz-rust2`
-or by arca itself; no third-party binary artifact is redistributed. `sevenz-rust2`
-is dual-licensed under `MIT OR Apache-2.0`. arca output is covered by this
-repository's `MIT OR Apache-2.0` license.
+All 7z bytes are produced at test time by pinned dev-dependencies
+`sevenz-rust2`/`compcol` or by arca itself; no third-party binary artifact is
+redistributed. `sevenz-rust2` is dual-licensed under `MIT OR Apache-2.0`;
+`compcol` is MIT-licensed. arca output is covered by this repository's
+`MIT OR Apache-2.0` license.
 
 ## How to regenerate
 

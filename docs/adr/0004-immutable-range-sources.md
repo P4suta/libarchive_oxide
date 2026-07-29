@@ -1,6 +1,6 @@
 # ADR-0004: immutable range sources share the seek parser
 
-- Status: accepted
+- Status: synchronous contract superseded by ADR-0020
 - Date: 2026-07-20
 - Tracks: RM-102 / issue #34
 

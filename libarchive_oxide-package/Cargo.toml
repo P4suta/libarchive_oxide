@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "libarchive_oxide-package"
+version.workspace = true
+description = "Offline software-package inspection, verification, and trust policy"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["archive", "package", "verification", "signature"]
+categories = ["authentication", "compression", "parser-implementations"]
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["portable-codecs"]
+
+[features]
+default = ["portable-codecs"]
+portable-codecs = [
+    "gzip",
+    "bzip2",
+    "zstd",
+    "xz",
+    "lz4",
+    "libarchive_oxide/portable-codecs",
+]
+native-codecs = [
+    "gzip",
+    "bzip2",
+    "zstd",
+    "xz",
+    "lz4",
+    "libarchive_oxide/native-codecs",
+]
+gzip = ["libarchive_oxide/gzip"]
+bzip2 = ["gzip", "libarchive_oxide/bzip2"]
+zstd = ["gzip", "libarchive_oxide/zstd"]
+xz = ["gzip", "libarchive_oxide/xz"]
+lz4 = ["gzip", "libarchive_oxide/lz4"]
+
+[dependencies]
+base64 = "0.22"
+bcder = "0.7.7"
+# Its default `http` feature performs timestamp-protocol requests; verification
+# in this crate is deliberately offline.
+cryptographic-message-syntax = { version = "0.28", default-features = false }
+libarchive_oxide = { path = "../libarchive_oxide", version = "0.2.0", default-features = false }
+libarchive_oxide-codecs = { path = "../libarchive_oxide-codecs", version = "0.2.0", default-features = false, features = ["gzip"] }
+libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
+quick-xml = { version = "0.41", default-features = false }
+ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
+sha2 = "0.11"
+sha3 = "0.11"
+spki = { version = "0.7", default-features = false, features = ["alloc"] }
+subtle = "2.6"
+unicode-normalization = "0.1.24"
+x509-certificate = "0.25"
+
+[dev-dependencies]
+crc32fast = "1"
+flate2 = "1"
+
+[lints]
+workspace = true

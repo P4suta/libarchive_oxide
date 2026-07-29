@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -16,17 +16,15 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const CRATES: &[&str] = &[
     "libarchive_oxide-core",
+    "libarchive_oxide-codecs",
     "libarchive_oxide",
+    "libarchive_oxide-package",
     "libarchive_oxide-cli",
 ];
 const LICENSES: &[&str] = &["Apache-2.0.txt", "MIT.txt"];
-const SOURCE_TREES: &[&str] = &[
-    "libarchive_oxide-core/src",
-    "libarchive_oxide/src",
-    "libarchive_oxide-cli/src",
-];
 const PORTABLE_CODEC_FEATURES: &str = "portable-codecs,aes,sevenz,async,tokio";
 const NATIVE_CODEC_FEATURES: &str = "native-codecs,aes,sevenz,async,tokio";
+const FUZZ_NIGHTLY_TOOLCHAIN: &str = "+nightly-2026-07-29";
 const BIG_ENDIAN_FEATURES: &str = "libarchive_oxide/portable-codecs,\
 libarchive_oxide/aes,libarchive_oxide/sevenz,libarchive_oxide/async,\
 libarchive_oxide/tokio";
@@ -41,15 +39,20 @@ fn main() {
 const PACKAGE_CONSUMER_MAIN: &str = r#"use std::io::Cursor;
 
 use libarchive_oxide::{
-    ArchiveEngine, ArchiveReader, CodecCapabilities, CodecProvider, FilesystemAdapter,
-    FilesystemAdapterError, FilesystemCapabilities, FilesystemEntry, FilesystemEntryReport,
-    FilesystemFinding, FilesystemMaterialization, FormatCapabilities, FormatProvider,
-    ProviderArchiveEncoder, ProviderSet, ReaderEvent, SeekArchiveReader,
+    ArchiveEngine, ArchiveReader, FilesystemAdapter, FilesystemAdapterError,
+    FilesystemCapabilities, FilesystemEntry, FilesystemEntryReport, FilesystemFinding,
+    FilesystemMaterialization, ReaderEvent, SeekArchiveReader,
+};
+use libarchive_oxide::advanced::{
+    CodecCapabilities, FormatCapabilities, IncrementalCodecProvider,
+    IncrementalFormatProvider, ProviderArchiveEncoder, Registry,
 };
 use libarchive_oxide_core::{
-    ArchiveDecoder, ArchiveEncoder, ArchiveError, Codec, CodecStep, DecodeStep, EncodeCommand,
-    EncodeStep, EndOfInput, ErrorKind, FilterId, FormatId, Limits, ProbeResult,
+    AccessMode, ArchiveDecoder, ArchiveEncoder, ArchiveError, Codec, CodecStep, DecodeStep,
+    DirectionSet, EncodeCommand, EncodeStep, EndOfInput, ErrorKind, FilterId, FormatId, Limits,
+    ProbeResult,
 };
+use libarchive_oxide_package::{PackageVerifier, TrustPolicy};
 
 struct ExternalDecoder;
 impl ArchiveDecoder for ExternalDecoder {
@@ -76,21 +79,24 @@ impl ArchiveEncoder for ExternalEncoder {
 impl ProviderArchiveEncoder for ExternalEncoder {}
 
 struct ExternalFormat;
-impl FormatProvider for ExternalFormat {
-    type Decoder = ExternalDecoder;
-    type Encoder = ExternalEncoder;
-
+impl IncrementalFormatProvider for ExternalFormat {
     fn format(&self) -> FormatId { FormatId::Tar }
     fn name(&self) -> &'static str { "package-smoke-format" }
     fn probe(&self, _prefix: &[u8]) -> ProbeResult<()> { ProbeResult::NoMatch }
     fn capabilities(&self) -> FormatCapabilities {
-        FormatCapabilities::new(true, true, false)
+        FormatCapabilities::uniform(DirectionSet::READ_WRITE, AccessMode::Sequential)
     }
-    fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
-        Ok(ExternalDecoder)
+    fn decoder(
+        &self,
+        _limits: Limits,
+    ) -> Result<Box<dyn ArchiveDecoder + Send>, ArchiveError> {
+        Ok(Box::new(ExternalDecoder))
     }
-    fn encoder(&self, _limits: Limits) -> Result<Self::Encoder, ArchiveError> {
-        Ok(ExternalEncoder)
+    fn encoder(
+        &self,
+        _limits: Limits,
+    ) -> Result<Box<dyn ProviderArchiveEncoder + Send>, ArchiveError> {
+        Ok(Box::new(ExternalEncoder))
     }
 }
 
@@ -105,15 +111,15 @@ impl Codec for ExternalCodec {
         Err(ArchiveError::new(libarchive_oxide_core::ErrorKind::Protocol))
     }
 }
-impl CodecProvider for ExternalCodec {
-    type Decoder = Self;
-
+impl IncrementalCodecProvider for ExternalCodec {
     fn filter(&self) -> FilterId { FilterId::Gzip }
     fn name(&self) -> &'static str { "package-smoke-codec" }
     fn probe(&self, _prefix: &[u8]) -> ProbeResult<()> { ProbeResult::NoMatch }
-    fn capabilities(&self) -> CodecCapabilities { CodecCapabilities::new(true, true) }
-    fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
-        Ok(ExternalCodec)
+    fn capabilities(&self) -> CodecCapabilities {
+        CodecCapabilities::new(DirectionSet::READ_WRITE)
+    }
+    fn decoder(&self, _limits: Limits) -> Result<Box<dyn Codec + Send>, ArchiveError> {
+        Ok(Box::new(ExternalCodec))
     }
     fn encode_frame(&self, input: &[u8], _limits: Limits) -> Result<Vec<u8>, ArchiveError> {
         Ok(input.to_vec())
@@ -212,15 +218,19 @@ fn assert_deflate64_is_listable_without_gzip() {
 
 fn main() {
     let _filesystem = ExternalFilesystem;
-    let _engine = ArchiveEngine::new()
-        .with_format_provider(ExternalFormat)
-        .with_codec_provider(ExternalCodec);
-    let _closed = ProviderSet::empty()
-        .with_format_provider(ExternalFormat)
-        .with_codec_provider(ExternalCodec);
+    let mut registry = Registry::builder();
+    registry.register_format(Box::new(ExternalFormat)).expect("register format");
+    registry.register_codec(Box::new(ExternalCodec)).expect("register codec");
+    let registry = registry.build();
+    let _engine = ArchiveEngine::from_registry(&registry);
     let limits = Limits::safe();
+    let _closed = registry.pipeline(limits);
     let mut reader = ArchiveReader::with_limits(Cursor::new(Vec::<u8>::new()), limits);
     let _event: Result<ReaderEvent<'_>, _> = reader.next_event();
+    let verifier = PackageVerifier::new(TrustPolicy::offline());
+    assert!(!verifier.trust_policy().allows_unsigned());
+    #[cfg(any(feature = "portable-codecs", feature = "native-codecs"))]
+    let _portable_codec = libarchive_oxide_codecs::gzip::GzipDecoder::new(limits);
     assert_deflate64_is_listable_without_gzip();
 }
 "#;
@@ -238,22 +248,186 @@ fn main() -> ExitCode {
 fn run() -> Result {
     let root = workspace_root()?;
     match env::args().nth(1).as_deref() {
-        Some("no-dyn") => check_no_dyn(&root),
         Some("license-sync") => check_license_sync(&root),
         Some("package-licenses") => check_package_licenses(&root),
         Some("package-smoke") => check_package_smoke(&root),
         Some("codec-policy") => check_codec_policy(&root),
+        Some("capability-docs") => check_capability_docs(&root),
+        Some("capability-docs-write") => write_capability_docs(&root),
         Some("release-policy") => check_release_policy(&root),
         Some("fuzz-ci") => run_fuzz_ci(&root),
         Some("big-endian-ci-compile") => compile_big_endian_ci(&root),
         Some("big-endian-ci") => run_big_endian_ci(&root),
         Some(command) => Err(format!("unknown command {command:?}").into()),
         None => Err(
-            "expected one of: no-dyn, license-sync, package-licenses, package-smoke, \
-             codec-policy, release-policy, fuzz-ci, big-endian-ci-compile, big-endian-ci"
+            "expected one of: license-sync, package-licenses, package-smoke, \
+             codec-policy, capability-docs, capability-docs-write, release-policy, fuzz-ci, \
+             big-endian-ci-compile, big-endian-ci"
                 .into(),
         ),
     }
+}
+
+fn check_capability_docs(root: &Path) -> Result {
+    let path = root.join("docs/support-matrix.md");
+    let expected = render_capability_docs()?;
+    let actual = fs::read_to_string(&path)?;
+    if actual == expected {
+        println!("capability-docs: OK ({})", path.display());
+        Ok(())
+    } else {
+        Err("docs/support-matrix.md is stale; run `just capability-docs-write`".into())
+    }
+}
+
+fn write_capability_docs(root: &Path) -> Result {
+    let path = root.join("docs/support-matrix.md");
+    fs::write(&path, render_capability_docs()?)?;
+    println!("capability-docs: wrote {}", path.display());
+    Ok(())
+}
+
+fn render_capability_docs() -> Result<String> {
+    use libarchive_oxide_core::{CAPABILITY_LEDGER, CapabilitySubject};
+
+    let mut output = String::from(
+        "# Support matrix\n\n\
+         <!-- This file is generated by `just capability-docs-write`. Do not edit it manually. -->\n\n\
+         This matrix is generated from the machine-readable `CAPABILITY_LEDGER` in\n\
+         `libarchive_oxide-core`. A format or method is supported only in the directions shown;\n\
+         an empty direction is a recognized, structured `Unsupported` path rather than a claim of\n\
+         implementation. Cargo requirements must also be enabled in the consuming build.\n\n\
+         ## Archive formats\n\n\
+         | Format | Read access | Write access | Portable | Native | Requirements | Notes |\n\
+         |---|---|---|---|---|---|---|\n",
+    );
+    for record in CAPABILITY_LEDGER {
+        if !matches!(record.subject(), CapabilitySubject::Format(_)) {
+            continue;
+        }
+        writeln!(
+            output,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            record.name(),
+            access_name(record.access().read()),
+            access_name(record.access().write()),
+            direction_name(record.portable()),
+            direction_name(record.native()),
+            requirement_name(record.requirements()),
+            note_name(record.note()),
+        )?;
+    }
+
+    output.push_str(
+        "\n## Container methods\n\n\
+         | Format | Method | Identifier | Read access | Write access | Portable | Native | Requirements | Notes |\n\
+         |---|---|---|---|---|---|---|---|---|\n",
+    );
+    for record in CAPABILITY_LEDGER {
+        let CapabilitySubject::Method { format, id } = record.subject() else {
+            continue;
+        };
+        let format_name = libarchive_oxide_core::capability::format_capability(format)
+            .map_or("custom", |format_record| format_record.name());
+        writeln!(
+            output,
+            "| {format_name} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            record.name(),
+            method_id_name(id),
+            access_name(record.access().read()),
+            access_name(record.access().write()),
+            direction_name(record.portable()),
+            direction_name(record.native()),
+            requirement_name(record.requirements()),
+            note_name(record.note()),
+        )?;
+    }
+
+    output.push_str(
+        "\n## Outer compression filters\n\n\
+         | Filter | Read access | Write access | Portable | Native | Requirements | Notes |\n\
+         |---|---|---|---|---|---|---|\n",
+    );
+    for record in CAPABILITY_LEDGER {
+        if !matches!(record.subject(), CapabilitySubject::Filter(_)) {
+            continue;
+        }
+        writeln!(
+            output,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            record.name(),
+            access_name(record.access().read()),
+            access_name(record.access().write()),
+            direction_name(record.portable()),
+            direction_name(record.native()),
+            requirement_name(record.requirements()),
+            note_name(record.note()),
+        )?;
+    }
+    output.push_str(
+        "\nDirection values are `read`, `write`, `read/write`, or `—`. The portable and native\n\
+         columns describe backend capability, not which Cargo features happen to be enabled in one\n\
+         particular binary. Use `oxarchive capabilities --json` for build-specific `available`,\n\
+         `disabled`, and `unsupported` states.\n",
+    );
+    Ok(output)
+}
+
+fn direction_name(directions: libarchive_oxide_core::DirectionSet) -> &'static str {
+    use libarchive_oxide_core::Direction;
+
+    match (
+        directions.contains(Direction::Read),
+        directions.contains(Direction::Write),
+    ) {
+        (true, true) => "read/write",
+        (true, false) => "read",
+        (false, true) => "write",
+        (false, false) => "—",
+    }
+}
+
+fn access_name(access: Option<libarchive_oxide_core::AccessMode>) -> &'static str {
+    use libarchive_oxide_core::AccessMode;
+
+    match access {
+        Some(AccessMode::Sequential) => "sequential",
+        Some(AccessMode::Seek) => "seek",
+        Some(AccessMode::Filter) => "filter",
+        Some(_) => "unknown",
+        None => "—",
+    }
+}
+
+fn method_id_name(id: libarchive_oxide_core::MethodId) -> String {
+    use libarchive_oxide_core::MethodId;
+
+    match id {
+        MethodId::Numeric(value) => value.to_string(),
+        MethodId::Bytes(bytes) => bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        MethodId::Name(name) => format!("`{name}`"),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn requirement_name(requirements: &[&str]) -> String {
+    if requirements.is_empty() {
+        "—".to_string()
+    } else {
+        requirements
+            .iter()
+            .map(|requirement| format!("`{requirement}`"))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+}
+
+fn note_name(note: &str) -> &str {
+    if note.is_empty() { "—" } else { note }
 }
 
 fn workspace_root() -> Result<PathBuf> {
@@ -261,71 +435,6 @@ fn workspace_root() -> Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| "xtask manifest has no workspace parent".into())
-}
-
-fn check_no_dyn(root: &Path) -> Result {
-    let mut rust_files = Vec::new();
-    for tree in SOURCE_TREES {
-        collect_rust_files(&root.join(tree), &mut rust_files)?;
-    }
-    rust_files.sort();
-
-    let mut violations = Vec::new();
-    for path in rust_files {
-        let source = fs::read_to_string(&path)?;
-        for (index, line) in source.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            let inspected =
-                if line.contains("fn source(&self)") && line.contains("dyn std::error::Error") {
-                    line.replacen("dyn std::error::Error", "std::error::Error", 1)
-                } else {
-                    line.to_owned()
-                };
-            if contains_word(&inspected, "dyn") {
-                let relative = path.strip_prefix(root).unwrap_or(&path);
-                violations.push(format!("{}:{}:{line}", relative.display(), index + 1));
-            }
-        }
-    }
-
-    if violations.is_empty() {
-        println!(
-            "check-no-dyn: OK (static dispatch; only std::error::Error::source signatures use dyn)"
-        );
-        return Ok(());
-    }
-    for violation in violations {
-        eprintln!("{violation}");
-    }
-    Err("found dyn outside std::error::Error::source".into())
-}
-
-fn collect_rust_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rust_files(&path, output)?;
-        } else if path.extension() == Some(OsStr::new("rs")) {
-            output.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn contains_word(text: &str, needle: &str) -> bool {
-    text.match_indices(needle).any(|(start, _)| {
-        let before = text[..start].chars().next_back();
-        let after = text[start + needle.len()..].chars().next();
-        !before.is_some_and(is_identifier_character) && !after.is_some_and(is_identifier_character)
-    })
-}
-
-fn is_identifier_character(character: char) -> bool {
-    character == '_' || character.is_alphanumeric()
 }
 
 fn check_license_sync(root: &Path) -> Result {
@@ -370,7 +479,10 @@ fn check_package_licenses(root: &Path) -> Result {
         let listing = String::from_utf8(output.stdout)?;
         for license in LICENSES {
             let expected = format!("LICENSES/{license}");
-            if !listing.lines().any(|line| line == expected) {
+            if !listing
+                .lines()
+                .any(|line| line.replace('\\', "/") == expected)
+            {
                 return Err(format!("{crate_name} package omits {expected}").into());
             }
         }
@@ -416,18 +528,24 @@ fn check_package_smoke(root: &Path) -> Result {
     let consumer_package_path =
         |name: &str| format!("../packages/{name}-{version}").replace('\\', "/");
     let core = workspace_package_path("libarchive_oxide-core");
+    let codecs = workspace_package_path("libarchive_oxide-codecs");
     let flagship = workspace_package_path("libarchive_oxide");
+    let package = workspace_package_path("libarchive_oxide-package");
     let cli = workspace_package_path("libarchive_oxide-cli");
     let consumer_core = consumer_package_path("libarchive_oxide-core");
+    let consumer_codecs = consumer_package_path("libarchive_oxide-codecs");
     let consumer_flagship = consumer_package_path("libarchive_oxide");
+    let consumer_package = consumer_package_path("libarchive_oxide-package");
     let workspace_manifest = format!(
         r#"[workspace]
 resolver = "2"
-members = ["consumer", "{core}", "{flagship}", "{cli}"]
+members = ["consumer", "{core}", "{codecs}", "{flagship}", "{package}", "{cli}"]
 
 [patch.crates-io]
 libarchive_oxide-core = {{ path = "{core}" }}
+libarchive_oxide-codecs = {{ path = "{codecs}" }}
 libarchive_oxide = {{ path = "{flagship}" }}
+libarchive_oxide-package = {{ path = "{package}" }}
 "#
     );
     fs::write(smoke.join("Cargo.toml"), workspace_manifest)?;
@@ -442,12 +560,14 @@ publish = false
 
 [features]
 default = ["portable-codecs"]
-portable-codecs = ["libarchive_oxide/portable-codecs"]
-native-codecs = ["libarchive_oxide/native-codecs"]
+portable-codecs = ["libarchive_oxide/portable-codecs", "libarchive_oxide-package/portable-codecs", "libarchive_oxide-codecs/gzip"]
+native-codecs = ["libarchive_oxide/native-codecs", "libarchive_oxide-package/native-codecs", "libarchive_oxide-codecs/gzip"]
 
 [dependencies]
 libarchive_oxide = {{ path = "{consumer_flagship}", default-features = false }}
+libarchive_oxide-package = {{ path = "{consumer_package}", default-features = false }}
 libarchive_oxide-core = {{ path = "{consumer_core}" }}
+libarchive_oxide-codecs = {{ path = "{consumer_codecs}" }}
 "#
         ),
     )?;
@@ -534,7 +654,7 @@ fn check_packaged_profiles(smoke: &Path) -> Result {
         )
         .into());
     }
-    let conflict = Command::new(cargo())
+    let combined = Command::new(cargo())
         .current_dir(smoke)
         .args([
             "check",
@@ -543,16 +663,14 @@ fn check_packaged_profiles(smoke: &Path) -> Result {
             "--features",
             "native-codecs",
         ])
-        .output()?;
-    if conflict.status.success()
-        || !String::from_utf8_lossy(&conflict.stderr).contains("mutually exclusive")
-    {
-        return Err("packaged codec profiles did not fail with the documented conflict".into());
+        .status()?;
+    if !combined.success() {
+        return Err("packaged codec profiles are not additive in an external consumer".into());
     }
     println!(
         "packaged crates compile in portable and native profiles; no-default Deflate64 is listable \
-         then Unsupported, Deflate64 has no write-method surface, and the profile combination \
-         fails closed"
+         then Unsupported, Deflate64 has no write-method surface, and both backend profiles compile \
+         together"
     );
     Ok(())
 }
@@ -727,14 +845,40 @@ fn require_dependency_profile(
 fn check_release_policy(root: &Path) -> Result {
     let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
     let assets = fs::read_to_string(root.join(".github/workflows/release-assets.yml"))?;
+    let bootstrap = fs::read_to_string(root.join(".github/workflows/bootstrap-publish.yml"))?;
     let release_plz = fs::read_to_string(root.join("release-plz.toml"))?;
     let contributing = fs::read_to_string(root.join("CONTRIBUTING.md"))?;
+    let workspace_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
 
-    check_manual_only_workflow("release.yml", &release)?;
-    check_manual_only_workflow("release-assets.yml", &assets)?;
+    check_release_policy_contents(
+        &release,
+        &assets,
+        &bootstrap,
+        &release_plz,
+        &contributing,
+        &workspace_manifest,
+    )?;
+    println!(
+        "release policy is version-frozen for development, manual-only, and \
+         draft-before-final-publication"
+    );
+    Ok(())
+}
+
+fn check_release_policy_contents(
+    release: &str,
+    assets: &str,
+    bootstrap: &str,
+    release_plz: &str,
+    contributing: &str,
+    workspace_manifest: &str,
+) -> Result {
+    check_manual_only_workflow("release.yml", release)?;
+    check_manual_only_workflow("release-assets.yml", assets)?;
+    check_manual_only_workflow("bootstrap-publish.yml", bootstrap)?;
     require_all(
         "release.yml",
-        &release,
+        release,
         &[
             "Type PREPARE or RELEASE",
             "inputs.operation == 'prepare'",
@@ -745,7 +889,7 @@ fn check_release_policy(root: &Path) -> Result {
     )?;
     require_all(
         "release-assets.yml",
-        &assets,
+        assets,
         &[
             "Type PREFLIGHT without upload, or ASSETS with upload",
             "if: inputs.upload",
@@ -754,8 +898,31 @@ fn check_release_policy(root: &Path) -> Result {
         ],
     )?;
     require_all(
+        "bootstrap-publish.yml",
+        bootstrap,
+        &[
+            "Type \"publish-0.2.0\"",
+            "inputs.confirmation == 'publish-0.2.0'",
+            "environment: release",
+        ],
+    )?;
+    require_toml_assignment(
         "release-plz.toml",
-        &release_plz,
+        release_plz,
+        "workspace",
+        "semver_check",
+        "false",
+    )?;
+    require_toml_assignment(
+        "Cargo.toml",
+        workspace_manifest,
+        "workspace.package",
+        "version",
+        "\"0.2.0\"",
+    )?;
+    require_all(
+        "release-plz.toml",
+        release_plz,
         &[
             "git_release_enable = true",
             "git_release_draft = true",
@@ -764,14 +931,13 @@ fn check_release_policy(root: &Path) -> Result {
     )?;
     require_all(
         "CONTRIBUTING.md",
-        &contributing,
+        contributing,
         &[
             "verify every draft asset",
             "Publish the completed draft Release manually",
             "Never automate",
         ],
     )?;
-    println!("release policy is manual-only and draft-before-final-publication");
     Ok(())
 }
 
@@ -781,19 +947,55 @@ fn check_manual_only_workflow(name: &str, workflow: &str) -> Result {
     if !trigger.trim_start().starts_with("workflow_dispatch:") {
         return Err(format!("{name} must start with workflow_dispatch").into());
     }
-    for forbidden in [
-        "\n  push:",
-        "\n  pull_request:",
-        "\n  schedule:",
-        "\n  release:",
-    ] {
-        if trigger.contains(forbidden) {
-            return Err(
-                format!("{name} contains forbidden automatic trigger {forbidden:?}").into(),
-            );
+
+    for line in trigger.lines() {
+        let without_comment = line.split_once('#').map_or(line, |(before, _)| before);
+        let indent = without_comment
+            .chars()
+            .take_while(char::is_ascii_whitespace)
+            .count();
+        if indent == 2
+            && let Some((event, _)) = without_comment.trim().split_once(':')
+            && event != "workflow_dispatch"
+        {
+            return Err(format!("{name} contains non-manual trigger {event:?}").into());
         }
     }
     Ok(())
+}
+
+fn require_toml_assignment(
+    name: &str,
+    text: &str,
+    section: &str,
+    key: &str,
+    expected: &str,
+) -> Result {
+    let mut current_section = "";
+    for line in text.lines() {
+        let without_comment = line.split_once('#').map_or(line, |(before, _)| before);
+        let trimmed = without_comment.trim();
+        if let Some(header) = trimmed
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            current_section = header.trim();
+            continue;
+        }
+        if current_section == section
+            && let Some((candidate, value)) = trimmed.split_once('=')
+            && candidate.trim() == key
+        {
+            let actual = value.trim();
+            if actual == expected {
+                return Ok(());
+            }
+            return Err(
+                format!("{name} [{section}].{key} must be {expected}, found {actual}").into(),
+            );
+        }
+    }
+    Err(format!("{name} is missing required [{section}].{key} = {expected}").into())
 }
 
 fn section_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
@@ -822,7 +1024,7 @@ fn run_fuzz_ci(root: &Path) -> Result {
             root,
             cargo(),
             &[
-                "+nightly",
+                FUZZ_NIGHTLY_TOOLCHAIN,
                 "test",
                 "-Z",
                 "panic-abort-tests",
@@ -842,14 +1044,20 @@ fn run_fuzz_ci(root: &Path) -> Result {
     run_command(
         root,
         cargo(),
-        &["+nightly", "fuzz", "build", "--target", &fuzz_target],
+        &[
+            FUZZ_NIGHTLY_TOOLCHAIN,
+            "fuzz",
+            "build",
+            "--target",
+            &fuzz_target,
+        ],
         "portable libFuzzer build",
     )?;
     run_command(
         root,
         cargo(),
         &[
-            "+nightly",
+            FUZZ_NIGHTLY_TOOLCHAIN,
             "fuzz",
             "build",
             "--no-default-features",
@@ -868,7 +1076,7 @@ fn run_fuzz_ci(root: &Path) -> Result {
     ] {
         for target in &targets {
             let mut arguments = vec![
-                "+nightly".to_owned(),
+                FUZZ_NIGHTLY_TOOLCHAIN.to_owned(),
                 "fuzz".to_owned(),
                 "run".to_owned(),
                 target.clone(),
@@ -901,7 +1109,7 @@ fn run_fuzz_ci(root: &Path) -> Result {
 fn fuzz_targets(root: &Path) -> Result<Vec<String>> {
     let output = Command::new(cargo())
         .current_dir(root)
-        .args(["+nightly", "fuzz", "list"])
+        .args([FUZZ_NIGHTLY_TOOLCHAIN, "fuzz", "list"])
         .output()?;
     if !output.status.success() {
         return Err(format!(
@@ -970,7 +1178,7 @@ fn run_big_endian_ci(root: &Path) -> Result {
             "--skip",
             "arbitrary_seeds_uphold_invariants",
             "--skip",
-            "seed_mutants_uphold_invariants",
+            "seed_mutants_",
             // The OCI layer tests measure compression throughput and multi-filter
             // rebuilds, not byte order: a multi-megabyte streaming hash and the
             // determinism batch that rebuilds every filter push the 15-minute
@@ -1040,15 +1248,56 @@ fn cargo() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_manual_only_workflow, contains_word, section_between};
+    use super::{
+        check_manual_only_workflow, check_release_policy_contents, require_toml_assignment,
+        section_between,
+    };
 
-    #[test]
-    fn dyn_is_matched_only_as_a_complete_identifier() {
-        assert!(contains_word("Box<dyn Error>", "dyn"));
-        assert!(contains_word("(dyn Error)", "dyn"));
-        assert!(!contains_word("dynamic", "dyn"));
-        assert!(!contains_word("some_dyn_type", "dyn"));
-    }
+    const VALID_RELEASE: &str = r"name: release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+description: Type PREPARE or RELEASE
+prepare: inputs.operation == 'prepare'
+publish: inputs.operation == 'publish'
+environment: release
+# leaves the GitHub Release as a draft
+";
+    const VALID_ASSETS: &str = r"name: assets
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+description: Type PREFLIGHT without upload, or ASSETS with upload
+if: inputs.upload
+ref: refs/tags/${{ inputs.ref }}
+# draft GitHub Release
+";
+    const VALID_BOOTSTRAP: &str = r#"name: bootstrap
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type "publish-0.2.0"
+permissions:
+  contents: read
+if: inputs.confirmation == 'publish-0.2.0'
+environment: release
+"#;
+    const VALID_RELEASE_PLZ: &str = r"[workspace]
+semver_check = false
+
+[[package]]
+git_release_enable = true
+git_release_draft = true
+git_tag_enable = true
+";
+    const VALID_CONTRIBUTING: &str =
+        "verify every draft asset\nPublish the completed draft Release manually\nNever automate\n";
+    const VALID_WORKSPACE_MANIFEST: &str = r#"[workspace.package]
+version = "0.2.0"
+"#;
 
     #[test]
     fn workflow_trigger_section_is_bounded() {
@@ -1064,5 +1313,119 @@ mod tests {
     fn automatic_release_trigger_is_rejected() {
         let workflow = "name: x\non:\n  workflow_dispatch:\n  release:\n    types: [published]\npermissions:\n";
         assert!(check_manual_only_workflow("test.yml", workflow).is_err());
+    }
+
+    #[test]
+    fn release_policy_fixture_is_accepted() {
+        assert!(
+            check_release_policy_contents(
+                VALID_RELEASE,
+                VALID_ASSETS,
+                VALID_BOOTSTRAP,
+                VALID_RELEASE_PLZ,
+                VALID_CONTRIBUTING,
+                VALID_WORKSPACE_MANIFEST,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn semver_freeze_is_rejected() {
+        let release_plz = VALID_RELEASE_PLZ.replace("semver_check = false", "semver_check = true");
+        assert!(
+            check_release_policy_contents(
+                VALID_RELEASE,
+                VALID_ASSETS,
+                VALID_BOOTSTRAP,
+                &release_plz,
+                VALID_CONTRIBUTING,
+                VALID_WORKSPACE_MANIFEST,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_version_bump_is_rejected() {
+        let manifest = VALID_WORKSPACE_MANIFEST.replace("0.2.0", "0.3.0");
+        assert!(
+            check_release_policy_contents(
+                VALID_RELEASE,
+                VALID_ASSETS,
+                VALID_BOOTSTRAP,
+                VALID_RELEASE_PLZ,
+                VALID_CONTRIBUTING,
+                &manifest,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn automatic_bootstrap_trigger_is_rejected() {
+        let bootstrap =
+            VALID_BOOTSTRAP.replace("  workflow_dispatch:", "  workflow_dispatch:\n  push:");
+        assert!(
+            check_release_policy_contents(
+                VALID_RELEASE,
+                VALID_ASSETS,
+                &bootstrap,
+                VALID_RELEASE_PLZ,
+                VALID_CONTRIBUTING,
+                VALID_WORKSPACE_MANIFEST,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_without_typed_confirmation_is_rejected() {
+        let bootstrap = VALID_BOOTSTRAP.replace(
+            "inputs.confirmation == 'publish-0.2.0'",
+            "inputs.confirmation != ''",
+        );
+        assert!(
+            check_release_policy_contents(
+                VALID_RELEASE,
+                VALID_ASSETS,
+                &bootstrap,
+                VALID_RELEASE_PLZ,
+                VALID_CONTRIBUTING,
+                VALID_WORKSPACE_MANIFEST,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_without_protected_environment_is_rejected() {
+        let bootstrap = VALID_BOOTSTRAP.replace("environment: release", "environment: staging");
+        assert!(
+            check_release_policy_contents(
+                VALID_RELEASE,
+                VALID_ASSETS,
+                &bootstrap,
+                VALID_RELEASE_PLZ,
+                VALID_CONTRIBUTING,
+                VALID_WORKSPACE_MANIFEST,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn commented_policy_assignment_does_not_count() {
+        let config = "[workspace]\n# semver_check = false\nsemver_check = true\n";
+        assert!(
+            require_toml_assignment(
+                "release-plz.toml",
+                config,
+                "workspace",
+                "semver_check",
+                "false",
+            )
+            .is_err()
+        );
     }
 }

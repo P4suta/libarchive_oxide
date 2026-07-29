@@ -45,6 +45,8 @@ impl core::error::Error for Error {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    /// An underlying reader, writer, or filesystem operation failed.
+    Io,
     /// Malformed bytes or contradictory headers.
     Malformed,
     /// Valid but unsupported format capability.

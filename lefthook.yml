@@ -47,10 +47,11 @@ pre-commit:
       run: mise exec -- just lint-macos
       fail_text: "macOS-target Clippy failed; fix cfg-gated errors before committing."
 
-    check-no-dyn:
+    registry:
       tags: lint
       glob: "*.rs"
-      run: mise exec -- just no-dyn
+      run: mise exec -- just registry
+      fail_text: "Object-safe provider registry conformance failed."
 
     reuse:
       tags: license

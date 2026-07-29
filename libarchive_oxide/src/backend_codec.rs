@@ -454,13 +454,7 @@ fn xz_error(error: &xz_codec::stream::Error) -> ArchiveError {
         .with_context(error.to_string())
 }
 
-const fn filter_name(filter: FilterId) -> &'static str {
-    match filter {
-        FilterId::Gzip => "gzip",
-        FilterId::Bzip2 => "bzip2",
-        FilterId::Zstd => "zstd",
-        FilterId::Xz => "xz",
-        FilterId::Lz4 => "lz4",
-        _ => "unknown",
-    }
+fn filter_name(filter: FilterId) -> &'static str {
+    libarchive_oxide_core::capability::filter_capability(filter)
+        .map_or("unknown", |record| record.name())
 }

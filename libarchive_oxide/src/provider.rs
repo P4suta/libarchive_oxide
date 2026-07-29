@@ -2,95 +2,120 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Compile-time archive format and outer-codec provider registration.
+//! Archive format and outer-codec provider contracts.
 //!
-//! Providers are composed as generic cons-lists. There is no global registry,
-//! trait object, dynamic loading boundary, or plugin ABI.
+//! Built-ins and legacy generic chains implement the same internal selection
+//! contract as the application-owned object-safe [`crate::Registry`].
 
 use std::fmt;
 use std::io::Write;
 
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
-    ArDecoder, ArEncoder, ArchiveDecoder, ArchiveEncoder, ArchiveError, ArchiveMetadata, Codec,
-    CpioDecoder, CpioEncoder, DecodeStep, EncodeCommand, EncodeStep, ErrorKind, FormatId, Limits,
-    ProbeResult, TarDecoder, TarEncoder,
+    AccessMode, AccessProfile, ArDecoder, ArEncoder, ArchiveDecoder, ArchiveEncoder, ArchiveError,
+    ArchiveMetadata, Codec, CpioDecoder, CpioEncoder, DecodeStep, Direction, DirectionSet,
+    EmptyDecoder, EncodeCommand, EncodeStep, ErrorKind, FormatId, Limits, ProbeResult, RawDecoder,
+    TarDecoder, TarEncoder, WarcDecoder,
 };
 
+use crate::BackendPreference;
 use crate::pipeline_codec::PipelineCodec;
 use crate::zip_stream::{StreamZipMethod, ZipStreamEncoder};
 
 /// Read/write capabilities advertised by one archive format provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatCapabilities {
-    decode: bool,
-    encode: bool,
-    seek: bool,
+    access: AccessProfile,
 }
 
 impl FormatCapabilities {
-    /// Creates an explicit capability description.
+    /// Creates an explicit direction-specific capability description.
     #[must_use]
-    pub const fn new(decode: bool, encode: bool, seek: bool) -> Self {
-        Self {
-            decode,
-            encode,
-            seek,
-        }
+    pub const fn new(access: AccessProfile) -> Self {
+        Self { access }
+    }
+
+    /// Creates a capability whose implemented directions share one access mode.
+    #[must_use]
+    pub const fn uniform(directions: DirectionSet, access: AccessMode) -> Self {
+        Self::new(AccessProfile::uniform(directions, access))
+    }
+
+    /// Supported operation directions.
+    #[must_use]
+    pub const fn directions(self) -> DirectionSet {
+        self.access.directions()
+    }
+
+    /// Complete direction-specific access profile.
+    #[must_use]
+    pub const fn accesses(self) -> AccessProfile {
+        self.access
+    }
+
+    /// Required access model for one direction.
+    #[must_use]
+    pub const fn access(self, direction: Direction) -> Option<AccessMode> {
+        self.access.get(direction)
     }
 
     /// Whether the provider can decode the format.
     #[must_use]
     pub const fn can_decode(self) -> bool {
-        self.decode
+        self.directions().contains(Direction::Read)
     }
 
     /// Whether the provider can encode the format.
     #[must_use]
     pub const fn can_encode(self) -> bool {
-        self.encode
+        self.directions().contains(Direction::Write)
     }
 
     /// Whether this identifier uses the crate's built-in seek-native path.
     /// Downstream sequential providers set this to `false`.
     #[must_use]
-    pub const fn requires_seek(self) -> bool {
-        self.seek
+    pub const fn requires_seek(self, direction: Direction) -> bool {
+        matches!(self.access(direction), Some(AccessMode::Seek))
     }
 
     const fn available(self) -> bool {
-        self.decode || self.encode
+        !self.directions().is_empty()
     }
 }
 
 /// Decode/encode capabilities advertised by one outer codec provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodecCapabilities {
-    decode: bool,
-    encode: bool,
+    directions: DirectionSet,
 }
 
 impl CodecCapabilities {
-    /// Creates an explicit capability description.
+    /// Creates an explicit typed capability description.
     #[must_use]
-    pub const fn new(decode: bool, encode: bool) -> Self {
-        Self { decode, encode }
+    pub const fn new(directions: DirectionSet) -> Self {
+        Self { directions }
+    }
+
+    /// Supported operation directions.
+    #[must_use]
+    pub const fn directions(self) -> DirectionSet {
+        self.directions
     }
 
     /// Whether the provider can decode the filter.
     #[must_use]
     pub const fn can_decode(self) -> bool {
-        self.decode
+        self.directions.contains(Direction::Read)
     }
 
     /// Whether the provider can encode the filter.
     #[must_use]
     pub const fn can_encode(self) -> bool {
-        self.encode
+        self.directions.contains(Direction::Write)
     }
 
     const fn available(self) -> bool {
-        self.decode || self.encode
+        !self.directions.is_empty()
     }
 }
 
@@ -794,11 +819,27 @@ fn combine_codec_probes<S>(
 
 /// Built-in format provider tail.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BuiltinFormatProviders;
+pub struct BuiltinFormatProviders {
+    backend: BackendPreference,
+}
+
+impl BuiltinFormatProviders {
+    pub(crate) const fn new(backend: BackendPreference) -> Self {
+        Self { backend }
+    }
+}
 
 /// Built-in codec provider tail.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BuiltinCodecProviders;
+pub struct BuiltinCodecProviders {
+    backend: BackendPreference,
+}
+
+impl BuiltinCodecProviders {
+    pub(crate) const fn new(backend: BackendPreference) -> Self {
+        Self { backend }
+    }
+}
 
 /// Statically dispatched built-in sequential decoder.
 #[doc(hidden)]
@@ -812,6 +853,9 @@ enum BuiltinFormatDecoderInner {
     Tar(Box<TarDecoder>),
     Cpio(Box<CpioDecoder>),
     Ar(Box<ArDecoder>),
+    Empty(EmptyDecoder),
+    Raw(RawDecoder),
+    Warc(Box<WarcDecoder>),
 }
 
 impl BuiltinFormatDecoder {
@@ -820,6 +864,9 @@ impl BuiltinFormatDecoder {
             FormatId::Tar => BuiltinFormatDecoderInner::Tar(Box::new(TarDecoder::new(limits))),
             FormatId::Cpio => BuiltinFormatDecoderInner::Cpio(Box::new(CpioDecoder::new(limits))),
             FormatId::Ar => BuiltinFormatDecoderInner::Ar(Box::new(ArDecoder::new(limits))),
+            FormatId::Empty => BuiltinFormatDecoderInner::Empty(EmptyDecoder::new()),
+            FormatId::Raw => BuiltinFormatDecoderInner::Raw(RawDecoder::with_limits(limits)),
+            FormatId::Warc => BuiltinFormatDecoderInner::Warc(Box::new(WarcDecoder::new(limits))),
             FormatId::Zip | FormatId::SevenZip | FormatId::Iso9660 | FormatId::Udf => {
                 return Err(ArchiveError::new(ErrorKind::Capability)
                     .with_format(format_name(format))
@@ -842,6 +889,9 @@ impl ArchiveDecoder for BuiltinFormatDecoder {
             BuiltinFormatDecoderInner::Tar(decoder) => decoder.step(input, output, end),
             BuiltinFormatDecoderInner::Cpio(decoder) => decoder.step(input, output, end),
             BuiltinFormatDecoderInner::Ar(decoder) => decoder.step(input, output, end),
+            BuiltinFormatDecoderInner::Empty(decoder) => decoder.step(input, output, end),
+            BuiltinFormatDecoderInner::Raw(decoder) => decoder.step(input, output, end),
+            BuiltinFormatDecoderInner::Warc(decoder) => decoder.step(input, output, end),
         }
     }
 }
@@ -869,17 +919,29 @@ impl BuiltinFormatEncoder {
     }
 
     pub(crate) fn sequential(format: FormatId, limits: Limits) -> Result<Self, ArchiveError> {
+        Self::sequential_with_backend(format, limits, BackendPreference::Auto)
+    }
+
+    pub(crate) fn sequential_with_backend(
+        format: FormatId,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
         let inner = match format {
             FormatId::Tar => BuiltinFormatEncoderInner::Tar(TarEncoder::new(limits)),
             FormatId::Cpio => BuiltinFormatEncoderInner::Cpio(CpioEncoder::new(limits)),
             FormatId::Ar => BuiltinFormatEncoderInner::Ar(ArEncoder::new(limits)),
             FormatId::Zip => {
-                BuiltinFormatEncoderInner::Zip(Box::new(ZipStreamEncoder::new(limits)))
+                BuiltinFormatEncoderInner::Zip(Box::new(ZipStreamEncoder::with_method_and_backend(
+                    limits,
+                    StreamZipMethod::Deflate,
+                    backend,
+                )))
             },
-            FormatId::Udf => {
+            FormatId::Udf | FormatId::Empty | FormatId::Raw | FormatId::Warc => {
                 return Err(ArchiveError::new(ErrorKind::Unsupported)
                     .with_format(format_name(format))
-                    .with_context("UDF writing is not supported"));
+                    .with_context("archive format is read-only"));
             },
             FormatId::SevenZip | FormatId::Iso9660 => {
                 return Err(ArchiveError::new(ErrorKind::Capability)
@@ -891,12 +953,13 @@ impl BuiltinFormatEncoder {
         Ok(Self { inner })
     }
 
-    pub(crate) fn zip(limits: Limits, method: crate::ZipMethod) -> Self {
-        let (method, deferred) = map_zip_method(method);
-        let mut encoder = ZipStreamEncoder::with_method(limits, method);
-        if let Some(message) = deferred {
-            encoder.set_deferred_unsupported(message);
-        }
+    pub(crate) fn zip_with_backend(
+        limits: Limits,
+        method: crate::ZipMethod,
+        backend: BackendPreference,
+    ) -> Self {
+        let method = map_zip_method(method);
+        let encoder = ZipStreamEncoder::with_method_and_backend(limits, method, backend);
         Self {
             inner: BuiltinFormatEncoderInner::Zip(Box::new(encoder)),
         }
@@ -909,43 +972,35 @@ impl BuiltinFormatEncoder {
     }
 
     #[cfg(feature = "aes")]
-    pub(crate) fn encrypted_zip(
+    pub(crate) fn encrypted_zip_with_backend(
         limits: Limits,
         method: crate::ZipMethod,
         password: crate::SecretBytes,
+        backend: BackendPreference,
     ) -> Self {
-        let (method, deferred) = map_zip_method(method);
-        let mut encoder = ZipStreamEncoder::with_password(limits, method, password);
-        if let Some(message) = deferred {
-            encoder.set_deferred_unsupported(message);
-        }
+        let method = map_zip_method(method);
+        let encoder =
+            ZipStreamEncoder::with_password_and_backend(limits, method, password, backend);
         Self {
             inner: BuiltinFormatEncoderInner::Zip(Box::new(encoder)),
         }
     }
 }
 
-/// Maps the public [`crate::ZipMethod`] to the writer's internal method,
-/// returning a deferred structured-Unsupported message when the requested
-/// method has no encoder in the current build profile (ZIP Zstandard write
-/// requires `native-codecs`; the portable `ruzstd` path is decode-only).
-fn map_zip_method(method: crate::ZipMethod) -> (StreamZipMethod, Option<&'static str>) {
+/// Maps the public [`crate::ZipMethod`] to the writer's internal method.
+///
+/// Feature-disabled methods are absent from the public enum, so this mapping
+/// cannot create a writer that only fails later as `Unsupported`.
+fn map_zip_method(method: crate::ZipMethod) -> StreamZipMethod {
     match method {
-        crate::ZipMethod::Store => (StreamZipMethod::Store, None),
-        crate::ZipMethod::Deflate => (StreamZipMethod::Deflate, None),
+        crate::ZipMethod::Store => StreamZipMethod::Store,
+        crate::ZipMethod::Deflate => StreamZipMethod::Deflate,
         #[cfg(feature = "bzip2")]
-        crate::ZipMethod::Bzip2 => (StreamZipMethod::Bzip2, None),
-        #[cfg(all(feature = "zstd", feature = "native-codecs"))]
-        crate::ZipMethod::Zstd => (StreamZipMethod::Zstd, None),
-        #[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
-        crate::ZipMethod::Zstd => (
-            StreamZipMethod::Deflate,
-            Some(
-                "ZIP Zstandard write requires the native-codecs profile (no portable zstd encoder)",
-            ),
-        ),
+        crate::ZipMethod::Bzip2 => StreamZipMethod::Bzip2,
+        #[cfg(feature = "zstd")]
+        crate::ZipMethod::Zstd => StreamZipMethod::Zstd,
         #[cfg(feature = "xz")]
-        crate::ZipMethod::Lzma => (StreamZipMethod::Lzma, None),
+        crate::ZipMethod::Lzma => StreamZipMethod::Lzma,
     }
 }
 
@@ -1018,24 +1073,13 @@ impl StaticFormatProviders for BuiltinFormatProviders {
     }
 
     fn format_capability(&self, format: FormatId) -> ProviderCapability<FormatCapabilities> {
-        match format {
-            FormatId::Tar | FormatId::Cpio | FormatId::Ar | FormatId::Zip | FormatId::Iso9660 => {
-                ProviderCapability::Available(FormatCapabilities::new(
-                    true,
-                    true,
-                    matches!(format, FormatId::Zip | FormatId::Iso9660),
-                ))
-            },
-            FormatId::SevenZip if cfg!(feature = "sevenz") => {
-                ProviderCapability::Available(FormatCapabilities::new(true, true, true))
-            },
-            FormatId::SevenZip => ProviderCapability::Disabled,
-            // UDF, CAB, and XAR are seek-native READ-ONLY providers.
-            FormatId::Udf | FormatId::Cab | FormatId::Xar => {
-                ProviderCapability::Available(FormatCapabilities::new(true, false, true))
-            },
-            _ => ProviderCapability::Unknown,
+        let Some(record) = libarchive_oxide_core::capability::format_capability(format) else {
+            return ProviderCapability::Unknown;
+        };
+        if !crate::capability::requirements_enabled(record.requirements()) {
+            return ProviderCapability::Disabled;
         }
+        ProviderCapability::Available(FormatCapabilities::new(record.access()))
     }
 
     fn select_format(&self, format: FormatId) -> Result<Self::Selection, ArchiveError> {
@@ -1070,7 +1114,7 @@ impl StaticFormatProviders for BuiltinFormatProviders {
         ) {
             return Err(disabled_format(selection, format_name(selection), "encode"));
         }
-        BuiltinFormatEncoder::sequential(selection, limits)
+        BuiltinFormatEncoder::sequential_with_backend(selection, limits, self.backend)
     }
 }
 
@@ -1091,19 +1135,18 @@ impl StaticCodecProviders for BuiltinCodecProviders {
     }
 
     fn codec_capability(&self, filter: FilterId) -> ProviderCapability<CodecCapabilities> {
-        let enabled = match filter {
-            FilterId::Gzip => true,
-            FilterId::Bzip2 => cfg!(feature = "bzip2"),
-            FilterId::Zstd => cfg!(feature = "zstd"),
-            FilterId::Xz => cfg!(feature = "xz"),
-            FilterId::Lz4 => cfg!(feature = "lz4"),
-            _ => return ProviderCapability::Unknown,
+        let Some(record) = libarchive_oxide_core::capability::filter_capability(filter) else {
+            return ProviderCapability::Unknown;
         };
-        if enabled {
-            ProviderCapability::Available(CodecCapabilities::new(true, true))
-        } else {
-            ProviderCapability::Disabled
+        if !crate::capability::requirements_enabled(record.requirements()) {
+            return ProviderCapability::Disabled;
         }
+        let directions = if cfg!(feature = "native-codecs") {
+            record.portable().union(record.native())
+        } else {
+            record.portable()
+        };
+        ProviderCapability::Available(CodecCapabilities::new(directions))
     }
 
     fn select_codec(&self, filter: FilterId) -> Result<Self::Selection, ArchiveError> {
@@ -1118,13 +1161,15 @@ impl StaticCodecProviders for BuiltinCodecProviders {
         selection: Self::Selection,
         limits: Limits,
     ) -> Result<Self::Decoder, ArchiveError> {
-        if matches!(
-            self.codec_capability(selection),
-            ProviderCapability::Disabled
-        ) {
-            return Err(disabled_codec(selection, filter_name(selection), "decode"));
+        match self.codec_capability(selection) {
+            ProviderCapability::Available(capabilities) if capabilities.can_decode() => {},
+            ProviderCapability::Available(_) | ProviderCapability::Disabled => {
+                return Err(disabled_codec(selection, filter_name(selection), "decode"));
+            },
+            ProviderCapability::Unknown => return Err(unknown_codec(selection)),
         }
-        PipelineCodec::new(selection, limits).map(|inner| BuiltinCodecDecoder { inner })
+        PipelineCodec::with_backend(selection, limits, self.backend)
+            .map(|inner| BuiltinCodecDecoder { inner })
     }
 
     fn encode_codec_frame(
@@ -1133,15 +1178,21 @@ impl StaticCodecProviders for BuiltinCodecProviders {
         input: &[u8],
         limits: Limits,
     ) -> Result<Vec<u8>, ArchiveError> {
-        if matches!(
-            self.codec_capability(selection),
-            ProviderCapability::Disabled
-        ) {
-            return Err(disabled_codec(selection, filter_name(selection), "encode"));
+        match self.codec_capability(selection) {
+            ProviderCapability::Available(capabilities) if capabilities.can_encode() => {},
+            ProviderCapability::Available(_) | ProviderCapability::Disabled => {
+                return Err(disabled_codec(selection, filter_name(selection), "encode"));
+            },
+            ProviderCapability::Unknown => return Err(unknown_codec(selection)),
         }
         let encoded = match selection {
             FilterId::Gzip => {
-                let mut writer = crate::filtered_io::GzipFilterWrite::new(Vec::new(), limits);
+                let mut writer = crate::filtered_io::GzipFilterWrite::with_backend(
+                    Vec::new(),
+                    limits,
+                    self.backend,
+                )
+                .map_err(|error| codec_io_error("gzip", &error))?;
                 writer
                     .write_all(input)
                     .and_then(|()| writer.finish())
@@ -1165,8 +1216,12 @@ impl StaticCodecProviders for BuiltinCodecProviders {
             FilterId::Zstd | FilterId::Xz | FilterId::Lz4 => {
                 #[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
                 {
-                    crate::filtered_io::encode_profile_frame(selection, input)
-                        .map_err(|error| codec_io_error(filter_name(selection), &error))?
+                    crate::filtered_io::encode_profile_frame_with_backend(
+                        selection,
+                        input,
+                        self.backend,
+                    )
+                    .map_err(|error| codec_io_error(filter_name(selection), &error))?
                 }
                 #[cfg(not(any(feature = "zstd", feature = "xz", feature = "lz4")))]
                 {
@@ -1190,9 +1245,15 @@ impl ProviderSet<BuiltinFormatProviders, BuiltinCodecProviders> {
     /// Built-in providers compiled into this crate.
     #[must_use]
     pub const fn builtins() -> Self {
+        Self::builtins_with_backend(BackendPreference::Auto)
+    }
+
+    /// Built-in providers with an explicit runtime codec backend preference.
+    #[must_use]
+    pub const fn builtins_with_backend(backend: BackendPreference) -> Self {
         Self {
-            formats: BuiltinFormatProviders,
-            codecs: BuiltinCodecProviders,
+            formats: BuiltinFormatProviders::new(backend),
+            codecs: BuiltinCodecProviders::new(backend),
         }
     }
 }
@@ -1214,6 +1275,7 @@ impl<F, C> ProviderSet<F, C> {
     }
 
     /// Prepends an archive format provider to the static chain.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_format_provider<P>(self, provider: P) -> ProviderSet<FormatProviderNode<P, F>, C>
     where
@@ -1229,6 +1291,7 @@ impl<F, C> ProviderSet<F, C> {
     }
 
     /// Prepends an outer codec provider to the static chain.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_codec_provider<P>(self, provider: P) -> ProviderSet<F, CodecProviderNode<P, C>>
     where
@@ -1346,28 +1409,12 @@ fn codec_io_error(provider: &'static str, error: &std::io::Error) -> ArchiveErro
         .with_context(error.to_string())
 }
 
-pub(crate) const fn format_name(format: FormatId) -> &'static str {
-    match format {
-        FormatId::Tar => "tar",
-        FormatId::Cpio => "cpio",
-        FormatId::Ar => "ar",
-        FormatId::Zip => "zip",
-        FormatId::SevenZip => "7z",
-        FormatId::Iso9660 => "iso9660",
-        FormatId::Udf => "udf",
-        FormatId::Cab => "cab",
-        FormatId::Xar => "xar",
-        _ => "unknown",
-    }
+pub(crate) fn format_name(format: FormatId) -> &'static str {
+    libarchive_oxide_core::capability::format_capability(format)
+        .map_or("unknown", |record| record.name())
 }
 
-pub(crate) const fn filter_name(filter: FilterId) -> &'static str {
-    match filter {
-        FilterId::Gzip => "gzip",
-        FilterId::Bzip2 => "bzip2",
-        FilterId::Zstd => "zstd",
-        FilterId::Xz => "xz",
-        FilterId::Lz4 => "lz4",
-        _ => "unknown",
-    }
+pub(crate) fn filter_name(filter: FilterId) -> &'static str {
+    libarchive_oxide_core::capability::filter_capability(filter)
+        .map_or("unknown", |record| record.name())
 }

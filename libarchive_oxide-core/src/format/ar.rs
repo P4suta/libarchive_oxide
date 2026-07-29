@@ -213,10 +213,7 @@ impl ArDecoder {
             gid: parse_decimal(rtrim(field(header, F_GID), b' ')).unwrap_or(0),
             mtime: parse_decimal(rtrim(field(header, F_MTIME), b' '))
                 .ok()
-                .map(|seconds| Timestamp {
-                    secs: i64::try_from(seconds).unwrap_or(i64::MAX),
-                    nanos: 0,
-                }),
+                .map(|seconds| Timestamp::from_seconds(i64::try_from(seconds).unwrap_or(i64::MAX))),
         })
     }
 
@@ -693,7 +690,7 @@ impl ArEncoder {
         let mtime = metadata
             .times()
             .modified
-            .map_or(0, |time| u64::try_from(time.secs.max(0)).unwrap_or(0));
+            .map_or(0, |time| u64::try_from(time.seconds().max(0)).unwrap_or(0));
         put_field(
             &mut header[F_MTIME.0..F_MTIME.1],
             radix_bytes(mtime, 10, &mut buffer),

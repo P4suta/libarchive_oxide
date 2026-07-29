@@ -4,10 +4,12 @@
 
 # CI for libarchive_oxide (safe-Rust unified archive library).
 #
-# Layout under test: three published crates + an excluded fuzz sub-workspace.
+# Layout under test: five publishable crates + an excluded fuzz sub-workspace.
 #   - libarchive_oxide-core   no_std + alloc, zero external deps (sans-I/O state machines).
+#   - libarchive_oxide-codecs no_std + alloc, additive portable codec state machines.
 #   - libarchive_oxide        the std flagship (auto-detection, FS extraction, safe paths, codecs).
-#   - libarchive_oxide-cli    the bsdtar-family bins (oxtar/oxcpio/oxcat/oxunzip).
+#   - libarchive_oxide-package ecosystem package rules and offline verification.
+#   - libarchive_oxide-cli    the unified oxarchive command.
 #   - xtask                   portable repository-policy checks used by Just and CI.
 #   - fuzz/                   cargo-fuzz targets; outside the workspace, nightly-only.
 #
@@ -39,8 +41,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
   # NOTE: `-D warnings` is applied *per job*, only on the stable toolchain we can reproduce locally
-  # (fmt/clippy/test/32-bit/no_std/doc). It is deliberately NOT global: the msrv (cargo-msrv installs 1.85 /
-  # 1.87), fuzz (nightly), and big-endian (cross/qemu) jobs run toolchains or emulators the dev box
+  # (fmt/clippy/test/32-bit/no_std/doc). It is deliberately NOT global: the msrv (cargo-msrv installs
+  # 1.88), fuzz (nightly), and big-endian (cross/qemu) jobs run toolchains or emulators the dev box
   # cannot reproduce, and a version-specific warning from the compiler or a dependency there would
   # turn CI red for a reason invisible to every local gate. Those jobs still fail on real errors.
 
@@ -77,9 +79,13 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # Each maximal profile includes the bounded, target-sharded invariant replay, followed by
+    # doctests. Keep the job ceiling above two complete profiles while nextest's per-test timeout
+    # still catches individual hangs.
+    timeout-minutes: 30
     env:
       RUSTFLAGS: -D warnings
+      NEXTEST_TEST_THREADS: ${{ matrix.test_threads }}
       RUST_TEST_THREADS: ${{ matrix.test_threads }}
     strategy:
       fail-fast: false
@@ -98,11 +104,45 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
+          tool: just@1.50.0,nextest@0.9.140
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Nextest runs the normal conformance and committed fuzz-replay corpus process-per-test
+      # through both maximal profiles. Cargo follows each profile with its doctests.
+      - run: just test-ci
+
+  streaming-soak:
+    name: 10 GiB tar/gzip/xz/zstd soak (peak RSS <= 128 MiB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: -D warnings
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
           tool: just@1.50.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # This runs the same conformance and committed fuzz-replay corpus through the maximal
-      # portable and native profiles on all three OSes. The profiles are deliberately exclusive.
-      - run: just test
+      # Each test synthesizes a raw tar or repeats one small compressed frame on demand, consumes
+      # all 10 GiB through ArchiveReader, and reads Linux VmHWM after completion. No archive-sized
+      # file, compressed fixture, or allocation is ever created.
+      - run: just streaming-soak
+
+  feature-matrix:
+    name: feature matrix (cargo-hack, all targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: just@1.50.0,cargo-hack@0.6.45
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: just feature-matrix
 
   check-32-bit-windows:
     name: check (i686 Windows, portable + native)
@@ -134,9 +174,27 @@ jobs:
         with:
           tool: just@1.50.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # libarchive_oxide-core must stay pure no_std + alloc; building for a bare-metal target with no
-      # std available proves it. Do NOT pass --all-features here (that pulls std).
+      # Core and all portable codec features must stay no_std + alloc. Building both for a
+      # bare-metal target with no std available proves the physical crate boundary.
       - run: just no-std
+
+  wasi:
+    name: WASI inspection stack (wasm32-wasip1)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: wasm32-wasip1
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: just@1.50.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # This is compile-only: archive inspection and portable codecs must remain
+      # usable without enabling native libraries or filesystem extraction.
+      - run: just wasi
 
   doc:
     name: doc (rustdoc, warnings are errors)
@@ -162,7 +220,7 @@ jobs:
       - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
 
   msrv:
-    name: msrv (core 1.85, flagship 1.87)
+    name: msrv (workspace 1.88, including no_std)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -170,19 +228,18 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
-          tool: cargo-msrv
+          tool: cargo-msrv@0.19.3
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: just@1.50.0
       # `cargo-msrv verify` reads each crate's declared `rust-version` and proves it actually builds
-      # on that floor (installing the toolchain via rustup). The two crates have different floors —
-      # core's zero-dep no_std baseline (1.85) and the flagship's codec closure (1.87) — so each is
-      # verified against its own manifest. The CLI inherits the flagship's floor and is covered by it.
+      # on that floor (installing the toolchain via rustup). Every workspace member uses the
+      # same 1.88 floor; core and portable codecs are additionally built as no_std + alloc.
       - name: verify declared MSRVs
         run: just msrv
 
-  nodyn:
-    name: no-dyn gate
+  registry:
+    name: object-safe registry conformance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -190,9 +247,9 @@ jobs:
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: just@1.50.0
-      # Mechanically enforce static format/codec dispatch. The safe-Rust xtask permits only the
-      # standard Error::source signature needed to preserve concrete I/O sources.
-      - run: just no-dyn
+      # Boxed downstream providers retain the common bounded incremental protocol,
+      # duplicate-ID rejection, and capability semantics.
+      - run: just registry
 
   reuse:
     name: reuse (SPDX/REUSE compliance)
@@ -207,10 +264,9 @@ jobs:
       # time, whose image-manifest fetch intermittently timed out and turned `ci-required` red for a
       # network reason unrelated to compliance. PyPI (uv/reuse) is far more reliable than anonymous
       # Docker Hub pulls, and running the same command as local keeps CI and the dev box from drifting.
-      - name: install uv
-        run: |
-          curl --proto '=https' --tlsv1.2 -LsSf --retry 5 --retry-connrefused https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: 0.11.32
       - run: just reuse
 
   license-sync:
@@ -229,58 +285,32 @@ jobs:
         run: just package-smoke
       - name: verify portable exclusion and explicit native codec backends
         run: just codec-policy
+      - name: verify generated capability documentation
+        run: just capability-docs
       - name: verify manual draft-first release policy
         run: just release-policy
 
   deny:
-    name: cargo-deny (advisories, licenses, bans, sources)
+    name: dependency policy (cargo-deny + cargo-shear)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2,cargo-shear@1.13.3
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: just@1.50.0
       - run: just deny
-
-  semver-checks:
-    name: semver-checks (PR API compatibility)
-    # PRs only: compares this branch's public API against the crates.io baseline. A push to main has
-    # no "proposed change" to weigh, and the release job re-runs the same gate at publish time.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: explain first-publish bootstrap skip
-        if: vars.V02_BASELINE_PUBLISHED != 'true'
-        run: >-
-          echo "::notice::Skipping semver-checks until v0.2 establishes the new crates.io
-          baselines; setting V02_BASELINE_PUBLISHED=true enables this gate for later PRs."
-      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
-        if: vars.V02_BASELINE_PUBLISHED == 'true'
-        with:
-          tool: cargo-semver-checks
-      # Flags an SemVer-breaking change to the two published library crates that is not paired with a
-      # major bump. `release-plz` re-runs the same tool at publish time (release.yml); this is the
-      # early PR-time signal.
-      - if: vars.V02_BASELINE_PUBLISHED == 'true'
-        # cargo-semver-checks otherwise heuristically enables almost every feature, which would
-        # intentionally trip the portable/native mutual-exclusion guard.
-        run: >-
-          cargo semver-checks check-release
-          -p libarchive_oxide-core
-          -p libarchive_oxide
-          --default-features
+      - run: just shear
 
   fuzz:
     name: fuzz (nightly, build + short run)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The 27-target inventory receives 30 seconds per portable target and 10
+    # seconds per native target (18 minutes total) after two complete builds.
+    timeout-minutes: 30
     env:
       # cargo-binstall distributes cargo-fuzz as a musl-linked executable. Explicitly select the
       # runner's GNU target so cargo-fuzz does not mistake its own build target for the fuzz target;
@@ -293,11 +323,12 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
-          tool: cargo-fuzz
-      # libFuzzer needs nightly + the sanitizer runtime; install it via rustup (no unpinnable
-      # nightly action ref). The fuzz crate is outside the workspace, so it carries its own lockfile.
-      - name: install nightly (libFuzzer)
-        run: rustup toolchain install nightly --profile minimal --no-self-update
+          tool: cargo-fuzz@0.13.2
+      # libFuzzer needs nightly + the sanitizer runtime. Pin the dated official
+      # toolchain so an unrelated nightly update cannot change this required gate.
+      # The fuzz crate is outside the workspace, so it carries its own lockfile.
+      - name: install pinned nightly (libFuzzer)
+        run: rustup toolchain install nightly-2026-07-29 --profile minimal --no-self-update
       # A panic in a dependency must fail as a process abort here as it does under libFuzzer.
       # Overflow checks keep malformed length arithmetic on the same fail-closed path.
       # Both profiles run the same target list and committed corpus. The portable budget remains the
@@ -326,27 +357,40 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
-          tool: cross
+          tool: cross@0.2.5
       - name: compile big-endian s390x test binaries
         run: cargo run --quiet -p xtask -- big-endian-ci-compile
       - name: test suite on big-endian s390x under qemu
         run: cargo run --quiet -p xtask -- big-endian-ci
 
   actionlint:
-    name: actionlint (workflow self-check)
+    name: actionlint + zizmor (workflow self-check)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: just@1.50.0,zizmor@1.28.0
       - name: actionlint
         env:
           ACTIONLINT_VERSION: 1.7.12
+          # Official digest published on the v1.7.12 GitHub Release asset.
+          ACTIONLINT_LINUX_AMD64_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
-          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
-            | tar xz -C /tmp actionlint
-          /tmp/actionlint -color
+          asset="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          archive="$RUNNER_TEMP/$asset"
+          curl --fail --show-error --location --retry 5 --retry-connrefused \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$asset"
+          printf '%s  %s\n' "$ACTIONLINT_LINUX_AMD64_SHA256" "$archive" |
+            sha256sum --check --strict -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+      - name: zizmor (offline, high severity)
+        run: just zizmor
 
-  # Single aggregation gate. `if: always()` so it runs when an upstream job fails; `skipped` counts
-  # as pass, letting PR-only jobs (semver-checks) report green on push / merge_group.
+  # Single aggregation gate. `if: always()` makes failures and cancellations
+  # visible through the one branch-protection status.
   ci-required:
     name: ci-required
     if: always()
@@ -354,16 +398,18 @@ jobs:
       - fmt
       - clippy
       - test
+      - streaming-soak
+      - feature-matrix
       - check-32-bit-windows
       - no_std
+      - wasi
       - doc
       - typos
       - msrv
-      - nodyn
+      - registry
       - reuse
       - license-sync
       - deny
-      - semver-checks
       - fuzz
       - big-endian
       - actionlint

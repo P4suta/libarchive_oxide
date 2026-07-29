@@ -8,25 +8,39 @@
 
 use std::io::{self, Cursor};
 use std::path::Component;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-use libarchive_oxide::libarchive_oxide_core::{
-    ArchivePath, EntryKind, EntryMetadata, EntryTimes, Timestamp,
-};
-#[cfg(target_os = "linux")]
-use libarchive_oxide::libarchive_oxide_core::{Owner, SparseExtent};
+#[cfg(unix)]
+use libarchive_oxide::CapStdFilesystemAdapter;
 use libarchive_oxide::{
     ArchiveEngine, ArchiveWriter, EntryOutcomeKind, FilesystemAdapter, FilesystemAdapterError,
     FilesystemCapabilities, FilesystemEntry, FilesystemEntryReport, FilesystemFinding,
-    FilesystemFindingKind, FilesystemMaterialization, FilesystemOperation, Policy, RejectionReason,
+    FilesystemFindingKind, FilesystemMaterialization, FilesystemOperation, PlanDisposition, Policy,
+    RejectionReason,
 };
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, EntryTimes, Timestamp};
+#[cfg(target_os = "linux")]
+use libarchive_oxide_core::{Owner, SparseExtent};
 
 fn archive(metadata: &EntryMetadata, logical: &[u8]) -> Vec<u8> {
     let mut writer = ArchiveWriter::new(Vec::new());
     writer.start_entry(metadata).expect("start fixture entry");
     writer.write_data(logical).expect("write fixture payload");
     writer.end_entry().expect("end fixture entry");
+    writer.finish().expect("finish fixture")
+}
+
+fn archive_many(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = ArchiveWriter::new(Vec::new());
+    for (path, logical) in entries {
+        let metadata = regular_metadata(path, logical.len());
+        writer.start_entry(&metadata).expect("start fixture entry");
+        writer.write_data(logical).expect("write fixture payload");
+        writer.end_entry().expect("end fixture entry");
+    }
     writer.finish().expect("finish fixture")
 }
 
@@ -147,6 +161,97 @@ impl FilesystemAdapter for RecordingAdapter {
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct AncestorSwapAdapter {
+    inner: CapStdFilesystemAdapter,
+    root: PathBuf,
+    outside: PathBuf,
+    swapped: bool,
+}
+
+#[cfg(unix)]
+impl FilesystemAdapter for AncestorSwapAdapter {
+    fn capabilities(&self) -> FilesystemCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn begin_session(&mut self) -> Result<(), FilesystemAdapterError> {
+        self.inner.begin_session()
+    }
+
+    fn begin_entry(&mut self, entry: FilesystemEntry<'_>) -> Result<(), FilesystemAdapterError> {
+        self.inner.begin_entry(entry)
+    }
+
+    fn write_data(&mut self, data: &[u8]) -> Result<(), FilesystemAdapterError> {
+        self.inner.write_data(data)
+    }
+
+    fn finish_entry(&mut self) -> Result<FilesystemEntryReport, FilesystemAdapterError> {
+        if !self.swapped {
+            let original = self.root.join("pivot");
+            let held = self.root.join("pivot-held");
+            let temporary = std::fs::read_dir(&original)
+                .expect("created extraction parent")
+                .map(|entry| entry.expect("temporary entry").file_name())
+                .find(|name| name.to_string_lossy().starts_with(".libarchive-oxide-"))
+                .expect("temporary sibling");
+            std::fs::rename(&original, &held).expect("move prepared parent");
+            std::os::unix::fs::symlink(&self.outside, &original)
+                .expect("replace parent with outside symlink");
+            std::fs::write(self.outside.join(temporary), b"attacker-controlled")
+                .expect("plant matching temporary name outside");
+            self.swapped = true;
+        }
+        self.inner.finish_entry()
+    }
+
+    fn abort_entry(&mut self) {
+        self.inner.abort_entry();
+    }
+
+    fn finish_session(&mut self) -> Result<Vec<FilesystemFinding>, FilesystemAdapterError> {
+        self.inner.finish_session()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_commit_is_bound_to_the_prepared_parent_directory_handle() {
+    let bytes = archive_many(&[("pivot/escaped.txt", b"archive-payload")]);
+    let destination = tempfile::tempdir().expect("destination");
+    let outside = tempfile::tempdir().expect("outside directory");
+    let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).expect("root");
+    let mut adapter = AncestorSwapAdapter {
+        inner: CapStdFilesystemAdapter::new(root),
+        root: destination.path().to_path_buf(),
+        outside: outside.path().to_path_buf(),
+        swapped: false,
+    };
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(bytes))
+        .expect("prepare");
+    let plan = session.plan(Policy::safe()).expect("plan");
+    let report = session
+        .apply_with_adapter(plan, &mut adapter)
+        .expect("apply through race injector");
+
+    assert!(matches!(
+        report.extraction().outcomes()[0].outcome(),
+        EntryOutcomeKind::File
+    ));
+    assert_eq!(
+        std::fs::read(destination.path().join("pivot-held/escaped.txt"))
+            .expect("file committed through stable parent handle"),
+        b"archive-payload"
+    );
+    assert!(
+        !outside.path().join("escaped.txt").exists(),
+        "ancestor replacement redirected the atomic commit outside the root"
+    );
+}
+
 #[test]
 fn custom_adapter_receives_normalized_stream_and_missing_fidelity_is_typed() {
     let metadata = EntryMetadata::builder(
@@ -156,21 +261,15 @@ fn custom_adapter_receives_normalized_stream_and_missing_fidelity_is_typed() {
     .size(Some(7))
     .mode(Some(0o640))
     .times(EntryTimes {
-        modified: Some(Timestamp {
-            secs: 1_700_000_000,
-            nanos: 0,
-        }),
-        changed: Some(Timestamp {
-            secs: 1_700_000_001,
-            nanos: 0,
-        }),
+        modified: Some(Timestamp::from_seconds(1_700_000_000)),
+        changed: Some(Timestamp::from_seconds(1_700_000_001)),
         ..EntryTimes::default()
     })
     .xattr(b"user.rm104".to_vec(), b"evidence".to_vec())
     .build();
     let bytes = archive(&metadata, b"payload");
     let mut session = ArchiveEngine::new()
-        .open(Cursor::new(bytes))
+        .prepare(Cursor::new(bytes))
         .expect("session");
     let plan = session.plan(Policy::safe()).expect("plan");
     let capabilities = FilesystemCapabilities::none()
@@ -212,7 +311,7 @@ fn custom_adapter_receives_normalized_stream_and_missing_fidelity_is_typed() {
 fn adapter_os_errors_remain_in_the_apply_report() {
     let metadata = regular_metadata("failed.bin", 3);
     let mut session = ArchiveEngine::new()
-        .open(Cursor::new(archive(&metadata, b"bad")))
+        .prepare(Cursor::new(archive(&metadata, b"bad")))
         .expect("session");
     let plan = session.plan(Policy::safe()).expect("plan");
     let mut adapter = RecordingAdapter::failing();
@@ -247,11 +346,11 @@ fn session_mismatch_does_not_touch_the_adapter() {
     let metadata = regular_metadata("identity.bin", 1);
     let bytes = archive(&metadata, b"x");
     let mut first = ArchiveEngine::new()
-        .open(Cursor::new(bytes.clone()))
+        .prepare(Cursor::new(bytes.clone()))
         .expect("first");
     let foreign_plan = first.plan(Policy::safe()).expect("foreign plan");
     let mut second = ArchiveEngine::new()
-        .open(Cursor::new(bytes))
+        .prepare(Cursor::new(bytes))
         .expect("second");
     let mut adapter =
         RecordingAdapter::successful(FilesystemCapabilities::none().with_atomic_commit(true));
@@ -268,7 +367,7 @@ fn session_mismatch_does_not_touch_the_adapter() {
 fn unsafe_paths_are_refused_before_adapter_dispatch() {
     let metadata = regular_metadata("../escape.bin", 1);
     let mut session = ArchiveEngine::new()
-        .open(Cursor::new(archive(&metadata, b"x")))
+        .prepare(Cursor::new(archive(&metadata, b"x")))
         .expect("session");
     let plan = session.plan(Policy::safe()).expect("plan");
     let mut adapter =
@@ -289,10 +388,127 @@ fn unsafe_paths_are_refused_before_adapter_dispatch() {
 }
 
 #[test]
+fn late_topology_collision_is_preflighted_before_any_entry_dispatch() {
+    let bytes = archive_many(&[("node", b"first"), ("node/child", b"must-not-dispatch")]);
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(bytes))
+        .expect("session");
+    let plan = session.plan(Policy::safe()).expect("whole-archive plan");
+    assert_eq!(
+        plan.entries()[1].disposition(),
+        PlanDisposition::Reject(RejectionReason::DestinationCollision)
+    );
+
+    let mut adapter =
+        RecordingAdapter::successful(FilesystemCapabilities::none().with_atomic_commit(true));
+    let report = session
+        .apply_with_adapter(plan, &mut adapter)
+        .expect("apply authoritative plan");
+
+    assert_eq!(adapter.begin_sessions, 1);
+    assert_eq!(adapter.begin_entries, 1);
+    assert_eq!(adapter.payload, b"first");
+    assert!(matches!(
+        report.extraction().outcomes()[1].outcome(),
+        EntryOutcomeKind::Rejected(RejectionReason::DestinationCollision)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_alias_collisions_are_refused_before_adapter_dispatch() {
+    let bytes = archive_many(&[
+        ("name.txt", b"case-first"),
+        ("NAME.TXT", b"case-alias"),
+        ("caf\u{00e9}.txt", b"nfc-first"),
+        ("cafe\u{0301}.txt", b"nfd-alias"),
+    ]);
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(bytes))
+        .expect("session");
+    let plan = session.plan(Policy::safe()).expect("plan");
+    let mut adapter =
+        RecordingAdapter::successful(FilesystemCapabilities::none().with_atomic_commit(true));
+    let report = session
+        .apply_with_adapter(plan, &mut adapter)
+        .expect("typed alias rejections");
+
+    assert_eq!(adapter.begin_sessions, 1);
+    assert_eq!(adapter.begin_entries, 2);
+    assert_eq!(adapter.payload, b"case-firstnfc-first");
+    assert!(matches!(
+        report.extraction().outcomes()[1].outcome(),
+        EntryOutcomeKind::Rejected(RejectionReason::DestinationCollision)
+    ));
+    assert!(matches!(
+        report.extraction().outcomes()[3].outcome(),
+        EntryOutcomeKind::Rejected(RejectionReason::DestinationCollision)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_real_filesystem_refuses_aliases_without_leaking_temporary_files() {
+    let bytes = archive_many(&[
+        ("published.txt", b"committed"),
+        ("PUBLISHED.TXT", b"must-not-replace"),
+        ("trailing.", b"must-not-write"),
+        ("trailing-space ", b"must-not-write"),
+        ("NUL.txt", b"must-not-write"),
+        ("published.txt:secret", b"must-not-write"),
+        ("caf\u{00e9}.txt", b"nfc"),
+        ("cafe\u{0301}.txt", b"must-not-replace"),
+    ]);
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(bytes))
+        .expect("session");
+    let plan = session.plan(Policy::safe()).expect("plan");
+    let destination = tempfile::tempdir().expect("destination");
+    let report = session
+        .apply(plan, capability(destination.path()))
+        .expect("apply");
+
+    assert_eq!(
+        std::fs::read(destination.path().join("published.txt")).expect("published payload"),
+        b"committed"
+    );
+    assert!(matches!(
+        report.extraction().outcomes()[1].outcome(),
+        EntryOutcomeKind::Rejected(RejectionReason::DestinationCollision)
+    ));
+    for outcome in &report.extraction().outcomes()[2..6] {
+        assert!(matches!(
+            outcome.outcome(),
+            EntryOutcomeKind::Rejected(RejectionReason::UnsafePath)
+        ));
+    }
+    assert!(matches!(
+        report.extraction().outcomes()[7].outcome(),
+        EntryOutcomeKind::Rejected(RejectionReason::DestinationCollision)
+    ));
+    assert_eq!(
+        std::fs::read(destination.path().join("caf\u{00e9}.txt")).expect("NFC payload"),
+        b"nfc"
+    );
+    let mut names = std::fs::read_dir(destination.path())
+        .expect("list destination")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            std::ffi::OsString::from("caf\u{00e9}.txt"),
+            std::ffi::OsString::from("published.txt"),
+        ]
+    );
+}
+
+#[test]
 fn destination_appearing_after_plan_is_not_replaced() {
     let metadata = regular_metadata("race.bin", 7);
     let mut session = ArchiveEngine::new()
-        .open(Cursor::new(archive(&metadata, b"archive")))
+        .prepare(Cursor::new(archive(&metadata, b"archive")))
         .expect("session");
     let plan = session.plan(Policy::safe()).expect("plan");
     let destination = tempfile::tempdir().expect("destination");
@@ -330,7 +546,7 @@ fn destination_appearing_after_plan_is_not_replaced() {
 fn standard_shortcut_reports_atomic_commit_success() {
     let metadata = regular_metadata("committed.bin", 7);
     let mut session = ArchiveEngine::new()
-        .open(Cursor::new(archive(&metadata, b"payload")))
+        .prepare(Cursor::new(archive(&metadata, b"payload")))
         .expect("session");
     let plan = session.plan(Policy::safe()).expect("plan");
     let destination = tempfile::tempdir().expect("destination");
@@ -365,10 +581,7 @@ fn linux_reference_adapter_restores_mode_time_xattr_acl_and_sparse_layout() {
     let mut logical = vec![0_u8; logical_size];
     logical[0] = b'A';
     logical[logical_size - 1] = b'Z';
-    let timestamp = Timestamp {
-        secs: 1_700_000_000,
-        nanos: 123_000_000,
-    };
+    let timestamp = Timestamp::new(1_700_000_000, 123_000_000).expect("valid timestamp");
     let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("sparse.bin"))
         .size(Some(logical_size as u64))
         .mode(Some(0o640))
@@ -383,19 +596,13 @@ fn linux_reference_adapter_restores_mode_time_xattr_acl_and_sparse_layout() {
             modified: Some(timestamp),
             ..EntryTimes::default()
         })
-        .sparse_extent(SparseExtent {
-            offset: 0,
-            length: 1,
-        })
-        .sparse_extent(SparseExtent {
-            offset: logical_size as u64 - 1,
-            length: 1,
-        })
+        .sparse_extent(SparseExtent::new(0, 1).expect("valid sparse extent"))
+        .sparse_extent(SparseExtent::new(logical_size as u64 - 1, 1).expect("valid sparse extent"))
         .xattr(b"user.rm104".to_vec(), b"evidence".to_vec())
         .acl(b"user::rw-,group::r--,other::---".to_vec())
         .build();
     let mut session = ArchiveEngine::new()
-        .open(Cursor::new(archive(&metadata, &logical)))
+        .prepare(Cursor::new(archive(&metadata, &logical)))
         .expect("session");
     let plan = session.plan(Policy::safe()).expect("plan");
     let report = session
@@ -406,7 +613,7 @@ fn linux_reference_adapter_restores_mode_time_xattr_acl_and_sparse_layout() {
 
     assert_eq!(std::fs::read(&output).expect("output payload"), logical);
     assert_eq!(filesystem_metadata.mode() & 0o7777, 0o640);
-    assert_eq!(filesystem_metadata.mtime(), timestamp.secs);
+    assert_eq!(filesystem_metadata.mtime(), timestamp.seconds());
     assert!(filesystem_metadata.blocks() * 512 < logical_size as u64);
     for operation in [
         FilesystemOperation::Mode,

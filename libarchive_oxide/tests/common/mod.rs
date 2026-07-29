@@ -13,9 +13,8 @@
 //!   independent decoders and asserts every one reconstructs identical shapes+content.
 //!
 //! Heterogeneous producers/consumers are carried as bare `fn` pointers inside concrete
-//! non-generic case structs. A `fn` pointer is a `Copy` scalar — not a trait object, not a
-//! closure, not a generic param — so the harness satisfies the crate's no-dyn gate while letting
-//! RM-302/303/304 add cases by writing a free fn and a `&[]` array, never editing this file.
+//! non-generic case structs. A `fn` pointer is a `Copy` scalar, so fixtures remain static data and
+//! RM-302/303/304 can add cases with a free function and a `&[]` array without editing this file.
 //!
 //! Files under `tests/common/` are NOT compiled as their own test binary; a test binary pulls this
 //! in with `mod common;`. `dead_code` is allowed because not every including binary uses every
@@ -272,7 +271,10 @@ impl MetaShape {
             mode: meta.mode(),
             uid: meta.owner().uid,
             gid: meta.owner().gid,
-            mtime: meta.times().modified.map(|time| time.secs),
+            mtime: meta
+                .times()
+                .modified
+                .map(libarchive_oxide_core::Timestamp::seconds),
             link_target: meta.link_target().map(|target| target.as_bytes().to_vec()),
         }
     }

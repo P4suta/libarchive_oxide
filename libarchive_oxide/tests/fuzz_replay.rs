@@ -21,13 +21,12 @@
 //! identity) — exactly what the fuzzer would flag, but reachable on stable Windows.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use libarchive_oxide_fuzz_cases::{TARGETS, run_target};
 
-/// `<repo>/fuzz/corpus` — sibling of this crate's manifest directory (`<repo>/arca`).
+/// `<repo>/fuzz/corpus` — sibling of this crate's manifest directory.
 fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -36,7 +35,8 @@ fn corpus_root() -> PathBuf {
         .join("corpus")
 }
 
-/// Bounded, deterministic adversarial mutants of one committed valid seed.
+/// Streams a bounded, deterministic shard of the adversarial mutants derived from one committed
+/// valid seed.
 ///
 /// The cargo-fuzz targets get hostile inputs from libFuzzer's coverage-guided mutator. The portable
 /// gate has no mutator, and a *random* seed is worthless against a reader that gates deep parsing
@@ -54,17 +54,33 @@ fn corpus_root() -> PathBuf {
 ///   4-byte length/offset/size field gets at least one byte forced out of range. For back-loaded
 ///   formats (zip's EOCD + central directory live at the tail) this reaches the offset fields while
 ///   leaving the signature elsewhere intact — exactly the shape that trips an unchecked slice index.
-fn adversarial_mutants(seed: &[u8]) -> Vec<Vec<u8>> {
+///
+/// Mutants are assigned to shards by their stable ordinal. Truncations borrow the seed directly,
+/// while field smashes reuse one seed-sized scratch buffer. Consequently peak memory is proportional
+/// to one input, not to the number of mutations.
+fn for_each_adversarial_mutant(
+    seed: &[u8],
+    shard_index: usize,
+    shard_count: usize,
+    mut visit: impl FnMut(&[u8]),
+) -> usize {
     /// Cap on truncation cuts (dense for small seeds, strided for large ones).
     const TRUNC_MAX: usize = 4096;
     /// Cap on 4-byte-window smash positions.
     const SMASH_MAX: usize = 8192;
 
+    assert!(shard_count > 0, "mutant shard count must be non-zero");
+    assert!(
+        shard_index < shard_count,
+        "mutant shard index {shard_index} is outside {shard_count} shards"
+    );
+
     let len = seed.len();
-    let mut out = Vec::new();
     if len == 0 {
-        return out;
+        return 0;
     }
+    let mut ordinal = 0usize;
+    let mut visited = 0usize;
 
     // (1) Truncations: dense for small seeds, strided to at most TRUNC_MAX cuts for large ones.
     // Optical images are necessarily much larger than the compact archive
@@ -75,23 +91,32 @@ fn adversarial_mutants(seed: &[u8]) -> Vec<Vec<u8>> {
     let tstride = len.div_ceil(trunc_max);
     let mut cut = 0;
     while cut < len {
-        out.push(seed[..cut].to_vec());
+        if ordinal % shard_count == shard_index {
+            visit(&seed[..cut]);
+            visited += 1;
+        }
+        ordinal += 1;
         cut += tstride;
     }
 
     // (2) 4-byte field smashes (all-0xFF → giant index; all-0x00 → zero count/size edge cases).
     let sstride = len.div_ceil(smash_max);
+    let mut scratch = seed.to_vec();
     let mut pos = 0;
     while pos < len {
         let end = (pos + 4).min(len);
         for fill in [0xFF_u8, 0x00_u8] {
-            let mut m = seed.to_vec();
-            m[pos..end].fill(fill);
-            out.push(m);
+            if ordinal % shard_count == shard_index {
+                scratch[pos..end].fill(fill);
+                visit(&scratch);
+                scratch[pos..end].copy_from_slice(&seed[pos..end]);
+                visited += 1;
+            }
+            ordinal += 1;
         }
         pos += sstride;
     }
-    out
+    visited
 }
 
 /// A deterministic splitmix64 byte stream — reproducible structured-input seeds, no external rng.
@@ -109,8 +134,10 @@ fn seed_bytes(mut state: u64, len: usize) -> Vec<u8> {
     out
 }
 
-/// Replays every committed corpus file through its target. Missing corpus is not a failure (the
-/// arbitrary batch still runs); this just guarantees the seeds we ship stay panic-free.
+/// Replays every committed corpus file through its target.
+///
+/// This broad pass skips a missing directory; the target-specific mutant tests
+/// below separately require every target to retain at least one committed seed.
 #[test]
 fn corpus_files_replay_without_panic() {
     let root = corpus_root();
@@ -134,9 +161,11 @@ fn corpus_files_replay_without_panic() {
     println!("fuzz_replay: replayed {processed} committed corpus file(s)");
 }
 
-/// Runs a deterministic batch of `arbitrary`-seeded inputs through every target. This is the real
-/// portable gate: it exercises detection, round-trip identity, and codec identity on structured
-/// inputs of many shapes and sizes without depending on any committed corpus.
+/// Runs a deterministic batch of `arbitrary`-seeded inputs through every target.
+///
+/// This exercises detection, round-trip identity, and codec identity on
+/// structured inputs of many shapes and sizes without depending on committed
+/// corpus bytes.
 #[test]
 fn arbitrary_seeds_uphold_invariants() {
     // A spread of lengths so `arbitrary` synthesizes everything from empty to multi-entry sets.
@@ -160,74 +189,141 @@ fn arbitrary_seeds_uphold_invariants() {
         }
     }
 
-    assert_eq!(TARGETS.len(), 19, "all fuzz targets are wired");
+    assert_eq!(
+        TARGETS.len(),
+        28,
+        "all stable replay targets are wired (27 libFuzzer targets plus lzip)"
+    );
     assert_eq!(runs, TARGETS.len() * LENGTHS.len() * STREAMS);
 }
 
-/// The real adversarial portable gate for the **reader** paths.
+/// Replays one deterministic shard of a target's adversarial mutations in its own test process.
 ///
 /// A pristine valid seed can never trigger a truncation/out-of-bounds panic in a deep-parse path —
-/// its fields are all in range. This test feeds each committed seed through [`adversarial_mutants`],
-/// so the deep-parse code runs against corrupt length/offset/size fields on every replay. That is
-/// what would flag a reintroduced unchecked read (e.g. a zip EOCD/central-directory offset used to
-/// index the buffer without validation): a mutant forces that offset high, the reader indexes out of
-/// bounds, and this test panics — on stable Windows, with no nightly and no libFuzzer. Round-trip
-/// and codec seeds are mutated too; their `run_target` bodies keep asserting their identities.
-#[test]
-fn seed_mutants_uphold_invariants() {
-    const READER_TARGETS: &[&str] = &[
-        "read_tar",
-        "read_cpio",
-        "read_ar",
-        "read_zip",
-        "read_7z",
-        "read_7z_graph",
-        "read_iso",
-        "read_udf",
-    ];
-
+/// its fields are all in range. These tests stream each committed seed through
+/// [`for_each_adversarial_mutant`], so the deep-parse code runs against corrupt
+/// length/offset/size fields on every replay. That is what would flag a reintroduced unchecked read
+/// (e.g. a zip EOCD/central-directory offset used to index the buffer without validation): a mutant
+/// forces that offset high, the reader indexes out of bounds, and this test panics — on stable
+/// Windows, with no nightly and no libFuzzer. Round-trip and codec seeds are mutated too; their
+/// `run_target` bodies keep asserting their identities.
+fn replay_seed_mutant_shard(target: &str, shard_index: usize, shard_count: usize) {
     let root = corpus_root();
     let mut mutant_runs = 0usize;
-    let mut targets_with_seed = 0usize;
-    let mut seeded_targets = BTreeSet::new();
-    for &target in TARGETS {
-        let dir = root.join(target);
-        let Ok(entries) = fs::read_dir(&dir) else {
+    let mut seeds = 0usize;
+    let directory = root.join(target);
+    let entries = fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("missing corpus directory for {target}: {error}"));
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
             continue;
-        };
-        let mut had_seed = false;
-        for entry in entries {
-            let path = entry.unwrap().path();
-            if !path.is_file() {
-                continue;
-            }
-            had_seed = true;
-            let seed = fs::read(&path).unwrap();
-            for mutant in adversarial_mutants(&seed) {
-                run_target(target, &mutant);
-                mutant_runs += 1;
-            }
         }
-        if had_seed {
-            targets_with_seed += 1;
-            seeded_targets.insert(target);
-        }
+        seeds += 1;
+        let seed = fs::read(&path).unwrap();
+        mutant_runs += for_each_adversarial_mutant(&seed, shard_index, shard_count, |mutant| {
+            run_target(target, mutant);
+        });
+    }
+    assert!(seeds > 0, "expected a committed seed for target {target}");
+    assert!(
+        mutant_runs > 0,
+        "adversarial mutation produced no runs for target {target}"
+    );
+    println!(
+        "fuzz_replay: {target} shard {}/{shard_count} exercised {mutant_runs} adversarial mutant(s) \
+         from {seeds} seed(s)",
+        shard_index + 1
+    );
+}
+
+#[test]
+fn mutant_shards_cover_the_unsharded_stream_exactly_once() {
+    let seed = b"structured archive seed";
+    let mut unsharded = Vec::new();
+    let unsharded_count =
+        for_each_adversarial_mutant(seed, 0, 1, |mutant| unsharded.push(mutant.to_vec()));
+
+    let mut sharded = Vec::new();
+    let mut sharded_count = 0usize;
+    for shard_index in 0..4 {
+        sharded_count += for_each_adversarial_mutant(seed, shard_index, 4, |mutant| {
+            sharded.push(mutant.to_vec());
+        });
     }
 
-    assert_eq!(READER_TARGETS.len(), 8, "all reader targets are enumerated");
-    for target in READER_TARGETS {
-        assert!(
-            seeded_targets.contains(target),
-            "expected a committed valid seed for reader target {target}"
-        );
-    }
-    assert!(
-        seeded_targets.contains("read_udf"),
-        "the UDF deep-parse replay seed is mandatory"
-    );
-    assert!(mutant_runs > 0, "adversarial mutation produced no runs");
-    println!(
-        "fuzz_replay: exercised {mutant_runs} adversarial seed mutant(s) across {targets_with_seed} \
-         seeded target(s)"
+    unsharded.sort_unstable();
+    sharded.sort_unstable();
+    assert_eq!(sharded_count, unsharded_count);
+    assert_eq!(sharded, unsharded);
+}
+
+macro_rules! mutant_replay_tests {
+    (
+        $(
+            $target:literal => {
+                $($test:ident : $shard_index:literal / $shard_count:literal),+ $(,)?
+            }
+        ),+ $(,)?
+    ) => {
+        const MUTANT_TARGETS: &[&str] = &[$($target),+];
+
+        $(
+            $(
+                #[test]
+                fn $test() {
+                    replay_seed_mutant_shard($target, $shard_index, $shard_count);
+                }
+            )+
+        )+
+    };
+}
+
+mutant_replay_tests! {
+    "read_tar" => { seed_mutants_read_tar: 0 / 1 },
+    "read_cpio" => { seed_mutants_read_cpio: 0 / 1 },
+    "read_ar" => { seed_mutants_read_ar: 0 / 1 },
+    "read_zip" => { seed_mutants_read_zip: 0 / 1 },
+    "read_7z" => { seed_mutants_read_7z: 0 / 1 },
+    "read_7z_graph" => { seed_mutants_read_7z_graph: 0 / 1 },
+    "read_iso" => { seed_mutants_read_iso: 0 / 1 },
+    "read_udf" => { seed_mutants_read_udf: 0 / 1 },
+    "read_cab" => { seed_mutants_read_cab: 0 / 1 },
+    "read_xar" => { seed_mutants_read_xar: 0 / 1 },
+    "roundtrip_tar" => { seed_mutants_roundtrip_tar: 0 / 1 },
+    "roundtrip_cpio" => { seed_mutants_roundtrip_cpio: 0 / 1 },
+    "roundtrip_ar" => { seed_mutants_roundtrip_ar: 0 / 1 },
+    "roundtrip_7z" => { seed_mutants_roundtrip_7z: 0 / 1 },
+    "roundtrip_iso" => { seed_mutants_roundtrip_iso: 0 / 1 },
+    "codec_gzip" => { seed_mutants_codec_gzip: 0 / 1 },
+    "codec_lzw" => { seed_mutants_codec_lzw: 0 / 1 },
+    "codec_bzip2" => { seed_mutants_codec_bzip2: 0 / 1 },
+    "codec_zstd" => { seed_mutants_codec_zstd: 0 / 1 },
+    "codec_xz" => { seed_mutants_codec_xz: 0 / 1 },
+    "codec_lzip" => { seed_mutants_codec_lzip: 0 / 1 },
+    "codec_lz4" => { seed_mutants_codec_lz4: 0 / 1 },
+    "codec_lzma2" => { seed_mutants_codec_lzma2: 0 / 1 },
+    "package_rpm" => { seed_mutants_package_rpm: 0 / 1 },
+    "package_alpine" => {
+        seed_mutants_package_alpine_1_of_4: 0 / 4,
+        seed_mutants_package_alpine_2_of_4: 1 / 4,
+        seed_mutants_package_alpine_3_of_4: 2 / 4,
+        seed_mutants_package_alpine_4_of_4: 3 / 4,
+    },
+    "package_zip" => { seed_mutants_package_zip: 0 / 1 },
+    "package_app" => {
+        seed_mutants_package_app_1_of_4: 0 / 4,
+        seed_mutants_package_app_2_of_4: 1 / 4,
+        seed_mutants_package_app_3_of_4: 2 / 4,
+        seed_mutants_package_app_4_of_4: 3 / 4,
+    },
+    "extraction_plan" => { seed_mutants_extraction_plan: 0 / 1 },
+}
+
+#[test]
+fn mutant_target_inventory_matches_fuzz_targets() {
+    assert_eq!(
+        MUTANT_TARGETS, TARGETS,
+        "every fuzz target must have an independently replayed mutant corpus"
     );
 }

@@ -12,7 +12,6 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_std::fs::Dir;
@@ -22,18 +21,20 @@ use libarchive_oxide_core::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::extractor::{ExtractionPolicy, ExtractionReport, RejectionReason};
-use crate::filesystem_driver::{extract_registered_with_adapter, extract_seek_with_adapter};
-use crate::path::sanitize_archive_path;
+use crate::extraction::{ExtractionReport, Policy, RejectionReason};
+use crate::filesystem_driver::{apply_registered_plan, apply_seek_plan};
+use crate::path::{DestinationClaims, DestinationKey};
 use crate::provider::{
     BuiltinCodecProviders, BuiltinFormatProviders, CodecProvider, CodecProviderNode,
     FormatProvider, FormatProviderNode, ProviderCapability, ProviderSet, StaticCodecProviders,
     StaticFormatProviders,
 };
+use crate::registry::{Registry, RegistryCodecs, RegistryFormats};
 use crate::spool::{DEFAULT_MAX_BYTES, DEFAULT_MEMORY_THRESHOLD};
+use crate::stream::ProviderArchiveWriter;
 use crate::{
-    ArchiveReader, ArchiveWriter, CapStdFilesystemAdapter, FilesystemAdapter, FilesystemFinding,
-    ProviderArchiveWriter, ReaderEvent, SeekArchiveReader, SeekArchiveWriter, SpoolReader,
+    ArchiveReader, ArchiveWriter, BackendPreference, CapStdFilesystemAdapter, FilesystemAdapter,
+    FilesystemFinding, ReaderEvent, SecretBytes, SeekArchiveReader, SeekArchiveWriter, SpoolReader,
     StreamError,
 };
 
@@ -68,6 +69,49 @@ impl fmt::Display for InputDigest {
     }
 }
 
+/// Explicit immutable snapshot used by inspect/plan/apply sessions.
+#[derive(Debug)]
+pub struct PreparedArchive {
+    snapshot: SpoolReader,
+    digest: InputDigest,
+}
+
+impl PreparedArchive {
+    /// Spools an input with the safe finite memory and total-size bounds.
+    pub fn spool(input: impl Read) -> Result<Self, StreamError> {
+        Self::spool_with_limits(input, DEFAULT_MEMORY_THRESHOLD, DEFAULT_MAX_BYTES)
+    }
+
+    /// Spools an input with explicit memory and total-size bounds.
+    pub fn spool_with_limits(
+        input: impl Read,
+        memory_threshold: usize,
+        maximum: u64,
+    ) -> Result<Self, StreamError> {
+        let mut snapshot = SpoolReader::from_reader_with_limits(input, memory_threshold, maximum)?;
+        let digest = digest_snapshot(&mut snapshot)?;
+        Ok(Self { snapshot, digest })
+    }
+
+    /// SHA-256 identity of the encoded snapshot.
+    #[must_use]
+    pub const fn digest(&self) -> InputDigest {
+        self.digest
+    }
+
+    /// Encoded snapshot length.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.snapshot.len()
+    }
+
+    /// Whether the encoded snapshot is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.snapshot.is_empty()
+    }
+}
+
 /// High-level archive engine configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct ArchiveEngine<F = BuiltinFormatProviders, C = BuiltinCodecProviders>
@@ -78,6 +122,7 @@ where
     limits: Limits,
     spool_memory_threshold: usize,
     spool_maximum: u64,
+    backend: BackendPreference,
     providers: ProviderSet<F, C>,
 }
 
@@ -89,8 +134,17 @@ impl ArchiveEngine<BuiltinFormatProviders, BuiltinCodecProviders> {
             limits: Limits::safe(),
             spool_memory_threshold: DEFAULT_MEMORY_THRESHOLD,
             spool_maximum: DEFAULT_MAX_BYTES,
+            backend: BackendPreference::Auto,
             providers: ProviderSet::builtins(),
         }
+    }
+
+    /// Selects the built-in portable or native codec backend at runtime.
+    #[must_use]
+    pub const fn with_backend_preference(mut self, backend: BackendPreference) -> Self {
+        self.backend = backend;
+        self.providers = ProviderSet::builtins_with_backend(backend);
+        self
     }
 
     /// Creates a sequential writer from high-level options.
@@ -100,8 +154,51 @@ impl ArchiveEngine<BuiltinFormatProviders, BuiltinCodecProviders> {
         options: CreateOptions,
     ) -> Result<ArchiveWriter<W>, StreamError> {
         let limits = options.limits.unwrap_or(self.limits);
-        ArchiveWriter::with_filter(output, options.format, options.filter, limits)
-            .map_err(StreamError::archive)
+        ArchiveWriter::with_filter_and_backend(
+            output,
+            options.format,
+            options.filter,
+            limits,
+            self.backend,
+        )
+        .map_err(StreamError::archive)
+    }
+
+    /// Creates a streaming `WinZip` AES-256 AE-2 writer.
+    ///
+    /// The high-level encrypted profile deliberately uses the same Deflate
+    /// method as ordinary high-level ZIP creation. Passwords are accepted only
+    /// for ZIP without an outer filter, so a supplied secret is never silently
+    /// ignored by another format.
+    #[cfg(feature = "aes")]
+    pub fn create_with_password<W: Write>(
+        self,
+        output: W,
+        options: CreateOptions,
+        password: SecretBytes,
+    ) -> Result<ArchiveWriter<W>, StreamError> {
+        if options.format != FormatId::Zip {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability).with_context(
+                    "password-protected high-level creation is available only for ZIP",
+                ),
+            ));
+        }
+        if options.filter.is_some() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_format("zip")
+                    .with_context("password-protected ZIP cannot use an outer filter"),
+            ));
+        }
+        let limits = options.limits.unwrap_or(self.limits);
+        Ok(ArchiveWriter::with_zip_password_and_backend(
+            output,
+            crate::ZipMethod::Deflate,
+            password,
+            limits,
+            self.backend,
+        ))
     }
 
     /// Creates a seek-capable writer from high-level options.
@@ -121,6 +218,20 @@ impl ArchiveEngine<BuiltinFormatProviders, BuiltinCodecProviders> {
             options.format,
             options.limits.unwrap_or(self.limits),
         )
+    }
+}
+
+impl ArchiveEngine<RegistryFormats, RegistryCodecs> {
+    /// Creates an engine backed by an immutable object-safe provider registry.
+    #[must_use]
+    pub fn from_registry(registry: &Registry) -> Self {
+        Self {
+            limits: Limits::safe(),
+            spool_memory_threshold: DEFAULT_MEMORY_THRESHOLD,
+            spool_maximum: DEFAULT_MAX_BYTES,
+            backend: BackendPreference::Auto,
+            providers: registry.providers(),
+        }
     }
 }
 
@@ -145,6 +256,7 @@ where
     }
 
     /// Prepends one compile-time format provider to this engine.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_format_provider<P>(self, provider: P) -> ArchiveEngine<FormatProviderNode<P, F>, C>
     where
@@ -154,11 +266,13 @@ where
             limits: self.limits,
             spool_memory_threshold: self.spool_memory_threshold,
             spool_maximum: self.spool_maximum,
+            backend: self.backend,
             providers: self.providers.with_format_provider(provider),
         }
     }
 
     /// Prepends one compile-time outer-codec provider to this engine.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_codec_provider<P>(self, provider: P) -> ArchiveEngine<F, CodecProviderNode<P, C>>
     where
@@ -168,6 +282,7 @@ where
             limits: self.limits,
             spool_memory_threshold: self.spool_memory_threshold,
             spool_maximum: self.spool_maximum,
+            backend: self.backend,
             providers: self.providers.with_codec_provider(provider),
         }
     }
@@ -179,6 +294,7 @@ where
     }
 
     /// Providers available to new sessions.
+    #[doc(hidden)]
     #[must_use]
     pub fn providers(self) -> ProviderSet<F, C> {
         self.providers
@@ -201,24 +317,150 @@ where
         .map_err(StreamError::archive)
     }
 
-    /// Opens an immutable, bounded snapshot session.
+    /// Opens a true streaming reader without implicitly spooling the input.
+    #[must_use]
+    pub fn open<R: Read>(self, input: R) -> ArchiveReader<R, F, C> {
+        ArchiveReader::with_providers(input, self.limits, self.providers)
+    }
+
+    /// Opens a true streaming reader with an explicit sequential format.
     ///
-    /// The snapshot remains in memory through the configured threshold and
-    /// then moves to an automatically deleted temporary file.
-    pub fn open(self, input: impl Read) -> Result<ArchiveSession<F, C>, StreamError> {
-        let mut snapshot = SpoolReader::from_reader_with_limits(
+    /// This is the safe entry point for signatureless formats such as raw
+    /// single-entry streams; automatic detection is never allowed to guess
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the identifier is not a readable sequential format
+    /// in this engine's provider set.
+    pub fn open_with_format<R: Read>(
+        self,
+        input: R,
+        format: FormatId,
+    ) -> Result<ArchiveReader<R, F, C>, ArchiveError> {
+        ArchiveReader::with_providers_and_format(input, format, self.limits, self.providers)
+    }
+
+    /// Explicitly spools input and opens an inspect/plan/apply session.
+    pub fn prepare(self, input: impl Read) -> Result<ArchiveSession<F, C>, StreamError> {
+        let prepared = PreparedArchive::spool_with_limits(
             input,
             self.spool_memory_threshold,
             self.spool_maximum,
         )?;
-        let digest = digest_snapshot(&mut snapshot)?;
-        let reader = SessionReader::open(snapshot, self.limits, self.providers)?;
+        self.open_prepared(prepared)
+    }
+
+    /// Explicitly spools input and opens a password-capable ZIP/7z session.
+    ///
+    /// This does not change [`Self::open`]: ordinary readers remain true
+    /// streaming readers and never spool implicitly. A supplied password is
+    /// rejected for formats other than seek-native ZIP and 7z.
+    pub fn prepare_with_password(
+        self,
+        input: impl Read,
+        password: SecretBytes,
+    ) -> Result<ArchiveSession<F, C>, StreamError> {
+        let prepared = PreparedArchive::spool_with_limits(
+            input,
+            self.spool_memory_threshold,
+            self.spool_maximum,
+        )?;
+        self.open_prepared_with_password(prepared, password)
+    }
+
+    /// Explicitly spools input and opens a session for one sequential format.
+    ///
+    /// Signatureless formats such as [`FormatId::Raw`] require this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if spooling fails or the requested identifier is not a
+    /// readable sequential format in this engine's provider set.
+    pub fn prepare_with_format(
+        self,
+        input: impl Read,
+        format: FormatId,
+    ) -> Result<ArchiveSession<F, C>, StreamError> {
+        let prepared = PreparedArchive::spool_with_limits(
+            input,
+            self.spool_memory_threshold,
+            self.spool_maximum,
+        )?;
+        self.open_prepared_with_format(prepared, format)
+    }
+
+    /// Opens an inspect/plan/apply session over a previously prepared snapshot.
+    pub fn open_prepared(
+        self,
+        prepared: PreparedArchive,
+    ) -> Result<ArchiveSession<F, C>, StreamError> {
+        let reader = SessionReader::open(prepared.snapshot, self.limits, self.providers, None)?;
         let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         Ok(ArchiveSession {
             id,
-            digest,
+            digest: prepared.digest,
             limits: self.limits,
             reader: Some(reader),
+            format_hint: None,
+            password: None,
+            applied: false,
+        })
+    }
+
+    /// Opens a prepared snapshot as a password-capable ZIP/7z session.
+    ///
+    /// The secret remains in zeroizing storage for the session lifetime so
+    /// [`ArchiveSession::rewind`] can reconstruct the authenticated reader.
+    /// Other formats reject the password instead of ignoring it.
+    pub fn open_prepared_with_password(
+        self,
+        prepared: PreparedArchive,
+        password: SecretBytes,
+    ) -> Result<ArchiveSession<F, C>, StreamError> {
+        let reader = SessionReader::open(
+            prepared.snapshot,
+            self.limits,
+            self.providers,
+            Some(&password),
+        )?;
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(ArchiveSession {
+            id,
+            digest: prepared.digest,
+            limits: self.limits,
+            reader: Some(reader),
+            format_hint: None,
+            password: Some(password),
+            applied: false,
+        })
+    }
+
+    /// Opens a prepared snapshot with an explicit sequential format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested identifier is not a readable
+    /// sequential format in this engine's provider set.
+    pub fn open_prepared_with_format(
+        self,
+        prepared: PreparedArchive,
+        format: FormatId,
+    ) -> Result<ArchiveSession<F, C>, StreamError> {
+        let reader = SessionReader::open_with_format(
+            prepared.snapshot,
+            self.limits,
+            self.providers,
+            format,
+        )?;
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(ArchiveSession {
+            id,
+            digest: prepared.digest,
+            limits: self.limits,
+            reader: Some(reader),
+            format_hint: Some(format),
+            password: None,
             applied: false,
         })
     }
@@ -294,95 +536,6 @@ impl Default for CreateOptions {
     }
 }
 
-/// High-level extraction policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct Policy {
-    overwrite: bool,
-    symlinks: bool,
-    hardlinks: bool,
-    special_files: bool,
-}
-
-impl Policy {
-    /// Conservative policy.
-    #[must_use]
-    pub const fn safe() -> Self {
-        Self {
-            overwrite: false,
-            symlinks: false,
-            hardlinks: false,
-            special_files: false,
-        }
-    }
-
-    /// Enables replacing existing regular files.
-    #[must_use]
-    pub const fn allow_overwrite(mut self, allow: bool) -> Self {
-        self.overwrite = allow;
-        self
-    }
-
-    /// Enables symbolic-link restoration.
-    #[must_use]
-    pub const fn allow_symlinks(mut self, allow: bool) -> Self {
-        self.symlinks = allow;
-        self
-    }
-
-    /// Enables links to files created earlier in the same session.
-    #[must_use]
-    pub const fn allow_hardlinks(mut self, allow: bool) -> Self {
-        self.hardlinks = allow;
-        self
-    }
-
-    /// Enables platform-supported special-file restoration.
-    #[must_use]
-    pub const fn allow_special_files(mut self, allow: bool) -> Self {
-        self.special_files = allow;
-        self
-    }
-
-    /// Whether existing regular files may be atomically replaced.
-    #[must_use]
-    pub const fn overwrite(self) -> bool {
-        self.overwrite
-    }
-
-    /// Whether symbolic-link restoration is enabled.
-    #[must_use]
-    pub const fn symlinks(self) -> bool {
-        self.symlinks
-    }
-
-    /// Whether hard-link restoration is enabled.
-    #[must_use]
-    pub const fn hardlinks(self) -> bool {
-        self.hardlinks
-    }
-
-    /// Whether special-file restoration is enabled.
-    #[must_use]
-    pub const fn special_files(self) -> bool {
-        self.special_files
-    }
-
-    const fn extraction_policy(self) -> ExtractionPolicy {
-        ExtractionPolicy::safe()
-            .allow_overwrite(self.overwrite)
-            .allow_symlinks(self.symlinks)
-            .allow_hardlinks(self.hardlinks)
-            .allow_special_files(self.special_files)
-    }
-}
-
-impl Default for Policy {
-    fn default() -> Self {
-        Self::safe()
-    }
-}
-
 /// Owned metadata descriptor used by inspections and plans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryDescriptor {
@@ -449,6 +602,8 @@ pub enum PlanDisposition {
 pub struct PlannedEntry {
     descriptor: EntryDescriptor,
     disposition: PlanDisposition,
+    destination: Option<DestinationKey>,
+    link_target: Option<DestinationKey>,
 }
 
 impl PlannedEntry {
@@ -462,6 +617,14 @@ impl PlannedEntry {
     #[must_use]
     pub const fn disposition(&self) -> PlanDisposition {
         self.disposition
+    }
+
+    pub(crate) const fn destination(&self) -> Option<&DestinationKey> {
+        self.destination.as_ref()
+    }
+
+    pub(crate) const fn link_target(&self) -> Option<&DestinationKey> {
+        self.link_target.as_ref()
     }
 }
 
@@ -582,10 +745,22 @@ where
     F: StaticFormatProviders,
     C: StaticCodecProviders,
 {
+    fn open_with_format(
+        snapshot: SpoolReader,
+        limits: Limits,
+        providers: ProviderSet<F, C>,
+        format: FormatId,
+    ) -> Result<Self, StreamError> {
+        let reader = ArchiveReader::with_providers_and_format(snapshot, format, limits, providers)
+            .map_err(StreamError::archive)?;
+        Ok(Self::Sequential(Box::new(reader)))
+    }
+
     fn open(
         mut snapshot: SpoolReader,
         limits: Limits,
         providers: ProviderSet<F, C>,
+        password: Option<&SecretBytes>,
     ) -> Result<Self, StreamError> {
         let mut prefix = vec![0; FORMAT_PROBE_BYTES];
         let mut read = 0;
@@ -599,16 +774,35 @@ where
             read += count;
         }
         snapshot.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
-        let seek_native = match FormatId::probe(&prefix[..read]) {
+        let probed = FormatId::probe(&prefix[..read]);
+        if password.is_some()
+            && !matches!(
+                probed,
+                ProbeResult::Match(FormatId::Zip | FormatId::SevenZip)
+            )
+        {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_context("password supplied for an archive that is not ZIP or 7z"),
+            ));
+        }
+        let seek_native = match probed {
             ProbeResult::Match(format) => matches!(
                 providers.format_capability(format),
-                ProviderCapability::Available(capability) if capability.requires_seek()
+                ProviderCapability::Available(capability)
+                    if capability.requires_seek(libarchive_oxide_core::Direction::Read)
             ),
             _ => false,
         };
         if seek_native {
+            let reader = match password {
+                Some(password) => {
+                    SeekArchiveReader::with_limits_and_password(snapshot, limits, password.clone())?
+                },
+                None => SeekArchiveReader::with_limits(snapshot, limits)?,
+            };
             Ok(Self::Seek {
-                reader: Box::new(SeekArchiveReader::with_limits(snapshot, limits)?),
+                reader: Box::new(reader),
                 providers,
             })
         } else {
@@ -632,10 +826,13 @@ where
         }
     }
 
-    fn into_parts(self) -> (SpoolReader, ProviderSet<F, C>) {
+    fn into_parts(self) -> Result<(SpoolReader, ProviderSet<F, C>), StreamError> {
         match self {
-            Self::Sequential(reader) => (*reader).into_parts(),
-            Self::Seek { reader, providers } => ((*reader).into_inner(), providers),
+            Self::Sequential(reader) => (*reader).into_parts().map_err(StreamError::archive),
+            Self::Seek { reader, providers } => (*reader)
+                .into_inner()
+                .map(|reader| (reader, providers))
+                .map_err(StreamError::archive),
         }
     }
 }
@@ -649,6 +846,8 @@ where
     digest: InputDigest,
     limits: Limits,
     reader: Option<SessionReader<F, C>>,
+    format_hint: Option<FormatId>,
+    password: Option<SecretBytes>,
     applied: bool,
 }
 
@@ -664,6 +863,8 @@ where
             .field("digest", &self.digest)
             .field("limits", &self.limits)
             .field("reader", &self.reader)
+            .field("format_hint", &self.format_hint)
+            .field("password", &self.password)
             .field("applied", &self.applied)
             .finish()
     }
@@ -700,9 +901,14 @@ where
                     .with_context("archive session reader is unavailable"),
             )
         })?;
-        let (mut snapshot, providers) = reader.into_parts();
+        let (mut snapshot, providers) = reader.into_parts()?;
         snapshot.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
-        self.reader = Some(SessionReader::open(snapshot, self.limits, providers)?);
+        self.reader = Some(match self.format_hint {
+            Some(format) => {
+                SessionReader::open_with_format(snapshot, self.limits, providers, format)?
+            },
+            None => SessionReader::open(snapshot, self.limits, providers, self.password.as_ref())?,
+        });
         Ok(())
     }
 
@@ -765,15 +971,19 @@ where
     /// Builds a non-serializable extraction plan for this session.
     pub fn plan(&mut self, policy: Policy) -> Result<ExtractionPlan, StreamError> {
         let inspection = self.inspect()?;
+        let mut claimed = DestinationClaims::default();
         let mut committed = BTreeSet::new();
         let entries = inspection
             .entries
             .into_iter()
             .map(|descriptor| {
-                let disposition = plan_entry(descriptor.metadata(), policy, &mut committed);
+                let (disposition, destination, link_target) =
+                    plan_entry(descriptor.metadata(), policy, &mut claimed, &mut committed);
                 PlannedEntry {
                     descriptor,
                     disposition,
+                    destination,
+                    link_target,
                 }
             })
             .collect();
@@ -812,7 +1022,7 @@ where
             digest,
             format,
             policy,
-            entries: _,
+            entries,
         } = plan;
         if session_id != self.id || digest != self.digest {
             return Err(StreamError::archive(
@@ -826,6 +1036,9 @@ where
                     .with_context("archive session has already applied a plan"),
             ));
         }
+        // `ExtractionPlan` has no public constructor or mutable fields. Its
+        // session identity is checked above, so these destinations are the
+        // authoritative result of the one whole-archive preflight.
         self.applied = true;
         self.rewind()?;
         let applied = match self.reader.as_mut().ok_or_else(|| {
@@ -834,14 +1047,11 @@ where
                     .with_context("archive session reader is unavailable"),
             )
         })? {
-            SessionReader::Sequential(reader) => extract_registered_with_adapter(
-                reader,
-                adapter,
-                policy.extraction_policy(),
-                self.limits,
-            )?,
+            SessionReader::Sequential(reader) => {
+                apply_registered_plan(reader, adapter, policy, self.limits, &entries)?
+            },
             SessionReader::Seek { reader, .. } => {
-                extract_seek_with_adapter(reader, adapter, policy.extraction_policy(), self.limits)?
+                apply_seek_plan(reader, adapter, policy, self.limits, &entries)?
             },
         };
         Ok(ApplyReport {
@@ -943,56 +1153,92 @@ fn archive_metadata_cost(metadata: &ArchiveMetadata) -> usize {
 fn plan_entry(
     metadata: &EntryMetadata,
     policy: Policy,
-    committed: &mut BTreeSet<PathBuf>,
-) -> PlanDisposition {
+    claimed: &mut DestinationClaims,
+    committed: &mut BTreeSet<DestinationKey>,
+) -> (
+    PlanDisposition,
+    Option<DestinationKey>,
+    Option<DestinationKey>,
+) {
     if metadata.extensions().iter().any(|extension| {
         extension.namespace() == "ar-thin" && extension.key() == b"external-reference"
     }) {
-        return PlanDisposition::Reject(RejectionReason::ExternalReference);
+        return (
+            PlanDisposition::Reject(RejectionReason::ExternalReference),
+            None,
+            None,
+        );
     }
     if metadata.kind() == EntryKind::Dir && matches!(metadata.path().as_bytes(), b"." | b"./") {
-        return PlanDisposition::Skip;
+        return (PlanDisposition::Skip, None, None);
     }
-    let Some(path) = sanitize_archive_path(metadata.path()) else {
-        return PlanDisposition::Reject(RejectionReason::UnsafePath);
+    let Some(destination) = DestinationKey::from_archive_path(metadata.path()) else {
+        return (
+            PlanDisposition::Reject(RejectionReason::UnsafePath),
+            None,
+            None,
+        );
     };
-    match metadata.kind() {
+    if !claimed.claim(&destination, metadata.kind()) {
+        return (
+            PlanDisposition::Reject(RejectionReason::DestinationCollision),
+            Some(destination),
+            None,
+        );
+    }
+    let (disposition, link_target) = match metadata.kind() {
         EntryKind::File => {
-            committed.insert(path);
-            PlanDisposition::Materialize
+            committed.insert(destination.clone());
+            (PlanDisposition::Materialize, None)
         },
-        EntryKind::Dir => PlanDisposition::Materialize,
-        EntryKind::Symlink if policy.symlinks => {
-            if metadata
+        EntryKind::Dir => (PlanDisposition::Materialize, None),
+        EntryKind::Symlink if policy.symlinks() => {
+            if let Some(target) = metadata
                 .link_target()
-                .and_then(sanitize_archive_path)
-                .is_some()
+                .and_then(DestinationKey::from_archive_path)
             {
-                PlanDisposition::Materialize
+                (PlanDisposition::Materialize, Some(target))
             } else {
-                PlanDisposition::Reject(RejectionReason::UnsafeLinkTarget)
+                (
+                    PlanDisposition::Reject(RejectionReason::UnsafeLinkTarget),
+                    None,
+                )
             }
         },
-        EntryKind::Hardlink if policy.hardlinks => {
-            let Some(target) = metadata.link_target().and_then(sanitize_archive_path) else {
-                return PlanDisposition::Reject(RejectionReason::UnsafeLinkTarget);
+        EntryKind::Hardlink if policy.hardlinks() => {
+            let Some(target) = metadata
+                .link_target()
+                .and_then(DestinationKey::from_archive_path)
+            else {
+                return (
+                    PlanDisposition::Reject(RejectionReason::UnsafeLinkTarget),
+                    Some(destination),
+                    None,
+                );
             };
-            if committed.contains(&target) {
-                committed.insert(path);
-                PlanDisposition::Materialize
+            if let Some(committed_target) = committed.get(&target).cloned() {
+                committed.insert(destination.clone());
+                (PlanDisposition::Materialize, Some(committed_target))
             } else {
-                PlanDisposition::Reject(RejectionReason::UnsafeLinkTarget)
+                (
+                    PlanDisposition::Reject(RejectionReason::UnsafeLinkTarget),
+                    None,
+                )
             }
         },
         EntryKind::Char | EntryKind::Block | EntryKind::Fifo | EntryKind::Socket
-            if policy.special_files =>
+            if policy.special_files() =>
         {
             if cfg!(any(target_os = "linux", target_os = "android")) {
-                PlanDisposition::Materialize
+                (PlanDisposition::Materialize, None)
             } else {
-                PlanDisposition::Reject(RejectionReason::UnsupportedRestore)
+                (
+                    PlanDisposition::Reject(RejectionReason::UnsupportedRestore),
+                    None,
+                )
             }
         },
-        _ => PlanDisposition::Reject(RejectionReason::EntryKind),
-    }
+        _ => (PlanDisposition::Reject(RejectionReason::EntryKind), None),
+    };
+    (disposition, Some(destination), link_target)
 }

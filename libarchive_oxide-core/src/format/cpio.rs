@@ -14,7 +14,9 @@ use alloc::vec::Vec;
 use crate::Limits;
 use crate::error::{ArchiveError, Error, ErrorKind, Result};
 use crate::meta::{EntryKind, Timestamp, default_mode};
-use crate::metadata::{ArchivePath, Device, EntryMetadata, EntryTimes, Owner};
+use crate::metadata::{
+    ArchivePath, Checksum, ChecksumAlgorithm, Device, EntryMetadata, EntryTimes, Owner,
+};
 use crate::protocol::{
     ArchiveDecoder, ArchiveEncoder, Chunk, DecodeEvent, DecodeStep, EncodeCommand, EncodeStatus,
     EncodeStep, EndOfInput, ProbeResult,
@@ -483,15 +485,14 @@ impl CpioDecoder {
                     group: None,
                 })
                 .times(EntryTimes {
-                    modified: Some(Timestamp {
-                        secs: i64::try_from(mtime).unwrap_or(i64::MAX),
-                        nanos: 0,
-                    }),
+                    modified: Some(Timestamp::from_seconds(
+                        i64::try_from(mtime).unwrap_or(i64::MAX),
+                    )),
                     ..EntryTimes::default()
                 })
                 .inode_and_links(Some(inode), Some(links))
                 .devices(device, referenced_device)
-                .checksum(checksum.map(u32::to_be_bytes).map(Vec::from))
+                .checksum(checksum.map(Checksum::cpio_sum32))
                 .build();
         let size_usize = usize::try_from(size).map_err(|_| {
             ArchiveError::new(ErrorKind::Limit)
@@ -674,10 +675,12 @@ impl ArchiveDecoder for CpioDecoder {
         _output: &'a mut [u8],
         end: EndOfInput,
     ) -> core::result::Result<DecodeStep<'a>, ArchiveError> {
-        if matches!(self.state, DecoderState::Header | DecoderState::Done) {
-            if let Some(step) = self.pop_queued(0) {
-                return Ok(step);
-            }
+        let queued_step = match self.state {
+            DecoderState::Header | DecoderState::Done => self.pop_queued(0),
+            _ => None,
+        };
+        if let Some(step) = queued_step {
+            return Ok(step);
         }
         match self.state {
             DecoderState::Done => {
@@ -1028,7 +1031,7 @@ impl CpioEncoder {
         let links = metadata.and_then(EntryMetadata::links).unwrap_or(1);
         let mtime = metadata
             .and_then(|meta| meta.times().modified)
-            .map_or(0, |time| u64::try_from(time.secs.max(0)).unwrap_or(0));
+            .map_or(0, |time| u64::try_from(time.seconds().max(0)).unwrap_or(0));
         let device = metadata.and_then(EntryMetadata::device).unwrap_or_default();
         let referenced = metadata
             .and_then(EntryMetadata::referenced_device)
@@ -1038,13 +1041,13 @@ impl CpioEncoder {
             .unwrap_or(u64::from(self.inode));
         let checksum = if self.dialect == CpioDialect::Crc {
             match metadata.and_then(EntryMetadata::checksum) {
-                Some(bytes) if bytes.len() == 4 => {
-                    Some(u32::from_be_bytes(bytes.try_into().map_err(|_| {
+                Some(checksum) if checksum.algorithm() == ChecksumAlgorithm::CpioSum32 => Some(
+                    u32::from_be_bytes(checksum.as_bytes().try_into().map_err(|_| {
                         ArchiveError::new(ErrorKind::Protocol)
                             .with_format("cpio")
                             .with_context("CRC checksum conversion failed")
-                    })?))
-                },
+                    })?),
+                ),
                 None if size == 0 => Some(0),
                 _ => {
                     return Err(ArchiveError::new(ErrorKind::Unsupported)

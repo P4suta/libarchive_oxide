@@ -11,11 +11,13 @@ pub(crate) mod bcj;
 #[cfg(feature = "sevenz")]
 pub(crate) mod delta;
 pub mod gzip;
-#[cfg(all(feature = "lz4", not(feature = "native-codecs")))]
+#[cfg(feature = "lz4")]
 pub(crate) mod lz4;
-#[cfg(all(feature = "xz", not(feature = "native-codecs")))]
+#[cfg(feature = "lzip")]
+pub(crate) mod lzip;
+#[cfg(feature = "xz")]
 pub(crate) mod xz;
-#[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
+#[cfg(feature = "zstd")]
 pub(crate) mod zstd;
 
 /// IEEE CRC-32 primitives.

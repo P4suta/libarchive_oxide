@@ -8,21 +8,23 @@
 rust = "stable"
 
 lefthook = "2.1.9"
-committed = "latest"
+committed = "1.1.11"
 just = "1.50.0"
 
 typos = "1.48.0"
 actionlint = "1.7.12"
+zizmor = "1.28.0"
 
 # REUSE runs through uvx.
-uv = "latest"
+uv = "0.11.32"
 
-cargo-binstall = "latest"
+cargo-binstall = "1.21.1"
 
-"cargo:cargo-msrv" = "latest"
-"cargo:cargo-deny" = "latest"
-"cargo:cargo-semver-checks" = "latest"
-"cargo:release-plz" = "latest"
+"cargo:cargo-msrv" = "0.19.3"
+"cargo:cargo-deny" = "0.20.2"
+"cargo:cargo-hack" = "0.6.45"
+"cargo:cargo-nextest" = "0.9.140"
+"cargo:cargo-shear" = "1.13.3"
 
 [settings.cargo]
 binstall = true
