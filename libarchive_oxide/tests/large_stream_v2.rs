@@ -4,7 +4,7 @@
 
 //! Automated proof that archive size does not determine reader allocation.
 
-#![allow(clippy::panic, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::io::{self, Read};
 use std::time::Instant;
