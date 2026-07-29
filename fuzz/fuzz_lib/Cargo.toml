@@ -28,4 +28,4 @@ libarchive_oxide = { path = "../../libarchive_oxide", default-features = false, 
 # Structured input synthesis (round-trip entry sets); no rand/no clock.
 arbitrary = { version = "1", features = ["derive"] }
 # The LZMA2 codec that backs the 7z folder — driven directly for the `codec_lzma2` target.
-lzma-rust2 = "0.16.5"
+lzma-rust2 = "0.18.0"
