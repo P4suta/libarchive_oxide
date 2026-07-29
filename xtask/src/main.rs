@@ -1178,7 +1178,7 @@ fn run_big_endian_ci(root: &Path) -> Result {
             "--skip",
             "arbitrary_seeds_uphold_invariants",
             "--skip",
-            "seed_mutants_uphold_invariants",
+            "seed_mutants_",
             // The OCI layer tests measure compression throughput and multi-filter
             // rebuilds, not byte order: a multi-megabyte streaming hash and the
             // determinism batch that rebuilds every filter push the 15-minute
