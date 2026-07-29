@@ -2,8 +2,8 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# Manual native build and optional draft-release upload for the four CLI
-# binaries. Published releases are immutable, so this workflow never reacts to
+# Manual native build and optional draft-release upload for the unified
+# `oxarchive` binary. Published releases are immutable, so this workflow never reacts to
 # a release event. Upload mode targets the draft created by release-plz; after
 # every matrix job succeeds, a maintainer inspects and publishes that draft in
 # the GitHub UI.
@@ -84,7 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: build release binaries
         run: cargo build --locked --release -p libarchive_oxide-cli --target ${{ matrix.target }}
-      - name: smoke-test all binaries
+      - name: smoke-test oxarchive
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -94,14 +94,12 @@ jobs:
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             suffix=".exe"
           fi
-          for bin in oxtar oxcpio oxcat oxunzip; do
-            "target/$TARGET/release/$bin$suffix" --version
-          done
+          "target/$TARGET/release/oxarchive$suffix" --version
       - name: upload archives and checksums to the draft
         if: inputs.upload
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
-          bin: oxtar,oxcpio,oxcat,oxunzip
+          bin: oxarchive
           target: ${{ matrix.target }}
           archive: libarchive_oxide-cli-$tag-$target
           checksum: sha256

@@ -4,11 +4,13 @@
 
 [package]
 name = "libarchive_oxide-cli"
+autobins = false
+autotests = false
 version.workspace = true
-description = "Archive CLI tools: oxarchive, oxtar, oxcpio, oxcat, and oxunzip"
+description = "Unified safe archive and package CLI"
 edition.workspace = true
-# MSRV inherited from codec dependencies.
-rust-version = "1.87"
+# Workspace MSRV inherited from codec dependencies.
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -24,36 +26,41 @@ features = ["portable-codecs"]
 
 [features]
 default = ["portable-codecs"]
-portable-codecs = ["libarchive_oxide/portable-codecs"]
-native-codecs = ["libarchive_oxide/native-codecs"]
+portable-codecs = [
+    "libarchive_oxide/portable-codecs",
+    "libarchive_oxide-package/portable-codecs",
+]
+native-codecs = [
+    "libarchive_oxide/native-codecs",
+    "libarchive_oxide-package/native-codecs",
+]
 
 # Command-line entry points.
 [[bin]]
 name = "oxarchive"
 path = "src/bin/oxarchive.rs"
 
-[[bin]]
-name = "oxtar"
-path = "src/bin/oxtar.rs"
+[[test]]
+name = "oxarchive"
+path = "tests/oxarchive.rs"
 
-[[bin]]
-name = "oxcpio"
-path = "src/bin/oxcpio.rs"
+[[test]]
+name = "oci_cli"
+path = "tests/oci_cli.rs"
 
-[[bin]]
-name = "oxcat"
-path = "src/bin/oxcat.rs"
-
-[[bin]]
-name = "oxunzip"
-path = "src/bin/oxunzip.rs"
+[[test]]
+name = "package_cli"
+path = "tests/package_cli.rs"
 
 [dependencies]
 # Enable CLI-supported formats.
 libarchive_oxide = { path = "../libarchive_oxide", version = "0.2.0", default-features = false, features = ["aes", "sevenz"] }
+libarchive_oxide-package = { path = "../libarchive_oxide-package", version = "0.2.0", default-features = false }
 libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
 cap-std = "4.0.2"
+rpassword = "7.5.4"
 serde_json = "1.0.149"
+zeroize = "1.8.2"
 
 [lints]
 workspace = true

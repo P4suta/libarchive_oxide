@@ -59,9 +59,11 @@ restoration can reject any non-`Applied` finding, while callers with a looser
 policy can accept a materialized payload and retain precise degradation
 evidence.
 
-The low-level `Extractor` and Tokio extraction APIs remain available and
-source-compatible. They continue to be convenient concrete `cap-std` surfaces;
-the session engine is the preferred capability-reporting path.
+The former low-level `Extractor` and Tokio extraction surfaces are removed.
+They could begin materialization before a later archive member exposed a host
+identity collision. The session engine is now the only filesystem application
+path, and both its built-in and downstream-adapter variants consume the same
+opaque whole-archive preflight plan.
 
 Raw ACL records are applied only when they can be represented as numeric POSIX
 ACL text. Names are not looked up implicitly. Change/birth times and filesystem

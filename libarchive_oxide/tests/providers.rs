@@ -6,18 +6,24 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 
-use libarchive_oxide::libarchive_oxide_core::{
-    ArchiveDecoder, ArchiveEncoder, ArchiveError, ArchivePath, Chunk, Codec, CodecStatus,
-    CodecStep, DecodeEvent, DecodeStep, EncodeCommand, EncodeStatus, EncodeStep, EndOfInput,
-    EntryKind, EntryMetadata, ErrorKind, FilterId, FormatId, Limits, ProbeResult,
+use libarchive_oxide::advanced::legacy::{
+    CodecProvider, CodecProviderNode, FormatProvider, FormatProviderNode, NoCodecProviders,
+    NoFormatProviders, ProviderSet,
+};
+use libarchive_oxide::advanced::{
+    CodecCapabilities, FormatCapabilities, Pipeline, PipelineEvent, ProviderArchiveEncoder,
+    ProviderCapability, Registry,
 };
 use libarchive_oxide::{
-    ArchiveEngine, ArchiveReader, CodecCapabilities, CodecProvider, CodecProviderNode,
-    CreateOptions, FormatCapabilities, FormatProvider, FormatProviderNode, NoCodecProviders,
-    NoFormatProviders, Pipeline, PipelineEvent, PlanDisposition, ProviderArchiveEncoder,
-    ProviderCapability, ProviderSet,
+    ArchiveEngine, ArchiveReader, ArchiveWriter, CreateOptions, PlanDisposition,
+};
+use libarchive_oxide_core::{
+    AccessMode, ArchiveDecoder, ArchiveEncoder, ArchiveError, ArchivePath, CAPABILITY_LEDGER,
+    CapabilitySubject, Chunk, Codec, CodecStatus, CodecStep, DecodeEvent, DecodeStep, DirectionSet,
+    EncodeCommand, EncodeStatus, EncodeStep, EndOfInput, EntryKind, EntryMetadata, ErrorKind,
+    FilterId, FormatId, Limits, ProbeResult,
 };
 
 const FORMAT: FormatId = FormatId::Tar;
@@ -34,6 +40,101 @@ fn example_providers() -> ExampleProviders {
     ProviderSet::empty()
         .with_format_provider(ExampleFormat)
         .with_codec_provider(ExampleCodec)
+}
+
+#[test]
+fn built_in_provider_queries_are_derived_from_the_capability_ledger() {
+    let providers = ProviderSet::builtins();
+    for record in CAPABILITY_LEDGER {
+        match record.subject() {
+            CapabilitySubject::Format(format) => match providers.format_capability(format) {
+                ProviderCapability::Available(capabilities) => {
+                    assert!(
+                        libarchive_oxide::capability::requirements_enabled(record.requirements()),
+                        "{} unexpectedly enabled",
+                        record.key()
+                    );
+                    assert_eq!(
+                        capabilities.directions(),
+                        record.portable().union(record.native()),
+                        "{}",
+                        record.key()
+                    );
+                    assert_eq!(capabilities.accesses(), record.access(), "{}", record.key());
+                },
+                ProviderCapability::Disabled => assert!(
+                    !libarchive_oxide::capability::requirements_enabled(record.requirements()),
+                    "{} unexpectedly disabled",
+                    record.key()
+                ),
+                ProviderCapability::Unknown => {
+                    panic!("ledger format is unknown to provider: {}", record.key())
+                },
+                _ => panic!("unknown provider capability state"),
+            },
+            CapabilitySubject::Filter(filter) => match providers.codec_capability(filter) {
+                ProviderCapability::Available(capabilities) => {
+                    assert!(
+                        libarchive_oxide::capability::requirements_enabled(record.requirements()),
+                        "{} unexpectedly enabled",
+                        record.key()
+                    );
+                    assert_eq!(
+                        capabilities.directions(),
+                        record.portable().union(record.native()),
+                        "{}",
+                        record.key()
+                    );
+                },
+                ProviderCapability::Disabled => assert!(
+                    !libarchive_oxide::capability::requirements_enabled(record.requirements()),
+                    "{} unexpectedly disabled",
+                    record.key()
+                ),
+                ProviderCapability::Unknown => {
+                    panic!("ledger filter is unknown to provider: {}", record.key())
+                },
+                _ => panic!("unknown provider capability state"),
+            },
+            CapabilitySubject::Method { .. } => {},
+            _ => panic!("unknown capability subject"),
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "compress")]
+fn built_in_compress_provider_is_decode_only() {
+    #[derive(Debug)]
+    struct RejectIo;
+
+    impl Write for RejectIo {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            panic!("read-only filter reached output I/O")
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("read-only filter reached output I/O")
+        }
+    }
+
+    let providers = ProviderSet::builtins();
+    let ProviderCapability::Available(capabilities) =
+        providers.codec_capability(FilterId::Compress)
+    else {
+        panic!("compress provider must be enabled by the portable profile");
+    };
+    assert!(capabilities.can_decode());
+    assert!(!capabilities.can_encode());
+
+    let error = ArchiveWriter::with_filter(
+        RejectIo,
+        FormatId::Tar,
+        Some(FilterId::Compress),
+        Limits::default(),
+    )
+    .expect_err("read-only compress provider must reject encoding before I/O");
+    assert_eq!(error.kind(), ErrorKind::Capability);
 }
 
 fn probe_magic(prefix: &[u8], magic: &[u8]) -> ProbeResult<()> {
@@ -72,7 +173,7 @@ impl FormatProvider for ExampleFormat {
     }
 
     fn capabilities(&self) -> FormatCapabilities {
-        FormatCapabilities::new(true, true, false)
+        FormatCapabilities::uniform(DirectionSet::READ_WRITE, AccessMode::Sequential)
     }
 
     fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
@@ -316,7 +417,7 @@ impl CodecProvider for ExampleCodec {
     }
 
     fn capabilities(&self) -> CodecCapabilities {
-        CodecCapabilities::new(true, true)
+        CodecCapabilities::new(DirectionSet::READ_WRITE)
     }
 
     fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
@@ -486,7 +587,7 @@ fn registered_create_event_inspect_plan_and_rewind_share_one_state_model() {
     let engine = ArchiveEngine::new()
         .with_format_provider(ExampleFormat)
         .with_codec_provider(ExampleCodec);
-    let mut session = engine.open(Cursor::new(encoded)).unwrap();
+    let mut session = engine.prepare(Cursor::new(encoded)).unwrap();
     let digest = session.digest();
     let inspection = session.inspect().unwrap();
     assert_eq!(inspection.format(), FORMAT);
@@ -544,6 +645,82 @@ fn caller_driven_pipeline_uses_registered_codec_and_format_at_one_byte_boundarie
     assert_eq!(decoded, payload);
 }
 
+#[test]
+fn object_safe_registry_runs_boxed_incremental_providers() {
+    let payload: Vec<u8> = (0_u8..=127).cycle().take(4097).collect();
+    let encoded = create_example_archive(&payload);
+    let mut builder = Registry::builder();
+    builder.register_format(Box::new(ExampleFormat)).unwrap();
+    builder.register_codec(Box::new(ExampleCodec)).unwrap();
+    let registry = builder.build();
+    assert_eq!(registry.format_count(), 1);
+    assert_eq!(registry.codec_count(), 1);
+
+    assert!(matches!(
+        registry.format_capability(FORMAT),
+        ProviderCapability::Available(_)
+    ));
+    assert!(matches!(
+        registry.codec_capability(FILTER),
+        ProviderCapability::Available(_)
+    ));
+    let mut pipeline = registry.pipeline(Limits::safe());
+    let mut offset = 0;
+    let mut finished = false;
+    let mut decoded = Vec::new();
+    loop {
+        match pipeline.poll_event().unwrap() {
+            PipelineEvent::NeedInput if offset < encoded.len() => {
+                let end = (offset + 7).min(encoded.len());
+                assert_eq!(pipeline.feed(&encoded[offset..end]).unwrap(), end - offset);
+                offset = end;
+            },
+            PipelineEvent::NeedInput if !finished => {
+                pipeline.finish_input().unwrap();
+                finished = true;
+            },
+            PipelineEvent::NeedInput => panic!("finished registry pipeline requested more input"),
+            PipelineEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            PipelineEvent::Done => break,
+            PipelineEvent::ArchiveMetadata(_)
+            | PipelineEvent::Entry(_)
+            | PipelineEvent::EndEntry => {},
+            _ => panic!("unknown registry pipeline event"),
+        }
+    }
+    assert_eq!(pipeline.format(), Some(FORMAT));
+    assert_eq!(decoded, payload);
+
+    let mut session = ArchiveEngine::from_registry(&registry)
+        .prepare(Cursor::new(encoded))
+        .unwrap();
+    assert_eq!(session.inspect().unwrap().format(), FORMAT);
+    session.rewind().unwrap();
+    let mut replayed = Vec::new();
+    loop {
+        match session.next_event().unwrap() {
+            libarchive_oxide::ReaderEvent::Data(bytes) => replayed.extend_from_slice(bytes),
+            libarchive_oxide::ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(replayed, payload);
+}
+
+#[test]
+fn object_safe_registry_rejects_duplicate_ids_before_io() {
+    let mut builder = Registry::builder();
+    builder.register_format(Box::new(ExampleFormat)).unwrap();
+    let format_error = builder
+        .register_format(Box::new(ExampleFormat))
+        .unwrap_err();
+    assert_eq!(format_error.kind(), ErrorKind::Protocol);
+
+    builder.register_codec(Box::new(ExampleCodec)).unwrap();
+    let codec_error = builder.register_codec(Box::new(ExampleCodec)).unwrap_err();
+    assert_eq!(codec_error.kind(), ErrorKind::Protocol);
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DisabledFormat;
 
@@ -561,7 +738,7 @@ impl FormatProvider for DisabledFormat {
         probe_magic(prefix, FORMAT_MAGIC)
     }
     fn capabilities(&self) -> FormatCapabilities {
-        FormatCapabilities::new(false, false, false)
+        FormatCapabilities::uniform(DirectionSet::NONE, AccessMode::Sequential)
     }
     fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
         Ok(ExampleFormatDecoder::default())
@@ -610,7 +787,7 @@ impl FormatProvider for InvalidProbe {
         }
     }
     fn capabilities(&self) -> FormatCapabilities {
-        FormatCapabilities::new(true, true, false)
+        FormatCapabilities::uniform(DirectionSet::READ_WRITE, AccessMode::Sequential)
     }
     fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
         Ok(ExampleFormatDecoder::default())
@@ -640,7 +817,7 @@ impl FormatProvider for ConflictFormat {
         probe_magic(prefix, b"CF01")
     }
     fn capabilities(&self) -> FormatCapabilities {
-        FormatCapabilities::new(true, true, false)
+        FormatCapabilities::uniform(DirectionSet::READ_WRITE, AccessMode::Sequential)
     }
     fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
         Ok(ExampleFormatDecoder::default())
@@ -714,7 +891,7 @@ impl FormatProvider for NoProgressFormat {
         probe_magic(prefix, b"NP01")
     }
     fn capabilities(&self) -> FormatCapabilities {
-        FormatCapabilities::new(true, true, false)
+        FormatCapabilities::uniform(DirectionSet::READ_WRITE, AccessMode::Sequential)
     }
     fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {
         Ok(NoProgressDecoder)
@@ -756,7 +933,7 @@ impl CodecProvider for ExpandingCodec {
     }
 
     fn capabilities(&self) -> CodecCapabilities {
-        CodecCapabilities::new(false, true)
+        CodecCapabilities::new(DirectionSet::WRITE)
     }
 
     fn decoder(&self, _limits: Limits) -> Result<Self::Decoder, ArchiveError> {

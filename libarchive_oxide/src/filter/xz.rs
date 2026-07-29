@@ -32,12 +32,13 @@ enum WorkerEvent {
     Output(Vec<u8>),
 }
 
-/// Cloneable worker-event sender that wakes the async owner after every send.
+/// Cloneable worker-event sender that wakes the async owner around every send.
 ///
-/// The worker thread and its input pipe both hold clones. `send` first delivers
-/// the event over the blocking channel, then wakes (and clears) any async waker
-/// registered by the owner, so a parked executor observes both `NeedInput` and
-/// `Output` progress. `wake_owner` performs just the wake, used on worker exit.
+/// The worker thread and its input pipe both hold clones. `send` uses a
+/// non-blocking fast path. If the bounded queue is full, it wakes before
+/// blocking so the owner can make space, then wakes again after delivery to
+/// close the registration race. `wake_owner` performs just the wake, used on
+/// worker exit.
 #[derive(Clone)]
 struct EventSink {
     sender: SyncSender<WorkerEvent>,
@@ -46,9 +47,19 @@ struct EventSink {
 
 impl EventSink {
     fn send(&self, event: WorkerEvent) -> Result<(), mpsc::SendError<WorkerEvent>> {
-        let result = self.sender.send(event);
-        self.wake_owner();
-        result
+        match self.sender.try_send(event) {
+            Ok(()) => {
+                self.wake_owner();
+                Ok(())
+            },
+            Err(TrySendError::Full(event)) => {
+                self.wake_owner();
+                let result = self.sender.send(event);
+                self.wake_owner();
+                result
+            },
+            Err(TrySendError::Disconnected(event)) => Err(mpsc::SendError(event)),
+        }
     }
 
     fn wake_owner(&self) {
@@ -58,10 +69,12 @@ impl EventSink {
 
 /// Wakes and clears the waker parked in `cell`, tolerating lock poisoning.
 fn wake_cell(cell: &Mutex<Option<Waker>>) {
-    if let Ok(mut guard) = cell.lock() {
-        if let Some(waker) = guard.take() {
-            waker.wake();
-        }
+    let waker = match cell.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    if let Some(waker) = waker {
+        waker.wake();
     }
 }
 
@@ -597,7 +610,9 @@ impl XzDecoder {
             Err(TrySendError::Disconnected(_)) => {
                 Err(self.fail(malformed("XZ decoder worker stopped accepting input")))
             },
-            Err(TrySendError::Full(InputMessage::End)) => unreachable!(),
+            Err(TrySendError::Full(InputMessage::End)) => Err(self.fail(malformed(
+                "XZ decoder input queue returned the wrong full message",
+            ))),
         }
     }
 
@@ -617,7 +632,9 @@ impl XzDecoder {
             Err(TrySendError::Disconnected(_)) => {
                 Err(self.fail(malformed("XZ decoder worker stopped before end of input")))
             },
-            Err(TrySendError::Full(InputMessage::Data(_))) => unreachable!(),
+            Err(TrySendError::Full(InputMessage::Data(_))) => Err(self.fail(malformed(
+                "XZ decoder input queue returned the wrong end marker",
+            ))),
         }
     }
 
@@ -873,17 +890,15 @@ impl XzDecoder {
 }
 
 impl Codec for XzDecoder {
-    // The `None` waker drives the blocking path, which never yields `Ok(None)`;
-    // the `expect` documents that invariant on the one impossible branch.
-    #[allow(clippy::expect_used)]
     fn process(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         end: EndOfInput,
     ) -> Result<CodecStep, ArchiveError> {
-        self.drive(input, output, end, None)
-            .map(|step| step.expect("blocking XZ drive always yields a step"))
+        self.drive(input, output, end, None)?.ok_or_else(|| {
+            malformed("blocking XZ decoder yielded without arranging synchronous progress")
+        })
     }
 
     fn poll_process(
@@ -1030,4 +1045,41 @@ pub(crate) fn encode_frame(input: &[u8]) -> io::Result<Vec<u8>> {
     let mut writer = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6))?;
     writer.write_all(input)?;
     writer.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Wake, Waker};
+
+    use super::wake_cell;
+
+    struct LockProbe {
+        cell: Arc<Mutex<Option<Waker>>>,
+        acquired: Arc<AtomicBool>,
+    }
+
+    impl Wake for LockProbe {
+        fn wake(self: Arc<Self>) {
+            self.acquired
+                .store(self.cell.try_lock().is_ok(), Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn wake_cell_releases_mutex_before_invoking_waker() {
+        let cell = Arc::new(Mutex::new(None));
+        let acquired = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(LockProbe {
+            cell: Arc::clone(&cell),
+            acquired: Arc::clone(&acquired),
+        }));
+        *cell.lock().expect("waker cell") = Some(waker);
+
+        wake_cell(&cell);
+
+        assert!(acquired.load(Ordering::SeqCst));
+        assert!(cell.lock().expect("waker cell").is_none());
+    }
 }

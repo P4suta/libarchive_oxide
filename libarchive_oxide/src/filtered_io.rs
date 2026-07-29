@@ -9,36 +9,53 @@ use std::fmt;
 use std::io::{self, BufReader, Read, Write};
 use std::rc::Rc;
 
-#[cfg(not(feature = "native-codecs"))]
 use libarchive_oxide_core::Codec;
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, CodecStatus, EndOfInput, ErrorKind, Limits};
 
-#[cfg(any(feature = "zstd", feature = "lz4"))]
+use crate::capability::{Backend, BackendPreference};
+#[cfg(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
 use crate::codec_read::CodecReader;
-#[cfg(not(feature = "native-codecs"))]
 use crate::filter::gzip::GzipEncoder;
 use crate::pipeline_codec::PipelineCodec;
 
 const BUFFER: usize = 64 * 1024;
 
 /// A bounded outer-filter reader: the shared [`CodecReader`] engine driving a [`PipelineCodec`].
-#[cfg(any(feature = "zstd", feature = "lz4"))]
+#[cfg(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
 type PipelineRead<R> = CodecReader<R, PipelineCodec>;
 
 /// Builds a [`PipelineRead`] for an outer filter, constructing its [`PipelineCodec`] first.
-#[cfg(any(feature = "zstd", feature = "lz4"))]
+#[cfg(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "compress",
+    feature = "lzip"
+))]
 fn pipeline_reader<R: Read>(
     input: R,
     filter: FilterId,
     limits: Limits,
+    backend: BackendPreference,
 ) -> io::Result<PipelineRead<R>> {
     let name = match filter {
         FilterId::Zstd => "zstd",
         FilterId::Lz4 => "LZ4",
+        FilterId::Compress => "compress",
+        FilterId::Lzip => "lzip",
         _ => "codec",
     };
-    let codec = PipelineCodec::new(filter, limits).map_err(codec_archive_io)?;
+    let codec = PipelineCodec::with_backend(filter, limits, backend).map_err(codec_archive_io)?;
     Ok(CodecReader::new(input, codec, name))
 }
 
@@ -69,6 +86,12 @@ enum FilterReaderInner<R: Read> {
     /// LZ4 frame.
     #[cfg(feature = "lz4")]
     Lz4(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
+    /// Unix `compress(1)` LZW stream.
+    #[cfg(feature = "compress")]
+    Compress(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
+    /// Concatenated lzip members.
+    #[cfg(feature = "lzip")]
+    Lzip(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
 }
 
 impl<R: Read> FilterReader<R> {
@@ -78,7 +101,17 @@ impl<R: Read> FilterReader<R> {
     }
 
     /// Detects an outer filter with explicit decoded-output budgets.
-    pub fn with_limits(mut input: R, limits: Limits) -> io::Result<Self> {
+    pub fn with_limits(input: R, limits: Limits) -> io::Result<Self> {
+        Self::with_backend(input, limits, BackendPreference::Auto)
+    }
+
+    /// Detects an outer filter using the selected portable or native codec backend.
+    #[allow(clippy::too_many_lines)] // One ownership-preserving dispatch over all built-in filters.
+    pub fn with_backend(
+        mut input: R,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> io::Result<Self> {
         let mut prefix = [0_u8; 6];
         let mut prefix_len = 0;
         while prefix_len != prefix.len() {
@@ -95,12 +128,49 @@ impl<R: Read> FilterReader<R> {
             input,
         });
         let available = &prefix[..prefix_len];
+        if available.starts_with(b"LZIP") {
+            #[cfg(feature = "lzip")]
+            {
+                return pipeline_reader(input, FilterId::Lzip, limits, backend)
+                    .map(Box::new)
+                    .map(FilterReaderInner::Lzip)
+                    .map(|inner| Self {
+                        inner,
+                        decoded: 0,
+                        decoded_limit: limits.decoded_total(),
+                    });
+            }
+            #[cfg(not(feature = "lzip"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "lzip filter is not enabled",
+            ));
+        }
+        backend.resolve().map_err(codec_archive_io)?;
         if available.starts_with(&[0x1f, 0x8b]) {
             return Ok(Self {
-                inner: FilterReaderInner::Gzip(Box::new(GzipRead::new(input, limits)?)),
+                inner: FilterReaderInner::Gzip(Box::new(GzipRead::new(input, limits, backend)?)),
                 decoded: 0,
                 decoded_limit: limits.decoded_total(),
             });
+        }
+        if available.starts_with(&[0x1f, 0x9d]) {
+            #[cfg(feature = "compress")]
+            {
+                return pipeline_reader(input, FilterId::Compress, limits, backend)
+                    .map(Box::new)
+                    .map(FilterReaderInner::Compress)
+                    .map(|inner| Self {
+                        inner,
+                        decoded: 0,
+                        decoded_limit: limits.decoded_total(),
+                    });
+            }
+            #[cfg(not(feature = "compress"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "compress/LZW filter is not enabled",
+            ));
         }
         if available.starts_with(b"BZh") {
             #[cfg(feature = "bzip2")]
@@ -118,7 +188,7 @@ impl<R: Read> FilterReader<R> {
         if available.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
             #[cfg(feature = "zstd")]
             {
-                return pipeline_reader(input, FilterId::Zstd, limits)
+                return pipeline_reader(input, FilterId::Zstd, limits, backend)
                     .map(Box::new)
                     .map(FilterReaderInner::Zstd)
                     .map(|inner| Self {
@@ -136,7 +206,7 @@ impl<R: Read> FilterReader<R> {
         }
         if available.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
             #[cfg(feature = "xz")]
-            return XzRead::new(input, limits)
+            return XzRead::new(input, limits, backend)
                 .map(Box::new)
                 .map(FilterReaderInner::Xz)
                 .map(|inner| Self {
@@ -152,7 +222,7 @@ impl<R: Read> FilterReader<R> {
         }
         if available.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
             #[cfg(feature = "lz4")]
-            return pipeline_reader(input, FilterId::Lz4, limits)
+            return pipeline_reader(input, FilterId::Lz4, limits, backend)
                 .map(Box::new)
                 .map(FilterReaderInner::Lz4)
                 .map(|inner| Self {
@@ -187,6 +257,10 @@ impl<R: Read> FilterReader<R> {
             FilterReaderInner::Xz(input) => input.into_inner().into_inner().input,
             #[cfg(feature = "lz4")]
             FilterReaderInner::Lz4(input) => input.into_inner().into_inner().input,
+            #[cfg(feature = "compress")]
+            FilterReaderInner::Compress(input) => input.into_inner().into_inner().input,
+            #[cfg(feature = "lzip")]
+            FilterReaderInner::Lzip(input) => input.into_inner().into_inner().input,
         }
     }
 }
@@ -224,6 +298,7 @@ struct XzRead<R: Read> {
     eof: bool,
     state: XzReadState,
     limits: Limits,
+    backend: BackendPreference,
 }
 
 #[cfg(feature = "xz")]
@@ -237,16 +312,18 @@ enum XzReadState {
 
 #[cfg(feature = "xz")]
 impl<R: Read> XzRead<R> {
-    fn new(input: R, limits: Limits) -> io::Result<Self> {
+    fn new(input: R, limits: Limits, backend: BackendPreference) -> io::Result<Self> {
         Ok(Self {
             input,
-            decoder: PipelineCodec::new(FilterId::Xz, limits).map_err(codec_archive_io)?,
+            decoder: PipelineCodec::with_backend(FilterId::Xz, limits, backend)
+                .map_err(codec_archive_io)?,
             buffer: vec![0; BUFFER],
             start: 0,
             end: 0,
             eof: false,
             state: XzReadState::Running,
             limits,
+            backend,
         })
     }
 
@@ -318,8 +395,8 @@ impl<R: Read> XzRead<R> {
                     "non-member trailing filter data",
                 ));
             }
-            self.decoder =
-                PipelineCodec::new(FilterId::Xz, self.limits).map_err(codec_archive_io)?;
+            self.decoder = PipelineCodec::with_backend(FilterId::Xz, self.limits, self.backend)
+                .map_err(codec_archive_io)?;
             self.state = XzReadState::Running;
             return Ok(());
         }
@@ -451,6 +528,10 @@ fn read_inner<R: Read>(input: &mut FilterReaderInner<R>, output: &mut [u8]) -> i
         FilterReaderInner::Xz(input) => input.read(output),
         #[cfg(feature = "lz4")]
         FilterReaderInner::Lz4(input) => input.read(output),
+        #[cfg(feature = "compress")]
+        FilterReaderInner::Compress(input) => input.read(output),
+        #[cfg(feature = "lzip")]
+        FilterReaderInner::Lzip(input) => input.read(output),
     }
 }
 
@@ -467,6 +548,10 @@ impl<R: Read> fmt::Debug for FilterReader<R> {
             FilterReaderInner::Xz(_) => "xz",
             #[cfg(feature = "lz4")]
             FilterReaderInner::Lz4(_) => "lz4",
+            #[cfg(feature = "compress")]
+            FilterReaderInner::Compress(_) => "compress",
+            #[cfg(feature = "lzip")]
+            FilterReaderInner::Lzip(_) => "lzip",
         };
         f.debug_tuple("FilterReader").field(&filter).finish()
     }
@@ -482,13 +567,15 @@ struct GzipRead<R> {
     between_members: bool,
     done: bool,
     limits: Limits,
+    backend: BackendPreference,
 }
 
 impl<R: Read> GzipRead<R> {
-    fn new(input: R, limits: Limits) -> io::Result<Self> {
+    fn new(input: R, limits: Limits, backend: BackendPreference) -> io::Result<Self> {
         Ok(Self {
             input,
-            decoder: PipelineCodec::new(FilterId::Gzip, limits).map_err(codec_archive_io)?,
+            decoder: PipelineCodec::with_backend(FilterId::Gzip, limits, backend)
+                .map_err(codec_archive_io)?,
             buffer: vec![0; BUFFER],
             start: 0,
             end: 0,
@@ -496,6 +583,7 @@ impl<R: Read> GzipRead<R> {
             between_members: false,
             done: false,
             limits,
+            backend,
         })
     }
 
@@ -550,7 +638,8 @@ impl<R: Read> Read for GzipRead<R> {
                     ));
                 }
                 self.decoder =
-                    PipelineCodec::new(FilterId::Gzip, self.limits).map_err(codec_archive_io)?;
+                    PipelineCodec::with_backend(FilterId::Gzip, self.limits, self.backend)
+                        .map_err(codec_archive_io)?;
                 self.between_members = false;
             }
             if self.start == self.end && !self.eof {
@@ -606,6 +695,15 @@ fn codec_archive_io(error: ArchiveError) -> io::Error {
     io::Error::new(kind, error)
 }
 
+fn filter_writer_error(error: &io::Error) -> ArchiveError {
+    let kind = if error.kind() == io::ErrorKind::Unsupported {
+        ErrorKind::Capability
+    } else {
+        ErrorKind::Protocol
+    };
+    ArchiveError::new(kind).with_context(error.to_string())
+}
+
 pub(crate) struct SharedOutput<W>(Rc<RefCell<Option<W>>>);
 
 impl<W> SharedOutput<W> {
@@ -646,119 +744,147 @@ impl<W: Write> Write for SharedOutput<W> {
 }
 
 pub(crate) struct GzipFilterWrite<W: Write> {
-    #[cfg(not(feature = "native-codecs"))]
-    output: W,
-    #[cfg(not(feature = "native-codecs"))]
-    encoder: GzipEncoder,
-    #[cfg(not(feature = "native-codecs"))]
-    buffer: Vec<u8>,
+    inner: GzipFilterWriteInner<W>,
+}
+
+enum GzipFilterWriteInner<W: Write> {
+    Portable {
+        output: W,
+        encoder: GzipEncoder,
+        buffer: Vec<u8>,
+    },
     #[cfg(feature = "native-codecs")]
-    encoder: flate2::write::GzEncoder<W>,
+    Native(flate2::write::GzEncoder<W>),
 }
 
-#[cfg(not(feature = "native-codecs"))]
 impl<W: Write> GzipFilterWrite<W> {
-    pub(crate) fn new(output: W, limits: Limits) -> Self {
-        Self {
-            output,
-            encoder: GzipEncoder::new(limits),
-            buffer: vec![0; BUFFER],
-        }
-    }
-
-    pub(crate) fn finish(mut self) -> io::Result<W> {
-        loop {
-            let step = self
-                .encoder
-                .process(&[], &mut self.buffer, EndOfInput::End)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            self.output.write_all(&self.buffer[..step.produced])?;
-            if matches!(step.status, CodecStatus::Done) {
-                self.output.flush()?;
-                return Ok(self.output);
-            }
-            if step.produced == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "gzip encoder made no finish progress",
-                ));
-            }
-        }
-    }
-}
-
-#[cfg(feature = "native-codecs")]
-impl<W: Write> GzipFilterWrite<W> {
-    pub(crate) fn new(output: W, _limits: Limits) -> Self {
-        Self {
-            encoder: flate2::write::GzEncoder::new(output, flate2::Compression::default()),
-        }
+    pub(crate) fn with_backend(
+        output: W,
+        limits: Limits,
+        preference: BackendPreference,
+    ) -> io::Result<Self> {
+        let inner = match preference.resolve().map_err(io::Error::other)? {
+            Backend::Portable => GzipFilterWriteInner::Portable {
+                output,
+                encoder: GzipEncoder::new(limits),
+                buffer: vec![0; BUFFER],
+            },
+            Backend::Native => {
+                #[cfg(feature = "native-codecs")]
+                {
+                    GzipFilterWriteInner::Native(flate2::write::GzEncoder::new(
+                        output,
+                        flate2::Compression::default(),
+                    ))
+                }
+                #[cfg(not(feature = "native-codecs"))]
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "native codec backend is not compiled",
+                    ));
+                }
+            },
+        };
+        Ok(Self { inner })
     }
 
     pub(crate) fn finish(self) -> io::Result<W> {
-        self.encoder.finish()
+        match self.inner {
+            GzipFilterWriteInner::Portable {
+                mut output,
+                mut encoder,
+                mut buffer,
+            } => loop {
+                let step = encoder
+                    .process(&[], &mut buffer, EndOfInput::End)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                output.write_all(&buffer[..step.produced])?;
+                if matches!(step.status, CodecStatus::Done) {
+                    output.flush()?;
+                    return Ok(output);
+                }
+                if step.produced == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "gzip encoder made no finish progress",
+                    ));
+                }
+            },
+            #[cfg(feature = "native-codecs")]
+            GzipFilterWriteInner::Native(encoder) => encoder.finish(),
+        }
     }
 }
 
-#[cfg(not(feature = "native-codecs"))]
 impl<W: Write> Write for GzipFilterWrite<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
         }
-        loop {
-            let step = self
-                .encoder
-                .process(bytes, &mut self.buffer, EndOfInput::More)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            self.output.write_all(&self.buffer[..step.produced])?;
-            if step.consumed != 0 {
-                return Ok(step.consumed);
-            }
-            if step.produced == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "gzip encoder made no write progress",
-                ));
-            }
+        match &mut self.inner {
+            GzipFilterWriteInner::Portable {
+                output,
+                encoder,
+                buffer,
+            } => loop {
+                let step = encoder
+                    .process(bytes, buffer, EndOfInput::More)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                output.write_all(&buffer[..step.produced])?;
+                if step.consumed != 0 {
+                    return Ok(step.consumed);
+                }
+                if step.produced == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "gzip encoder made no write progress",
+                    ));
+                }
+            },
+            #[cfg(feature = "native-codecs")]
+            GzipFilterWriteInner::Native(encoder) => encoder.write(bytes),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.output.flush()
-    }
-}
-
-#[cfg(feature = "native-codecs")]
-impl<W: Write> Write for GzipFilterWrite<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.encoder.write(bytes)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.encoder.flush()
+        match &mut self.inner {
+            GzipFilterWriteInner::Portable { output, .. } => output.flush(),
+            #[cfg(feature = "native-codecs")]
+            GzipFilterWriteInner::Native(encoder) => encoder.flush(),
+        }
     }
 }
 #[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
-pub(crate) fn encode_profile_frame(filter: FilterId, input: &[u8]) -> io::Result<Vec<u8>> {
-    #[cfg(feature = "native-codecs")]
-    {
-        crate::backend_codec::encode_frame(filter, input)
-    }
-    #[cfg(not(feature = "native-codecs"))]
-    {
-        match filter {
+pub(crate) fn encode_profile_frame_with_backend(
+    filter: FilterId,
+    input: &[u8],
+    preference: BackendPreference,
+) -> io::Result<Vec<u8>> {
+    match preference.resolve().map_err(io::Error::other)? {
+        Backend::Portable => match filter {
             #[cfg(feature = "zstd")]
-            FilterId::Zstd => Ok(crate::filter::zstd::encode_frame(input)),
+            FilterId::Zstd => {
+                crate::filter::zstd::encode_frame(input, Limits::safe()).map_err(io::Error::other)
+            },
             #[cfg(feature = "xz")]
             FilterId::Xz => crate::filter::xz::encode_frame(input),
             #[cfg(feature = "lz4")]
-            FilterId::Lz4 => crate::filter::lz4::encode_frame(input),
+            FilterId::Lz4 => crate::filter::lz4::encode_frame(input).map_err(io::Error::other),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "filter has no frame encoder in the selected codec profile",
             )),
-        }
+        },
+        Backend::Native => {
+            #[cfg(feature = "native-codecs")]
+            return crate::backend_codec::encode_frame(filter, input);
+            #[cfg(not(feature = "native-codecs"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native codec backend is not compiled",
+            ));
+        },
     }
 }
 #[cfg(feature = "zstd")]
@@ -766,20 +892,22 @@ pub(crate) struct ZstdFrameWrite<W: Write> {
     output: W,
     input: Vec<u8>,
     wrote_frame: bool,
+    backend: BackendPreference,
 }
 
 #[cfg(feature = "zstd")]
 impl<W: Write> ZstdFrameWrite<W> {
-    pub(crate) fn new(output: W) -> Self {
+    pub(crate) fn with_backend(output: W, backend: BackendPreference) -> Self {
         Self {
             output,
             input: Vec::with_capacity(BUFFER),
             wrote_frame: false,
+            backend,
         }
     }
 
     fn emit_frame(&mut self) -> io::Result<()> {
-        let encoded = encode_profile_frame(FilterId::Zstd, &self.input)?;
+        let encoded = encode_profile_frame_with_backend(FilterId::Zstd, &self.input, self.backend)?;
         self.output.write_all(&encoded)?;
         self.input.clear();
         self.wrote_frame = true;
@@ -824,20 +952,22 @@ pub(crate) struct XzFrameWrite<W: Write> {
     output: W,
     input: Vec<u8>,
     wrote_frame: bool,
+    backend: BackendPreference,
 }
 
 #[cfg(feature = "xz")]
 impl<W: Write> XzFrameWrite<W> {
-    pub(crate) fn new(output: W) -> Self {
+    pub(crate) fn with_backend(output: W, backend: BackendPreference) -> Self {
         Self {
             output,
             input: Vec::with_capacity(BUFFER),
             wrote_frame: false,
+            backend,
         }
     }
 
     fn emit_frame(&mut self) -> io::Result<()> {
-        let encoded = encode_profile_frame(FilterId::Xz, &self.input)?;
+        let encoded = encode_profile_frame_with_backend(FilterId::Xz, &self.input, self.backend)?;
         self.output.write_all(&encoded)?;
         self.input.clear();
         self.wrote_frame = true;
@@ -882,20 +1012,22 @@ pub(crate) struct Lz4FrameWrite<W: Write> {
     output: W,
     input: Vec<u8>,
     wrote_frame: bool,
+    backend: BackendPreference,
 }
 
 #[cfg(feature = "lz4")]
 impl<W: Write> Lz4FrameWrite<W> {
-    pub(crate) fn new(output: W) -> Self {
+    pub(crate) fn with_backend(output: W, backend: BackendPreference) -> Self {
         Self {
             output,
             input: Vec::with_capacity(BUFFER),
             wrote_frame: false,
+            backend,
         }
     }
 
     fn emit_frame(&mut self) -> io::Result<()> {
-        let encoded = encode_profile_frame(FilterId::Lz4, &self.input)?;
+        let encoded = encode_profile_frame_with_backend(FilterId::Lz4, &self.input, self.backend)?;
         self.output.write_all(&encoded)?;
         self.input.clear();
         self.wrote_frame = true;
@@ -969,16 +1101,24 @@ impl<W: Write> SyncFilterWriter<W> {
         Self::Plain(SharedOutput::new(output))
     }
 
-    pub(crate) fn new(
+    pub(crate) fn with_backend(
         output: W,
         filter: Option<FilterId>,
         limits: Limits,
+        backend: BackendPreference,
     ) -> Result<Self, ArchiveError> {
+        backend.resolve()?;
         let shared = SharedOutput::new(output);
         match filter {
             None => Ok(Self::Plain(shared)),
+            Some(FilterId::Lzip) => Err(ArchiveError::new(ErrorKind::Capability)
+                .with_format("lzip")
+                .with_context("lzip filter is read-only")),
             Some(FilterId::Gzip) => Ok(Self::Gzip {
-                writer: Box::new(GzipFilterWrite::new(shared.clone(), limits)),
+                writer: Box::new(
+                    GzipFilterWrite::with_backend(shared.clone(), limits, backend)
+                        .map_err(|error| filter_writer_error(&error))?,
+                ),
                 output: shared,
             }),
             #[cfg(feature = "bzip2")]
@@ -991,17 +1131,17 @@ impl<W: Write> SyncFilterWriter<W> {
             }),
             #[cfg(feature = "zstd")]
             Some(FilterId::Zstd) => Ok(Self::Zstd {
-                writer: Box::new(ZstdFrameWrite::new(shared.clone())),
+                writer: Box::new(ZstdFrameWrite::with_backend(shared.clone(), backend)),
                 output: shared,
             }),
             #[cfg(feature = "xz")]
             Some(FilterId::Xz) => Ok(Self::Xz {
-                writer: Box::new(XzFrameWrite::new(shared.clone())),
+                writer: Box::new(XzFrameWrite::with_backend(shared.clone(), backend)),
                 output: shared,
             }),
             #[cfg(feature = "lz4")]
             Some(FilterId::Lz4) => Ok(Self::Lz4 {
-                writer: Box::new(Lz4FrameWrite::new(shared.clone())),
+                writer: Box::new(Lz4FrameWrite::with_backend(shared.clone(), backend)),
                 output: shared,
             }),
             Some(_) => Err(ArchiveError::new(ErrorKind::Capability)

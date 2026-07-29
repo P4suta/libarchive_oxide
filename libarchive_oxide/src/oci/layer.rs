@@ -155,7 +155,11 @@ impl<R: Read> OciLayerSession<R> {
         // The tar decoder stops at the archive trailer, which may leave a few
         // trailing compressed bytes unread. Drain the raw source so the
         // compressed digest covers the entire blob.
-        let mut source = reader.into_inner().into_inner().into_inner();
+        let mut source = reader
+            .into_inner()
+            .map_err(StreamError::archive)?
+            .into_inner()
+            .into_inner();
         let mut scratch = vec![0u8; DRAIN_BUFFER];
         loop {
             let read = source.read(&mut scratch).map_err(OciLayerError::Io)?;

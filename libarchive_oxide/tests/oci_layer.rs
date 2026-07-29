@@ -13,9 +13,6 @@ use std::fs;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-use libarchive_oxide::libarchive_oxide_core::{
-    ArchivePath, EntryKind, EntryMetadata, FilterId, FormatId, Limits, Owner,
-};
 use libarchive_oxide::{
     ArchiveEngine, CapStdFilesystemAdapter, CreateOptions, DigestKind, FilterReader,
     IdentityOwnership, LayerDigests, OciApplyReport, OciLayerApplier, OciLayerEngine,
@@ -23,6 +20,9 @@ use libarchive_oxide::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use libarchive_oxide::{FilesystemFindingKind, FilesystemOperation};
+use libarchive_oxide_core::{
+    ArchivePath, EntryKind, EntryMetadata, FilterId, FormatId, Limits, Owner,
+};
 use sha2::{Digest, Sha256};
 
 /// The tar entries every fixture layer contains.

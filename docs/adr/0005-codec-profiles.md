@@ -1,6 +1,6 @@
 # ADR-0005: codec backend profiles are explicit and mutually exclusive
 
-- Status: accepted
+- Status: superseded by ADR-0014
 - Date: 2026-07-20
 - Tracks: RM-115 / issue #44
 
@@ -46,3 +46,7 @@ represent two features whose contract is mutual exclusion.
 - Compressed bytes are deterministic within one profile but are not promised
   identical across profiles. Decoded bytes, framing validation, limits, and
   error classes are the compatibility contract.
+
+This decision described the initial profile implementation. ADR-0014 replaces
+the mutual-exclusion rule with additive Cargo features and runtime backend
+selection.

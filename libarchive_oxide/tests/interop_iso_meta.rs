@@ -33,9 +33,10 @@
 use std::io::Cursor;
 use std::process::Command;
 
-use libarchive_oxide::SeekArchiveWriter;
+use libarchive_oxide::{ReaderEvent, SeekArchiveReader, SeekArchiveWriter};
 use libarchive_oxide_core::{
-    ArchivePath, EntryKind, EntryMetadata, EntryTimes, FormatId, Limits, Owner, Timestamp,
+    ArchivePath, EntryKind, EntryMetadata, EntryTimes, ErrorKind, Extension, FormatId, Limits,
+    Owner, Timestamp,
 };
 
 mod common;
@@ -221,10 +222,7 @@ fn arca_iso_meta() -> Vec<u8> {
         ..Owner::default()
     })
     .times(EntryTimes {
-        modified: Some(Timestamp {
-            secs: MTIME,
-            nanos: 0,
-        }),
+        modified: Some(Timestamp::from_seconds(MTIME)),
         ..EntryTimes::default()
     })
     .build();
@@ -282,5 +280,146 @@ fn iso_metadata_round_trip() {
         link.mode,
         Some(0o777),
         "symlink mode survives Rock Ridge PX"
+    );
+}
+
+fn continuation_iso() -> (Vec<u8>, Vec<u8>) {
+    let mut writer = SeekArchiveWriter::with_format(
+        Cursor::new(Vec::new()),
+        FormatId::Iso9660,
+        Limits::default(),
+    )
+    .unwrap();
+    let target = (0..40)
+        .map(|index| format!("component-{index:02}"))
+        .collect::<Vec<_>>()
+        .join("/")
+        .into_bytes();
+    let mut builder = EntryMetadata::builder(
+        EntryKind::Symlink,
+        ArchivePath::from_bytes(b"continued-link".to_vec()),
+    )
+    .size(Some(0))
+    .mode(Some(0o777))
+    .link_target(Some(ArchivePath::from_bytes(target.clone())));
+    // Twelve independently framed SUSP fields make the continuation longer
+    // than one logical block, exercising offset+length ranges across sectors.
+    for index in 0..12_u8 {
+        builder = builder.extension(Extension::new(
+            "iso-system-use",
+            vec![b'X', b'A' + index],
+            vec![index; 240],
+        ));
+    }
+    let metadata = builder.build();
+    writer.start_entry(&metadata).unwrap();
+    writer.end_entry().unwrap();
+    (writer.finish().unwrap().into_inner(), target)
+}
+
+fn ce_offset(image: &[u8]) -> usize {
+    image
+        .windows(4)
+        .position(|window| window == b"CE\x1c\x01")
+        .expect("Rock Ridge CE field")
+}
+
+fn ce_target(image: &[u8], ce: usize) -> (u32, u32, u32) {
+    (
+        u32::from_le_bytes(image[ce + 4..ce + 8].try_into().unwrap()),
+        u32::from_le_bytes(image[ce + 12..ce + 16].try_into().unwrap()),
+        u32::from_le_bytes(image[ce + 20..ce + 24].try_into().unwrap()),
+    )
+}
+
+fn put_both_u32(output: &mut [u8], offset: usize, value: u32) {
+    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    output[offset + 4..offset + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+#[test]
+fn iso_rock_ridge_continuation_crosses_sectors_and_roundtrips() {
+    let (bytes, target) = continuation_iso();
+    let ce = ce_offset(&bytes);
+    let length = u32::from_le_bytes(bytes[ce + 20..ce + 24].try_into().unwrap());
+    assert!(length > 2048, "fixture must cross a logical-block boundary");
+
+    let shapes = read_meta_seek_with_arca(&bytes);
+    let link = shapes
+        .iter()
+        .find(|shape| shape.path == b"continued-link")
+        .expect("continued link");
+    assert_eq!(link.kind, EntryKind::Symlink);
+    assert_eq!(link.link_target.as_deref(), Some(target.as_slice()));
+}
+
+#[test]
+fn iso_rock_ridge_continuation_honors_in_flight_limit() {
+    let (bytes, _) = continuation_iso();
+    let limits = Limits::default().with_in_flight_bytes(Some(2048));
+    let error = match SeekArchiveReader::with_limits(Cursor::new(bytes), limits) {
+        Ok(mut reader) => loop {
+            match reader.next_event() {
+                Ok(ReaderEvent::Done) => panic!("oversized continuation unexpectedly succeeded"),
+                Ok(_) => {},
+                Err(error) => break error,
+            }
+        },
+        Err(error) => error,
+    };
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Limit)
+    );
+}
+
+#[test]
+fn iso_rock_ridge_continuation_outside_image_is_malformed() {
+    let (mut bytes, _) = continuation_iso();
+    let ce = ce_offset(&bytes);
+    bytes[ce + 4..ce + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+    bytes[ce + 8..ce + 12].copy_from_slice(&u32::MAX.to_be_bytes());
+    let error = match SeekArchiveReader::new(Cursor::new(bytes)) {
+        Ok(mut reader) => loop {
+            match reader.next_event() {
+                Ok(ReaderEvent::Done) => {
+                    panic!("out-of-range continuation unexpectedly succeeded");
+                },
+                Ok(_) => {},
+                Err(error) => break error,
+            }
+        },
+        Err(error) => error,
+    };
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Malformed)
+    );
+}
+
+#[test]
+fn iso_rock_ridge_continuation_cycle_is_malformed() {
+    let (mut bytes, _) = continuation_iso();
+    let ce = ce_offset(&bytes);
+    let (block, offset, length) = ce_target(&bytes, ce);
+    let start = block as usize * 2048 + offset as usize;
+    bytes[start..start + length as usize].fill(0);
+    bytes[start..start + 4].copy_from_slice(b"CE\x1c\x01");
+    put_both_u32(&mut bytes[start..start + 28], 4, block);
+    put_both_u32(&mut bytes[start..start + 28], 12, offset);
+    put_both_u32(&mut bytes[start..start + 28], 20, 32);
+    bytes[start + 28..start + 32].copy_from_slice(b"ST\x04\x01");
+
+    let error = SeekArchiveReader::new(Cursor::new(bytes))
+        .expect_err("cyclic continuation must fail during index construction");
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Malformed)
     );
 }

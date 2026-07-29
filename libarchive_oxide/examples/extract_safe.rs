@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-use libarchive_oxide::{ArchiveReader, ArchiveWriter, Extractor};
+use libarchive_oxide::{ArchiveEngine, ArchiveWriter, Policy};
 use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata};
 
 fn main() -> ExitCode {
@@ -47,13 +47,18 @@ fn run() -> Result<(), String> {
     let destination = tempfile::tempdir().map_err(|error| error.to_string())?;
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority())
         .map_err(|error| error.to_string())?;
-    let mut reader = ArchiveReader::new(Cursor::new(archive));
-    let report = Extractor::new(root)
-        .extract(&mut reader)
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(archive))
+        .map_err(|error| error.to_string())?;
+    let plan = session
+        .plan(Policy::safe())
+        .map_err(|error| error.to_string())?;
+    let report = session
+        .apply(plan, root)
         .map_err(|error| error.to_string())?;
     println!(
         "{} entry outcomes under {}",
-        report.outcomes().len(),
+        report.extraction().outcomes().len(),
         destination.path().display()
     );
     Ok(())

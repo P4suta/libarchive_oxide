@@ -7,7 +7,7 @@ name = "libarchive_oxide-fuzz-cases"
 version = "0.0.0"
 publish = false
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Portable fuzz invariant bodies for libarchive_oxide, shared by the cargo-fuzz targets and the libarchive_oxide/tests/fuzz_replay.rs runner. No libFuzzer dependency."
 
@@ -17,14 +17,24 @@ doctest = false
 
 [features]
 default = ["portable-codecs"]
-portable-codecs = ["libarchive_oxide/portable-codecs"]
-native-codecs = ["libarchive_oxide/native-codecs"]
+portable-codecs = [
+    "libarchive_oxide/portable-codecs",
+    "libarchive_oxide-package/portable-codecs",
+]
+native-codecs = [
+    "libarchive_oxide/native-codecs",
+    "libarchive_oxide-package/native-codecs",
+]
 
 [dependencies]
-# All formats and codecs are needed, so every relevant feature is switched on unconditionally.
+# Feature-neutral replay keeps the baseline codecs below. CAB LZX and Quantum
+# come from the portable/native profiles above so no-default integration tests
+# can prove their typed feature-off behavior without dev-dependency unification.
 # The former arca-filter crate is now `libarchive_oxide::filter`, gated by the same codec features.
 libarchive_oxide-core = { path = "../../libarchive_oxide-core" }
-libarchive_oxide = { path = "../../libarchive_oxide", default-features = false, features = ["gzip", "zstd", "xz", "lz4", "aes", "sevenz"] }
+libarchive_oxide-codecs = { path = "../../libarchive_oxide-codecs", default-features = false, features = ["lz4", "lzw"] }
+libarchive_oxide = { path = "../../libarchive_oxide", default-features = false, features = ["gzip", "zstd", "xz", "lz4", "compress", "lzip", "aes", "sevenz"] }
+libarchive_oxide-package = { path = "../../libarchive_oxide-package", default-features = false }
 # Structured input synthesis (round-trip entry sets); no rand/no clock.
 arbitrary = { version = "1", features = ["derive"] }
 # The LZMA2 codec that backs the 7z folder — driven directly for the `codec_lzma2` target.

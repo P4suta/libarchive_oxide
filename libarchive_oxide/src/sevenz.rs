@@ -6,17 +6,19 @@
 //!
 //! Readers parse every folder's full coder graph (any number of coders, bind
 //! pairs, and packed streams) so listing works for any archive. Decoding is
-//! limited to linear chains over a single pack stream whose coders are each
-//! LZMA2/LZMA, a decode-only byte filter (delta, BCJ), a general-purpose coder
-//! reused from the shared codec dispatch (Deflate, `BZip2`, Zstd), or — under the
-//! `aes` feature, given a password — the AES-256/SHA-256 decryption coder: such a
-//! folder streams normally, while richer graphs (BCJ2, `PPMd`, multi-pack) list
-//! but report `Unsupported` on extraction. Exactly one folder decode chain is live at a
-//! time, so memory stays bounded regardless of folder count. Writers still emit
+//! limited to linear chains over a single pack stream and one four-input `BCJ2`
+//! junction whose branches and optional tail use supported single-input coders.
+//! LZMA2/LZMA/PPMd7, decode-only byte filters (delta, BCJ), general-purpose coders
+//! reused from the shared codec dispatch (Deflate, `BZip2`, Zstd), and — under the
+//! `aes` feature, given a password — AES-256/SHA-256 all stream normally. Exactly
+//! one folder decode graph is live at a time, and `BCJ2` branches share seekable
+//! extents rather than buffering their packed streams, so memory stays bounded
+//! regardless of folder or archive size. Writers still emit
 //! a single solid LZMA2 folder. Each substream's stored CRC-32 is verified after decode,
 //! which also distinguishes a correct 7z AES password from a wrong one.
 
 use std::io::{Read, Seek, SeekFrom, Take, Write};
+use std::sync::{Arc, Mutex};
 
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
@@ -73,11 +75,16 @@ const K_START_POS: u8 = 0x18;
 const METHOD_LZMA2: u8 = 0x21;
 /// LZMA (v1) coder method id (3 bytes) — how mainstream 7-Zip compresses encoded headers and folders.
 const METHOD_LZMA: [u8; 3] = [0x03, 0x01, 0x01];
+/// `PPMd7` (variant H) coder method id. Its five properties are model order followed by the
+/// little-endian model-memory size.
+const METHOD_PPMD: [u8; 3] = [0x03, 0x04, 0x01];
+/// `BCJ2` four-input x86 branch-converter method id.
+const METHOD_BCJ2: [u8; 4] = [0x03, 0x03, 0x01, 0x1B];
 /// Delta filter coder method id (1 byte); its single property byte is `distance - 1`.
 const METHOD_DELTA: u8 = 0x03;
 /// BCJ x86 filter coder method id.
 const METHOD_BCJ_X86: [u8; 4] = [0x03, 0x03, 0x01, 0x03];
-/// BCJ PowerPC filter coder method id.
+/// BCJ `PowerPC` filter coder method id.
 const METHOD_BCJ_PPC: [u8; 4] = [0x03, 0x03, 0x02, 0x05];
 /// BCJ IA-64 filter coder method id.
 const METHOD_BCJ_IA64: [u8; 4] = [0x03, 0x03, 0x04, 0x01];
@@ -104,10 +111,14 @@ const METHOD_AES256: [u8; 4] = [0x06, 0xF1, 0x07, 0x01];
 /// libbzip2 documents ~3.7 MiB for `-9` decompression; rounded up. A folder's bzip2 coder is
 /// refused when the configured codec-memory budget cannot hold it.
 const BZIP2_DECODE_WORKSPACE: usize = 4 * 1024 * 1024;
+/// Raw Deflate's fixed LZ77 window.
+const DEFLATE_DECODE_WORKSPACE: usize = 32 * 1024;
 /// Smallest zstd window (the format's minimum `Window_Log` of 10 → 1 KiB) the decoder must be
 /// allowed to allocate. The native zstd backend additionally caps the frame window to the
 /// codec-memory budget inside [`PipelineCodec`]; this floor rejects a nonsensically tiny budget.
 const ZSTD_MIN_WINDOW: usize = 1024;
+/// `lzma-rust2`'s streaming `BCJ2` reader retains four 256 KiB input windows.
+const BCJ2_STREAM_WORKSPACE: usize = 4 * (1 << 18);
 
 /// `FILE_ATTRIBUTE_DIRECTORY`.
 const ATTR_DIRECTORY: u32 = 0x10;
@@ -131,8 +142,9 @@ const WRITER_PRESET: u32 = 6;
 
 /// One coder's decode method as parsed from a folder graph. Decoding supports LZMA2 (what this
 /// crate writes), plain LZMA (what 7-Zip and `sevenz-rust2` use for compressed/encoded headers and
-/// folders), the decode-only delta and BCJ byte filters, and the general-purpose Deflate/BZip2/Zstd
-/// coders reused from the shared [`PipelineCodec`] dispatch. Every other method id (`PPMd`, BCJ2, …)
+/// folders), `PPMd7`, the decode-only delta and BCJ byte filters, and the general-purpose
+/// Deflate/BZip2/Zstd coders reused from the shared [`PipelineCodec`] dispatch. Every other method
+/// id
 /// parses into [`CoderMethod::Unsupported`] so listing works, but its payload cannot be decoded here.
 #[derive(Debug, Clone, Copy)]
 enum CoderMethod {
@@ -140,6 +152,10 @@ enum CoderMethod {
     Lzma2 { dict_prop: u8 },
     /// LZMA (v1), carrying its 5 property bytes: `lc/lp/pb` byte + little-endian `u32` dict size.
     Lzma { props: [u8; 5] },
+    /// `PPMd7` (variant H), carrying its validated model order and model-memory size.
+    Ppmd7 { order: u32, memory_size: u32 },
+    /// `BCJ2`, the four-input, one-output x86 branch converter.
+    Bcj2,
     /// A decode-only byte-to-byte filter (delta or BCJ) applied after its inner coder.
     Filter(SevenFilter),
     /// AES-256/SHA-256 decryption, carrying its parsed (archive-public) salt/IV/work
@@ -272,16 +288,33 @@ impl FolderInfo {
         self.pack_sizes.iter().sum()
     }
 
-    /// Whether the folder can be decoded here: a linear chain of LZMA/LZMA2 coders over a single
-    /// pack stream. Non-linear graphs (BCJ2, multi-pack) and unsupported methods list but do not
-    /// decode.
+    /// Whether the folder has one of the decoder graph shapes implemented below: a linear
+    /// single-pack chain, or one four-input `BCJ2` junction with single-input branches and an
+    /// optional single-input tail.
     fn is_decodable(&self) -> bool {
-        self.graph.is_linear_chain()
-            && self
-                .graph
-                .coders
-                .iter()
-                .all(|coder| !matches!(coder.method, CoderMethod::Unsupported))
+        let methods_supported = self
+            .graph
+            .coders
+            .iter()
+            .all(|coder| !matches!(coder.method, CoderMethod::Unsupported));
+        if !methods_supported {
+            return false;
+        }
+        if self.graph.is_linear_chain() {
+            return true;
+        }
+        let mut bcj2_count = 0;
+        for coder in &self.graph.coders {
+            if matches!(coder.method, CoderMethod::Bcj2) {
+                bcj2_count += 1;
+                if coder.num_in != 4 || coder.num_out != 1 {
+                    return false;
+                }
+            } else if coder.num_in != 1 || coder.num_out != 1 {
+                return false;
+            }
+        }
+        bcj2_count == 1 && self.decode_order.len() == self.graph.coders.len()
     }
 
     /// Whether the folder chains an AES-256/SHA-256 coder (so decoding needs a password).
@@ -511,18 +544,18 @@ impl HeaderParser {
     }
 }
 
-/// One stage of a folder's decode chain, recursively wrapping the stage below it. The innermost
-/// stage is the raw pack stream (`Source`); each coder in the folder's decode order wraps the
-/// stage below with its own reader, keeping dispatch static (no trait objects). Stages are
-/// LZMA/LZMA2 coders or decode-only byte filters (delta, BCJ); a folder is built as a chain only
-/// when it is a linear graph of such coders over one pack stream.
-enum SevenStage<R> {
-    /// The base pack stream, bounded to the folder's packed bytes.
-    Source(Take<R>),
+/// One single-input stage of a folder's decode graph. `R` is either a direct bounded pack stream,
+/// one shared seek extent feeding a `BCJ2` input branch, or the four-stream junction itself.
+enum SevenStage<R: Read> {
+    /// The base stream for this single-input chain.
+    Source(R),
     /// An LZMA2 coder reading the stage below.
     Lzma2(Box<lzma_rust2::Lzma2Reader<SevenStage<R>>>),
     /// An LZMA (v1) coder reading the stage below.
     Lzma(Box<lzma_rust2::LzmaReader<SevenStage<R>>>),
+    /// A `PPMd7` coder bounded to its declared output size. 7z `PPMd` streams normally omit an end
+    /// marker, so this `Take` is also the semantic end of the decoded stream.
+    Ppmd7(Box<Take<ppmd_rust::Ppmd7Decoder<SevenStage<R>>>>),
     /// A delta decode filter reading the stage below.
     Delta(Box<CodecReader<SevenStage<R>, DeltaDecoder>>),
     /// A BCJ decode filter reading the stage below.
@@ -535,54 +568,34 @@ enum SevenStage<R> {
     Aes(Box<CodecReader<SevenStage<R>, crate::filter::aes7z::AesDecoder>>),
 }
 
-enum SevenInput<R> {
-    Source(R),
-    Decoder(Box<SevenStage<R>>),
-}
-
 impl<R: Read> SevenStage<R> {
-    /// Borrows the raw source at the bottom of the chain.
-    fn source_ref(&self) -> &R {
-        match self {
-            Self::Source(take) => take.get_ref(),
-            Self::Lzma2(reader) => reader.inner().source_ref(),
-            Self::Lzma(reader) => reader.inner().source_ref(),
-            Self::Delta(reader) => reader.get_ref().source_ref(),
-            Self::Bcj(reader) => reader.get_ref().source_ref(),
-            Self::Pipeline(reader) => reader.get_ref().source_ref(),
-            #[cfg(feature = "aes")]
-            Self::Aes(reader) => reader.get_ref().source_ref(),
-        }
-    }
-
-    /// Unwinds the whole chain, reclaiming the raw source (and freeing every codec workspace).
-    fn into_source(self) -> R {
-        match self {
-            Self::Source(take) => take.into_inner(),
-            Self::Lzma2(reader) => reader.into_inner().into_source(),
-            Self::Lzma(reader) => reader.into_inner().into_source(),
-            Self::Delta(reader) => reader.into_inner().into_source(),
-            Self::Bcj(reader) => reader.into_inner().into_source(),
-            Self::Pipeline(reader) => reader.into_inner().into_source(),
-            #[cfg(feature = "aes")]
-            Self::Aes(reader) => reader.into_inner().into_source(),
-        }
-    }
-}
-
-impl<R: Read> SevenInput<R> {
-    fn source_ref(&self) -> &R {
+    /// Borrows the base source at the bottom of the chain.
+    fn base_ref(&self) -> &R {
         match self {
             Self::Source(source) => source,
-            Self::Decoder(decoder) => decoder.source_ref(),
+            Self::Lzma2(reader) => reader.inner().base_ref(),
+            Self::Lzma(reader) => reader.inner().base_ref(),
+            Self::Ppmd7(reader) => reader.get_ref().get_ref().base_ref(),
+            Self::Delta(reader) => reader.get_ref().base_ref(),
+            Self::Bcj(reader) => reader.get_ref().base_ref(),
+            Self::Pipeline(reader) => reader.get_ref().base_ref(),
+            #[cfg(feature = "aes")]
+            Self::Aes(reader) => reader.get_ref().base_ref(),
         }
     }
 
-    /// Reclaims the raw source, dropping any live folder decode chain (and its codec workspaces).
-    fn into_source(self) -> R {
+    /// Unwinds the chain, reclaiming its base source and freeing every codec workspace.
+    fn into_base(self) -> R {
         match self {
             Self::Source(source) => source,
-            Self::Decoder(decoder) => (*decoder).into_source(),
+            Self::Lzma2(reader) => reader.into_inner().into_base(),
+            Self::Lzma(reader) => reader.into_inner().into_base(),
+            Self::Ppmd7(reader) => reader.into_inner().into_inner().into_base(),
+            Self::Delta(reader) => reader.into_inner().into_base(),
+            Self::Bcj(reader) => reader.into_inner().into_base(),
+            Self::Pipeline(reader) => reader.into_inner().into_base(),
+            #[cfg(feature = "aes")]
+            Self::Aes(reader) => reader.into_inner().into_base(),
         }
     }
 }
@@ -590,14 +603,163 @@ impl<R: Read> SevenInput<R> {
 impl<R: Read> Read for SevenStage<R> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Self::Source(take) => take.read(output),
+            Self::Source(source) => source.read(output),
             Self::Lzma2(reader) => reader.read(output),
             Self::Lzma(reader) => reader.read(output),
+            Self::Ppmd7(reader) => reader.read(output),
             Self::Delta(reader) => reader.read(output),
             Self::Bcj(reader) => reader.read(output),
             Self::Pipeline(reader) => reader.read(output),
             #[cfg(feature = "aes")]
             Self::Aes(reader) => reader.read(output),
+        }
+    }
+}
+
+/// One independently positioned view of a packed stream. All views share the archive source, but
+/// every read seeks to its own cursor before touching bytes, so `BCJ2` can suspend and resume any
+/// of its four upstream decoder branches without buffering a whole stream.
+struct SharedExtent<R> {
+    source: Arc<Mutex<Option<R>>>,
+    start: u64,
+    length: u64,
+    position: u64,
+}
+
+impl<R> SharedExtent<R> {
+    fn new(source: Arc<Mutex<Option<R>>>, start: u64, length: u64) -> Self {
+        Self {
+            source,
+            start,
+            length,
+            position: 0,
+        }
+    }
+}
+
+impl<R: Read + Seek> Read for SharedExtent<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() || self.position >= self.length {
+            return Ok(0);
+        }
+        let available = usize::try_from((self.length - self.position).min(output.len() as u64))
+            .unwrap_or(output.len());
+        let absolute = self
+            .start
+            .checked_add(self.position)
+            .ok_or_else(|| std::io::Error::other("7z BCJ2 extent offset overflow"))?;
+        let mut guard = self
+            .source
+            .lock()
+            .map_err(|_| std::io::Error::other("7z BCJ2 source lock was poisoned"))?;
+        let source = guard
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("7z BCJ2 source was already reclaimed"))?;
+        source.seek(SeekFrom::Start(absolute))?;
+        let read = source.read(&mut output[..available])?;
+        self.position = self
+            .position
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("7z BCJ2 extent position overflow"))?;
+        Ok(read)
+    }
+}
+
+/// Streaming `BCJ2` junction over four statically dispatched input chains.
+struct Bcj2Stage<R: Read + Seek> {
+    reader: lzma_rust2::filter::bcj2::Bcj2Reader<SevenStage<SharedExtent<R>>>,
+    source: Arc<Mutex<Option<R>>>,
+}
+
+impl<R: Read + Seek> Read for Bcj2Stage<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(output)
+    }
+}
+
+impl<R: Read + Seek> Bcj2Stage<R> {
+    fn with_source<T>(
+        &self,
+        inspect: impl FnOnce(&R) -> T,
+    ) -> core::result::Result<T, ArchiveError> {
+        let guard = self
+            .source
+            .lock()
+            .map_err(|_| seven_source_error("7z BCJ2 source lock was poisoned"))?;
+        let source = guard
+            .as_ref()
+            .ok_or_else(|| seven_source_error("7z BCJ2 source was already reclaimed"))?;
+        Ok(inspect(source))
+    }
+
+    fn into_source(self) -> core::result::Result<R, ArchiveError> {
+        let Self { reader, source } = self;
+        drop(reader);
+        let mut guard = source
+            .lock()
+            .map_err(|_| seven_source_error("7z BCJ2 source lock was poisoned"))?;
+        guard
+            .take()
+            .ok_or_else(|| seven_source_error("7z BCJ2 source was already reclaimed"))
+    }
+}
+
+/// Base source of the final single-input chain: either the direct pack extent or a decoded `BCJ2`
+/// junction. Both variants retain ownership of the original archive source.
+enum FolderSource<R: Read + Seek> {
+    Direct(Take<R>),
+    Bcj2(Box<Bcj2Stage<R>>),
+}
+
+impl<R: Read + Seek> Read for FolderSource<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Direct(source) => source.read(output),
+            Self::Bcj2(source) => source.read(output),
+        }
+    }
+}
+
+impl<R: Read + Seek> FolderSource<R> {
+    fn with_source<T>(
+        &self,
+        inspect: impl FnOnce(&R) -> T,
+    ) -> core::result::Result<T, ArchiveError> {
+        match self {
+            Self::Direct(source) => Ok(inspect(source.get_ref())),
+            Self::Bcj2(source) => source.with_source(inspect),
+        }
+    }
+
+    fn into_source(self) -> core::result::Result<R, ArchiveError> {
+        match self {
+            Self::Direct(source) => Ok(source.into_inner()),
+            Self::Bcj2(source) => (*source).into_source(),
+        }
+    }
+}
+
+enum SevenInput<R: Read + Seek> {
+    Source(R),
+    Decoder(Box<SevenStage<FolderSource<R>>>),
+}
+
+impl<R: Read + Seek> SevenInput<R> {
+    fn with_source<T>(
+        &self,
+        inspect: impl FnOnce(&R) -> T,
+    ) -> core::result::Result<T, ArchiveError> {
+        match self {
+            Self::Source(source) => Ok(inspect(source)),
+            Self::Decoder(decoder) => decoder.base_ref().with_source(inspect),
+        }
+    }
+
+    /// Reclaims the raw source, dropping any live folder decode graph and its codec workspaces.
+    fn into_source(self) -> core::result::Result<R, ArchiveError> {
+        match self {
+            Self::Source(source) => Ok(source),
+            Self::Decoder(decoder) => (*decoder).into_base().into_source(),
         }
     }
 }
@@ -616,7 +778,7 @@ enum SevenPhase {
 /// The reader owns the raw source through `input`; at most one folder decoder is live at a
 /// time. `input` is `None` only transiently while [`SevenZSeekReader::set_active_folder`]
 /// swaps the source between decoders, so the raw `R` is always reclaimable between calls.
-pub(crate) struct SevenZSeekReader<R> {
+pub(crate) struct SevenZSeekReader<R: Read + Seek> {
     input: Option<SevenInput<R>>,
     limits: Limits,
     /// Zeroizing password for AES folders (`None` when the caller supplied none). Never logged.
@@ -640,7 +802,7 @@ pub(crate) struct SevenZSeekReader<R> {
     active_folder_encrypted: bool,
 }
 
-impl<R> std::fmt::Debug for SevenZSeekReader<R> {
+impl<R: Read + Seek> std::fmt::Debug for SevenZSeekReader<R> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SevenZSeekReader")
@@ -774,21 +936,20 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         }
     }
 
-    // `input` is only `None` transiently inside `set_active_folder`; it is always `Some` at any
-    // point a caller can observe the reader, so the fallbacks below are unreachable in practice.
-    #[allow(clippy::expect_used)]
-    pub(crate) fn into_inner(self) -> R {
+    pub(crate) fn into_inner(self) -> core::result::Result<R, ArchiveError> {
         self.input
-            .map(SevenInput::into_source)
-            .expect("7z reader source is present outside a folder switch")
+            .ok_or_else(|| seven_source_error("7z reader source is unavailable"))?
+            .into_source()
     }
 
-    #[allow(clippy::expect_used)]
-    pub(crate) fn source_ref(&self) -> &R {
+    pub(crate) fn with_source<T>(
+        &self,
+        inspect: impl FnOnce(&R) -> T,
+    ) -> core::result::Result<T, ArchiveError> {
         self.input
             .as_ref()
-            .map(SevenInput::source_ref)
-            .expect("7z reader source is present outside a folder switch")
+            .ok_or_else(|| seven_source_error("7z reader source is unavailable"))?
+            .with_source(inspect)
     }
 
     fn prepare_record(
@@ -832,7 +993,7 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
                 crc.update(&target);
             }
             self.verify_entry_crc()?;
-            link_target = Some(ArchivePath::from_encoded(target, PathEncoding::Utf8));
+            link_target = Some(ArchivePath::try_from_encoded(target, PathEncoding::Utf8)?);
             self.phase = SevenPhase::EndEntry;
         } else if record.has_stream {
             self.phase = if has_decoder {
@@ -847,7 +1008,7 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         }
         let mut builder = EntryMetadata::builder(
             record.kind,
-            ArchivePath::from_encoded(record.name.clone(), PathEncoding::Utf8),
+            ArchivePath::try_from_encoded(record.name.clone(), PathEncoding::Utf8)?,
         )
         .size(Some(u64::try_from(record.size).map_err(|_| {
             seven_error(ErrorKind::Limit, "entry size exceeds u64")
@@ -971,15 +1132,15 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
     /// generic corruption. Never a no-op silently: a `None` accumulator simply means the archive
     /// stored no digest to check against.
     fn verify_entry_crc(&mut self) -> core::result::Result<(), StreamError> {
-        if let Some((crc, expected)) = self.entry_crc.take() {
-            if crc.finalize() != expected {
-                let context = if self.active_folder_encrypted {
-                    "wrong password or corrupt data"
-                } else {
-                    "substream CRC-32 mismatch"
-                };
-                return Err(seven_error(ErrorKind::Integrity, context));
-            }
+        if let Some((crc, expected)) = self.entry_crc.take()
+            && crc.finalize() != expected
+        {
+            let context = if self.active_folder_encrypted {
+                "wrong password or corrupt data"
+            } else {
+                "substream CRC-32 mismatch"
+            };
+            return Err(seven_error(ErrorKind::Integrity, context));
         }
         Ok(())
     }
@@ -1038,7 +1199,7 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
         let decodable = folder.is_decodable();
         let encrypted = folder.is_encrypted();
         let pack_offset = folder.pack_offset;
-        let pack_size = folder.pack_sizes.first().copied();
+        let pack_size = folder.pack_span();
         // Reject a missing password before reclaiming the source, so the raw `R` stays reachable
         // (via `into_inner`/`source_ref`) after the error. The secret is never touched here.
         if decodable && encrypted && self.password.is_none() {
@@ -1055,10 +1216,6 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
             self.input = Some(SevenInput::Source(source));
             return Ok(false);
         }
-        // A decodable folder is a linear chain over exactly one pack stream, so its size is present.
-        let pack_size = pack_size.ok_or_else(|| {
-            seven_error(ErrorKind::Protocol, "decodable folder has no pack stream")
-        })?;
         let offset = u64::try_from(pack_offset)
             .map_err(|_| seven_error(ErrorKind::Limit, "pack offset exceeds u64"))?;
         let size = u64::try_from(pack_size)
@@ -1080,15 +1237,16 @@ impl<R: Read + Seek> SevenZSeekReader<R> {
     fn take_source(&mut self) -> core::result::Result<R, StreamError> {
         self.input
             .take()
-            .map(SevenInput::into_source)
-            .ok_or_else(|| seven_error(ErrorKind::Protocol, "7z reader source is unavailable"))
+            .ok_or_else(|| seven_error(ErrorKind::Protocol, "7z reader source is unavailable"))?
+            .into_source()
+            .map_err(StreamError::archive)
     }
 
     fn has_decoder(&self) -> bool {
         matches!(&self.input, Some(SevenInput::Decoder(_)))
     }
 
-    fn decoder_mut(&mut self) -> Option<&mut SevenStage<R>> {
+    fn decoder_mut(&mut self) -> Option<&mut SevenStage<FolderSource<R>>> {
         match &mut self.input {
             Some(SevenInput::Decoder(decoder)) => Some(decoder.as_mut()),
             _ => None,
@@ -1226,10 +1384,7 @@ fn decode_seek_header(
         ));
     }
     validate_folder_range(folder, image_length)?;
-    let pack_size =
-        folder.pack_sizes.first().copied().ok_or_else(|| {
-            seven_error(ErrorKind::Unsupported, "encoded-header has no pack stream")
-        })?;
+    let pack_size = folder.pack_span();
     input
         .seek(SeekFrom::Start(u64::try_from(folder.pack_offset).map_err(
             |_| seven_error(ErrorKind::Limit, "encoded-header offset exceeds u64"),
@@ -1350,23 +1505,35 @@ fn validate_folder_range(
     Ok(())
 }
 
-/// Folds a folder's linear decode chain over its single pack stream, wrapping each coder in
-/// [`resolve_folder`] order (dependencies first) so the outermost stage yields the folder's final
-/// output. Only linear LZMA/LZMA2 folders are buildable; anything else reports `Unsupported`, which
-/// leaves the folder listable but not extractable.
-fn build_folder_reader<R: Read>(
+/// Builds either a linear folder chain or a four-input `BCJ2` graph. `BCJ2` owns the raw source
+/// through shared, independently positioned extents; it never materializes a complete packed
+/// stream or decoded folder.
+fn build_folder_reader<R: Read + Seek>(
     source: Take<R>,
     folder: &FolderInfo,
     limits: Limits,
     password: Option<&SecretBytes>,
-) -> core::result::Result<SevenStage<R>, StreamError> {
+) -> core::result::Result<SevenStage<FolderSource<R>>, StreamError> {
     if !folder.is_decodable() {
         return Err(seven_error(
             ErrorKind::Unsupported,
             "payload coder is unsupported",
         ));
     }
-    let mut stage = SevenStage::Source(source);
+    validate_folder_memory(folder, limits)?;
+    if folder.graph.is_linear_chain() {
+        return build_linear_folder(source, folder, limits, password);
+    }
+    build_bcj2_folder(source, folder, limits, password)
+}
+
+fn build_linear_folder<R: Read + Seek>(
+    source: Take<R>,
+    folder: &FolderInfo,
+    limits: Limits,
+    password: Option<&SecretBytes>,
+) -> core::result::Result<SevenStage<FolderSource<R>>, StreamError> {
+    let mut stage = SevenStage::Source(FolderSource::Direct(source));
     for &coder_index in &folder.decode_order {
         let coder = folder.graph.coders[coder_index];
         // Each stage's uncompressed size is the size of the coder's (single) output stream.
@@ -1378,6 +1545,133 @@ fn build_folder_reader<R: Read>(
         stage = wrap_coder(stage, coder.method, out_size, limits, password)?;
     }
     Ok(stage)
+}
+
+fn build_bcj2_folder<R: Read + Seek>(
+    source: Take<R>,
+    folder: &FolderInfo,
+    limits: Limits,
+    password: Option<&SecretBytes>,
+) -> core::result::Result<SevenStage<FolderSource<R>>, StreamError> {
+    let (bcj2_order, &bcj2_index) = folder
+        .decode_order
+        .iter()
+        .enumerate()
+        .find(|(_, index)| matches!(folder.graph.coders[**index].method, CoderMethod::Bcj2))
+        .ok_or_else(|| seven_error(ErrorKind::Protocol, "BCJ2 folder has no BCJ2 junction"))?;
+    let bcj2 = folder.graph.coders[bcj2_index];
+    if bcj2.num_in != 4 || bcj2.num_out != 1 {
+        return Err(seven_error(
+            ErrorKind::Malformed,
+            "BCJ2 junction must have four inputs and one output",
+        ));
+    }
+
+    // Validate every packed extent before transferring ownership of the archive source into the
+    // shared graph. After this point each branch seeks independently to its absolute cursor.
+    let mut extents = Vec::with_capacity(folder.graph.packed_indices.len());
+    let mut start = folder.pack_offset;
+    for (&input_index, &size) in folder.graph.packed_indices.iter().zip(&folder.pack_sizes) {
+        let start_u64 = u64::try_from(start)
+            .map_err(|_| seven_error(ErrorKind::Limit, "BCJ2 pack offset exceeds u64"))?;
+        let size_u64 = u64::try_from(size)
+            .map_err(|_| seven_error(ErrorKind::Limit, "BCJ2 pack size exceeds u64"))?;
+        extents.push((input_index, start_u64, size_u64));
+        start = start
+            .checked_add(size)
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "BCJ2 pack extent overflow"))?;
+    }
+
+    let source = Arc::new(Mutex::new(Some(source.into_inner())));
+    let mut inputs = Vec::with_capacity(4);
+    let input_base = folder.graph.in_base(bcj2_index);
+    for local in 0..4 {
+        inputs.push(build_bcj2_input(
+            Arc::clone(&source),
+            folder,
+            &extents,
+            input_base + local,
+            limits,
+            password,
+            0,
+        )?);
+    }
+    let unpack_size = folder
+        .output_sizes
+        .get(folder.graph.out_base(bcj2_index))
+        .copied()
+        .ok_or_else(|| seven_error(ErrorKind::Malformed, "BCJ2 output size missing"))?;
+    let reader = lzma_rust2::filter::bcj2::Bcj2Reader::new(inputs, unpack_size);
+    let mut stage = SevenStage::Source(FolderSource::Bcj2(Box::new(Bcj2Stage { reader, source })));
+
+    // Topological order places every branch before the junction. Only the optional linear tail
+    // remains to be wrapped around the BCJ2 output.
+    for &coder_index in folder.decode_order.iter().skip(bcj2_order + 1) {
+        let coder = folder.graph.coders[coder_index];
+        let out_size = folder
+            .output_sizes
+            .get(folder.graph.out_base(coder_index))
+            .copied()
+            .ok_or_else(|| seven_error(ErrorKind::Malformed, "coder output size missing"))?;
+        stage = wrap_coder(stage, coder.method, out_size, limits, password)?;
+    }
+    Ok(stage)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_bcj2_input<R: Read + Seek>(
+    source: Arc<Mutex<Option<R>>>,
+    folder: &FolderInfo,
+    extents: &[(usize, u64, u64)],
+    input_index: usize,
+    limits: Limits,
+    password: Option<&SecretBytes>,
+    depth: usize,
+) -> core::result::Result<SevenStage<SharedExtent<R>>, StreamError> {
+    if depth > folder.graph.coders.len() {
+        return Err(seven_error(
+            ErrorKind::Malformed,
+            "BCJ2 input graph contains a cycle",
+        ));
+    }
+    if let Some((_, start, size)) = extents
+        .iter()
+        .find(|(packed_input, _, _)| *packed_input == input_index)
+    {
+        return Ok(SevenStage::Source(SharedExtent::new(source, *start, *size)));
+    }
+    let pair = folder
+        .graph
+        .bind_pairs
+        .iter()
+        .find(|pair| pair.in_index == input_index)
+        .ok_or_else(|| seven_error(ErrorKind::Malformed, "BCJ2 input is not fed"))?;
+    let producer = folder
+        .graph
+        .coder_of_out(pair.out_index)
+        .ok_or_else(|| seven_error(ErrorKind::Malformed, "BCJ2 input producer is missing"))?;
+    let coder = folder.graph.coders[producer];
+    if coder.num_in != 1 || coder.num_out != 1 || matches!(coder.method, CoderMethod::Bcj2) {
+        return Err(seven_error(
+            ErrorKind::Malformed,
+            "BCJ2 branch coder must have one input and one output",
+        ));
+    }
+    let inner = build_bcj2_input(
+        source,
+        folder,
+        extents,
+        folder.graph.in_base(producer),
+        limits,
+        password,
+        depth + 1,
+    )?;
+    let out_size = folder
+        .output_sizes
+        .get(folder.graph.out_base(producer))
+        .copied()
+        .ok_or_else(|| seven_error(ErrorKind::Malformed, "BCJ2 branch output size missing"))?;
+    wrap_coder(inner, coder.method, out_size, limits, password)
 }
 
 /// Wraps `inner` with a single coder's reader, producing the next chain stage.
@@ -1410,6 +1704,16 @@ fn wrap_coder<R: Read>(
                 .map_err(|_| seven_error(ErrorKind::Malformed, "LZMA decoder setup failed"))?,
             )))
         },
+        CoderMethod::Ppmd7 { order, memory_size } => {
+            validate_ppmd_memory(memory_size, limits)?;
+            let decoder = ppmd_rust::Ppmd7Decoder::new(inner, order, memory_size)
+                .map_err(ppmd_setup_error)?;
+            Ok(SevenStage::Ppmd7(Box::new(decoder.take(unpack_size))))
+        },
+        CoderMethod::Bcj2 => Err(seven_error(
+            ErrorKind::Protocol,
+            "BCJ2 junction cannot be used as a single-input coder",
+        )),
         CoderMethod::Filter(SevenFilter::Delta { distance }) => Ok(SevenStage::Delta(Box::new(
             CodecReader::new(inner, DeltaDecoder::new(distance), "7z-delta"),
         ))),
@@ -1433,7 +1737,8 @@ fn wrap_coder<R: Read>(
                 seven_error(ErrorKind::Unsupported, "7z AES entry requires a password")
             })?;
             let decoder =
-                crate::filter::aes7z::AesDecoder::new(params, unpack_size, password.expose());
+                crate::filter::aes7z::AesDecoder::new(params, unpack_size, password.expose())
+                    .map_err(StreamError::archive)?;
             Ok(SevenStage::Aes(Box::new(CodecReader::new(
                 inner, decoder, "7z-aes",
             ))))
@@ -1442,6 +1747,91 @@ fn wrap_coder<R: Read>(
             ErrorKind::Unsupported,
             "payload coder is unsupported",
         )),
+    }
+}
+
+/// Checks the aggregate working set of all simultaneously live stages before any decoder can
+/// allocate. In a `BCJ2` graph all four branches, the junction, and the optional tail coexist.
+fn validate_folder_memory(
+    folder: &FolderInfo,
+    limits: Limits,
+) -> core::result::Result<(), StreamError> {
+    let Some(budget) = limits.codec_memory() else {
+        return Ok(());
+    };
+    let mut needed = if folder.graph.is_linear_chain() {
+        0
+    } else {
+        BCJ2_STREAM_WORKSPACE
+    };
+    for coder in &folder.graph.coders {
+        let workspace = match coder.method {
+            CoderMethod::Lzma2 { dict_prop } => usize::try_from(
+                lzma2_dict_size(dict_prop).map_err(seven_legacy_error)?,
+            )
+            .map_err(|_| seven_error(ErrorKind::Limit, "LZMA2 dictionary exceeds address space"))?,
+            CoderMethod::Lzma { props } => {
+                usize::try_from(u32::from_le_bytes([props[1], props[2], props[3], props[4]]))
+                    .map_err(|_| {
+                        seven_error(ErrorKind::Limit, "LZMA dictionary exceeds address space")
+                    })?
+            },
+            CoderMethod::Ppmd7 { memory_size, .. } => usize::try_from(memory_size)
+                .map_err(|_| seven_error(ErrorKind::Limit, "PPMd memory exceeds address space"))?,
+            CoderMethod::Filter(SevenFilter::Pipeline {
+                filter: FilterId::Deflate,
+            }) => DEFLATE_DECODE_WORKSPACE,
+            CoderMethod::Filter(SevenFilter::Pipeline {
+                filter: FilterId::Bzip2,
+            }) => BZIP2_DECODE_WORKSPACE,
+            CoderMethod::Filter(SevenFilter::Pipeline {
+                filter: FilterId::Zstd,
+            }) => ZSTD_MIN_WINDOW,
+            CoderMethod::Bcj2 | CoderMethod::Filter(_) | CoderMethod::Unsupported => 0,
+            #[cfg(feature = "aes")]
+            CoderMethod::Aes(_) => 0,
+        };
+        needed = needed
+            .checked_add(workspace)
+            .ok_or_else(|| seven_error(ErrorKind::Limit, "7z codec-memory accounting overflow"))?;
+    }
+    if needed > budget {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "7z folder exceeds configured codec-memory limit",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects an archive-requested `PPMd` model before the decoder allocates it.
+fn validate_ppmd_memory(memory_size: u32, limits: Limits) -> core::result::Result<(), StreamError> {
+    let needed = usize::try_from(memory_size)
+        .map_err(|_| seven_error(ErrorKind::Limit, "PPMd memory exceeds address space"))?;
+    if limits.codec_memory().is_some_and(|budget| needed > budget) {
+        return Err(seven_error(
+            ErrorKind::Limit,
+            "PPMd model exceeds configured codec-memory limit",
+        ));
+    }
+    Ok(())
+}
+
+/// Preserves source I/O errors while classifying invalid/truncated properties and allocation
+/// failures without exposing dependency-specific strings in the public error.
+fn ppmd_setup_error(error: ppmd_rust::Error) -> StreamError {
+    match error {
+        ppmd_rust::Error::IoError(error) => StreamError::io(error),
+        ppmd_rust::Error::MemoryAllocation => {
+            seven_error(ErrorKind::Limit, "PPMd model allocation failed")
+        },
+        ppmd_rust::Error::RangeDecoderInitialization => seven_error(
+            ErrorKind::Malformed,
+            "PPMd range decoder initialization failed",
+        ),
+        ppmd_rust::Error::InvalidParameter => {
+            seven_error(ErrorKind::Malformed, "invalid PPMd coder properties")
+        },
     }
 }
 
@@ -1508,6 +1898,12 @@ fn seven_error(kind: ErrorKind, context: &'static str) -> StreamError {
             .with_format("7z")
             .with_context(context),
     )
+}
+
+fn seven_source_error(context: &'static str) -> ArchiveError {
+    ArchiveError::new(ErrorKind::Protocol)
+        .with_format("7z")
+        .with_context(context)
 }
 
 /// Parses a `StreamsInfo` (`PackInfo`, `UnpackInfo`, `SubStreamsInfo`) into one [`FolderInfo`]
@@ -1834,8 +2230,8 @@ fn read_coder(r: &mut ByteReader<'_>) -> Result<Coder> {
     })
 }
 
-/// Maps a coder method id and its properties onto a [`CoderMethod`]. LZMA2 and LZMA decode; every
-/// other id lists as [`CoderMethod::Unsupported`].
+/// Maps a coder method id and its properties onto a [`CoderMethod`]. Every property-bearing coder
+/// is validated before it can allocate a codec workspace.
 fn classify_method(codec: &[u8], props: &[u8]) -> Result<CoderMethod> {
     if codec == [METHOD_LZMA2] {
         if props.len() != 1 {
@@ -1855,6 +2251,26 @@ fn classify_method(codec: &[u8], props: &[u8]) -> Result<CoderMethod> {
         let mut p = [0u8; 5];
         p.copy_from_slice(props);
         Ok(CoderMethod::Lzma { props: p })
+    } else if codec == METHOD_PPMD {
+        let [order, a, b, c, d] = props else {
+            return Err(HeaderError::Malformed("7z: unexpected PPMd property size"));
+        };
+        let order = u32::from(*order);
+        let memory_size = u32::from_le_bytes([*a, *b, *c, *d]);
+        if !(ppmd_rust::PPMD7_MIN_ORDER..=ppmd_rust::PPMD7_MAX_ORDER).contains(&order) {
+            return Err(HeaderError::Malformed("7z: invalid PPMd model order"));
+        }
+        if !(ppmd_rust::PPMD7_MIN_MEM_SIZE..=ppmd_rust::PPMD7_MAX_MEM_SIZE).contains(&memory_size) {
+            return Err(HeaderError::Malformed("7z: invalid PPMd memory size"));
+        }
+        Ok(CoderMethod::Ppmd7 { order, memory_size })
+    } else if codec == METHOD_BCJ2 {
+        if !props.is_empty() {
+            return Err(HeaderError::Malformed(
+                "7z: BCJ2 coder must not carry properties",
+            ));
+        }
+        Ok(CoderMethod::Bcj2)
     } else if codec == [METHOD_DELTA] {
         // The delta filter stores one property byte: `distance - 1`. An absent
         // property (rare) means distance 1; any other length is not a valid delta.
@@ -3101,10 +3517,10 @@ fn write_bit_vector(out: &mut Vec<u8>, bits: &[bool]) {
 
 /// Converts a Unix timestamp to a Windows `FILETIME` (100-ns ticks since 1601-01-01).
 fn timestamp_to_filetime(ts: Timestamp) -> u64 {
-    let secs = ts.secs.saturating_add(FILETIME_EPOCH_DIFF);
+    let secs = ts.seconds().saturating_add(FILETIME_EPOCH_DIFF);
     let ticks = secs
         .saturating_mul(10_000_000)
-        .saturating_add(i64::from(ts.nanos / 100));
+        .saturating_add(i64::from(ts.nanoseconds() / 100));
     u64::try_from(ticks).unwrap_or(0)
 }
 
@@ -3113,10 +3529,8 @@ fn filetime_to_timestamp(ft: u64) -> Timestamp {
     let ticks = i64::try_from(ft).unwrap_or(i64::MAX);
     let secs = ticks.div_euclid(10_000_000) - FILETIME_EPOCH_DIFF;
     let rem = ticks.rem_euclid(10_000_000);
-    Timestamp {
-        secs,
-        nanos: u32::try_from(rem).unwrap_or(0).saturating_mul(100),
-    }
+    Timestamp::new(secs, u32::try_from(rem).unwrap_or(0).saturating_mul(100))
+        .unwrap_or(Timestamp::from_seconds(secs))
 }
 
 /// Decodes null-stripped UTF-16LE code units into raw UTF-8 bytes (lossy for unpaired surrogates).
@@ -3161,4 +3575,80 @@ fn u64_le(data: &[u8], off: usize) -> Result<u64> {
 /// `u64` to `usize`, mapped to a limit error where it would truncate (32-bit hosts).
 fn usize_of(v: u64) -> Result<usize> {
     usize::try_from(v).map_err(|_| HeaderError::LimitExceeded("7z: value exceeds usize"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_built_in_coder_dispatch_has_a_capability_record() {
+        use libarchive_oxide_core::{FormatId, MethodId};
+
+        const METHOD_IDS: &[&[u8]] = &[
+            &[METHOD_LZMA2],
+            &METHOD_LZMA,
+            &METHOD_PPMD,
+            &METHOD_BCJ2,
+            &[METHOD_DELTA],
+            &METHOD_BCJ_X86,
+            &METHOD_BCJ_PPC,
+            &METHOD_BCJ_IA64,
+            &METHOD_BCJ_ARM,
+            &METHOD_BCJ_ARMT,
+            &METHOD_BCJ_SPARC,
+            &[METHOD_BCJ_ARM64],
+            &[METHOD_BCJ_RISCV],
+            &METHOD_DEFLATE,
+            &METHOD_BZIP2,
+            &METHOD_ZSTD,
+            &METHOD_AES256,
+        ];
+        for &identifier in METHOD_IDS {
+            assert!(
+                libarchive_oxide_core::capability::method_capability(
+                    FormatId::SevenZip,
+                    MethodId::Bytes(identifier),
+                )
+                .is_some(),
+                "missing capability record for 7z method {identifier:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ppmd_properties_are_validated_during_header_parse() {
+        let valid = [8, 0, 0, 16, 0];
+        assert!(matches!(
+            classify_method(&METHOD_PPMD, &valid),
+            Ok(CoderMethod::Ppmd7 {
+                order: 8,
+                memory_size: 1_048_576
+            })
+        ));
+
+        for invalid in [
+            &[8, 0, 0, 16][..],
+            &[1, 0, 0, 16, 0],
+            &[65, 0, 0, 16, 0],
+            &[8, 0, 0, 0, 0],
+        ] {
+            assert!(matches!(
+                classify_method(&METHOD_PPMD, invalid),
+                Err(HeaderError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn bcj2_properties_are_rejected_during_header_parse() {
+        assert!(matches!(
+            classify_method(&METHOD_BCJ2, &[]),
+            Ok(CoderMethod::Bcj2)
+        ));
+        assert!(matches!(
+            classify_method(&METHOD_BCJ2, &[0]),
+            Err(HeaderError::Malformed(_))
+        ));
+    }
 }

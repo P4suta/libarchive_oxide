@@ -10,9 +10,9 @@
 //! (b) arca's seek reader reads a `.7z` produced by `sevenz-rust2`'s `ArchiveWriter` (solid,
 //!     single-folder LZMA2) — validating arca's parser against an independent encoder.
 //!
-//! Both directions stay within arca's supported subset: a single solid LZMA2 folder. Direction (b)
-//! therefore uses one solid block (`push_archive_entries`), and the small headers `sevenz-rust2`
-//! emits stay as a plain (uncompressed) `kHeader`, which arca supports.
+//! The suite also exercises independent LZMA/PPMd/filter/general-codec producers and a BCJ2
+//! four-stream splitter, including compressed headers, non-solid folders, resource bounds, and
+//! malformed inputs.
 #![cfg(feature = "sevenz")]
 #![allow(
     clippy::unwrap_used,
@@ -23,15 +23,17 @@
     clippy::cast_possible_truncation
 )]
 
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
-use libarchive_oxide::SeekArchiveWriter;
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Limits};
+use libarchive_oxide::{Error, ReaderEvent, SeekArchiveReader, SeekArchiveWriter};
+use libarchive_oxide_core::{
+    ArchiveError, ArchivePath, EntryKind, EntryMetadata, ErrorKind, FormatId, Limits,
+};
 
 use sevenz_rust2::{
     ArchiveEntry, ArchiveReader as SevenReader, ArchiveWriter as SevenWriter, EncoderConfiguration,
     EncoderMethod, Password, SourceReader,
-    encoder_options::{DeltaOptions, EncoderOptions},
+    encoder_options::{DeltaOptions, EncoderOptions, PpmdOptions},
 };
 
 mod common;
@@ -425,14 +427,336 @@ fn arca_reads_sevenz_rust2_zstd() {
     assert_arca_reads_method(EncoderMethod::ZSTD, "zstd");
 }
 
+fn ppmd_archive(data: &[u8], memory_size: u32) -> Vec<u8> {
+    sevenz_with_methods(
+        vec![PpmdOptions::from_order_memory_size(8, memory_size).into()],
+        "ppmd.txt",
+        data,
+    )
+}
+
+fn read_with_limits(bytes: &[u8], limits: Limits) -> Result<Vec<u8>, Error> {
+    let mut reader = SeekArchiveReader::with_limits(Cursor::new(bytes.to_vec()), limits)?;
+    let mut output = Vec::new();
+    loop {
+        match reader.next_event()? {
+            ReaderEvent::Data(bytes) => output.extend_from_slice(bytes),
+            ReaderEvent::Done => return Ok(output),
+            _ => {},
+        }
+    }
+}
+
+/// A one-file 7z fixture assembled around four streams split by the independent `compcol` BCJ2
+/// implementation. The container is deliberately store+BCJ2 (no branch compression), keeping the
+/// fixture focused on graph wiring and making stream corruption deterministic.
+struct Bcj2Fixture {
+    bytes: Vec<u8>,
+    rc_offset: usize,
+}
+
+fn write_7z_number(output: &mut Vec<u8>, value: u64) {
+    let mut first = 0u8;
+    let mut mask = 0x80u8;
+    let mut count = 0u32;
+    while count < 8 {
+        if value < (1u64 << (7 * (count + 1))) {
+            first |= (value >> (8 * count)) as u8;
+            break;
+        }
+        first |= mask;
+        mask >>= 1;
+        count += 1;
+    }
+    output.push(first);
+    let mut remaining = value;
+    for _ in 0..count {
+        output.push(remaining as u8);
+        remaining >>= 8;
+    }
+}
+
+fn bcj2_archive(data: &[u8]) -> Bcj2Fixture {
+    bcj2_archive_with_branches(data, false)
+}
+
+fn bcj2_lzma2_archive(data: &[u8]) -> Bcj2Fixture {
+    bcj2_archive_with_branches(data, true)
+}
+
+fn bcj2_archive_with_branches(data: &[u8], lzma2_branches: bool) -> Bcj2Fixture {
+    const SIGNATURE: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+    const METHOD_BCJ2: [u8; 4] = [0x03, 0x03, 0x01, 0x1B];
+    const LZMA2_DICT_PROP_256_KIB: u8 = 12;
+
+    let (main, call, jump, rc) = compcol::bcj2::encode(data);
+    assert_eq!(
+        compcol::bcj2::decode(&main, &call, &jump, &rc, data.len()).unwrap(),
+        data,
+        "independent BCJ2 splitter must reproduce its input"
+    );
+    let streams = [main, call, jump, rc];
+    let packed_streams = if lzma2_branches {
+        streams
+            .iter()
+            .map(|stream| {
+                let options = lzma_rust2::Lzma2Options::with_preset(0);
+                assert_eq!(
+                    options.lzma_options.dict_size,
+                    1 << 18,
+                    "preset zero must match the fixture's dictionary property"
+                );
+                let mut writer = lzma_rust2::Lzma2Writer::new(Vec::new(), options);
+                writer.write_all(stream).unwrap();
+                writer.finish().unwrap()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        streams.clone().into()
+    };
+    let packed_size: usize = packed_streams.iter().map(Vec::len).sum();
+
+    // kHeader -> kMainStreamsInfo.
+    let mut header = vec![0x01, 0x04];
+    // PackInfo: PackPos=0, four streams, then their sizes.
+    header.push(0x06);
+    write_7z_number(&mut header, 0);
+    write_7z_number(&mut header, 4);
+    header.push(0x09);
+    for stream in &packed_streams {
+        write_7z_number(&mut header, stream.len() as u64);
+    }
+    header.push(0x00);
+    // UnpackInfo: one complex coder, four inputs and one output, no properties.
+    header.extend_from_slice(&[0x07, 0x0B]);
+    write_7z_number(&mut header, 1);
+    header.push(0); // External = false.
+    write_7z_number(&mut header, if lzma2_branches { 5 } else { 1 });
+    header.push(0x14); // idSize=4 | complex coder.
+    header.extend_from_slice(&METHOD_BCJ2);
+    write_7z_number(&mut header, 4);
+    write_7z_number(&mut header, 1);
+    if lzma2_branches {
+        for _ in 0..4 {
+            header.extend_from_slice(&[0x21, 0x21, 1, LZMA2_DICT_PROP_256_KIB]);
+        }
+        // Each LZMA2 output (global outputs 1..=4) feeds one BCJ2 input (global inputs 0..=3).
+        for branch in 0..4 {
+            write_7z_number(&mut header, branch);
+            write_7z_number(&mut header, branch + 1);
+        }
+    }
+    // The four direct pack inputs are either BCJ2's inputs or the four LZMA2 inputs.
+    let packed_base = if lzma2_branches { 4 } else { 0 };
+    for packed_index in packed_base..packed_base + 4 {
+        write_7z_number(&mut header, packed_index);
+    }
+    header.push(0x0C);
+    write_7z_number(&mut header, data.len() as u64);
+    if lzma2_branches {
+        for stream in &streams {
+            write_7z_number(&mut header, stream.len() as u64);
+        }
+    }
+    header.extend_from_slice(&[0x0A, 1]);
+    header.extend_from_slice(&libarchive_oxide::filter::crc32(data).to_le_bytes());
+    header.push(0x00);
+    // One default substream, then end MainStreamsInfo.
+    header.extend_from_slice(&[0x08, 0x00, 0x00]);
+
+    // FilesInfo: one UTF-16LE name.
+    header.push(0x05);
+    write_7z_number(&mut header, 1);
+    let mut name = vec![0]; // External = false.
+    for unit in "bcj2.bin".encode_utf16().chain(core::iter::once(0)) {
+        name.extend_from_slice(&unit.to_le_bytes());
+    }
+    header.push(0x11);
+    write_7z_number(&mut header, name.len() as u64);
+    header.extend_from_slice(&name);
+    header.extend_from_slice(&[0x00, 0x00]); // end FilesInfo, end Header.
+
+    let header_crc = libarchive_oxide::filter::crc32(&header);
+    let mut signature = [0u8; 32];
+    signature[..6].copy_from_slice(&SIGNATURE);
+    signature[7] = 4;
+    signature[12..20].copy_from_slice(&(packed_size as u64).to_le_bytes());
+    signature[20..28].copy_from_slice(&(header.len() as u64).to_le_bytes());
+    signature[28..32].copy_from_slice(&header_crc.to_le_bytes());
+    let start_crc = libarchive_oxide::filter::crc32(&signature[12..32]);
+    signature[8..12].copy_from_slice(&start_crc.to_le_bytes());
+
+    let rc_offset =
+        32 + packed_streams[0].len() + packed_streams[1].len() + packed_streams[2].len();
+    let mut bytes = signature.to_vec();
+    for stream in &packed_streams {
+        bytes.extend_from_slice(stream);
+    }
+    bytes.extend_from_slice(&header);
+    Bcj2Fixture { bytes, rc_offset }
+}
+
+struct ShortSeek {
+    inner: Cursor<Vec<u8>>,
+    maximum: usize,
+}
+
+impl Read for ShortSeek {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let amount = output.len().min(self.maximum);
+        self.inner.read(&mut output[..amount])
+    }
+}
+
+impl Seek for ShortSeek {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+fn bcj2_payload() -> Vec<u8> {
+    let mut data = Vec::with_capacity(1_200_000);
+    for index in 0..120_000u32 {
+        data.extend_from_slice(&[0x90, 0xE8]);
+        data.extend_from_slice(&index.wrapping_mul(31).to_le_bytes());
+        data.extend_from_slice(&[0x0F, 0x85]);
+        data.extend_from_slice(&index.wrapping_mul(17).to_le_bytes());
+    }
+    data
+}
+
+/// `compcol` supplies the independent BCJ2 split streams, `sevenz-rust2` independently validates
+/// the 7z graph/container, and arca reconstructs the same bytes through tiny source reads. The
+/// payload is larger than every internal event buffer, exercising incremental suspension across
+/// all four shared extents.
+#[test]
+fn arca_streams_compcol_bcj2_and_sevenz_rust2_accepts_container() {
+    let data = bcj2_payload();
+    let fixture = bcj2_lzma2_archive(&data);
+
+    let mut reference = SevenReader::new(Cursor::new(fixture.bytes.clone()), Password::empty())
+        .expect("sevenz-rust2 accepts independently assembled BCJ2 container");
+    assert_eq!(reference.read_file("bcj2.bin").unwrap(), data);
+
+    let source = ShortSeek {
+        inner: Cursor::new(fixture.bytes),
+        maximum: 7,
+    };
+    let mut reader = SeekArchiveReader::with_limits(source, Limits::default()).unwrap();
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(decoded, data);
+}
+
+/// The fixed four-window junction is charged to `codec_memory` before it allocates or reads a pack
+/// stream.
+#[test]
+fn bcj2_workspace_is_bounded_before_allocation() {
+    const BCJ2_WORKSPACE: usize = 4 * (1 << 18);
+    let fixture = bcj2_archive(b"\x90\xE8\x01\x00\x00\x00 bounded BCJ2\n");
+    let limits = Limits::default().with_codec_memory(Some(BCJ2_WORKSPACE - 1));
+    let error =
+        read_with_limits(&fixture.bytes, limits).expect_err("undersized BCJ2 budget must fail");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Limit)
+    );
+}
+
+/// Branch dictionaries coexist with the junction and are charged as one graph-wide allocation,
+/// rather than each decoder independently receiving the complete budget.
+#[test]
+fn bcj2_branch_dictionaries_are_aggregate_bounded() {
+    const TOTAL_WORKSPACE: usize = (4 * (1 << 18)) + (4 * (1 << 18));
+    let fixture = bcj2_lzma2_archive(b"\x90\xE8\x01\x00\x00\x00 bounded branches\n");
+    let limits = Limits::default().with_codec_memory(Some(TOTAL_WORKSPACE - 1));
+    let error =
+        read_with_limits(&fixture.bytes, limits).expect_err("aggregate BCJ2 budget must fail");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Limit)
+    );
+}
+
+/// A damaged range-control stream must be a typed malformed-input failure, never a panic or
+/// silently corrupted file.
+#[test]
+fn bcj2_corrupt_range_stream_is_malformed() {
+    let data = bcj2_payload();
+    let mut fixture = bcj2_archive(&data);
+    fixture.bytes[fixture.rc_offset] ^= 0xFF;
+    let error = read_with_limits(&fixture.bytes, Limits::default())
+        .expect_err("corrupt BCJ2 range stream must fail");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Malformed)
+    );
+}
+
+/// PPMd7 (variant H, method `03 04 01`) is produced independently by `sevenz-rust2` and decoded
+/// incrementally by arca. A payload much larger than the reader event buffer also guards the 7z
+/// no-end-marker boundary: exactly the declared folder size is returned, with no garbage suffix.
+#[test]
+fn arca_reads_sevenz_rust2_ppmd7() {
+    let mut data = b"PPMd predicts repeated text particularly well.\n".repeat(20_000);
+    data.extend(pseudo_random(65_537));
+    let bytes = ppmd_archive(&data, 4 * 1024 * 1024);
+
+    let mut reference = SevenReader::new(Cursor::new(bytes.clone()), Password::empty())
+        .expect("sevenz-rust2 opens its own PPMd7 archive");
+    assert_eq!(reference.read_file("ppmd.txt").unwrap(), data);
+    assert_eq!(read_with_limits(&bytes, Limits::default()).unwrap(), data);
+}
+
+/// The archive-declared PPMd model is checked against `Limits::codec_memory` before the decoder
+/// allocates it.
+#[test]
+fn ppmd7_model_memory_is_bounded_before_allocation() {
+    const MODEL_MEMORY: u32 = 4 * 1024 * 1024;
+    let bytes = ppmd_archive(b"bounded PPMd model\n", MODEL_MEMORY);
+    let limits = Limits::default().with_codec_memory(Some(MODEL_MEMORY as usize - 1));
+    let error =
+        read_with_limits(&bytes, limits).expect_err("oversized PPMd model must be rejected");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Limit)
+    );
+}
+
+/// A PPMd7 range stream must begin with the range coder's zero byte. Corrupting that byte leaves
+/// the independently generated next header intact but must fail deterministically as malformed.
+#[test]
+fn ppmd7_corrupt_range_initialization_is_malformed() {
+    let data = b"range decoder corruption fixture\n".repeat(100);
+    let mut bytes = ppmd_archive(&data, 2 * 1024 * 1024);
+    assert_eq!(
+        bytes.get(32),
+        Some(&0),
+        "fixture pack stream must start at 32"
+    );
+    bytes[32] = 0xFF;
+
+    let error =
+        read_with_limits(&bytes, Limits::default()).expect_err("corrupt PPMd range must fail");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Malformed)
+    );
+}
+
 /// AES-256/SHA-256 (method `06 F1 07 01`) differential coverage. `sevenz-rust2` (with its default
 /// `aes256` feature) produces a password-protected single-coder folder; arca decrypts it through the
 /// coder graph, deriving the key with 7-Zip's own UTF-16LE + SHA-256 KDF, and verifies the stored
 /// per-substream CRC-32 after decode. Gated on arca's `aes` feature.
 #[cfg(feature = "aes")]
 mod aes {
-    use libarchive_oxide::{ReaderEvent, SecretBytes, SeekArchiveReader, StreamError};
-    use libarchive_oxide_core::{ArchiveError, ErrorKind};
+    use libarchive_oxide::SecretBytes;
     use sevenz_rust2::encoder_options::AesEncoderOptions;
 
     use super::*;
@@ -452,7 +776,7 @@ mod aes {
     }
 
     /// Reads the whole (single-entry) archive's content through arca's seek reader with `password`.
-    fn read_aes(bytes: &[u8], password: &str) -> Result<Vec<u8>, StreamError> {
+    fn read_aes(bytes: &[u8], password: &str) -> Result<Vec<u8>, Error> {
         let mut reader = SeekArchiveReader::with_password(
             Cursor::new(bytes.to_vec()),
             SecretBytes::new(password.as_bytes().to_vec()),

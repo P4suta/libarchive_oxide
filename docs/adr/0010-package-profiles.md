@@ -238,6 +238,29 @@ or transport policy: any front end consumes the same `DebValidation`,
 `RpmValidation`, `ZipPackageValidation`, `AppPackageValidation`, `PackageFinding`,
 and `SupportStatus` types unchanged and re-implements no package policy of its own.
 
+### Continuation status
+
+The detection-only boundary above describes RM-214, not the current package
+crate. A later continuation added bounded offline APK v2/v3 verification:
+supported Signing Block certificate signatures and chunked APK content digests
+are evaluated by `PackageVerifier`, while `AppPackageValidator` remains the
+structure-only detector described by this decision. Unsupported cryptographic
+or rotation variants remain typed non-success verdicts, and trust still
+requires an explicit offline certificate fingerprint pin. Authenticated v1
+anti-stripping declarations are enforced. Per-signer signature records now use
+the AOSP platform-range selection policy and every algorithm winner is
+verified; only content-digest kinds requested by those winners are recomputed.
+Binary manifest SDK parsing is not implemented, so this result is not
+an Android platform installability verdict. The continuation also adds
+bounded MSIX/APPX block-map integrity: the 2010 Microsoft schema is parsed as a
+stream with strict metadata/nesting/object limits, every non-footprint package
+file must have one safe unique record, and exact sizes plus SHA-256 hashes over
+64-KiB uncompressed blocks are compared through the shared ZIP event reader.
+The 2015/2017 encrypted or delta BlockMap vocabularies return typed
+`unsupported` instead of being approximated by the 2010 parser.
+`AppxSignature.p7x` remains detection-only and cannot produce signature or
+trust success.
+
 ## Consequences
 
 Validating a `.deb` no longer requires unpacking it or trusting its size:
@@ -259,7 +282,7 @@ RPM-specific codes, and the ZIP-container profiles (RM-213) do the same with onl
 a bounded central-directory reader and four additive codes. The OS/app profiles
 (RM-214) extend that same reader — extracted to a shared `zip_reader` module — to
 APK, IPA, and MSIX, adding APK signing-scheme detection and MSIX signature
-detection as informational findings under two more additive codes. Cryptographic
-signature *verification* and digest checking (as opposed to scheme detection) and
-any package-validation CLI are outside these units and remain later Campaign 2
-work.
+detection as informational findings under two more additive codes. That
+detection-only boundary describes RM-214; the continuation above now supplies
+the implemented APK signature/content-digest and MSIX block-map integrity
+checks while keeping unimplemented signature schemes explicit.

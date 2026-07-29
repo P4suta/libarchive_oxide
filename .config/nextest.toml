@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Keep local and CI execution on the version whose configuration is validated
+# below. Newer compatible releases remain usable because this is a minimum.
+nextest-version = "0.9.140"
+
+[profile.default]
+# A failure must remain visible. If a narrow override ever adds retries, a
+# pass-after-retry is still a failing result rather than hidden flakiness.
+retries = 0
+flaky-result = "fail"
+
+# Report tests after one minute and terminate a genuinely stuck test after ten.
+# The intentionally long 10 GiB soak tests use their separate cargo-test recipe.
+slow-timeout = { period = "60s", terminate-after = 10, grace-period = "10s" }
+
+[test-groups.seed-mutants]
+# These are CPU-heavy but independently bounded. Four processes make failures
+# target-specific without allowing a high-core-count workstation to fan out all
+# corpus mutations at once.
+max-threads = 4
+
+[[profile.default.overrides]]
+filter = "test(seed_mutants_)"
+test-group = "seed-mutants"
+
+[profile.ci]
+inherits = "default"
+# Finish the profile so one failure does not hide independent regressions.
+fail-fast = false

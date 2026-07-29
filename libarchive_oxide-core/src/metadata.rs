@@ -8,6 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::meta::{EntryKind, Timestamp};
+use crate::{ArchiveError, ErrorKind};
 
 /// Encoding of an archive-native path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,12 +49,13 @@ impl ArchivePath {
     }
 
     /// Constructs a path from archive-native bytes and an encoding tag.
-    #[must_use]
-    pub fn from_encoded(raw: impl Into<Vec<u8>>, encoding: PathEncoding) -> Self {
-        Self {
-            raw: raw.into(),
-            encoding,
-        }
+    pub fn try_from_encoded(
+        raw: impl Into<Vec<u8>>,
+        encoding: PathEncoding,
+    ) -> Result<Self, ArchiveError> {
+        let raw = raw.into();
+        validate_encoded_path(&raw, encoding)?;
+        Ok(Self { raw, encoding })
     }
 
     /// Archive-native bytes.
@@ -126,10 +128,116 @@ pub struct Device {
 /// One sparse-file data extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparseExtent {
+    offset: u64,
+    length: u64,
+}
+
+impl SparseExtent {
+    /// Creates a non-empty sparse data extent whose end offset is representable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Malformed`] for a zero length or offset overflow.
+    pub fn new(offset: u64, length: u64) -> Result<Self, ArchiveError> {
+        if length == 0 {
+            return Err(ArchiveError::new(ErrorKind::Malformed)
+                .with_context("sparse extent length must be non-zero"));
+        }
+        if offset.checked_add(length).is_none() {
+            return Err(ArchiveError::new(ErrorKind::Malformed)
+                .with_context("sparse extent end offset overflows u64"));
+        }
+        Ok(Self { offset, length })
+    }
+
     /// Logical byte offset.
-    pub offset: u64,
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
     /// Number of stored bytes.
-    pub length: u64,
+    #[must_use]
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+
+    /// Exclusive logical end offset.
+    #[must_use]
+    pub const fn end(self) -> u64 {
+        self.offset + self.length
+    }
+}
+
+/// Algorithm attached to an entry checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChecksumAlgorithm {
+    /// POSIX cpio `newc` additive 32-bit checksum.
+    CpioSum32,
+    /// CRC-32.
+    Crc32,
+    /// SHA-256.
+    Sha256,
+    /// BLAKE2b-256.
+    Blake2b256,
+}
+
+impl ChecksumAlgorithm {
+    const fn output_bytes(self) -> usize {
+        match self {
+            Self::CpioSum32 | Self::Crc32 => 4,
+            Self::Sha256 | Self::Blake2b256 => 32,
+        }
+    }
+}
+
+/// A checksum whose algorithm and output size have been validated together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checksum {
+    algorithm: ChecksumAlgorithm,
+    value: Vec<u8>,
+}
+
+impl Checksum {
+    /// Creates a checksum and validates the digest size for its algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Malformed`] when `value` has the wrong length.
+    pub fn new(
+        algorithm: ChecksumAlgorithm,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<Self, ArchiveError> {
+        let value = value.into();
+        if value.len() != algorithm.output_bytes() {
+            return Err(ArchiveError::new(ErrorKind::Malformed).with_context(
+                "checksum byte length does not match the selected checksum algorithm",
+            ));
+        }
+        Ok(Self { algorithm, value })
+    }
+
+    /// Creates the fixed-width checksum carried by cpio CRC entries.
+    #[must_use]
+    pub fn cpio_sum32(value: u32) -> Self {
+        Self {
+            algorithm: ChecksumAlgorithm::CpioSum32,
+            value: value.to_be_bytes().to_vec(),
+        }
+    }
+
+    /// Checksum algorithm.
+    #[must_use]
+    pub const fn algorithm(&self) -> ChecksumAlgorithm {
+        self.algorithm
+    }
+
+    /// Raw checksum bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.value
+    }
 }
 
 /// A namespaced raw extension retained for round-tripping.
@@ -192,7 +300,7 @@ pub struct EntryMetadata {
     xattrs: Vec<(Vec<u8>, Vec<u8>)>,
     acl: Vec<Vec<u8>>,
     file_flags: u64,
-    checksum: Option<Vec<u8>>,
+    checksum: Option<Checksum>,
     encrypted: bool,
     comment: Option<Vec<u8>>,
     extensions: Vec<Extension>,
@@ -319,8 +427,8 @@ impl EntryMetadata {
 
     /// Archive checksum bytes, if present.
     #[must_use]
-    pub fn checksum(&self) -> Option<&[u8]> {
-        self.checksum.as_deref()
+    pub const fn checksum(&self) -> Option<&Checksum> {
+        self.checksum.as_ref()
     }
 
     /// Whether the payload is encrypted.
@@ -349,6 +457,65 @@ impl EntryMetadata {
     #[must_use]
     pub fn into_builder(self) -> EntryMetadataBuilder {
         EntryMetadataBuilder { inner: self }
+    }
+
+    /// Validates encoded paths and cross-field metadata invariants.
+    ///
+    /// This is also called by every public archive writer before it begins an
+    /// entry, so metadata assembled through the compatibility [`EntryMetadataBuilder::build`]
+    /// path cannot cause output before validation succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for an empty or invalidly encoded path, an invalid
+    /// timestamp, a mismatched link target, or an invalid sparse layout.
+    pub fn validate(&self) -> Result<(), ArchiveError> {
+        if self.path.raw.is_empty() {
+            return Err(ArchiveError::new(ErrorKind::Malformed)
+                .with_context("archive entry path must not be empty"));
+        }
+        validate_encoded_path(&self.path.raw, self.path.encoding)?;
+        if let Some(target) = &self.link_target {
+            validate_encoded_path(&target.raw, target.encoding)?;
+        }
+        for timestamp in [
+            self.times.modified,
+            self.times.accessed,
+            self.times.changed,
+            self.times.created,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            Timestamp::new(timestamp.seconds(), timestamp.nanoseconds())?;
+        }
+
+        let is_link = matches!(self.kind, EntryKind::Symlink | EntryKind::Hardlink);
+        if is_link != self.link_target.is_some() {
+            return Err(ArchiveError::new(ErrorKind::Malformed).with_context(
+                "link entries require a target and non-link entries must not carry one",
+            ));
+        }
+        if !self.sparse.is_empty() && self.kind != EntryKind::File {
+            return Err(ArchiveError::new(ErrorKind::Malformed)
+                .with_context("only regular files may carry sparse extents"));
+        }
+        let mut previous_end = 0_u64;
+        for (index, extent) in self.sparse.iter().copied().enumerate() {
+            // Re-run constructor validation for values decoded by older internal
+            // paths before all value construction became fallible.
+            SparseExtent::new(extent.offset, extent.length)?;
+            if index != 0 && extent.offset < previous_end {
+                return Err(ArchiveError::new(ErrorKind::Malformed)
+                    .with_context("sparse extents overlap or are not sorted"));
+            }
+            previous_end = extent.end();
+            if self.size.is_some_and(|size| previous_end > size) {
+                return Err(ArchiveError::new(ErrorKind::Malformed)
+                    .with_context("sparse extent exceeds the declared entry size"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -458,7 +625,7 @@ impl EntryMetadataBuilder {
 
     /// Sets checksum bytes.
     #[must_use]
-    pub fn checksum(mut self, checksum: Option<Vec<u8>>) -> Self {
+    pub fn checksum(mut self, checksum: Option<Checksum>) -> Self {
         self.inner.checksum = checksum;
         self
     }
@@ -484,10 +651,53 @@ impl EntryMetadataBuilder {
         self
     }
 
-    /// Completes the metadata.
+    /// Completes metadata assembled by trusted format readers.
+    ///
+    /// Application code should prefer [`Self::try_build`]. Public archive
+    /// writers validate this value again before producing output.
     #[must_use]
     pub fn build(self) -> EntryMetadata {
         self.inner
+    }
+
+    /// Validates every cross-field invariant and completes the metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed archive error for an invalid encoded path, timestamp,
+    /// link relationship, or sparse extent layout.
+    pub fn try_build(self) -> Result<EntryMetadata, ArchiveError> {
+        self.inner.validate()?;
+        Ok(self.inner)
+    }
+}
+
+fn validate_encoded_path(raw: &[u8], encoding: PathEncoding) -> Result<(), ArchiveError> {
+    match encoding {
+        PathEncoding::Bytes => Ok(()),
+        PathEncoding::Utf8 => {
+            core::str::from_utf8(raw).map_err(|_| {
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_context("path tagged as UTF-8 contains invalid UTF-8")
+            })?;
+            Ok(())
+        },
+        PathEncoding::Utf16Le => {
+            if (raw.len() & 1) != 0 {
+                return Err(ArchiveError::new(ErrorKind::Malformed)
+                    .with_context("UTF-16LE path has an odd byte length"));
+            }
+            let units = raw
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+            for decoded in char::decode_utf16(units) {
+                decoded.map_err(|_| {
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_context("UTF-16LE path contains an unpaired surrogate")
+                })?;
+            }
+            Ok(())
+        },
     }
 }
 

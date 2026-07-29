@@ -28,8 +28,8 @@ so references remain meaningful if titles or issue numbers change.
 | [RM-200](https://github.com/P4suta/libarchive_oxide/issues/23) | 2 | OCI layer engine | RM-100, RM-110 |
 | [RM-210](https://github.com/P4suta/libarchive_oxide/issues/24) | 2 | Package profile validators | RM-100, RM-110 |
 | [RM-300](https://github.com/P4suta/libarchive_oxide/issues/25) | 3 | Mainstream format depth | RM-100, RM-110 |
-| [RM-310](https://github.com/P4suta/libarchive_oxide/issues/26) | 3 | Stable C ABI preview and limited compatibility shim | RM-100 |
-| [RM-400](https://github.com/P4suta/libarchive_oxide/issues/27) | 4 | Modern Replacement conformance and 1.0 gates | all prior epics |
+| RM-310 (superseded) | 3 | C ABI work moved outside this Rust-first project | — |
+| [RM-400](https://github.com/P4suta/libarchive_oxide/issues/27) | 4 | Continuous Modern Replacement conformance gates, excluding release/ABI freezes | active in-scope epics |
 
 Detailed bodies used for initial issue creation live in
 [`issue-bodies`](issue-bodies/). New work should use the
@@ -60,8 +60,10 @@ Detailed bodies used for initial issue creation live in
 | RM-213 | RM-210 | implementation (DEV-101) | Bounded ZIP-container profile validators (JAR, NuGet, Wheel, EPUB) reading only the central directory with no payload decompression |
 | RM-214 | RM-210 | implementation (DEV-102) | Bounded OS/app package validators (Android APK, iOS IPA, Windows MSIX) with required-member checks and informational APK v1/v2/v3 and MSIX signing-scheme detection |
 | RM-215 | RM-210 | implementation (DEV-103) | `oxarchive package validate` CLI over the shared package validators, rendering their typed findings and stable severity as one `package_validation` JSON record without re-implementing validation |
+| RM-216 | RM-210 | implementation (continuation) | Offline Android APK v1 anti-strip; bounded v2/v3 RSA/ECDSA signed-data; chunked and fs-verity content digests; v3/v3.1 proof-of-rotation, targeted SDK ranges, and stripping protection; AOSP positive/negative fixtures, explicit trust pins, CLI JSON, and fuzz seeds. Binary-manifest SDK installability remains unclaimed |
+| RM-217 | RM-210 | implementation (continuation) | Bounded MSIX/APPX 2010 `AppxBlockMap.xml` exact file coverage, size/LFH/compressed-block checks, streamed 64-KiB SHA-256 verification, Microsoft SDK fixtures, CLI JSON, and fuzz seed; 2015/2017 encrypted/delta vocabularies are unsupported and `AppxSignature.p7x` remains unevaluated |
 | RM-301 | RM-300 | implementation (DEV-107) | Reusable interoperability-evidence harness (≥3 producers read, ≥2 consumers accept) and producer-corpus provenance policy, proven on ZIP Store/Deflate and 7z LZMA2 |
-| RM-302 | RM-300 | implementation (DEV-108) | ZIP BZip2 (method 12) read+write behind the `bzip2` feature, ZIP Zstandard (method 93) read on both profiles + write on native-codecs only, and ZIP LZMA (method 14) read+write behind the `xz` feature (with a committed CPython/liblzma fixture as the independent-codec reference), proven with independent producers/consumers plus truncation, bomb, bad-header, portable-write-Unsupported, and feature-off Unsupported adversarial tests |
+| RM-302 | RM-300 | implementation (DEV-108 + follow-on) | ZIP BZip2 (method 12), Zstandard (method 93), and LZMA (method 14) read/write on portable and native profiles; portable Zstandard uses bounded raw blocks and runtime backend selection; proven with independent producers/consumers plus codec-memory, truncation, bomb, bad-header, and feature-off Unsupported tests |
 | RM-303 | RM-300 | implementation (DEV-109) | 7z coder-graph depth interop corpora over LZMA2/LZMA folders and plain/encoded headers |
 | RM-304 | RM-300 | implementation (DEV-110) | tar/cpio/ar/ISO producer corpora with metadata-fidelity comparison through the shared harness |
 | RM-305 | RM-300 | implementation (DEV-111) | CAB/XAR read-only interop corpora read back through arca against independent producers |

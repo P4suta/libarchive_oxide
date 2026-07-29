@@ -8,6 +8,8 @@
 use std::io::{self, Cursor, Read, Write};
 
 use libarchive_oxide::filter::gzip::GzipEncoder;
+#[cfg(all(feature = "portable-codecs", feature = "native-codecs"))]
+use libarchive_oxide::{ArchiveWriter, BackendPreference};
 use libarchive_oxide::{FilterReader, filter_for_name};
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{Codec, CodecStatus, EndOfInput, Limits};
@@ -31,10 +33,20 @@ fn compress(plain: &[u8], filter: FilterId) -> io::Result<Vec<u8>> {
             }
         },
         FilterId::Bzip2 => {
-            let mut writer =
-                bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
-            writer.write_all(plain)?;
-            writer.finish()
+            #[cfg(feature = "bzip2")]
+            {
+                let mut writer =
+                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+                writer.write_all(plain)?;
+                writer.finish()
+            }
+            #[cfg(not(feature = "bzip2"))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "bzip2 feature is disabled",
+                ))
+            }
         },
         FilterId::Zstd => zstd_codec::stream::encode_all(Cursor::new(plain), 3),
         FilterId::Xz => {
@@ -83,9 +95,26 @@ fn decode(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Outer filters available in the current additive feature set.
+fn enabled_outer_filters() -> Vec<FilterId> {
+    [FilterId::Gzip, FilterId::Zstd, FilterId::Xz, FilterId::Lz4]
+        .into_iter()
+        .chain(cfg!(feature = "bzip2").then_some(FilterId::Bzip2))
+        .collect()
+}
+
+#[cfg(all(feature = "portable-codecs", feature = "native-codecs"))]
+fn decode_with_backend(bytes: Vec<u8>, backend: BackendPreference) -> io::Result<Vec<u8>> {
+    let mut reader = FilterReader::with_backend(OneByte::new(bytes), Limits::default(), backend)?;
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output)?;
+    Ok(output)
+}
+
 #[test]
-fn every_outer_filter_decodes_from_one_byte_reads() {
-    let plain = vec![0x5a; 300_000];
+#[cfg(all(feature = "portable-codecs", feature = "native-codecs"))]
+fn portable_and_native_backends_decode_independent_frames() {
+    let plain: Vec<u8> = (0_u8..=251).cycle().take(300_000).collect();
     for filter in [
         FilterId::Gzip,
         FilterId::Bzip2,
@@ -93,6 +122,54 @@ fn every_outer_filter_decodes_from_one_byte_reads() {
         FilterId::Xz,
         FilterId::Lz4,
     ] {
+        let encoded = compress(&plain, filter).unwrap();
+        for backend in [BackendPreference::Portable, BackendPreference::Native] {
+            assert_eq!(
+                decode_with_backend(encoded.clone(), backend).unwrap(),
+                plain,
+                "{filter:?} with {backend:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(all(feature = "portable-codecs", feature = "native-codecs"))]
+fn portable_and_native_writers_interoperate_with_both_readers() {
+    let plain = ArchiveWriter::new(Vec::new()).finish().unwrap();
+    for filter in [
+        FilterId::Gzip,
+        FilterId::Bzip2,
+        FilterId::Zstd,
+        FilterId::Xz,
+        FilterId::Lz4,
+    ] {
+        for writer_backend in [BackendPreference::Portable, BackendPreference::Native] {
+            let encoded = ArchiveWriter::with_filter_and_backend(
+                Vec::new(),
+                libarchive_oxide_core::FormatId::Tar,
+                Some(filter),
+                Limits::default(),
+                writer_backend,
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            for reader_backend in [BackendPreference::Portable, BackendPreference::Native] {
+                assert_eq!(
+                    decode_with_backend(encoded.clone(), reader_backend).unwrap(),
+                    plain,
+                    "{filter:?}: {writer_backend:?} -> {reader_backend:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_outer_filter_decodes_from_one_byte_reads() {
+    let plain = vec![0x5a; 300_000];
+    for filter in enabled_outer_filters() {
         let encoded = compress(&plain, filter).unwrap();
         assert_eq!(decode(encoded).unwrap(), plain, "{filter:?}");
     }
@@ -130,13 +207,7 @@ fn gzip_members_concatenate_and_trailing_data_is_rejected() {
 
 #[test]
 fn every_filter_concatenates_members_and_rejects_trailing_data() {
-    for filter in [
-        FilterId::Gzip,
-        FilterId::Bzip2,
-        FilterId::Zstd,
-        FilterId::Xz,
-        FilterId::Lz4,
-    ] {
+    for filter in enabled_outer_filters() {
         let mut members = compress(b"first", filter).unwrap();
         members.extend_from_slice(&compress(b"second", filter).unwrap());
         assert_eq!(decode(members).unwrap(), b"firstsecond", "{filter:?}");
@@ -152,6 +223,7 @@ fn every_filter_concatenates_members_and_rejects_trailing_data() {
 }
 
 #[test]
+#[cfg(feature = "bzip2")]
 fn bzip2_accepts_an_independent_python_fixture_and_rejects_corruption() {
     // Produced by Python 3's stdlib `bz2.compress(b"independent-producer", 6)`.
     const PYTHON_BZ2: &[u8] = &[
@@ -176,6 +248,60 @@ fn bzip2_accepts_an_independent_python_fixture_and_rejects_corruption() {
 
     assert!(decode(b"BZh0malformed".to_vec()).is_err());
     assert!(decode(PYTHON_BZ2[..PYTHON_BZ2.len() - 3].to_vec()).is_err());
+}
+
+#[test]
+#[cfg(feature = "compress")]
+fn compress_lzw_accepts_independent_fixture_and_rejects_bad_headers() {
+    // Produced independently by:
+    // `printf "hello world" | compress -c | xxd -p`.
+    const COMPRESS_HELLO_WORLD: &[u8] = &[
+        0x1f, 0x9d, 0x90, 0x68, 0xca, 0xb0, 0x61, 0xf3, 0x06, 0xc4, 0x9d, 0x37, 0x72, 0xd8, 0x90,
+        0x01,
+    ];
+
+    assert_eq!(
+        decode(COMPRESS_HELLO_WORLD.to_vec()).unwrap(),
+        b"hello world"
+    );
+
+    let mut reserved_bits = COMPRESS_HELLO_WORLD.to_vec();
+    reserved_bits[2] |= 0x60;
+    assert_eq!(
+        decode(reserved_bits).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        decode(vec![0x1f, 0x9d]).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    let error = FilterReader::with_limits(
+        Cursor::new(COMPRESS_HELLO_WORLD),
+        Limits::default().with_codec_memory(Some(1)),
+    )
+    .expect_err("LZW dictionary must be rejected before allocation");
+    assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+}
+
+#[test]
+#[cfg(all(
+    feature = "compress",
+    feature = "portable-codecs",
+    feature = "native-codecs"
+))]
+fn compress_lzw_has_an_explicit_portable_backend_only() {
+    const COMPRESS_HELLO: &[u8] = &[0x1f, 0x9d, 0x90, 0x68, 0xca, 0xb0, 0x61, 0xf3, 0x06];
+    assert_eq!(
+        decode_with_backend(COMPRESS_HELLO.to_vec(), BackendPreference::Portable).unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        decode_with_backend(COMPRESS_HELLO.to_vec(), BackendPreference::Native)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
 }
 
 #[test]
@@ -204,14 +330,11 @@ fn malformed_zstd_block_does_not_panic() {
 #[test]
 fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
     let limits = Limits::default().with_decoded_total(Some(4));
-    for bytes in [
-        b"12345".to_vec(),
-        compress(b"12345", FilterId::Gzip).unwrap(),
-        compress(b"12345", FilterId::Bzip2).unwrap(),
-        compress(b"12345", FilterId::Zstd).unwrap(),
-        compress(b"12345", FilterId::Xz).unwrap(),
-        compress(b"12345", FilterId::Lz4).unwrap(),
-    ] {
+    let mut inputs = vec![b"12345".to_vec()];
+    for filter in enabled_outer_filters() {
+        inputs.push(compress(b"12345", filter).unwrap());
+    }
+    for bytes in inputs {
         let mut reader = FilterReader::with_limits(OneByte::new(bytes), limits).unwrap();
         let mut output = Vec::new();
         assert_eq!(
@@ -226,6 +349,13 @@ fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
 fn bzip2_filename_conventions_are_detected_case_insensitively() {
     for name in ["archive.bz2", "archive.tbz", "archive.tbz2", "ARCHIVE.TBZ2"] {
         assert_eq!(filter_for_name(name), Some(FilterId::Bzip2), "{name}");
+    }
+}
+
+#[test]
+fn compress_filename_conventions_are_detected_case_insensitively() {
+    for name in ["archive.Z", "archive.z", "ARCHIVE.Z"] {
+        assert_eq!(filter_for_name(name), Some(FilterId::Compress), "{name}");
     }
 }
 

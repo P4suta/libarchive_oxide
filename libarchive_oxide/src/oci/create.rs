@@ -93,7 +93,7 @@ struct LayerEntry {
 ///
 /// ```
 /// use libarchive_oxide::{OciLayerBuilder, OciLayerFilter};
-/// use libarchive_oxide::libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata};
+/// use libarchive_oxide::{ArchivePath, EntryKind, EntryMetadata};
 ///
 /// let mut builder = OciLayerBuilder::new(OciLayerFilter::Gzip);
 /// let metadata = EntryMetadata::builder(

@@ -2,26 +2,21 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Range-backed OCI layer reading: an in-memory `RangeSource` fed through
+//! Range-backed OCI layer reading: an in-memory `ReadAt` fed through
 //! `RangeReader` into `OciLayerEngine` must produce byte-identical digests to a
-//! direct `Read`, and its `read_range` offsets and boundaries must be exact.
+//! direct `Read`, and its `read_at` offsets and boundaries must be exact.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use std::cell::RefCell;
 use std::io::{self, Cursor, Read};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
-use libarchive_oxide::libarchive_oxide_core::{
-    ArchivePath, EntryKind, EntryMetadata, FilterId, FormatId,
-};
-use libarchive_oxide::{
-    ArchiveEngine, CreateOptions, LayerDigests, OciLayerEngine, RangeReader, RangeSource,
-    SourceIdentity,
-};
+use libarchive_oxide::advanced::{RangeReader, ReadAt, SourceIdentity};
+use libarchive_oxide::{ArchiveEngine, CreateOptions, LayerDigests, OciLayerEngine};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FilterId, FormatId};
 
-/// A log of every `(offset, buffer_len)` pair passed to `read_range`.
-type CallLog = Rc<RefCell<Vec<(u64, usize)>>>;
+/// A log of every `(offset, buffer_len)` pair passed to `read_at`.
+type CallLog = Arc<Mutex<Vec<(u64, usize)>>>;
 
 /// An immutable in-memory range source that records each fetch it serves.
 struct MemoryRange {
@@ -30,7 +25,7 @@ struct MemoryRange {
     calls: CallLog,
 }
 
-impl RangeSource for MemoryRange {
+impl ReadAt for MemoryRange {
     fn len(&self) -> u64 {
         self.bytes.len() as u64
     }
@@ -39,14 +34,17 @@ impl RangeSource for MemoryRange {
         &self.identity
     }
 
-    fn read_range(&mut self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
         // The adapter must never address bytes beyond the declared length.
         assert!(
             offset <= self.len(),
-            "read_range offset {offset} exceeds declared len {}",
+            "read_at offset {offset} exceeds declared len {}",
             self.len(),
         );
-        self.calls.borrow_mut().push((offset, output.len()));
+        self.calls
+            .lock()
+            .expect("call log lock")
+            .push((offset, output.len()));
         let start = usize::try_from(offset).unwrap();
         let available = &self.bytes[start..];
         let count = available.len().min(output.len());
@@ -57,11 +55,12 @@ impl RangeSource for MemoryRange {
 
 /// Builds a `MemoryRange` over `blob` plus a handle to its fetch log.
 fn memory_source(blob: &[u8]) -> (MemoryRange, CallLog) {
-    let calls: CallLog = Rc::new(RefCell::new(Vec::new()));
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
     let source = MemoryRange {
         bytes: blob.to_vec(),
-        identity: SourceIdentity::new(b"oci-range-test-v1".to_vec()),
-        calls: calls.clone(),
+        identity: SourceIdentity::try_new(b"oci-range-test-v1".to_vec())
+            .expect("valid source identity"),
+        calls: Arc::clone(&calls),
     };
     (source, calls)
 }
@@ -113,7 +112,7 @@ fn range_backed_digests_match_direct_read() {
 
     let (source, calls) = memory_source(&blob);
     let mut session = OciLayerEngine::new()
-        .open(RangeReader::new(source))
+        .open(RangeReader::new(source).expect("construct range reader"))
         .expect("open range");
     let mut paths = Vec::new();
     while let Some(entry) = session.next_entry().expect("range next entry") {
@@ -124,7 +123,7 @@ fn range_backed_digests_match_direct_read() {
     assert_eq!(paths, direct_paths);
     assert_eq!(range, direct);
     assert!(
-        !calls.borrow().is_empty(),
+        !calls.lock().expect("call log lock").is_empty(),
         "the range source must have been read"
     );
 }
@@ -136,7 +135,7 @@ fn range_backed_session_verifies_against_direct_digests() {
 
     let (source, _calls) = memory_source(&blob);
     let mut session = OciLayerEngine::new()
-        .open(RangeReader::new(source))
+        .open(RangeReader::new(source).expect("construct range reader"))
         .expect("open range");
     session.verify(direct).expect("verify range-backed layer");
 }
@@ -146,7 +145,7 @@ fn range_reader_reproduces_bytes_across_chunk_boundaries() {
     let blob = build_layer();
     let (source, calls) = memory_source(&blob);
 
-    let mut reader = RangeReader::new(source);
+    let mut reader = RangeReader::new(source).expect("construct range reader");
     let mut readback = Vec::new();
     reader.read_to_end(&mut readback).expect("read to end");
     assert_eq!(
@@ -154,7 +153,7 @@ fn range_reader_reproduces_bytes_across_chunk_boundaries() {
         "range reader must reproduce the blob exactly"
     );
 
-    let log = calls.borrow();
+    let log = calls.lock().expect("call log lock");
     assert!(!log.is_empty(), "at least one fetch is required");
     for (offset, len) in log.iter().copied() {
         // Every fetch starts strictly inside the source and requests bytes.
@@ -167,21 +166,21 @@ fn range_reader_reproduces_bytes_across_chunk_boundaries() {
 }
 
 #[test]
-fn read_range_returns_exact_bytes_at_each_offset() {
+fn read_at_returns_exact_bytes_at_each_offset() {
     let blob = build_layer();
     let len = blob.len();
-    let (mut source, _calls) = memory_source(&blob);
+    let (source, _calls) = memory_source(&blob);
 
     // Full read from the start returns a prefix of the blob.
     let mut whole = vec![0u8; len];
-    let read = source.read_range(0, &mut whole).expect("read from start");
+    let read = source.read_at(0, &mut whole).expect("read from start");
     assert_eq!(&whole[..read], &blob[..read]);
 
     // A window read from the middle into a smaller buffer.
     let mid = len / 2;
     let mut window = [0u8; 7];
     let read = source
-        .read_range(mid as u64, &mut window)
+        .read_at(mid as u64, &mut window)
         .expect("read middle");
     assert_eq!(read, window.len().min(len - mid));
     assert_eq!(&window[..read], &blob[mid..mid + read]);
@@ -189,15 +188,13 @@ fn read_range_returns_exact_bytes_at_each_offset() {
     // The final byte is reachable and returns exactly one byte.
     let mut last = [0u8; 4];
     let read = source
-        .read_range((len - 1) as u64, &mut last)
+        .read_at((len - 1) as u64, &mut last)
         .expect("read last byte");
     assert_eq!(read, 1);
     assert_eq!(last[0], blob[len - 1]);
 
     // An offset exactly at the length yields zero bytes without error.
     let mut past = [0u8; 4];
-    let read = source
-        .read_range(len as u64, &mut past)
-        .expect("read at end");
+    let read = source.read_at(len as u64, &mut past).expect("read at end");
     assert_eq!(read, 0);
 }

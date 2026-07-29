@@ -7,8 +7,9 @@ name = "libarchive_oxide"
 version.workspace = true
 description = "Safe-Rust archive detection, compression, extraction, and creation"
 edition.workspace = true
-# MSRV with all features.
-rust-version = "1.87"
+# Workspace MSRV; `cab-quantum` uses compcol 0.6.8, whose audited
+# frame-overshoot fix establishes this floor.
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -27,15 +28,29 @@ rustdoc-args = ["--generate-link-to-definition"]
 
 [features]
 default = ["portable-codecs"]
-# Mutually exclusive codec backend profiles. Individual codec features remain
-# compatible and select their portable backend when neither profile is named.
-portable-codecs = ["gzip", "bzip2", "zstd", "xz", "lz4"]
+# Additive codec backend profiles. Individual codec features remain compatible
+# and select their portable backend when neither profile is named. When both
+# profiles are enabled, native implementations remain the current default until
+# a caller selects a runtime backend preference.
+portable-codecs = [
+    "gzip",
+    "bzip2",
+    "zstd",
+    "xz",
+    "lz4",
+    "compress",
+    "lzip",
+    "cab-lzx",
+    "cab-quantum",
+]
 native-codecs = [
     "gzip",
     "bzip2",
     "zstd",
     "xz",
     "lz4",
+    "cab-lzx",
+    "cab-quantum",
     "dep:compression-codecs",
     "compression-codecs/gzip",
     "compression-codecs/bzip2",
@@ -53,13 +68,43 @@ bzip2 = [
     "compression-codecs/bzip2",
     "async-compression?/bzip2",
 ]
-zstd = ["dep:ruzstd"]
-xz = ["dep:lzma-rust2"]
-lz4 = ["dep:lz4_flex", "dep:twox-hash"]
+zstd = ["libarchive_oxide-codecs/zstd"]
+xz = ["dep:lzma-rust2", "lzma-rust2/encoder", "lzma-rust2/xz"]
+lz4 = ["libarchive_oxide-codecs/lz4"]
+# Unix compress(1) / .Z LZW read support.
+compress = ["libarchive_oxide-codecs/lzw"]
+# lzip/LZMA read support. The public outer-filter writer intentionally has no
+# lzip branch.
+lzip = ["dep:lzma-rust2"]
+# Microsoft CAB LZX read support. The format remains listable when this
+# additive codec feature is disabled.
+cab-lzx = ["libarchive_oxide-codecs/lzx"]
+# Microsoft CAB Quantum read support. `compcol` is safe Rust, no_std + alloc,
+# and the format remains listable with a typed Unsupported payload error when
+# this additive codec feature is disabled.
+cab-quantum = ["dep:compcol"]
 # WinZip AES-256 AE-2 (ZIP) and AES-256/SHA-256 (7z, via `cbc`).
-aes = ["dep:aes", "dep:cbc", "dep:ctr", "dep:hmac", "dep:sha1", "dep:pbkdf2", "dep:subtle", "dep:getrandom"]
-# 7z single-folder LZMA2 and shared CRC-32.
-sevenz = ["dep:lzma-rust2", "gzip"]
+aes = [
+    "dep:aes",
+    "dep:ctr",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:pbkdf2",
+    "dep:subtle",
+    "dep:getrandom",
+    "libarchive_oxide-codecs/aes7z",
+]
+# 7z streaming decode/write support. PPMd7 is decode-only here; writers remain
+# deliberately pinned to the reproducible LZMA2 profile.
+sevenz = [
+    "dep:lzma-rust2",
+    "lzma-rust2/encoder",
+    "dep:ppmd-rust",
+    "gzip",
+    "libarchive_oxide-codecs/bcj",
+    "libarchive_oxide-codecs/deflate",
+    "libarchive_oxide-codecs/delta",
+]
 # Runtime-neutral and Tokio I/O adapters. Both drive the same sans-I/O
 # pipeline; Tokio is a thin poll shim and does not enable a second parser.
 async = [
@@ -72,24 +117,27 @@ tokio = ["async", "dep:tokio"]
 
 [dependencies]
 libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
+libarchive_oxide-codecs = { path = "../libarchive_oxide-codecs", version = "0.2.0", default-features = false, features = ["gzip"] }
 # Feature-gated codecs.
-miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
 deflate64 = { version = "0.1.12", default-features = false, optional = true }
-ruzstd = { version = "0.8.2", optional = true }
-lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"], optional = true }
-twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash32"], optional = true }
 compression-codecs = { version = "0.4.38", default-features = false, optional = true }
 bzip2 = { version = "0.6.1", optional = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib"], optional = true }
 xz-codec = { package = "xz2", version = "0.1.7", optional = true }
 # Shared by xz and 7z.
-lzma-rust2 = { version = "0.16.5", default-features = false, features = ["std", "encoder", "xz"], optional = true }
+lzma-rust2 = { version = "0.16.5", default-features = false, features = ["std"], optional = true }
+# PPMd7 (variant H) with the 7z range coder. The adapter validates the archive
+# properties and codec-memory budget before this dependency allocates its model.
+ppmd-rust = { version = "1.4.0", optional = true }
+# Safe streaming CAB Quantum decoder. Keep the patch release exact: 0.6.8
+# contains the signed frame-accounting fix required at 32 KiB boundaries.
+compcol = { version = "=0.6.8", default-features = false, features = ["quantum"], optional = true }
 # WinZip AE-2 requires SHA-1. `zeroize` wipes the expanded AES key schedule on drop,
 # so a folder/member key never lingers in freed memory after the decoder is dropped
 # (defense in depth for both the 7z CBC and the ZIP AE-2 CTR paths).
 aes = { version = "0.9", features = ["zeroize"], optional = true }
 # 7z AES-256/SHA-256 uses CBC (ZIP AE-2 uses CTR via `ctr`).
-cbc = { version = "0.2", optional = true }
 ctr = { version = "0.10", optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
@@ -98,12 +146,19 @@ subtle = { version = "2.6", default-features = false, optional = true }
 getrandom = { version = "0.4", optional = true }
 futures-io = { version = "0.3.31", optional = true }
 async-compression = { version = "0.4.42", default-features = false, optional = true }
-tokio = { version = "1.48", default-features = false, features = ["io-util", "rt", "sync"], optional = true }
+tokio = { version = "1.48", default-features = false, features = ["io-util"], optional = true }
+zeroize = { version = "1.8.2", features = ["derive"] }
+sha2 = "0.11"
+
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
 cap-std = "4.0.2"
 cap-fs-ext = "4.0.2"
 tempfile = "3.27.0"
-zeroize = { version = "1.8.2", features = ["derive"] }
-sha2 = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+# Win32 destination identities are NFC-normalized before case folding so
+# canonically equivalent archive names cannot address the same object twice.
+unicode-normalization = "0.1.24"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
@@ -111,8 +166,6 @@ rustix = { version = "1.1.4", features = ["fs"] }
 [dev-dependencies]
 # Shared portable fuzz cases.
 libarchive_oxide-fuzz-cases = { path = "../fuzz/fuzz_lib", default-features = false }
-# Deterministic structured inputs.
-arbitrary = { version = "1", features = ["derive"] }
 # Test fixture generation.
 flate2 = "1"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
@@ -121,13 +174,15 @@ lz4-codec = { package = "lz4", version = "1.28.1" }
 lzma-rust2 = "0.16.5"
 # Independent liblzma producer/consumer used only for XZ interoperability tests.
 xz-codec = { package = "xz2", version = "0.1.7" }
-ruzstd = "0.8.2"
 zstd-codec = { package = "zstd", version = "0.13.3" }
 # Independent SHA-256 reference for OCI layer digest/diffID tests.
 sha2 = "0.11"
 # `bzip2` is on by default; `deflate` and `zstd` are enabled so the 7z differential
 # tests can produce Deflate/Zstd folders for arca's reuse-codec decode path.
 sevenz-rust2 = { version = "0.21.3", features = ["deflate", "zstd"] }
+# Independent batch BCJ2 splitter/oracle used only to produce interoperability fixtures. The
+# production reader uses lzma-rust2's bounded streaming junction.
+compcol = { version = "0.6.8", default-features = false, features = ["bcj2"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto", "bzip2", "zstd", "lzma"] }
 # Independent tar/ar producers and consumers used only for RM-304 interop tests.
 tar = { version = "0.4", default-features = false }

@@ -1,54 +1,70 @@
-# Compile-time providers
+# Object-safe provider registry
 
-`libarchive_oxide` composes archive-format and outer-codec providers at compile
-time. Registration changes the concrete Rust type; it does not create a global
-registry, trait object, dynamic library boundary, or plugin ABI.
+`libarchive_oxide` composes archive-format and outer-codec providers in an
+application-owned immutable `Registry`. It does not create global mutable
+state, a dynamic-library boundary, or a plugin ABI.
 
 ## Registration
 
-Start from one of two provider sets:
+Build a registry with `Registry::builder()`:
 
-- `ProviderSet::builtins()` retains the standard tar/cpio/ar/ZIP/7z/ISO and
-  gzip/bzip2/zstd/xz/LZ4 behavior.
-- `ProviderSet::empty()` creates a closed set for downstream-only formats and
-  codecs.
+```rust
+use libarchive_oxide::advanced::{
+    IncrementalCodecProvider, IncrementalFormatProvider, Registry,
+};
+# let _ = core::mem::size_of::<Option<Box<dyn IncrementalCodecProvider>>>();
+# let _ = core::mem::size_of::<Option<Box<dyn IncrementalFormatProvider>>>();
+let registry = Registry::builder().build();
+# let _ = registry;
+```
 
-Prepend implementations with `with_format_provider` and
-`with_codec_provider`, or use the equivalent `ArchiveEngine` builders. A
-provider serves an existing stable `FormatId` or `FilterId`; prepend order
-selects an alternative implementation for that identifier. Adding a new
-identifier remains a core API decision rather than a runtime registration side
-effect. `name()` is diagnostic and should remain stable.
+- `register_format(Box<dyn IncrementalFormatProvider>)` adds one object-safe
+  archive provider.
+- `register_codec(Box<dyn IncrementalCodecProvider>)` adds one object-safe
+  outer-codec provider.
+- `build()` freezes the lists into a cheaply cloneable `Registry`.
 
-`FormatProvider` supplies associated caller-driven decoder and encoder state.
-`CodecProvider` supplies associated decoder state and a bounded encoded
-frame/member. Associated types keep every chain statically dispatched.
-Downstream format providers are sequential in this contract and advertise
-`FormatCapabilities::new(..., false)`; seek-native provider registration is not
-part of RM-103.
+Duplicate identifiers are rejected during registration, before archive I/O.
+Downstream identifiers must be created with `FormatId::custom` or
+`FilterId::custom`; reserved built-in values cannot be constructed through
+those APIs. `name()` is diagnostic and should remain stable.
+
+Providers create boxed incremental sans-I/O states. Downstream format providers
+in this contract are sequential and advertise
+`FormatCapabilities::uniform(directions, AccessMode::Sequential)`;
+asymmetric providers instead construct an `AccessProfile` and pass it to
+`FormatCapabilities::new`;
+seek-native registration remains a separate interface.
 
 ## Shared paths
 
 | Entry point | Registered state used |
 |---|---|
-| `Pipeline::with_providers` | codec probe/decode and format probe/decode |
-| `ArchiveReader::with_providers` | the same caller-driven `Pipeline` |
-| `ArchiveEngine::open` | events, inspection, rewind, planning, and apply |
+| `Registry::pipeline` | codec probe/decode and format probe/decode |
+| `Registry::reader` | the same caller-driven pipeline through a `Read` adapter |
+| `ArchiveEngine::from_registry` | events, inspection, rewind, planning, and apply |
 | `ArchiveEngine::create_registered` | format encode and optional codec encode |
-| `ProviderSet::{format,codec}_capability` | available, disabled, or unknown capability |
+| `Registry::{format,codec}_capability` | available, disabled, or unknown capability |
 
-`ArchiveSession::rewind` recovers the concrete provider chains from the prior
-reader and installs them over the same immutable input snapshot. It neither
-reconstructs a default registry nor changes parser state models.
+`ArchiveSession::rewind` recovers the registry-backed provider set from the
+prior reader and installs it over the same immutable input snapshot. It neither
+reconstructs defaults nor changes parser state models.
 
 ## Probe and protocol rules
 
 A probe returns `Match`, `NoMatch`, or `NeedMore { minimum }`. `minimum` must be
 strictly greater than the supplied prefix length; otherwise the pipeline
-returns `ErrorKind::Protocol`. The prepended head provider is the explicit
-override when it and a tail provider use the same identifier. Simultaneous
-matches for different identifiers are an ambiguity and also fail with a typed
-protocol error.
+returns `ErrorKind::Protocol`. Simultaneous matches for different identifiers
+are an ambiguity and also fail with a typed protocol error.
+
+Signatureless formats must never claim every input from `probe`. Callers opt
+in through an explicit-format constructor instead. The pipeline still detects
+and removes registered outer filters first, validates read/sequential
+capabilities before I/O, and then creates only the selected decoder. Built-in
+`FormatId::Raw` follows this contract.
+Built-in `FormatId::Warc` instead auto-detects only the exact bounded
+`WARC/1.0\r\n` and `WARC/1.1\r\n` signatures and advertises sequential read
+capability only.
 
 All provider codec and archive steps pass through the core progress validators.
 Out-of-range counts, empty data events, and no-progress loops fail closed.
@@ -61,7 +77,11 @@ A frame cannot be emitted after `abort`.
 
 ## Compatibility
 
-`ArchiveEngine::new`, `ProviderSet::builtins`, `ArchiveReader::new`,
-`ArchiveWriter`, async/Tokio adapters, and seek-native readers keep their
-existing built-in behavior. Registration is opt-in; no existing format or
-individual codec feature is deprecated by this API.
+`ArchiveEngine::new`, `ArchiveReader::new`, `ArchiveWriter`, async/Tokio
+adapters, and seek-native readers keep their built-in behavior. Generic static
+provider chains remain only as doc-hidden workspace migration machinery in
+`advanced::legacy`; applications use `Registry`.
+
+All registry, provider, range-source, and caller-driven pipeline types live
+under `libarchive_oxide::advanced`; they are intentionally not duplicated at
+the crate root.

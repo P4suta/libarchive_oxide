@@ -1,6 +1,6 @@
 # CLI and streaming-output contract
 
-`oxarchive`, `oxtar`, `oxcpio`, `oxcat`, and `oxunzip` share this process
+`oxarchive` is the single command-line entry point and follows this process
 contract:
 
 | Exit | Meaning | Standard output | Standard error |
@@ -15,7 +15,8 @@ never silently ignored.
 ## `oxarchive create`
 
 ```text
-oxarchive [--json] create --format FORMAT [--filter FILTER] ARCHIVE INPUT...
+oxarchive [--json] create [--format FORMAT] [--filter FILTER] [--reproducible]
+    [--password-file FILE | --password-prompt] ARCHIVE INPUT...
 ```
 
 Sequential formats are `tar`, `cpio`, `ar`, and `zip`. Outer filters are
@@ -23,6 +24,13 @@ Sequential formats are `tar`, `cpio`, `ar`, and `zip`. Outer filters are
 `ArchiveEngine`, `CreateOptions`, and `StreamingArchiveBuilder`, so the same
 finite limits, writer state machines, and safe archive-name policy apply to the
 Rust API and CLI.
+
+Recognized filename suffixes infer the format and outer filter; explicit flags
+take precedence, while standard output still requires `--format`. Directory
+children are emitted in archive-native byte order and duplicate archive paths
+are rejected. `--reproducible` uses portable fixed modes and omits host
+ownership and timestamps. JSON success output reports `metadata_profile` as
+`reproducible` or `filesystem`.
 
 For a file `ARCHIVE`, creation writes to a unique `create_new` sibling,
 synchronizes it, and publishes it without replacing an existing destination.
@@ -34,6 +42,42 @@ For `ARCHIVE` equal to `-`, archive bytes are the only standard output.
 Streaming cannot retract bytes: if a later input fails, exit is 1 and the
 already-written prefix remains partial. `--json create -` is therefore a usage
 error instead of mixing JSON and archive bytes.
+
+## Archive passwords
+
+The archive read commands `list`, `extract`, `inspect`, `plan`, `apply`, and
+`verify`, plus ZIP `create`, accept at most one of:
+
+```text
+--password-file FILE
+--password-prompt
+```
+
+Read passwords are consumed only by automatically detected seek-native ZIP or
+7z sessions. Supplying one for a sequential format, another seek format, or an
+explicit sequential `--format` is an error rather than an ignored option.
+Password-protected creation is WinZip AES-256 AE-2 ZIP with Deflate; another
+create format or an outer filter is rejected before output is opened.
+
+`FILE` must name a regular file, not a directory, symlink, device, pipe, or
+standard input. It must be non-empty after removal of one trailing LF or CRLF
+and at most 64 KiB. On Unix, every group and other permission bit must be clear
+(mode `0600` or stricter); the opened file identity and permissions are checked
+again to detect replacement while opening. `--password-file -` is always a
+usage error.
+
+`--password-prompt` reads without echo through the maintained `rpassword`
+console adapter. It requires an interactive TTY and is refused when archive
+input is `-`, so archive bytes and a secret never compete for standard input.
+The returned allocation is moved directly into `SecretBytes`, which zeroizes
+it on drop. Prepared ZIP/7z sessions retain only that redacted, zeroizing value
+so `inspect`, `plan`, and `apply` rewinds keep authentication enabled.
+
+Literal password argv forms are never supported. `--password`,
+`--password=VALUE`, `-P`, and `-PVALUE` are detected before command dispatch or
+file I/O and return exit 2 with a fixed diagnostic that does not echo the
+argument. JSON output, human output, errors, and debug formatting never expose
+the secret.
 
 ## Bounded inspection records
 
@@ -110,23 +154,40 @@ between the verify and apply passes; `-` is a usage error (exit 2).
 ## `oxarchive package`
 
 ```text
-oxarchive package validate PACKAGE --type <deb|rpm|jar|nuget|wheel|epub|apk|ipa|msix>
+oxarchive package validate PACKAGE --type <deb|rpm|alpine-apk|jar|nuget|wheel|epub|android-apk|ipa|msix> [--idsig-file PATH] [TRUST FLAGS]
 ```
 
-The `package validate` subcommand drives the library's package validators
-(`DebValidator`, `RpmValidator`, `ZipPackageValidator` over `ZipPackageProfile`,
-and `AppPackageValidator` over `AppPackageProfile`) directly. The CLI
-re-implements no package-structure interpretation or finding classification; it
-selects a profile, opens a bounded input, and renders the shared typed
-`SupportStatus` and `PackageFinding` values. Every invocation emits machine
-JSON regardless of the top-level `--json` flag, and the record carries
+The `package validate` subcommand drives `PackageVerifier` from the dedicated
+`libarchive_oxide-package` crate. The CLI re-implements no package-structure
+interpretation or finding classification; it selects a profile, opens a bounded
+input, and renders the shared typed verdicts and findings. The verifier performs
+no implicit network access. Every invocation emits machine JSON regardless of
+the top-level `--json` flag, and the record carries
 `schema_version: "oxarchive.output.v0alpha1"`.
 
-`--type` is required and selects the profile: `deb`, `rpm`, `jar`, `nuget`,
-`wheel`, `epub`, `apk`, `ipa`, or `msix` (a repeated `--type`, or the equals
-form `--type=jar`, is accepted; a repeat is a usage error). A missing `--type`,
-an unknown type, an unknown subcommand, a missing subcommand, or more than one
-`PACKAGE` operand is a usage error (exit 2).
+`--type` is required and selects the profile: `deb`, `rpm`, `alpine-apk`,
+`jar`, `nuget`, `wheel`, `epub`, `android-apk`, `ipa`, or `msix`. The ambiguous
+name `apk` is rejected. The equals form `--type=jar` is accepted; a repeated
+`--type` is a usage error. A missing or unknown type, an unknown or missing
+subcommand, or more than one `PACKAGE` operand is a usage error (exit 2).
+`--trusted-signer-sha256 HEX` adds one exact, 64-hex-digit SHA-256 pin of a
+canonical signer identity (CMS certificate DER or Alpine PKCS#1 public-key DER)
+and may be repeated; its equals form is accepted.
+`--alpine-rsa-key-file PATH` supplies a PEM/DER RSA verification key and may be
+repeated only with `--type alpine-apk`; its equals form is accepted. The file
+basename must exactly match the `.SIGN.*` key ID and each key file is bounded
+to 64 KiB. Duplicate key IDs, malformed keys, oversized files, or use with
+another profile are usage errors. A supplied key enables validity checking but
+does not grant issuer trust.
+`--idsig-file PATH` supplies an Android APK Signature Scheme v4/v4.1 detached
+sidecar and is valid only with `--type android-apk`. Its equals form is
+accepted. It may appear once, must name a file rather than `-`, and is never
+derived from the APK path. Omitting it is valid and produces an explicit
+sidecar-specific `not-evaluated` result; the CLI neither probes a sibling path
+nor performs network access.
+`--allow-unsigned` explicitly allows a package proven to be unsigned to satisfy
+trust policy. A malformed pin or repeated `--allow-unsigned` is a usage error.
+Neither option enables network access.
 
 `package validate` emits one `package_validation` object:
 
@@ -137,35 +198,115 @@ an unknown type, an unknown subcommand, a missing subcommand, or more than one
 4. `profile_valid` (bool) reports whether the package additionally satisfied its
    profile with no blocking findings. The two verdicts are independent: a
    readable container can still fail its profile.
-5. `findings` is an array of the shared typed findings, each carrying
+5. `integrity`, `signature_validity`, and `trust` are independent verdicts:
+   `verified`, `invalid`, `not-present`, `not-evaluated`, or `unsupported`.
+   A detected signature container is only `not-evaluated` until its signed
+   bytes and algorithm have actually been checked; structure validity never
+   implies signature validity or issuer trust. JAR and Android APK v1 are
+   checked through their manifest, `.SF`, and bounded embedded CMS chain; the
+   resulting signer-certificate SHA-256 fingerprints are evaluated only
+   against explicit offline certificate pins. Alpine APK v2 RSA/SHA-1,
+   RSA/SHA-256, and RSA/SHA-512 signatures cover the exact compressed control
+   member; `.PKGINFO datahash` covers the exact compressed data member.
+   Android APK v2/v3 RSA-PSS, RSA-PKCS#1, and P-256/P-384
+   ECDSA-with-SHA-256 signatures cover the bounded Signing Block signed-data;
+   their SHA-256/SHA-512 content digests are recomputed as streamed 1 MiB
+   chunks over the APK outside the Signing Block with the required EOCD offset
+   rewrite. For each signer, the AOSP platform-range policy selects the
+   strongest signature at every represented algorithm-introduction SDK and all
+   selected records must verify. Only content-digest kinds requested by those
+   winners are integrity inputs. Standard and fs-verity SHA-256 records may
+   coexist; the latter is recomputed as a bounded 4 KiB salted tree over the
+   specification's virtual APK. Authenticated APK v1 anti-stripping declarations
+   are enforced.
+   Bounded v3 proof-of-rotation verifies every predecessor signature,
+   certificate, flag, and algorithm through the active signer. v3/v3.1
+   targeted signers enforce authenticated SDK ranges, release/development
+   boundaries, lineage extension, and rotation-min-SDK stripping protection.
+   DSA, ECDSA-with-SHA-512/P-521, out-of-backend RSA sizes, and unknown lineage
+   algorithms are explicit `unsupported` verdicts. The record authenticates
+   signer ranges but does not parse binary-manifest SDK declarations or claim
+   installability across an Android SDK range.
+   When `--idsig-file` is present, the bounded v4 verifier checks every
+   sidecar `SigningInfo` signature and certificate/SPKI, binds the primary
+   signer and preferred authenticated digest to verified v3 (or v2), binds a
+   v4.1 additional block to the exact v3.1 signer, and recomputes the
+   SHA-256 fs-verity-compatible Merkle root and optional serialized tree over
+   every raw APK byte. Base-APK rotation evidence remains in the independent
+   `android_apk_rotation` object.
+   For MSIX/APPX, `integrity` verifies the bounded `AppxBlockMap.xml` file set,
+   declared uncompressed/local-header/compressed-block sizes, and SHA-256 over
+   exact streamed 64-KiB uncompressed blocks. `AppxSignature.p7x` presence
+   remains `signature_validity: "not-evaluated"` until its CMS signed bytes are
+   implemented; an unsigned package reports `not-present`. The encrypted/delta
+   2015 and 2017 BlockMap vocabularies report `integrity: "unsupported"`.
+6. `signer_fingerprints_sha256` is an array of lowercase SHA-256 hex strings
+   for certificate DER or canonical Alpine PKCS#1 public-key DER whose
+   signatures were cryptographically verified. An entry identifies a signer
+   but does not imply trust.
+7. `findings` is an array of the shared typed findings, each carrying
    `severity` (`info`/`warning`/`error`, the stable `Severity` label), `code`
    (the stable `PackageFindingCode` identifier such as `missing-debian-binary`
    or `missing-required-member`), `path` (the archive-native member or entry
    name, lossily decoded, or `null`), `path_raw_hex` (the same bytes as hex, or
    `null`), and `detail` (human context). Severity and code are read from the
    finding accessors and are never re-derived by the CLI.
+8. `android_apk_rotation` is `null` unless authenticated v3/v3.1 rotation
+   evidence is present. Its object carries `v3_1_present`, `rotation_min_sdk`,
+   `targets_dev_release`, and ordered `signers` and `lineage` arrays. A signer
+   records its scheme, minimum/maximum SDK, active certificate fingerprint,
+   lineage depth, and development marker. A lineage level records its
+   certificate fingerprint, flags, signed algorithm, and next algorithm in
+   numeric and zero-padded hexadecimal forms. These fields are authenticated
+   evidence, not issuer-trust decisions.
+9. `android_apk_v4` is `null` for non-Android profiles. Android APK reports
+   carry an object with `revision` (`"v4.0"`, `"v4.1"`, or `null`),
+   sidecar-specific `integrity`, `signature_validity`, and `trust`,
+   `signer_fingerprints_sha256`, and `findings`. The nested dimensions remain
+   independent: for example, a correctly signed sidecar whose serialized
+   Merkle tree was altered reports verified signature validity and invalid
+   integrity. Missing optional input uses `revision: null` and
+   `not-evaluated` dimensions with `signature-sidecar-not-provided`; it is not
+   inferred as success.
 
 The record is written before any exit-code error, so a machine consumer always
-observes the findings even when the profile was not satisfied. Exit is 0 when
-`profile_valid` is true, 1 when the container was read but the profile was not
-satisfied or a runtime error occurred, and 2 for a usage failure.
+observes the findings even when validation failed. Exit is 0 when
+`profile_valid` is true and none of the three verification dimensions is
+`invalid`; it is 1 when the profile was not satisfied, an evaluated
+cryptographic dimension is invalid, or a runtime error occurred, and 2 for a
+usage failure. `not-present`, `not-evaluated`, and `unsupported` remain explicit
+non-success verdicts but do not by themselves change the process exit status.
 
-`PACKAGE` may be `-` to read standard input for the `deb` and `rpm` profiles,
-which need only sequential reads. The ZIP-container profiles (`jar`, `nuget`,
-`wheel`, `epub`, `apk`, `ipa`, `msix`) parse a central directory at the end of
+`PACKAGE` may be `-` to read standard input for the `deb`, `rpm`, and
+`alpine-apk` profiles, which need only sequential reads. Alpine APK v2 is
+validated as its logical tar stream across concatenated gzip members and
+requires `.PKGINFO`; signature entries are detected only when they precede
+control and data entries. Verification drains and validates every gzip member,
+retains the exact compressed signature/control members under the metadata
+budget, and hashes the compressed data member without retaining it. The
+ZIP-container profiles (`jar`, `nuget`, `wheel`,
+`epub`, `android-apk`, `ipa`, `msix`) parse a central directory at the end of
 the file and therefore require a seekable file; `-` is a usage error (exit 2)
 for them.
 
+## Completion and manual output
+
+`oxarchive completion <bash|zsh|fish|powershell>` writes a shell completion
+script, including the two password-source options, to standard output.
+`oxarchive man` writes the roff manual source.
+Neither form accepts `--json`, because its standard output is the requested
+artifact rather than a JSON record.
+
 ## Standard streams and unsafe paths
 
-- `inspect`, `plan`, `apply`, and `verify` accept archive input `-`.
+- `list`, `extract`, `inspect`, `plan`, `apply`, and `verify` accept archive
+  input `-`; `--password-prompt` cannot be used in that form.
 - `oci inspect` and `oci verify` accept layer input `-`; `oci apply` requires a
   seekable file and rejects `-`.
-- `package validate` accepts `PACKAGE` `-` for the `deb` and `rpm` profiles; the
-  ZIP-container profiles require a seekable file and reject `-`.
+- `package validate` accepts `PACKAGE` `-` for the `deb`, `rpm`, and
+  `alpine-apk` profiles; the ZIP-container profiles require a seekable file and
+  reject `-`.
 - `create` accepts archive output `-`; inputs are filesystem paths.
-- `oxtar`, `oxcpio`, and `oxcat` retain their documented stdin/stdout
-  compatibility forms.
 - Extraction traversal, absolute, drive/UNC, link-order, and destination
   policy failures remain visible and return exit 1.
 - Creation rejects parent-directory archive names and derives relative names

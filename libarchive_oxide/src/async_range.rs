@@ -13,7 +13,10 @@ use std::io;
 use libarchive_oxide_core::{ArchiveMetadata, EntryMetadata, FormatId, Limits};
 
 use crate::async_seek::{DemandReader, is_demand};
-use crate::range_source::{RangeMetrics, RangeReadError, SourceIdentity, range_error};
+use crate::range_source::{
+    RangeMetrics, RangeReadError, RangeReadErrorKind, SourceIdentity, SourceLimits, range_error,
+    usize_to_u64, validate_source_length,
+};
 use crate::{ReaderEvent, SecretBytes, SeekArchiveReader, StreamError};
 
 const BUFFER: usize = 64 * 1024;
@@ -58,49 +61,60 @@ impl<S: AsyncRangeSource> AsyncRangeArchiveReader<S> {
     }
 
     /// Opens a range-backed archive with explicit limits.
-    pub async fn with_limits(mut source: S, limits: Limits) -> Result<Self, StreamError> {
-        let identity = source.identity().clone();
-        let length = source.len();
-        let demand = DemandReader::new(length, limits);
-        let mut metrics = RangeMetrics::default();
-        let reader = loop {
-            match SeekArchiveReader::with_limits(demand.clone(), limits) {
-                Ok(reader) => break reader,
-                Err(error) if is_demand(&error) => {
-                    fulfill(&mut source, &demand, &identity, length, &mut metrics).await?;
-                },
-                Err(error) => return Err(error),
-            }
-        };
-        demand.clear_cache()?;
-        validate_source(&source, &identity, length)?;
-        Ok(Self {
-            source,
-            reader,
-            demand,
-            identity,
-            length,
-            metrics,
-            event_data: Vec::with_capacity(BUFFER),
-        })
+    pub async fn with_limits(source: S, limits: Limits) -> Result<Self, StreamError> {
+        Self::with_source_limits(source, limits, SourceLimits::default()).await
+    }
+
+    /// Opens a range-backed archive with explicit parser and source limits.
+    pub async fn with_source_limits(
+        source: S,
+        limits: Limits,
+        source_limits: SourceLimits,
+    ) -> Result<Self, StreamError> {
+        Self::open(source, limits, source_limits, None).await
     }
 
     /// Opens an encrypted archive with explicit limits and password.
     pub async fn with_limits_and_password(
-        mut source: S,
+        source: S,
         limits: Limits,
         password: SecretBytes,
     ) -> Result<Self, StreamError> {
+        Self::with_source_limits_and_password(source, limits, SourceLimits::default(), password)
+            .await
+    }
+
+    /// Opens an encrypted archive with explicit parser and source limits.
+    pub async fn with_source_limits_and_password(
+        source: S,
+        limits: Limits,
+        source_limits: SourceLimits,
+        password: SecretBytes,
+    ) -> Result<Self, StreamError> {
+        Self::open(source, limits, source_limits, Some(password)).await
+    }
+
+    async fn open(
+        mut source: S,
+        limits: Limits,
+        source_limits: SourceLimits,
+        password: Option<SecretBytes>,
+    ) -> Result<Self, StreamError> {
         let identity = source.identity().clone();
         let length = source.len();
+        validate_source_length(length, source_limits, None).map_err(StreamError::io)?;
         let demand = DemandReader::new(length, limits);
         let mut metrics = RangeMetrics::default();
         let reader = loop {
-            match SeekArchiveReader::with_limits_and_password(
-                demand.clone(),
-                limits,
-                password.clone(),
-            ) {
+            let opened = match &password {
+                Some(password) => SeekArchiveReader::with_limits_and_password(
+                    demand.clone(),
+                    limits,
+                    password.clone(),
+                ),
+                None => SeekArchiveReader::with_limits(demand.clone(), limits),
+            };
+            match opened {
                 Ok(reader) => break reader,
                 Err(error) if is_demand(&error) => {
                     fulfill(&mut source, &demand, &identity, length, &mut metrics).await?;
@@ -229,12 +243,14 @@ fn validate_source<S: AsyncRangeSource>(
     length: u64,
 ) -> Result<(), StreamError> {
     if source.identity() != identity {
-        return Err(StreamError::io(range_error(
-            RangeReadError::IdentityChanged,
-        )));
+        return Err(StreamError::io(range_error(RangeReadError::new(
+            RangeReadErrorKind::IdentityChanged,
+        ))));
     }
     if source.len() != length {
-        return Err(StreamError::io(range_error(RangeReadError::LengthChanged)));
+        return Err(StreamError::io(range_error(RangeReadError::new(
+            RangeReadErrorKind::LengthChanged,
+        ))));
     }
     Ok(())
 }
@@ -248,22 +264,28 @@ async fn fulfill<S: AsyncRangeSource>(
 ) -> Result<(), StreamError> {
     let (offset, fetch_length) = demand.take_fetch_request()?;
     validate_source(source, identity, length)?;
-    let end = offset
-        .checked_add(fetch_length as u64)
-        .ok_or_else(|| StreamError::io(range_error(RangeReadError::OffsetOverflow)))?;
+    let fetch_length_u64 = usize_to_u64(fetch_length).map_err(StreamError::io)?;
+    let end = offset.checked_add(fetch_length_u64).ok_or_else(|| {
+        StreamError::io(range_error(RangeReadError::new(
+            RangeReadErrorKind::OffsetOverflow,
+        )))
+    })?;
     if end > length {
-        return Err(StreamError::io(range_error(
-            RangeReadError::OffsetOutOfBounds,
-        )));
+        return Err(StreamError::io(range_error(RangeReadError::new(
+            RangeReadErrorKind::OffsetOutOfBounds,
+        ))));
     }
 
     let mut bytes = vec![0; fetch_length];
     let mut filled = 0;
     while filled != fetch_length {
+        let filled_u64 = usize_to_u64(filled).map_err(StreamError::io)?;
         validate_source(source, identity, length)?;
-        let request_offset = offset
-            .checked_add(filled as u64)
-            .ok_or_else(|| StreamError::io(range_error(RangeReadError::OffsetOverflow)))?;
+        let request_offset = offset.checked_add(filled_u64).ok_or_else(|| {
+            StreamError::io(range_error(RangeReadError::new(
+                RangeReadErrorKind::OffsetOverflow,
+            )))
+        })?;
         metrics
             .record_request()
             .map_err(|error| StreamError::io(range_error(error)))?;
@@ -272,18 +294,22 @@ async fn fulfill<S: AsyncRangeSource>(
             .await
         {
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(StreamError::io(range_error(RangeReadError::ShortRead)));
+                return Err(StreamError::io(range_error(RangeReadError::new(
+                    RangeReadErrorKind::ShortRead,
+                ))));
             },
             Err(error) => return Err(StreamError::io(error)),
             Ok(read) => read,
         };
         if read > fetch_length - filled {
-            return Err(StreamError::io(range_error(
-                RangeReadError::InvalidReadCount,
-            )));
+            return Err(StreamError::io(range_error(RangeReadError::new(
+                RangeReadErrorKind::InvalidReadCount,
+            ))));
         }
         if read == 0 {
-            return Err(StreamError::io(range_error(RangeReadError::NoProgress)));
+            return Err(StreamError::io(range_error(RangeReadError::new(
+                RangeReadErrorKind::NoProgress,
+            ))));
         }
         metrics
             .record_bytes(read)

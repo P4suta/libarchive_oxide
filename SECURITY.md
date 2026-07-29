@@ -35,19 +35,24 @@ compatibility.
 - all project-owned published crates use `#![forbid(unsafe_code)]`;
 - `libarchive_oxide-core` is zero-dependency safe Rust; the default
   `portable-codecs` normal/build graph excludes codec C/FFI packages, while
-  `native-codecs` is an explicit mutually exclusive profile. Both run the same
-  bounded conformance, malformed, and fuzz corpus;
+  additive `native-codecs` explicitly enables system backends. Portable,
+  native, and combined builds run the same bounded conformance, malformed, and
+  fuzz corpus;
 - every decoder, encoder, filter pipeline, spool, and extractor receives
   finite-by-default resource limits;
-- session apply keeps path normalization, limits, link order, and policy in a
-  shared driver, then passes only relative normalized operations to a
-  compile-time filesystem adapter;
-- the built-in `cap-std` adapter commits regular files atomically from a
-  `create_new` sibling, reopens parents/directories without following links,
-  and leaves the destination unpublished on commit failure;
-- safe extraction rejects traversal, pre-existing destinations, links, and
-  special files; applied, unsupported, refused, partial, and OS-error
-  filesystem outcomes remain typed in `ApplyReport`;
+- session planning validates every destination before apply starts; the shared
+  driver binds replayed entries to that plan and passes only relative normalized
+  operations to a compile-time filesystem adapter. Windows additionally rejects
+  trailing-dot/space, reserved-device, ADS, case, and Unicode-normalization
+  aliases while Unix retains byte-exact case-sensitive identity;
+- the built-in `cap-std` adapter resolves every parent one component at a time
+  without following links, then creates and atomically commits relative to that
+  stable directory capability; replacing an ancestor after preparation cannot
+  redirect a write, and commit failure leaves the destination unpublished;
+- safe extraction rejects traversal, duplicate destination identities,
+  pre-existing destinations, links, and special files; applied, unsupported,
+  refused, partial, and OS-error filesystem outcomes remain typed in
+  `ApplyReport`;
 - `oxarchive create` rejects unsafe derived archive names and stages file
   output in a unique sibling; input or writer failure removes the sibling and
   existing destinations are never replaced;

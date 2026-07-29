@@ -23,3 +23,94 @@ path = ["fuzz/corpus/**", "**/tests/fixtures/**"]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 libarchive_oxide contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = [
+  "libarchive_oxide-package/tests/fixtures/nuget_signed/nuget.common.6.0.0.nupkg",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "Microsoft Corporation and NuGet contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [
+  "fuzz/corpus/read_cab/lzx_libmspack.hex",
+  "fuzz/corpus/read_cab/quantum_libmspack_history.hex",
+  "libarchive_oxide/tests/fixtures/cab/libmspack/cve-2010-2801-qtm-flush.hex",
+  "libarchive_oxide/tests/fixtures/cab/libmspack/mszip_lzx_qtm.hex",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "Stuart Caie and libmspack contributors"
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+
+[[annotations]]
+path = [
+  "libarchive_oxide-package/tests/fixtures/alpine_apk_v2/alpine-keys-2.5-r0.apk",
+  "libarchive_oxide-package/tests/fixtures/alpine_apk_v2/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub",
+  "libarchive_oxide-package/tests/fixtures/alpine_apk_v2/wrong-alpine-devel-61666e3f.rsa.pub",
+  "fuzz/corpus/package_alpine/alpine-keys-2.5-r0.apk",
+  "libarchive_oxide-cli/tests/fixtures/package/alpine-keys-2.5-r0.apk",
+  "libarchive_oxide-cli/tests/fixtures/package/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "Alpine Linux contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = [
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/golden-aligned-v2-out.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/golden-aligned-v3-out.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/golden-rsa-verity-out.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v1v2v3-with-rsa-2048-lineage-3-signers.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v2-only-apk-sig-block-size-mismatch.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v2-only-signatures-and-digests-block-mismatch.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v2-only-with-ecdsa-sha256-p256.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v2-only-with-ecdsa-sha256-p521.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v2-only-with-rsa-pkcs1-sha256-1024.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v2-only-with-rsa-pkcs1-sha256-16384.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v1-only-two-signers.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v1-only-with-signed-attrs-signerInfo1-good-signerInfo2-good.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v1-only-with-signed-attrs-signerInfo1-wrong-signature-signerInfo2-good.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v2-stripped.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v2-stripped-with-ignorable-signing-schemes.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-rsa-2048_2-tgt-33-1-tgt-28.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v3-rsa-2048_2-tgt-dev-release.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-rsa-2048_2-tgt-10000-dev-release.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-rsa-2048_2-tgt-34-1-tgt-28.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v1v2v3-with-rsa-2048-lineage-3-signers-invalid-lineage-attr.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-2elem-incorrect-lineage.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-2elem-lineage-incorrect-digest.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-block-stripped-v3-attr-value-33.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-tgt-33-no-v3-attr.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-tgt-33-no-v3-block.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v2_v3/v31-tgt-34-v3-attr-value-33.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v4/v4-digest-v2v3.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v4/v4-digest-v2v3.apk.idsig",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v4/v31-rsa-2048_2-tgt-10000-dev-release.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v4/v31-rsa-2048_2-tgt-10000-dev-release.apk.idsig",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v4/v41-digest-mismatched-with-v31.apk",
+  "libarchive_oxide-package/tests/fixtures/android_apk_v4/v41-digest-mismatched-with-v31.apk.idsig",
+  "fuzz/corpus/package_app/aosp-v2-rsa.apk",
+  "fuzz/corpus/package_app/aosp-v3-rsa.apk",
+  "fuzz/corpus/package_app/aosp-v31-rotation.apk",
+  "fuzz/corpus/package_app/aosp-v31-wrong-lineage.apk",
+  "libarchive_oxide-cli/tests/fixtures/package/android-apk-v2-aosp.apk",
+  "libarchive_oxide-cli/tests/fixtures/package/android-apk-v31-rotation-aosp.apk",
+  "libarchive_oxide-cli/tests/fixtures/package/android-apk-standard-verity-aosp.apk",
+  "libarchive_oxide-cli/tests/fixtures/package/android-apk-v4-cts.apk",
+  "libarchive_oxide-cli/tests/fixtures/package/android-apk-v4-cts.apk.idsig",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Android Open Source Project"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [
+  "libarchive_oxide-package/tests/fixtures/msix_blockmap/TestWindows.msix",
+  "libarchive_oxide-package/tests/fixtures/msix_blockmap/SignedUntrustedCert.appx",
+  "fuzz/corpus/package_app/microsoft-test-windows.msix",
+  "libarchive_oxide-cli/tests/fixtures/package/msix-blockmap-microsoft.msix",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "Microsoft Corporation"
+SPDX-License-Identifier = "MIT"

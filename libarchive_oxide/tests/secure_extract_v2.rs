@@ -11,9 +11,20 @@ use std::io::Cursor;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use libarchive_oxide::{
-    ArchiveReader, ArchiveWriter, EntryOutcomeKind, ExtractionPolicy, Extractor, RejectionReason,
+    ArchiveEngine, ArchiveWriter, EntryOutcomeKind, ExtractionReport, Policy, RejectionReason,
 };
 use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, ErrorKind, Limits};
+
+fn apply(archive: Vec<u8>, root: Dir, policy: Policy) -> ExtractionReport {
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(archive))
+        .expect("prepare immutable archive");
+    let plan = session.plan(policy).expect("preflight archive");
+    session
+        .apply(plan, root)
+        .expect("apply preflighted archive")
+        .into_extraction()
+}
 
 fn fixture() -> Vec<u8> {
     let mut writer = ArchiveWriter::new(Vec::new());
@@ -79,14 +90,31 @@ fn thin_ar_fixture() -> Vec<u8> {
     archive
 }
 
+#[cfg(windows)]
+fn windows_alias_fixture() -> Vec<u8> {
+    let mut writer = ArchiveWriter::new(Vec::new());
+    for (path, body) in [
+        ("streamed.txt", b"first".as_slice()),
+        ("STREAMED.TXT", b"alias".as_slice()),
+        ("caf\u{00e9}.txt", b"nfc".as_slice()),
+        ("cafe\u{0301}.txt", b"nfd".as_slice()),
+    ] {
+        let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8(path))
+            .size(Some(body.len() as u64))
+            .build();
+        writer.start_entry(&metadata).unwrap();
+        writer.write_data(body).unwrap();
+        writer.end_entry().unwrap();
+    }
+    writer.finish().unwrap()
+}
+
 #[test]
 fn safe_policy_rejects_absolute_and_existing_destinations() {
     let destination = tempfile::tempdir().unwrap();
     fs::write(destination.path().join("existing.txt"), b"original").unwrap();
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
-    let mut extractor = Extractor::with_policy(root, ExtractionPolicy::safe());
-    let mut reader = ArchiveReader::new(Cursor::new(fixture()));
-    let report = extractor.extract(&mut reader).unwrap();
+    let report = apply(fixture(), root, Policy::safe());
 
     assert_eq!(
         fs::read(destination.path().join("safe.txt")).unwrap(),
@@ -108,23 +136,55 @@ fn safe_policy_rejects_absolute_and_existing_destinations() {
     )));
 }
 
+#[cfg(windows)]
 #[test]
-fn extractor_enforces_its_own_entry_and_path_limits() {
+fn planned_extraction_never_dispatches_a_second_windows_alias() {
     let destination = tempfile::tempdir().unwrap();
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
+    let report = apply(windows_alias_fixture(), root, Policy::safe());
+
+    assert_eq!(
+        fs::read(destination.path().join("streamed.txt")).unwrap(),
+        b"first"
+    );
+    assert_eq!(
+        fs::read(destination.path().join("caf\u{00e9}.txt")).unwrap(),
+        b"nfc"
+    );
+    for index in [1, 3] {
+        assert!(matches!(
+            report.outcomes()[index].outcome(),
+            EntryOutcomeKind::Rejected(RejectionReason::DestinationCollision)
+        ));
+    }
+    assert!(fs::read_dir(destination.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".libarchive-oxide-")
+    }));
+}
+
+#[test]
+fn planning_enforces_entry_and_path_limits_before_filesystem_application() {
+    let destination = tempfile::tempdir().unwrap();
     let limits = Limits::default().with_entries(Some(0));
-    let mut extractor = Extractor::with_limits(root, limits);
-    let mut reader = ArchiveReader::new(Cursor::new(fixture()));
-    let error = extractor.extract(&mut reader).unwrap_err();
+    let error = ArchiveEngine::new()
+        .with_limits(limits)
+        .prepare(Cursor::new(fixture()))
+        .and_then(|mut session| session.plan(Policy::safe()).map(drop))
+        .unwrap_err();
     assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
     assert!(!destination.path().join("safe.txt").exists());
 
     let destination = tempfile::tempdir().unwrap();
-    let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
     let limits = Limits::default().with_path_bytes(Some(4));
-    let mut extractor = Extractor::with_limits(root, limits);
-    let mut reader = ArchiveReader::new(Cursor::new(fixture()));
-    let error = extractor.extract(&mut reader).unwrap_err();
+    let error = ArchiveEngine::new()
+        .with_limits(limits)
+        .prepare(Cursor::new(fixture()))
+        .and_then(|mut session| session.plan(Policy::safe()).map(drop))
+        .unwrap_err();
     assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
     assert!(!destination.path().join("safe.txt").exists());
 }
@@ -135,9 +195,13 @@ fn interrupted_archive_never_commits_partial_file() {
     archive.truncate(600);
     let destination = tempfile::tempdir().unwrap();
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
-    let mut extractor = Extractor::new(root);
-    let mut reader = ArchiveReader::new(Cursor::new(archive));
-    assert!(extractor.extract(&mut reader).is_err());
+    let result = ArchiveEngine::new()
+        .prepare(Cursor::new(archive))
+        .and_then(|mut session| {
+            let plan = session.plan(Policy::safe())?;
+            session.apply(plan, root).map(drop)
+        });
+    assert!(result.is_err());
     assert!(!destination.path().join("safe.txt").exists());
     assert!(
         fs::read_dir(destination.path()).unwrap().all(|item| !item
@@ -153,10 +217,8 @@ fn restore_overwrite_atomically_replaces_only_regular_files() {
     let destination = tempfile::tempdir().unwrap();
     fs::write(destination.path().join("existing.txt"), b"original").unwrap();
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
-    let policy = ExtractionPolicy::restore().allow_overwrite(true);
-    let mut extractor = Extractor::with_policy(root, policy);
-    let mut reader = ArchiveReader::new(Cursor::new(fixture()));
-    let report = extractor.extract(&mut reader).unwrap();
+    let policy = Policy::restore().allow_overwrite(true);
+    let report = apply(fixture(), root, policy);
 
     assert_eq!(
         fs::read(destination.path().join("existing.txt")).unwrap(),
@@ -172,10 +234,8 @@ fn restore_overwrite_atomically_replaces_only_regular_files() {
 fn restore_hardlinks_only_target_files_committed_earlier_in_the_session() {
     let destination = tempfile::tempdir().unwrap();
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
-    let policy = ExtractionPolicy::restore().allow_hardlinks(true);
-    let mut extractor = Extractor::with_policy(root, policy);
-    let mut reader = ArchiveReader::new(Cursor::new(link_fixture(false)));
-    let report = extractor.extract(&mut reader).unwrap();
+    let policy = Policy::restore().allow_hardlinks(true);
+    let report = apply(link_fixture(false), root, policy);
 
     assert_eq!(
         fs::read(destination.path().join("hard.txt")).unwrap(),
@@ -188,9 +248,7 @@ fn restore_hardlinks_only_target_files_committed_earlier_in_the_session() {
 
     let destination = tempfile::tempdir().unwrap();
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
-    let mut extractor = Extractor::with_policy(root, policy);
-    let mut reader = ArchiveReader::new(Cursor::new(link_fixture(true)));
-    let report = extractor.extract(&mut reader).unwrap();
+    let report = apply(link_fixture(true), root, policy);
     assert!(!destination.path().join("hard.txt").exists());
     assert!(matches!(
         report.outcomes()[0].outcome(),
@@ -202,9 +260,7 @@ fn restore_hardlinks_only_target_files_committed_earlier_in_the_session() {
 fn thin_ar_external_references_are_never_materialized() {
     let destination = tempfile::tempdir().unwrap();
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
-    let mut extractor = Extractor::new(root);
-    let mut reader = ArchiveReader::new(Cursor::new(thin_ar_fixture()));
-    let report = extractor.extract(&mut reader).unwrap();
+    let report = apply(thin_ar_fixture(), root, Policy::safe());
     assert!(!destination.path().join("external.o").exists());
     assert!(matches!(
         report.outcomes()[0].outcome(),
@@ -230,10 +286,8 @@ fn restore_symlink_requires_explicit_capability_and_safe_relative_target() {
     let destination = tempfile::tempdir().unwrap();
     fs::write(destination.path().join("target.txt"), b"payload").unwrap();
     let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).unwrap();
-    let policy = ExtractionPolicy::restore().allow_symlinks(true);
-    let mut extractor = Extractor::with_policy(root, policy);
-    let mut reader = ArchiveReader::new(Cursor::new(archive));
-    let report = extractor.extract(&mut reader).unwrap();
+    let policy = Policy::restore().allow_symlinks(true);
+    let report = apply(archive, root, policy);
 
     assert_eq!(
         fs::read_link(destination.path().join("link.txt")).unwrap(),

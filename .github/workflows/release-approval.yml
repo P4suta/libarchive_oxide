@@ -5,8 +5,9 @@
 # out or executes pull-request code, so a release PR cannot weaken its own gate.
 name: release approval
 
-on:
+on: # zizmor: ignore[dangerous-triggers] trusted base workflow; no PR checkout, actions, writes, or untrusted shell interpolation
   pull_request_target:
+    branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
@@ -16,6 +17,7 @@ permissions:
 jobs:
   release-approved:
     name: release-approved label
+    if: github.repository == 'P4suta/libarchive_oxide'
     runs-on: ubuntu-latest
     steps:
       - name: Allow ordinary pull requests

@@ -2,18 +2,19 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Lists a seek-format archive through the `RangeSource` contract.
+//! Lists a seek-format archive through the object-safe `ReadAt` contract.
 
 use std::io;
 
-use libarchive_oxide::{RangeArchiveReader, RangeSource, ReaderEvent, SourceIdentity};
+use libarchive_oxide::ReaderEvent;
+use libarchive_oxide::advanced::{RangeArchiveReader, ReadAt, SourceIdentity};
 
 struct MemoryRange {
     bytes: Vec<u8>,
     identity: SourceIdentity,
 }
 
-impl RangeSource for MemoryRange {
+impl ReadAt for MemoryRange {
     fn len(&self) -> u64 {
         self.bytes.len() as u64
     }
@@ -22,7 +23,7 @@ impl RangeSource for MemoryRange {
         &self.identity
     }
 
-    fn read_range(&mut self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
         let start = usize::try_from(offset)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds usize"))?;
         let available = self
@@ -41,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: range_source ARCHIVE")?;
     let source = MemoryRange {
         bytes: std::fs::read(path)?,
-        identity: SourceIdentity::new(b"in-memory-example-v1".to_vec()),
+        identity: SourceIdentity::try_new(b"in-memory-example-v1".to_vec())?,
     };
     let mut archive = RangeArchiveReader::new(source)?;
     loop {

@@ -7,8 +7,8 @@
 //! XAR is a read-only, seek-native format in arca (no writer), so the interop
 //! evidence is producer-driven: a first-party, deterministic RAW XAR byte builder
 //! (`raw_xar`) emits a valid archive with a big-endian header, a zlib-compressed
-//! TOC, and a heap carrying both STORED (`application/octet-stream`) and zlib
-//! (`application/x-gzip`) blobs. arca reads it back through the RM-301 harness
+//! TOC, and a heap carrying STORED (`application/octet-stream`), zlib
+//! (`application/x-gzip`), and feature-gated bzip2 blobs. arca reads it back through the RM-301 harness
 //! (`read_with_arca`) and every (path, kind, content) must equal the canonical
 //! shapes DERIVED from the shared logical corpus.
 //!
@@ -26,6 +26,8 @@
 use std::io::{Cursor, Write};
 
 use libarchive_oxide::SeekArchiveReader;
+#[cfg(feature = "bzip2")]
+use libarchive_oxide_core::Limits;
 use libarchive_oxide_core::{EntryKind, ErrorKind};
 
 mod common;
@@ -65,6 +67,13 @@ fn zlib_compress(data: &[u8]) -> Vec<u8> {
     let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     e.write_all(data).unwrap();
     e.finish().unwrap()
+}
+
+#[cfg(feature = "bzip2")]
+fn bzip2_compress(data: &[u8]) -> Vec<u8> {
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
 }
 
 struct XmlBuilder {
@@ -155,15 +164,16 @@ fn raw_xar(entries: &[LogicalEntry]) -> Vec<u8> {
                 // Top-level directory carrying its nested children.
                 b.open_file(name, "directory");
                 for child in entries {
+                    if child.kind != EntryKind::File {
+                        continue;
+                    }
                     if let Some(base) = child_of(&child.path, &e.path) {
-                        if child.kind == EntryKind::File {
-                            let enc = if child.content.len() > 32 {
-                                Enc::Gzip
-                            } else {
-                                Enc::Stored
-                            };
-                            b.add_regular(base, &child.content, enc);
-                        }
+                        let enc = if child.content.len() > 32 {
+                            Enc::Gzip
+                        } else {
+                            Enc::Stored
+                        };
+                        b.add_regular(base, &child.content, enc);
                     }
                 }
                 b.close_file();
@@ -191,6 +201,29 @@ fn raw_xar(entries: &[LogicalEntry]) -> Vec<u8> {
     }
     b.push("</toc></xar>");
     assemble(&b.xml, &b.heap)
+}
+
+#[cfg(feature = "bzip2")]
+fn bzip2_xar_with_length(content: &[u8], declared_length: usize, corrupt: bool) -> Vec<u8> {
+    let mut heap = bzip2_compress(content);
+    if corrupt {
+        let last = heap.len() - 1;
+        heap[last] ^= 0x40;
+    }
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><xar><toc>\
+         <file id=\"1\"><name>bzip2.txt</name><type>file</type>\
+         <data><length>{declared_length}</length><offset>0</offset><size>{}</size>\
+         <encoding style=\"application/x-bzip2\"/></data></file>\
+         </toc></xar>",
+        heap.len()
+    );
+    assemble(xml.as_bytes(), &heap)
+}
+
+#[cfg(feature = "bzip2")]
+fn bzip2_xar(content: &[u8], corrupt: bool) -> Vec<u8> {
+    bzip2_xar_with_length(content, content.len(), corrupt)
 }
 
 /// If `path` is a direct child of `dir` (one component deeper), returns its
@@ -243,12 +276,50 @@ fn xar_payload_bytes_exact() {
     assert_eq!(find(b"sub/nested.txt").content(), b"nested payload\n");
 }
 
+#[cfg(feature = "bzip2")]
+#[test]
+fn xar_bzip2_streams_and_enforces_integrity_and_memory_limits() {
+    let content = b"xar bzip2 payload\n".repeat(20_000);
+    let archive = bzip2_xar(&content, false);
+    let shapes = read_with_arca(&archive);
+    assert_eq!(shapes.len(), 1);
+    assert_eq!(shapes[0].content(), content);
+
+    let corrupted = bzip2_xar(&content, true);
+    let error = read_all(&corrupted).expect_err("corrupted bzip2 must fail");
+    assert_eq!(error.kind(), ErrorKind::Integrity);
+    assert_eq!(error.format(), Some("xar"));
+
+    let limits = Limits::safe().with_codec_memory(Some(1));
+    let mut reader =
+        SeekArchiveReader::with_limits(Cursor::new(archive), limits).expect("open XAR index");
+    let error = loop {
+        match reader.next_event() {
+            Ok(libarchive_oxide::ReaderEvent::Done) => {
+                panic!("memory-limited bzip2 unexpectedly completed")
+            },
+            Ok(_) => {},
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.kind(), ErrorKind::Limit);
+    assert_eq!(error.format(), Some("xar"));
+
+    let empty = read_with_arca(&bzip2_xar(b"", false));
+    assert_eq!(empty.len(), 1);
+    assert!(empty[0].content().is_empty());
+
+    let short_length = bzip2_xar_with_length(&content, content.len() - 1, false);
+    let error = read_all(&short_length).expect_err("declared decoded length must be exact");
+    assert_eq!(error.kind(), ErrorKind::Integrity);
+}
+
 // ---------------------------------------------------------------------------
 // Negative: unsupported encoding -> structured Unsupported (direct reader).
 // ---------------------------------------------------------------------------
 
 /// Drives `SeekArchiveReader` to completion, returning the first error (if any).
-fn read_all(bytes: &[u8]) -> Result<usize, libarchive_oxide::StreamError> {
+fn read_all(bytes: &[u8]) -> Result<usize, libarchive_oxide::Error> {
     let mut reader = SeekArchiveReader::new(Cursor::new(bytes.to_vec()))?;
     let mut entries = 0usize;
     loop {

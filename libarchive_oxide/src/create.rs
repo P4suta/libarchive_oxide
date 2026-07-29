@@ -4,6 +4,7 @@
 
 //! Bounded filesystem-to-archive streaming.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -13,13 +14,26 @@ use std::path::{Component, Path};
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
     ArchiveError, ArchivePath, EntryKind, EntryMetadata, EntryTimes, ErrorKind, FormatId, Limits,
-    Owner, PathEncoding, Timestamp,
+    Owner, Timestamp,
 };
 
+#[cfg(feature = "aes")]
+use crate::SecretBytes;
 use crate::path::sanitize_archive_path;
 use crate::{ArchiveEngine, ArchiveWriter, CreateOptions, StreamError};
 
 const COPY_BUFFER: usize = 64 * 1024;
+
+/// Metadata policy used while walking a filesystem tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CreationMetadataProfile {
+    /// Preserve portable mode, numeric ownership, and modification time.
+    #[default]
+    Filesystem,
+    /// Emit deterministic portable modes and omit host ownership/timestamps.
+    Reproducible,
+}
 
 /// Error from a filesystem-to-archive streaming operation.
 #[derive(Debug)]
@@ -78,6 +92,8 @@ pub struct StreamingArchiveBuilder<W: Write> {
     writer: ArchiveWriter<W>,
     copy_buffer: Vec<u8>,
     limits: Limits,
+    metadata_profile: CreationMetadataProfile,
+    seen_names: BTreeSet<Vec<u8>>,
 }
 
 impl<W: Write> fmt::Debug for StreamingArchiveBuilder<W> {
@@ -119,7 +135,39 @@ impl<W: Write> StreamingArchiveBuilder<W> {
             writer,
             copy_buffer: vec![0; COPY_BUFFER],
             limits,
+            metadata_profile: CreationMetadataProfile::Filesystem,
+            seen_names: BTreeSet::new(),
         })
+    }
+
+    /// Creates a bounded filesystem builder for a password-protected ZIP.
+    ///
+    /// The password remains in the underlying writer's zeroizing storage.
+    /// [`ArchiveEngine::create_with_password`] rejects non-ZIP formats and
+    /// outer filters before any archive bytes are written.
+    #[cfg(feature = "aes")]
+    pub fn with_engine_and_password(
+        engine: ArchiveEngine,
+        output: W,
+        options: CreateOptions,
+        password: SecretBytes,
+    ) -> Result<Self, CreateStreamError> {
+        let limits = options.limits().unwrap_or(engine.limits());
+        let writer = engine.create_with_password(output, options, password)?;
+        Ok(Self {
+            writer,
+            copy_buffer: vec![0; COPY_BUFFER],
+            limits,
+            metadata_profile: CreationMetadataProfile::Filesystem,
+            seen_names: BTreeSet::new(),
+        })
+    }
+
+    /// Selects how filesystem metadata is represented in generated entries.
+    #[must_use]
+    pub const fn with_metadata_profile(mut self, profile: CreationMetadataProfile) -> Self {
+        self.metadata_profile = profile;
+        self
     }
 
     /// Recursively appends a filesystem path using the supplied archive name.
@@ -156,6 +204,14 @@ impl<W: Write> StreamingArchiveBuilder<W> {
     ) -> Result<(), CreateStreamError> {
         validate_archive_name(archive_name, self.limits)?;
         let metadata = fs::symlink_metadata(filesystem_path)?;
+        let duplicate_key = duplicate_key(archive_name);
+        if !self.seen_names.insert(duplicate_key) {
+            return Err(CreateStreamError::Contract(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_entry(0, archive_name)
+                    .with_context("duplicate archive path during filesystem creation"),
+            ));
+        }
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             let target = fs::read_link(filesystem_path)?;
@@ -169,7 +225,8 @@ impl<W: Write> StreamingArchiveBuilder<W> {
                 body.len() as u64,
                 &metadata,
                 Some(&target),
-            );
+                self.metadata_profile,
+            )?;
             self.writer.start_entry(&entry)?;
             self.writer.write_data(body)?;
             self.writer.end_entry()?;
@@ -180,12 +237,25 @@ impl<W: Write> StreamingArchiveBuilder<W> {
             if !directory_name.ends_with(b"/") {
                 directory_name.push(b'/');
             }
-            let entry = metadata_for(EntryKind::Dir, &directory_name, 0, &metadata, None);
+            let entry = metadata_for(
+                EntryKind::Dir,
+                &directory_name,
+                0,
+                &metadata,
+                None,
+                self.metadata_profile,
+            )?;
             self.writer.start_entry(&entry)?;
             self.writer.end_entry()?;
-            for child in fs::read_dir(filesystem_path)? {
-                let child = child?;
-                let component = os_bytes_checked(&child.file_name())?;
+            let mut children = fs::read_dir(filesystem_path)?
+                .map(|child| {
+                    let child = child?;
+                    let component = os_bytes_checked(&child.file_name())?;
+                    Ok((component, child))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            children.sort_by(|left, right| left.0.cmp(&right.0));
+            for (component, child) in children {
                 let mut child_name = archive_name.to_vec();
                 if !child_name.ends_with(b"/") {
                     child_name.push(b'/');
@@ -202,7 +272,8 @@ impl<W: Write> StreamingArchiveBuilder<W> {
                 metadata.len(),
                 &metadata,
                 None,
-            );
+                self.metadata_profile,
+            )?;
             self.writer.start_entry(&entry)?;
             let mut input = fs::File::open(filesystem_path)?;
             loop {
@@ -229,21 +300,38 @@ fn metadata_for(
     size: u64,
     metadata: &fs::Metadata,
     link_target: Option<&[u8]>,
-) -> EntryMetadata {
-    let (mode, owner, modified) = platform_metadata(metadata);
-    EntryMetadata::builder(
-        kind,
-        ArchivePath::from_encoded(path.to_vec(), PathEncoding::Bytes),
-    )
-    .size(Some(size))
-    .mode(Some(mode))
-    .owner(owner)
-    .times(EntryTimes {
-        modified,
-        ..EntryTimes::default()
-    })
-    .link_target(link_target.map(|target| ArchivePath::from_bytes(target.to_vec())))
-    .build()
+    profile: CreationMetadataProfile,
+) -> Result<EntryMetadata, ArchiveError> {
+    let (mode, owner, modified) = match profile {
+        CreationMetadataProfile::Filesystem => platform_metadata(metadata),
+        CreationMetadataProfile::Reproducible => (
+            match kind {
+                EntryKind::Dir => 0o755,
+                EntryKind::Symlink => 0o777,
+                _ => 0o644,
+            },
+            Owner::default(),
+            None,
+        ),
+    };
+    EntryMetadata::builder(kind, ArchivePath::from_bytes(path.to_vec()))
+        .size(Some(size))
+        .mode(Some(mode))
+        .owner(owner)
+        .times(EntryTimes {
+            modified,
+            ..EntryTimes::default()
+        })
+        .link_target(link_target.map(|target| ArchivePath::from_bytes(target.to_vec())))
+        .try_build()
+}
+
+fn duplicate_key(name: &[u8]) -> Vec<u8> {
+    let mut key = name.to_vec();
+    while key.len() > 1 && key.ends_with(b"/") {
+        key.pop();
+    }
+    key
 }
 
 #[cfg(unix)]
@@ -257,10 +345,11 @@ fn platform_metadata(metadata: &fs::Metadata) -> (u32, Owner, Option<Timestamp>)
             gid: Some(u64::from(metadata.gid())),
             ..Owner::default()
         },
-        Some(Timestamp {
-            secs: metadata.mtime(),
-            nanos: u32::try_from(metadata.mtime_nsec()).unwrap_or(0),
-        }),
+        Timestamp::new(
+            metadata.mtime(),
+            u32::try_from(metadata.mtime_nsec()).unwrap_or(0),
+        )
+        .ok(),
     )
 }
 
@@ -275,9 +364,12 @@ fn platform_metadata(metadata: &fs::Metadata) -> (u32, Owner, Option<Timestamp>)
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| Timestamp {
-            secs: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-            nanos: duration.subsec_nanos(),
+        .and_then(|duration| {
+            Timestamp::new(
+                i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+                duration.subsec_nanos(),
+            )
+            .ok()
         });
     (mode, Owner::default(), modified)
 }

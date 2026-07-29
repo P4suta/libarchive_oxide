@@ -5,7 +5,7 @@
 
 ## Context
 
-- The workspace publishes three dependent crates.
+- The workspace contains five dependent product crates.
 - The crates form one product.
 - crates.io publishing is irreversible.
 - GitHub releases must contain CLI binaries.
@@ -14,7 +14,8 @@
 
 - Use one version for all published crates.
 - Publish in dependency order:
-  `libarchive_oxide-core`, `libarchive_oxide`, `libarchive_oxide-cli`.
+  `libarchive_oxide-core`, `libarchive_oxide-codecs`, `libarchive_oxide`,
+  `libarchive_oxide-package`, `libarchive_oxide-cli`.
 - Use one `vX.Y.Z` tag, root changelog, and GitHub Release.
 - Require a release-plz Release PR before publishing.
 - Require a maintainer to apply the `release-approved` label manually before a
@@ -29,7 +30,7 @@
 
 ## Consequences
 
-- A release updates all three crate versions.
+- A release updates all five crate versions.
 - Merging a Release PR cannot publish a release.
 - Publishing requires an exact expected tag, a typed confirmation, and
   Environment approval.

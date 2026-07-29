@@ -74,10 +74,7 @@ fn arca_zip_extra(entries: &[LogicalEntry]) -> Vec<u8> {
                 ..Owner::default()
             })
             .times(EntryTimes {
-                modified: Some(Timestamp {
-                    secs: i64::from(MTIME),
-                    nanos: 0,
-                }),
+                modified: Some(Timestamp::from_seconds(i64::from(MTIME))),
                 ..EntryTimes::default()
             })
             .build();
@@ -262,7 +259,7 @@ fn first_file_owner_and_mtime(archive: &[u8]) -> (Option<u64>, Option<u64>, Opti
                     return (
                         metadata.owner().uid,
                         metadata.owner().gid,
-                        metadata.times().modified.map(|value| value.secs),
+                        metadata.times().modified.map(Timestamp::seconds),
                     );
                 }
             },

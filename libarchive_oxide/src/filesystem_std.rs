@@ -6,8 +6,9 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use std::time::{Duration, SystemTime};
 
@@ -26,12 +27,20 @@ use crate::filesystem::{
 #[derive(Debug)]
 struct PendingFile {
     file: File,
-    temporary: PathBuf,
-    destination: PathBuf,
+    parent: Dir,
+    temporary: OsString,
+    destination: OsString,
     overwrite: bool,
     metadata: EntryMetadata,
     logical_position: u64,
     findings: Vec<FilesystemFinding>,
+}
+
+#[derive(Debug)]
+struct SecureDestination {
+    parent: Dir,
+    name: OsString,
+    path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -40,15 +49,18 @@ enum PendingMaterialization {
     Directory,
     Symlink {
         target: PathBuf,
-        destination: PathBuf,
+        parent: Dir,
+        destination: OsString,
     },
     Hardlink {
         target: PathBuf,
-        destination: PathBuf,
+        parent: Dir,
+        destination: OsString,
     },
     #[cfg(any(target_os = "linux", target_os = "android"))]
     Special {
-        destination: PathBuf,
+        parent: Dir,
+        destination: OsString,
         kind: EntryKind,
         mode: u32,
         device: Option<libarchive_oxide_core::Device>,
@@ -67,8 +79,9 @@ struct PendingEntry {
 ///
 /// Regular files are written into a unique `create_new` sibling, synchronized,
 /// decorated through the open file descriptor where the platform permits, and
-/// then atomically published. Parent and destination checks never follow an
-/// archive-created symbolic link.
+/// then atomically published. Parent components are opened without following
+/// links, and the resulting directory capability is retained through commit so
+/// a concurrent ancestor replacement cannot redirect publication.
 #[derive(Debug)]
 pub struct CapStdFilesystemAdapter {
     root: Dir,
@@ -115,61 +128,88 @@ impl CapStdFilesystemAdapter {
         }
     }
 
-    fn exists(&self, path: &Path) -> io::Result<bool> {
-        match self.root.symlink_metadata(path) {
+    fn exists(destination: &SecureDestination) -> io::Result<bool> {
+        match destination.parent.symlink_metadata(&destination.name) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
     }
 
-    fn ensure_parents(&mut self, path: &Path) -> io::Result<bool> {
-        let Some(parent) = path.parent() else {
-            return Ok(true);
-        };
-        let mut current = PathBuf::new();
+    /// Resolves the destination parent one component at a time and returns a
+    /// stable directory capability. Every subsequent create/commit operation
+    /// is relative to this handle, so replacing an ancestor after preflight
+    /// cannot redirect an entry outside the extraction root.
+    fn resolve_destination(&mut self, path: &Path) -> io::Result<Option<SecureDestination>> {
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "extraction destination has no final component",
+            )
+        })?;
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let mut directory = self.root.open_dir_nofollow(".")?;
+        let mut resolved = PathBuf::new();
         for component in parent.components() {
-            current.push(component.as_os_str());
-            if self.created_directories.contains(&current) {
-                self.root.open_dir_nofollow(&current)?;
+            let component = match component {
+                Component::CurDir => continue,
+                Component::Normal(component) => component,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "extraction destination contains a non-relative component",
+                    ));
+                },
+            };
+            resolved.push(component);
+            if self.created_directories.contains(&resolved) {
+                directory = directory.open_dir_nofollow(component)?;
                 continue;
             }
-            match self.root.symlink_metadata(&current) {
-                Ok(_) => return Ok(false),
+            match directory.symlink_metadata(component) {
+                Ok(_) => return Ok(None),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.root.create_dir(&current)?;
-                    self.restrict_directory(&current)?;
-                    self.root.open_dir_nofollow(&current)?;
-                    self.created_directories.insert(current.clone());
+                    directory.create_dir(component)?;
+                    Self::restrict_directory(&directory, Path::new(component))?;
+                    let child = directory.open_dir_nofollow(component)?;
+                    self.created_directories.insert(resolved.clone());
+                    directory = child;
                 },
                 Err(error) => return Err(error),
             }
         }
-        Ok(true)
+        Ok(Some(SecureDestination {
+            parent: directory,
+            name: name.to_os_string(),
+            path: path.to_path_buf(),
+        }))
     }
 
-    #[cfg_attr(not(unix), allow(clippy::unused_self, clippy::unnecessary_wraps))]
-    fn restrict_directory(&self, path: &Path) -> io::Result<()> {
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
+    fn restrict_directory(directory: &Dir, path: &Path) -> io::Result<()> {
         #[cfg(unix)]
         {
             use cap_std::fs::{Permissions, PermissionsExt};
-            self.root
-                .set_permissions(path, Permissions::from_mode(0o700))?;
+            directory.set_permissions(path, Permissions::from_mode(0o700))?;
         }
         #[cfg(not(unix))]
-        let _ = path;
+        let _ = (directory, path);
         Ok(())
     }
 
-    fn create_temporary_sibling(&mut self, destination: &Path) -> io::Result<(File, PathBuf)> {
-        let parent = destination.parent().unwrap_or_else(|| Path::new(""));
+    fn create_temporary_sibling(
+        &mut self,
+        destination: &SecureDestination,
+    ) -> io::Result<(File, OsString)> {
         for _ in 0..128 {
             self.temporary_counter = self.temporary_counter.wrapping_add(1);
-            let name = format!(".libarchive-oxide-{:016x}.tmp", self.temporary_counter);
-            let temporary = parent.join(name);
+            let temporary = OsString::from(format!(
+                ".libarchive-oxide-{:016x}.tmp",
+                self.temporary_counter
+            ));
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            match self.root.open_with(&temporary, &options) {
+            match destination.parent.open_with(&temporary, &options) {
                 Ok(file) => return Ok((file, temporary)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
                 Err(error) => return Err(error),
@@ -184,11 +224,22 @@ impl CapStdFilesystemAdapter {
     fn prepare(&mut self, entry: FilesystemEntry<'_>) -> PendingEntry {
         let metadata = entry.metadata();
         let path = metadata.path().clone();
-        let destination = entry.destination().to_path_buf();
+        let destination = match self.resolve_destination(entry.destination()) {
+            Ok(Some(destination)) => destination,
+            Ok(None) => {
+                return PendingEntry {
+                    path,
+                    materialization: PendingMaterialization::DestinationExists,
+                };
+            },
+            Err(error) => {
+                return Self::failed(path, "failed to resolve destination parent", &error);
+            },
+        };
         if let Some(reused) = self.reuse_directory(metadata, &destination) {
             return reused;
         }
-        match self.destination_available(entry, &destination) {
+        match Self::destination_available(entry, &destination) {
             Ok(true) => self.prepare_kind(entry, destination),
             Ok(false) => PendingEntry {
                 path,
@@ -201,13 +252,15 @@ impl CapStdFilesystemAdapter {
     fn reuse_directory(
         &mut self,
         metadata: &EntryMetadata,
-        destination: &Path,
+        destination: &SecureDestination,
     ) -> Option<PendingEntry> {
-        if metadata.kind() != EntryKind::Dir || !self.created_directories.contains(destination) {
+        if metadata.kind() != EntryKind::Dir
+            || !self.created_directories.contains(&destination.path)
+        {
             return None;
         }
         let path = metadata.path().clone();
-        if let Err(error) = self.root.open_dir_nofollow(destination) {
+        if let Err(error) = destination.parent.open_dir_nofollow(&destination.name) {
             return Some(Self::failed(
                 path,
                 "previously created directory changed before reuse",
@@ -215,7 +268,7 @@ impl CapStdFilesystemAdapter {
             ));
         }
         self.directory_metadata
-            .insert(destination.to_path_buf(), (path.clone(), metadata.clone()));
+            .insert(destination.path.clone(), (path.clone(), metadata.clone()));
         Some(PendingEntry {
             path,
             materialization: PendingMaterialization::Directory,
@@ -223,24 +276,24 @@ impl CapStdFilesystemAdapter {
     }
 
     fn destination_available(
-        &mut self,
         entry: FilesystemEntry<'_>,
-        destination: &Path,
+        destination: &SecureDestination,
     ) -> io::Result<bool> {
-        if !self.ensure_parents(destination)? {
-            return Ok(false);
-        }
-        if !self.exists(destination)? {
+        if !Self::exists(destination)? {
             return Ok(true);
         }
         if entry.metadata().kind() != EntryKind::File || !entry.overwrite() {
             return Ok(false);
         }
-        let existing = self.root.symlink_metadata(destination)?;
+        let existing = destination.parent.symlink_metadata(&destination.name)?;
         Ok(existing.file_type().is_file() && !existing.file_type().is_symlink())
     }
 
-    fn prepare_kind(&mut self, entry: FilesystemEntry<'_>, destination: PathBuf) -> PendingEntry {
+    fn prepare_kind(
+        &mut self,
+        entry: FilesystemEntry<'_>,
+        destination: SecureDestination,
+    ) -> PendingEntry {
         let metadata = entry.metadata();
         let path = metadata.path().clone();
         match metadata.kind() {
@@ -253,7 +306,8 @@ impl CapStdFilesystemAdapter {
                         .link_target()
                         .unwrap_or_else(|| Path::new(""))
                         .to_path_buf(),
-                    destination,
+                    parent: destination.parent,
+                    destination: destination.name,
                 },
             },
             EntryKind::Hardlink => PendingEntry {
@@ -263,7 +317,8 @@ impl CapStdFilesystemAdapter {
                         .link_target()
                         .unwrap_or_else(|| Path::new(""))
                         .to_path_buf(),
-                    destination,
+                    parent: destination.parent,
+                    destination: destination.name,
                 },
             },
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -271,7 +326,8 @@ impl CapStdFilesystemAdapter {
                 PendingEntry {
                     path,
                     materialization: PendingMaterialization::Special {
-                        destination,
+                        parent: destination.parent,
+                        destination: destination.name,
                         kind: metadata.kind(),
                         mode: metadata.mode().unwrap_or(0o600),
                         device: metadata.referenced_device(),
@@ -289,7 +345,11 @@ impl CapStdFilesystemAdapter {
         }
     }
 
-    fn prepare_file(&mut self, entry: FilesystemEntry<'_>, destination: PathBuf) -> PendingEntry {
+    fn prepare_file(
+        &mut self,
+        entry: FilesystemEntry<'_>,
+        destination: SecureDestination,
+    ) -> PendingEntry {
         let metadata = entry.metadata();
         let path = metadata.path().clone();
         match self.create_temporary_sibling(&destination) {
@@ -297,8 +357,9 @@ impl CapStdFilesystemAdapter {
                 path,
                 materialization: PendingMaterialization::File(Box::new(PendingFile {
                     file,
+                    parent: destination.parent,
                     temporary,
-                    destination,
+                    destination: destination.name,
                     overwrite: entry.overwrite(),
                     metadata: metadata.clone(),
                     logical_position: 0,
@@ -312,18 +373,27 @@ impl CapStdFilesystemAdapter {
     fn prepare_directory(
         &mut self,
         metadata: &EntryMetadata,
-        destination: PathBuf,
+        destination: SecureDestination,
     ) -> PendingEntry {
         let path = metadata.path().clone();
-        if let Err(error) = self.root.create_dir(&destination).and_then(|()| {
-            self.restrict_directory(&destination)
-                .and_then(|()| self.root.open_dir_nofollow(&destination).map(|_| ()))
-        }) {
+        if let Err(error) = destination
+            .parent
+            .create_dir(&destination.name)
+            .and_then(|()| {
+                Self::restrict_directory(&destination.parent, Path::new(&destination.name))
+                    .and_then(|()| {
+                        destination
+                            .parent
+                            .open_dir_nofollow(&destination.name)
+                            .map(|_| ())
+                    })
+            })
+        {
             return Self::failed(path, "failed to create or secure directory", &error);
         }
-        self.created_directories.insert(destination.clone());
+        self.created_directories.insert(destination.path.clone());
         self.directory_metadata
-            .insert(destination, (path.clone(), metadata.clone()));
+            .insert(destination.path, (path.clone(), metadata.clone()));
         PendingEntry {
             path,
             materialization: PendingMaterialization::Directory,
@@ -335,7 +405,7 @@ impl CapStdFilesystemAdapter {
             ..
         }) = &self.pending
         {
-            let _ = self.root.remove_file(&file.temporary);
+            let _ = file.parent.remove_file(&file.temporary);
         }
     }
 
@@ -345,10 +415,16 @@ impl CapStdFilesystemAdapter {
     fn open_dir_chain(&self, path: &Path) -> io::Result<Dir> {
         let mut current = self.root.open_dir_nofollow(".")?;
         for component in path.components() {
-            let component = component.as_os_str();
-            if component.is_empty() || component == std::ffi::OsStr::new(".") {
-                continue;
-            }
+            let component = match component {
+                Component::CurDir => continue,
+                Component::Normal(component) => component,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "directory chain contains a non-relative component",
+                    ));
+                },
+            };
             current = current.open_dir_nofollow(component)?;
         }
         Ok(current)
@@ -431,10 +507,13 @@ impl PendingFile {
             )
         })?;
         for extent in self.metadata.sparse_extents() {
-            let extent_end = extent.offset.checked_add(extent.length).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "sparse extent overflow")
-            })?;
-            let start = chunk_start.max(extent.offset);
+            let extent_end = extent
+                .offset()
+                .checked_add(extent.length())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "sparse extent overflow")
+                })?;
+            let start = chunk_start.max(extent.offset());
             let end = chunk_end.min(extent_end);
             if start >= end {
                 continue;
@@ -766,15 +845,15 @@ fn apply_linux_mode<Fd: std::os::fd::AsFd>(
 }
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_timespec(timestamp: Timestamp) -> io::Result<rustix::fs::Timespec> {
-    if timestamp.nanos >= 1_000_000_000 {
+    if timestamp.nanoseconds() >= 1_000_000_000 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "archive timestamp nanoseconds are out of range",
         ));
     }
     Ok(rustix::fs::Timespec {
-        tv_sec: timestamp.secs,
-        tv_nsec: timestamp.nanos.into(),
+        tv_sec: timestamp.seconds(),
+        tv_nsec: timestamp.nanoseconds().into(),
     })
 }
 
@@ -973,23 +1052,23 @@ fn apply_portable_times(
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn timestamp_spec(timestamp: Timestamp) -> io::Result<SystemTimeSpec> {
-    if timestamp.nanos >= 1_000_000_000 {
+    if timestamp.nanoseconds() >= 1_000_000_000 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "archive timestamp nanoseconds are out of range",
         ));
     }
-    let absolute = if timestamp.secs >= 0 {
+    let absolute = if timestamp.seconds() >= 0 {
         SystemTime::UNIX_EPOCH.checked_add(Duration::new(
-            timestamp.secs.unsigned_abs(),
-            timestamp.nanos,
+            timestamp.seconds().unsigned_abs(),
+            timestamp.nanoseconds(),
         ))
-    } else if timestamp.nanos == 0 {
-        SystemTime::UNIX_EPOCH.checked_sub(Duration::new(timestamp.secs.unsigned_abs(), 0))
+    } else if timestamp.nanoseconds() == 0 {
+        SystemTime::UNIX_EPOCH.checked_sub(Duration::new(timestamp.seconds().unsigned_abs(), 0))
     } else {
         SystemTime::UNIX_EPOCH.checked_sub(Duration::new(
-            timestamp.secs.unsigned_abs() - 1,
-            1_000_000_000 - timestamp.nanos,
+            timestamp.seconds().unsigned_abs() - 1,
+            1_000_000_000 - timestamp.nanoseconds(),
         ))
     }
     .ok_or_else(|| {
@@ -1057,20 +1136,12 @@ impl FilesystemAdapter for CapStdFilesystemAdapter {
         directories.sort_by_key(|(path, _)| Reverse(path.components().count()));
         let mut findings = Vec::new();
         for (filesystem_path, (_, metadata)) in directories {
-            match self.root.open_dir_nofollow(filesystem_path) {
+            match self.open_dir_chain(filesystem_path) {
                 Ok(directory) => {
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     apply_linux_metadata(&directory, metadata, &mut findings);
                     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    {
-                        drop(directory);
-                        apply_directory_metadata(
-                            &self.root,
-                            filesystem_path,
-                            metadata,
-                            &mut findings,
-                        );
-                    }
+                    apply_directory_metadata(&directory, Path::new("."), metadata, &mut findings);
                 },
                 Err(error) => metadata_error_findings(
                     metadata,
@@ -1118,22 +1189,47 @@ impl FilesystemAdapter for CapStdFilesystemAdapter {
 }
 
 impl CapStdFilesystemAdapter {
+    fn hard_link_target(
+        &self,
+        target: &Path,
+        destination_parent: &Dir,
+        destination: &OsString,
+    ) -> io::Result<()> {
+        let target_name = target.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hard-link target has no final component",
+            )
+        })?;
+        let target_parent =
+            self.open_dir_chain(target.parent().unwrap_or_else(|| Path::new("")))?;
+        let metadata = target_parent.symlink_metadata(target_name)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "hard-link target is no longer a regular file",
+            ));
+        }
+        target_parent.hard_link(target_name, destination_parent, destination)
+    }
+
     fn commit(&self, pending: PendingEntry) -> FilesystemEntryReport {
         let path = pending.path;
         match pending.materialization {
-            PendingMaterialization::File(file) => self.commit_file(path, *file),
+            PendingMaterialization::File(file) => Self::commit_file(path, *file),
             PendingMaterialization::Directory => FilesystemEntryReport::new(
                 FilesystemMaterialization::Directory,
                 vec![FilesystemFinding::applied(path, FilesystemOperation::Entry)],
             ),
             PendingMaterialization::Symlink {
                 target,
+                parent,
                 destination,
             } => {
                 #[cfg(not(windows))]
-                let result = self.root.symlink(&target, &destination);
+                let result = parent.symlink(&target, &destination);
                 #[cfg(windows)]
-                let result = self.root.symlink_file(&target, &destination);
+                let result = parent.symlink_file(&target, &destination);
                 materialization_result(
                     path,
                     FilesystemMaterialization::Symlink,
@@ -1143,9 +1239,10 @@ impl CapStdFilesystemAdapter {
             },
             PendingMaterialization::Hardlink {
                 target,
+                parent,
                 destination,
             } => {
-                let result = self.root.hard_link(&target, &self.root, &destination);
+                let result = self.hard_link_target(&target, &parent, &destination);
                 materialization_result(
                     path,
                     FilesystemMaterialization::Hardlink,
@@ -1155,12 +1252,13 @@ impl CapStdFilesystemAdapter {
             },
             #[cfg(any(target_os = "linux", target_os = "android"))]
             PendingMaterialization::Special {
+                parent,
                 destination,
                 kind,
                 mode,
                 device,
             } => {
-                let result = create_special(&self.root, &destination, kind, mode, device);
+                let result = create_special(&parent, Path::new(&destination), kind, mode, device);
                 materialization_result(
                     path,
                     FilesystemMaterialization::Special,
@@ -1182,7 +1280,7 @@ impl CapStdFilesystemAdapter {
         }
     }
 
-    fn commit_file(&self, path: ArchivePath, mut pending: PendingFile) -> FilesystemEntryReport {
+    fn commit_file(path: ArchivePath, mut pending: PendingFile) -> FilesystemEntryReport {
         pending.finish_sparse();
         if let Err(error) = pending.file.flush() {
             pending.findings.push(FilesystemFinding::os_error(
@@ -1197,8 +1295,8 @@ impl CapStdFilesystemAdapter {
             apply_linux_metadata(&pending.file, &pending.metadata, &mut pending.findings);
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             apply_file_metadata(
-                &self.root,
-                &pending.temporary,
+                &pending.parent,
+                Path::new(&pending.temporary),
                 &pending.file,
                 &pending.metadata,
                 &mut pending.findings,
@@ -1216,7 +1314,7 @@ impl CapStdFilesystemAdapter {
         drop(pending.file);
 
         if entry_failed {
-            let _ = self.root.remove_file(&pending.temporary);
+            let _ = pending.parent.remove_file(&pending.temporary);
             if !pending
                 .findings
                 .iter()
@@ -1232,14 +1330,16 @@ impl CapStdFilesystemAdapter {
         }
 
         let commit = if pending.overwrite {
-            self.root
-                .rename(&pending.temporary, &self.root, &pending.destination)
+            pending
+                .parent
+                .rename(&pending.temporary, &pending.parent, &pending.destination)
         } else {
-            self.root
-                .hard_link(&pending.temporary, &self.root, &pending.destination)
+            pending
+                .parent
+                .hard_link(&pending.temporary, &pending.parent, &pending.destination)
         };
         if let Err(error) = commit {
-            let _ = self.root.remove_file(&pending.temporary);
+            let _ = pending.parent.remove_file(&pending.temporary);
             let materialization = if error.kind() == io::ErrorKind::AlreadyExists {
                 pending.findings.push(FilesystemFinding::refused(
                     path.clone(),
@@ -1265,14 +1365,14 @@ impl CapStdFilesystemAdapter {
             return FilesystemEntryReport::new(materialization, pending.findings);
         }
 
-        if !pending.overwrite {
-            if let Err(error) = self.root.remove_file(&pending.temporary) {
-                pending.findings.push(FilesystemFinding::partial(
-                    path.clone(),
-                    FilesystemOperation::AtomicCommit,
-                    format!("destination committed but temporary link cleanup failed: {error}"),
-                ));
-            }
+        if !pending.overwrite
+            && let Err(error) = pending.parent.remove_file(&pending.temporary)
+        {
+            pending.findings.push(FilesystemFinding::partial(
+                path.clone(),
+                FilesystemOperation::AtomicCommit,
+                format!("destination committed but temporary link cleanup failed: {error}"),
+            ));
         }
         pending.findings.push(FilesystemFinding::applied(
             path.clone(),

@@ -1,6 +1,6 @@
 # ADR-0003: session-bound high-level engine
 
-- Status: accepted
+- Status: amended by ADR-0016
 - Date: 2026-07-20
 - Tracks: RM-101 / issue #30
 

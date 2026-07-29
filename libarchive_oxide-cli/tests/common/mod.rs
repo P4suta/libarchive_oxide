@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Shared helpers for the `ox*` CLI integration tests: locating the built binaries, running them,
+//! Shared helpers for `oxarchive` integration tests: locating the built binary, running it,
 //! and managing throwaway working directories. No external test crates are used (keeping the
 //! dependency footprint minimal); the bins are invoked through the `CARGO_BIN_EXE_*` paths Cargo
 //! exports to integration tests, and asserted on via `std::process`.
@@ -13,16 +13,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Absolute path to a built `ox*` binary.
+/// Absolute path to the built `oxarchive` binary.
 #[must_use]
 pub(crate) fn bin(name: &str) -> PathBuf {
     // Cargo exposes each bin's path to its own package's integration tests.
     let var = match name {
         "oxarchive" => env!("CARGO_BIN_EXE_oxarchive"),
-        "oxtar" => env!("CARGO_BIN_EXE_oxtar"),
-        "oxcpio" => env!("CARGO_BIN_EXE_oxcpio"),
-        "oxcat" => env!("CARGO_BIN_EXE_oxcat"),
-        "oxunzip" => env!("CARGO_BIN_EXE_oxunzip"),
         other => panic!("unknown bin {other}"),
     };
     PathBuf::from(var)

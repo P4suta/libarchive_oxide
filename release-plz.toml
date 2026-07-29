@@ -7,9 +7,10 @@
 [workspace]
 dependencies_update = false
 release_always = false
-# v0.2.0 is the intentionally breaking baseline; later releases must remain
-# semver-compatible with the published API.
-semver_check = true
+# The current completion program deliberately permits breaking Rust API
+# changes. A future release phase must choose and document its own compatibility
+# policy rather than silently freezing this evolving pre-1.0 surface.
+semver_check = false
 git_tag_enable = false
 git_release_enable = false
 changelog_update = false

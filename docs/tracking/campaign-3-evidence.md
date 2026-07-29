@@ -32,25 +32,29 @@ change, or versioned release candidate is part of this snapshot.
 | ZIP BZip2 3x2 interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_bzip2.rs`, `libarchive_oxide/tests/seek_stream_v2.rs` | three producers (arca, `zip@8.6.0`, first-party raw `.bz2` builder) × two consumers (arca, `zip@8.6.0`); round-trip loop plus truncation, bomb, and feature-off Unsupported tests |
 | Support-matrix ZIP BZip2 update | RM-302 | `docs/support-matrix.md` | ZIP row lists Store/Deflate/BZip2; the not-yet-implemented note drops BZip2 |
 | ZIP Zstandard (method 93) read | RM-302 | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/src/zip.rs` | `ZipBody::Zstd` drives the shared `PipelineCodec` (portable `ruzstd` / native `compression-codecs`) behind one static-dispatch enum — no new trait object; CRC-32, size, bomb (`Limits::decoded_total`), and truncation guards; gated on `zstd`, present on BOTH profiles |
-| ZIP Zstandard (method 93) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Zstd` + streaming `compression_codecs::ZstdEncoder` (pinned level 3) gated on `native-codecs`; version-needed 63 in local and central headers; on the portable profile the two `provider.rs` dispatch sites route to a deferred structured `Unsupported` error surfaced at entry-open |
-| ZIP Zstandard interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_zstd.rs`, `libarchive_oxide/tests/seek_stream_v2.rs` | READ proven on both profiles by two external producers (`zip@8.6.0`, first-party raw-zstd builder over independent-C `zstd` 0.13.3) × two consumers (arca, `zip@8.6.0`); WRITE + a third producer (arca) proven on native-codecs, decoded by both the `zip` crate and independent-C libzstd; truncation, bomb, portable-write-Unsupported, and feature-off Unsupported adversarial tests |
-| Support-matrix ZIP Zstandard update | RM-302 | `docs/support-matrix.md` | ZIP row splits Read (adds Zstandard) from Write (Zstandard native-codecs only); the not-yet-implemented note drops Zstandard and records the write profile-asymmetry |
+| ZIP Zstandard (method 93) write | RM-302 + follow-on | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | portable push state emits one bounded raw-block Zstandard frame with a 1 KiB window; native uses `compression_codecs::ZstdEncoder` level 3; runtime `BackendPreference` selects either when both are compiled; version-needed 63 in local and central headers |
+| ZIP Zstandard interop + adversarial evidence | RM-302 + follow-on | `libarchive_oxide/tests/interop_zip_zstd.rs`, `libarchive_oxide/tests/seek_stream_v2.rs` | READ proven on both profiles by two external producers (`zip@8.6.0`, first-party raw-zstd builder over independent-C `zstd` 0.13.3) × two consumers (arca, `zip@8.6.0`); WRITE proven on portable and native and decoded by both the `zip` crate and independent-C libzstd; multi-megabyte bounded streaming, runtime-backend coexistence, codec-memory, truncation, bomb, and feature-off Unsupported tests |
+| Support-matrix ZIP Zstandard update | RM-302 + follow-on | `docs/support-matrix.md` | canonical ledger reports method 93 read/write on portable and native; generated support matrix has no Zstandard deficit |
 | ZIP LZMA (method 14) read | RM-302 | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/src/zip.rs` | `ZipBody::Lzma` parses the 9-byte ZIP-LZMA header (prop_size==5, props byte, dict size), validates the dict against `codec_memory`, buffers the raw LZMA1 member, and drives a pull-based `lzma_rust2::LzmaReader` with the central-directory uncompressed size (handles both EOS-marker and known-size conventions); CRC-32, size, bomb (`Limits::decoded_total`), truncation, and bad-header guards; gated on `xz`, present on BOTH profiles |
 | ZIP LZMA (method 14) write | RM-302 | `libarchive_oxide/src/zip_stream.rs`, `libarchive_oxide/src/provider.rs` | `StreamZipMethod::Lzma` + `lzma_rust2::LzmaWriter::new_no_header` (raw LZMA1, EOS marker) drained through an in-crate `VecSink` (no trait object, `#![forbid(unsafe_code)]` intact); pinned preset 6 (props 93, 8 MiB dict); emits the 9-byte ZIP-LZMA header once at entry start; general-purpose bit 1 (`0x0002`) set in local+central flags outside the `0x0809` cross-check mask; version-needed 63 |
 | ZIP LZMA interop + adversarial evidence | RM-302 | `libarchive_oxide/tests/interop_zip_lzma.rs`, `libarchive_oxide/tests/seek_stream_v2.rs`, `libarchive_oxide/tests/fixtures/zip/python-lzma/` | three producers (arca + first-party raw-LZMA1 builder, both `lzma-rust2`; + committed CPython 3.14.6/liblzma fixture, independent codec) × two consumers (arca, `zip@8.6.0` with `lzma`); WRITE evidence = the `zip` crate decodes arca's method-14 output byte-identically; round-trip, empty-member, truncation, bad-property-size, bomb, and feature-off Unsupported tests; the committed fixture + `generate.py` are byte-reproducible (SHA-256 recorded in `PROVENANCE.md`) |
 | Support-matrix + PROVENANCE ZIP LZMA update | RM-302 | `docs/support-matrix.md`, `libarchive_oxide/tests/fixtures/zip/PROVENANCE.md` | ZIP row adds LZMA to Read and Write; the not-yet-implemented note now lists ONLY Deflate64; PROVENANCE records the committed-fixture escape hatch and the two-independent-codecs honesty note |
-| CAB read-only provider | RM-305 | `libarchive_oxide/src/cab.rs`, `libarchive_oxide-core/src/format.rs`, `libarchive_oxide/src/provider.rs`, `libarchive_oxide/src/seek_stream.rs` | `CabSeekReader`: MSCF header, CFFOLDER/CFFILE/CFDATA tables, Store + MSZIP (the 32 KiB LZ window is carried across a folder's `CFDATA` blocks via a miniz_oxide wrapping ring); QUANTUM/LZX/cross-cabinet/spanning are structured `Unsupported`; registered as a read-only seek-native provider (`FormatId::Cab`, capability decode-only) |
-| XAR read-only provider | RM-305 | `libarchive_oxide/src/xar.rs`, `.../format.rs`, `.../provider.rs`, `.../seek_stream.rs` | `XarSeekReader`: big-endian header, zlib TOC bounded by `metadata_bytes`, a hand-rolled bounded XML pull-scanner over the `<file>` tree, stored + zlib (`x-gzip`) heap data; `x-bzip2`/unknown encodings are structured `Unsupported`; `FormatId::Xar`, decode-only |
-| CAB/XAR interop + adversarial evidence | RM-305 | `libarchive_oxide/tests/interop_cab_meta.rs`, `libarchive_oxide/tests/interop_xar_meta.rs`, `libarchive_oxide/tests/fixtures/{cab,xar}/PROVENANCE.md` | first-party in-code raw container builders using lockfile-resolved `flate2` read back through the RM-301 harness; portable codec independence is not claimed because both sides use the `miniz_oxide` family; multi-file/nested/empty round trips plus unsupported-method and truncated-header structured-error negatives; a three-lens adversarial review with a verification pass |
+| CAB read-only provider | RM-305 + LZX/Quantum/volume follow-ons | `libarchive_oxide/src/cab.rs`, `libarchive_oxide/src/cab/volume.rs`, `libarchive_oxide-codecs/src/lzx/`, `libarchive_oxide-core/src/capability.rs`, `docs/adr/0018-cab-lzx-frame-boundaries.md`, `docs/adr/0019-cab-quantum-compcol.md`, `docs/adr/0021-cab-volume-set.md` | `CabSeekReader`: bounded MSCF tables and streamed Store/MSZIP/Quantum/LZX folders; aggregate folder/file metadata accounting, fallible attacker-sized allocations, CFDATA checksums, sticky typed failure state, and pre-allocation codec/in-flight/decoded/scan limits. LZX keeps history across word-aligned CFDATA bitstreams and Quantum keeps its dictionary/models across injected alignment trailers. `advanced::CabVolumeReader` and `CabVolumeProvider` validate a caller-owned `VolumeSet`, lazily concatenate physical split blocks, and preserve codec state across cabinets; the ordinary single-source reader retains structured `Unsupported` for continuation. Capabilities are read-only and additively `cab-lzx`/`cab-quantum`-gated |
+| XAR read-only provider | RM-305 | `libarchive_oxide/src/xar.rs`, `.../format.rs`, `.../provider.rs`, `.../seek_stream.rs` | `XarSeekReader`: big-endian header, zlib TOC bounded by `metadata_bytes`, a hand-rolled bounded XML pull-scanner over the `<file>` tree, and streaming stored, zlib (`x-gzip`), and feature-gated bzip2 (`x-bzip2`) heap data; unknown encodings are structured `Unsupported`; `FormatId::Xar`, decode-only |
+| CAB/XAR interop + adversarial evidence | RM-305 + follow-ons | `libarchive_oxide/tests/interop_cab_meta.rs`, `libarchive_oxide/tests/cab_volumes.rs`, `libarchive_oxide/tests/interop_xar_meta.rs`, `libarchive_oxide/tests/fixtures/{cab,xar}/PROVENANCE.md` | first-party Store/MSZIP builders, a Microsoft makecab two-volume fixture independently consumed by `extrac32`, and libmspack LZX/Quantum evidence; multi-frame and cross-cabinet history/alignment, missing/wrong/cyclic/duplicate/out-of-order cabinets, split-block corruption, aggregate metadata, poisoned retries, window, truncation, decoded-total/codec-memory/in-flight, and E8 regressions; XAR retains its independent bzip2 evidence |
 | Support-matrix CAB/XAR read-only rows | RM-305 | `docs/support-matrix.md` | CAB and XAR added to the archive-containers table as read-only seek providers; removed from the not-implemented list (RAR5/UDF remain, tracked by RM-306) |
 | RAR5/UDF/Deflate64 feasibility ADR | RM-306 | `docs/adr/0013-rar5-udf-deflate64-feasibility.md`, `docs/support-matrix.md` | Deflate64 read = go (adopt external pure-Rust `deflate64` behind the codec-provider boundary, follow-on slice) / write = won't-do; UDF read-only go (rev 1.02/1.50/2.01, follow-on); RAR5 deferred in its entirety (no clean-room pure-Rust decompressor); codec-deficit ledger + not-yet-implemented prose updated; no `src/` change, no dependency added |
 | ZIP Deflate64 read implementation | RM-306 follow-on | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/tests/interop_zip_deflate64.rs`, `libarchive_oxide/tests/fixtures/zip/{7zip,PROVENANCE.md}`, `xtask/src/main.rs` | method 9 streams through `deflate64` 0.1.12 under `gzip` on portable/native; fixed 64 KiB chunks, CRC/size/extent/no-progress/truncation/bomb checks; official 7-Zip 26.02 fixture exercises a >32 KiB distance; write remains absent/won't-do and package-smoke compile-fail coverage locks the lack of a public `ZipMethod::Deflate64` variant |
+| WinZip AES + Deflate64 read composition | RM-306 follow-on | `libarchive_oxide/src/seek_stream.rs`, `libarchive_oxide/tests/zip_aes.rs` | method 99 AE-2 metadata with real method 9 streams ciphertext through AES-CTR/HMAC and the bounded Deflate64 decoder; deterministic raw fixture covers correct/wrong password, authentication tamper, truncation, decoded bomb, and gzip-feature-off Unsupported |
 | UDF Phase 1 read implementation | RM-306 follow-on | `libarchive_oxide/src/udf.rs`, `libarchive_oxide/tests/udf.rs`, `fuzz/{fuzz_targets/read_udf.rs,corpus/read_udf/seed.udf}` | read-only seek provider for 1.02/1.50/2.01: VRS/bridge priority, backup anchors, Main→Reserve/continued VDS with prevailing descriptors, Type 1 maps, FSD/root ICB, FE/EFE strategy 4, short/long/inline/chained/multi/sparse allocation, streamed FIDs, OSTA Unicode/timestamps, symlink/hardlink metadata, checked ranges and all applicable archive `Limits`; shared sync/engine/range/futures/Tokio parser and adversarial replay |
+| UDF continued FSD and stream follow-on | RM-306 follow-on | `libarchive_oxide/src/udf.rs`, `libarchive_oxide/tests/udf.rs`, `libarchive_oxide/tests/fixtures/udf/PROVENANCE.md`, `fuzz/corpus/read_udf/seed.udf` | ECMA-167 Next Extent File Set Descriptor traversal with default file-set-zero/prevailing selection plus UDF 2.01 System Stream Directory and named-stream reads; safe synthetic archive paths and typed owner/kind/metadata extensions; tag checksum/CRC/location, partition bounds, FID order/version/long-ad/Unique ID, role-correct Stream/metadata flags, EFE Object Size, graph cycle/depth, and metadata/in-flight/path/entry limits are covered by deterministic positive/negative builders and stable fuzz replay |
+| UDF 2.50/2.60 Metadata Partition follow-on | RM-306 follow-on | `libarchive_oxide/src/udf.rs`, `libarchive_oxide/tests/udf.rs`, `libarchive_oxide/tests/fixtures/udf/PROVENANCE.md` | Type-2 Metadata Partition Map parsing paired with its physical Type-1 map; bounded short-AD Metadata File translation across allocation-unit boundaries; shared/duplicate mirror validation with Integrity/Malformed-only fallback; optional Metadata Bitmap ICB/SBD validation; deterministic revision, missing/wrong-type, alignment, overlap, cycle, corruption, mirror, limit, seek/engine/range-provider tests |
+| UDF Sparable Partition follow-on | RM-306 follow-on | `libarchive_oxide/src/udf.rs`, `libarchive_oxide/tests/udf.rs`, `libarchive_oxide/tests/fixtures/udf/{mkudffs-sparable-2.01.udf,PROVENANCE.md}`, `fuzz/corpus/read_udf/sparable-partition.udf` | UDF 1.50–2.60 Type-2 Sparable maps with profile-valid 16/32-block packets; validated packet-disjoint redundant Sparing Tables with highest-sequence agreement, corruption fallback, and the 65,535-byte descriptor-CRC cap; bounded whole-packet remapping across allocation continuations; UDF 2.50/2.60 Metadata-over-Sparable composition; deterministic malformed/range/overlap and exact capacity-based cumulative metadata-limit tests; public Seek/Engine/Range wiring; stable corpus replay; and independent `mkudffs` 2.3 interop evidence |
 | Metadata-fidelity harness extension | RM-304 | `libarchive_oxide/tests/common/mod.rs` | additive `read_seq_with_arca` (sequential `ArchiveReader`), `MetaShape` (REAL kind + mode/uid/gid/mtime/link_target, no kind folding), `read_meta_seq_with_arca` / `read_meta_seek_with_arca`, `assert_producers_agree_seq`; the content-only `EntryShape` path is unchanged |
 | tar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_tar_meta.rs`, `libarchive_oxide/tests/fixtures/tar/PROVENANCE.md` | 3 producers (arca, `tar@0.4`, first-party raw ustar builder) × 2 consumers (arca sequential reader, `tar@0.4`); mode/uid/gid/mtime and symlink-target fidelity |
 | cpio producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_cpio_meta.rs`, `libarchive_oxide/tests/fixtures/cpio/PROVENANCE.md` | 3 producers (arca `newc`, first-party raw `newc`, first-party raw `odc` — genuinely distinct on-disk framings) × 2 consumers (arca, first-party raw `newc` parser); mode/uid/gid/mtime plus a typed hardlink pair (File payload + Hardlink alias) |
 | ar producer corpus + metadata round trip | RM-304 | `libarchive_oxide/tests/interop_ar_meta.rs`, `libarchive_oxide/tests/fixtures/ar/PROVENANCE.md` | 3 producers (arca, `ar@0.9`, first-party raw `!<arch>` builder) × 2 consumers (arca, `ar@0.9`); mode/uid/gid/mtime (ar is flat regular-files-only, so no dir/symlink fidelity) |
-| ISO producer corpus + Rock Ridge metadata round trip | RM-304 | `libarchive_oxide/tests/interop_iso_meta.rs`, `libarchive_oxide/tests/fixtures/iso/PROVENANCE.md` | arca self round trip plus an external `xorriso`/`genisoimage`/`mkisofs` independent producer (graceful skip); Rock Ridge PX/TF/SL fidelity (mode/uid/gid/mtime + symlink target) through the seek reader |
+| ISO producer corpus + Rock Ridge metadata round trip | RM-304 + follow-on | `libarchive_oxide/src/{iso_stream,seek_stream}.rs`, `libarchive_oxide/tests/interop_iso_meta.rs`, `libarchive_oxide/tests/fixtures/iso/PROVENANCE.md` | arca self round trip plus an external `xorriso`/`genisoimage`/`mkisofs` independent producer (graceful skip); Rock Ridge PX/TF/SL fidelity and bounded SUSP CE continuation read/write, including multi-sector SL data, range and in-flight-limit failures |
 | ZIP Info-ZIP Unix uid/gid read | RM-308 | `libarchive_oxide/src/seek_stream.rs` | `zip_unix_owner` parses the Info-ZIP New Unix (0x7855) central body into `Owner` uid/gid; `zip_times` gains a 0x5855 (`UX`) access/modification-time arm. The central `UX` uid/gid trailer (a local-header layout) is deliberately not read to avoid a positional guess; both are bounded, structured-error walks reusing the shared `le16`/`.get()` guards |
 | ZIP Extended-Timestamp / Unix uid/gid write-back | RM-308 | `libarchive_oxide/src/zip_stream.rs` | `push_extended_timestamp` (0x5455) and `push_infozip_unix` (0x7855) synthesize extras from typed `EntryTimes`/`Owner`, guarded by `zip_extra_contains_id` so a preserved raw field is never duplicated; accounted against the metadata and extra-field budgets in both local and central headers |
 | ZIP extra structured-interpretation tests | RM-308 | `libarchive_oxide/tests/seek_stream_v2.rs` | typed-owner read, owner+timestamp round trip from typed metadata, no-duplicate preserved timestamp, and short-field no-misread |
@@ -175,48 +179,29 @@ change, or versioned release candidate is part of this snapshot.
   the same per-iteration `Limits::decoded_total()` check bounds a bomb on both
   profiles (the portable `ruzstd` decoder accepts no window cap, so the decoded-total
   check is the load-bearing defense there).
-- WRITE works ONLY under `native-codecs` and is gated on `native-codecs` (NOT
-  `zstd`): the portable `ruzstd` path is treated as decode-only for ZIP production.
-  `StreamZipMethod::Zstd` drives a true streaming `compression_codecs::ZstdEncoder`
-  at a pinned deterministic level 3 — `encode`/`finish` over `PartialBuffer`,
-  mirroring the Bzip2 Run/Finish arm; small members that buffer internally and emit
-  `(consumed, 0)` are tolerated as back-pressure, and the frame is terminated by the
-  `finish` loop at end-entry. Local and central "version needed to extract" for
-  method 93 is written as 63 (the APPNOTE 6.3.x codec-introduction version used by
-  the libarchive/7-Zip/info-zip lineage; APPNOTE defines no version for zstd and the
-  `zip` crate emits its generic 45 default — both are advisory and interop-safe, and
-  63 ≥ 45 so the zip64 escalation is preserved).
-- The public `ZipMethod::Zstd` variant is gated on `zstd`, so it is nameable on a
-  portable read-only build; because `StreamZipMethod::Zstd` exists only under
-  `native-codecs`, the two `provider.rs` dispatch sites map `ZipMethod::Zstd ->
-  StreamZipMethod::Zstd` only when both cfgs hold, and otherwise defer a structured
-  `Unsupported` error ("ZIP Zstandard write requires the native-codecs profile")
-  raised at the first entry-open — a clean structured error, never a panic or a
-  compile break. With the `zstd` feature off entirely, `ZipMethod::Zstd`,
-  `StreamZipMethod::Zstd`, and `ZipBody::Zstd` are all cfg'd out and a method-93 read
-  falls through to the existing `Unsupported { method, end_offset }` arm, staying
-  enumerable (identical to the bzip2-off behavior).
-- Evidence (`tests/interop_zip_zstd.rs`, whole-file gated on `zstd`) is stated with
-  its profile asymmetry honestly: READ is proven on BOTH profiles by TWO independent
-  external producers — the `zip` crate with `CompressionMethod::Zstd` (its
-  dev-dependency gains the `zstd` feature) and a first-party raw-ZIP builder
-  embedding a raw zstd frame from the independent-C `zstd` crate (dev-dep
-  `zstd-codec`, package `zstd` 0.13.3) — each read back byte-identical by arca and by
-  the `zip` crate, with a method-93 assertion through the `zip` consumer. WRITE plus
-  a THIRD producer (arca itself) are proven ONLY under `native-codecs`: arca's
-  method-93 members are decoded to identical content by both the `zip` crate and, via
-  a central-directory frame extraction, the independent-C `zstd` crate. Portable runs
-  therefore assert two producers, not three. `tests/seek_stream_v2.rs` adds
-  `ZipMethod::Zstd` to the streaming round-trip loops only under `native-codecs`
-  (round-trip needs the encoder), keeps portable read coverage via the raw-zstd
-  fixture, and adds adversarial tests: a truncated zstd payload yields a `Malformed`
-  structured error, a zstd bomb is bounded by a small `Limits::decoded_total`
-  (`Limit` error), a portable `ZipMethod::Zstd` write is rejected with the deferred
-  `Unsupported` error at entry-open, and — under `#[cfg(not(feature = "zstd"))]` — a
-  method-93 member reports the `Unsupported` structured error while still
-  enumerating. No new source file is created, no new runtime dependency is added
-  (`ruzstd` via `zstd`, `compression-codecs` via `native-codecs`), and the crate
-  keeps `#![forbid(unsafe_code)]`.
+- WRITE is available on both profiles behind `zstd`. The portable push state
+  accumulates at most one 1 KiB block and emits a single standards-compliant
+  Zstandard frame using raw blocks plus a terminal empty block. Its window
+  descriptor matches that bound, and entry-open rejects a `codec_memory` budget
+  smaller than the fixed one-block state before bytes reach the destination.
+  The native arm retains the true streaming
+  `compression_codecs::ZstdEncoder` at deterministic level 3.
+  `BackendPreference::{Portable, Native}` reaches the ZIP member writer, so a
+  build containing both profiles can select either implementation at runtime.
+  Local and central "version needed to extract" remains 63.
+- The public `ZipMethod::Zstd` and internal `StreamZipMethod::Zstd` are both
+  gated only on `zstd`; there is no deferred runtime-`Unsupported` writer path.
+  With the feature off, the public method is unnameable and method-93 reads
+  retain the enumerable structured `Unsupported` behavior.
+- Evidence (`tests/interop_zip_zstd.rs`) proves read and write on portable and
+  native. External producers remain `zip@8.6.0` and a raw-ZIP builder over
+  independent-C zstd; arca output is decoded by both `zip@8.6.0` and libzstd.
+  A 3 MiB input fed in 97-byte chunks locks bounded block aggregation and output
+  overhead, a low codec-memory budget fails with `Limit`, and a coexistence test
+  explicitly selects both runtime backends. `tests/seek_stream_v2.rs` includes
+  method 93 in both streaming writer loops whenever `zstd` is enabled and keeps
+  truncation, decoded-output bomb, and feature-off failures. No new dependency
+  or unsafe code is introduced.
 
 ### RM-302 LZMA sub-slice (method 14) — committed-fixture + two-independent-codecs
 
@@ -285,8 +270,10 @@ change, or versioned release candidate is part of this snapshot.
 - **UDF:** a *go* for a scoped read-only in-tree pure-Rust provider (Phase 1:
   revisions 1.02/1.50/2.01, AVDP → VDS → File Set Descriptor → ICB/File Entry →
   FIDs/allocation descriptors), activated from the Volume Recognition Sequence
-  arca already parses for ISO 9660; write, VAT/sequential CD-R, sparable maps, and
-  UDF 2.50/2.60 metadata partitions are out of Phase-1 scope. ECMA-167 and OSTA
+  arca already parses for ISO 9660; UDF 2.50/2.60 Metadata Partitions,
+  Virtual/VAT reads, and Sparable Partition reads were out of Phase-1 scope
+  and are now implemented as bounded follow-on slices. UDF creation and
+  sequential-media write remain out of scope. ECMA-167 and OSTA
   UDF specs are free public PDFs with only generic RAND boilerplate, recorded as a
   low-but-nonzero tracked IP risk.
 - **RAR5:** legally defensible as an independent read-only decoder (RAR compression
@@ -318,21 +305,20 @@ change, or versioned release candidate is part of this snapshot.
   engine consumes, or the native profile), and the portable/native split is a
   pressure valve toward completeness rather than a resting state — the RM-400
   claim is not satisfied while a Tier-1 deficit is merely documented.
-- The canonical worked example is portable zstd *encode*: `ruzstd` ships only a
-  one-shot whole-buffer encoder (`ruzstd::encoding::compress_to_vec`, already used
-  for outer-filter frames and `create --zstd`), which cannot emit a ZIP member as
-  a bounded stream without buffering the whole member and breaking the memory
-  guarantee, so ZIP method-93 write is `native-codecs` only — the engine refuses
-  the path rather than weaken the guarantee. Deflate64 read is now complete on
-  both profiles and its write direction is a permanent won't-do; the current
-  open codec ledger is portable streaming zstd encode plus the 7z PPMd/BCJ2
-  decode gaps recorded in the support matrix.
+- The original worked example, portable zstd encode, has since been resolved
+  without weakening the guarantee: method 93 emits bounded 1 KiB raw Zstandard
+  blocks instead of adapting `ruzstd`'s pull-to-EOF encoder. Deflate64 read is
+  complete on both profiles and its write direction is a permanent won't-do.
+  PPMd7 read is also complete with a pre-allocation model-memory gate and an
+  exact declared-output boundary. BCJ2 read is complete through a bounded
+  four-stream shared-seek junction, independently split by `compcol` and
+  container-validated by `sevenz-rust2`; no deferred 7z reader remains.
 - `docs/support-matrix.md` is refactored to the accountability grid: the ZIP row
   points to a `method × {read,write} × {portable,native}` table where every `—` is
   a data point (a structured `Unsupported`, enumeration continues), plus a
   "Codec capability deficits" ledger linking each gap to its resolution path and
-  tracking item, with the outer-filter zstd-encode note reconciled against the
-  ZIP-member write deficit.
+  tracking item. The generated method-93 row now records read/write for both
+  portable and native backends.
 - RM-307 adds no runtime code and no dependency; it is an
   architecture-and-documentation slice establishing the contract that RM-302..306
   and future codec work inherit.
@@ -346,7 +332,8 @@ change, or versioned release candidate is part of this snapshot.
   the portable profile.
 - Registration (five points, all in the scaffold): `FormatId::Cab` / `FormatId::Xar`
   (`libarchive_oxide-core/src/format.rs`) with `MSCF` / `xar!` probe signatures;
-  `format_capability` → `FormatCapabilities::new(true, false, true)` (decode yes,
+  `format_capability` →
+  `FormatCapabilities::uniform(DirectionSet::READ, AccessMode::Sequential)` (decode yes,
   encode NO, seek yes) and `format_name` in `provider.rs`; a `SeekDispatch::Cab` /
   `SeekDispatch::Xar` arm plus signature detection in `SeekArchiveReader::open`; and
   `mod cab` / `mod xar` in `lib.rs`. Each reader implements the same
@@ -358,12 +345,20 @@ change, or versioned release candidate is part of this snapshot.
   per-folder `CFDATA` blocks are all walked within the `Limits` budget. A folder is
   a solid unit decoded one `CFDATA` block at a time — no whole folder is
   materialized. Store copies bytes through; MSZIP verifies the `CK` block magic and
-  inflates each block's raw DEFLATE while carrying the folder's 32 KiB LZ77 window
-  across blocks via a fresh `DecompressorOxide` over a preserved power-of-two
-  wrapping ring (so a back-reference in block N resolves into block N−1's output).
-  QUANTUM/LZX methods, cross-cabinet continuation files (`iFolder` sentinels), and
-  spanning blocks (`cbUncomp == 0`) list their metadata then surface a structured
-  `Unsupported` on the payload.
+  inflates each block's raw DEFLATE while carrying at most 32 KiB of valid folder
+  history in a 64 KiB non-wrapping workspace. This accepts a back-reference into
+  block N−1 while rejecting references before the beginning of the folder.
+  Feature-gated LZX uses the audited `no_std + alloc` regular-LZX fork: each CFDATA
+  receives a fresh word-aligned bitstream while window/tree/recent-offset/E8
+  state persists across the folder. Aggregate metadata, CFDATA checksum,
+  codec-memory, in-flight, decoded-total, and scan-work checks happen before
+  attacker-sized allocation or decode; a decode failure poisons the stream so
+  retry cannot skip a rejected entry/block. Feature-gated Quantum follows the
+  same bounded stateful model. The advanced `CabVolumeReader` validates an
+  application-owned `VolumeSet`, joins `cbUncomp == 0` physical fragments
+  before decode, and preserves Store/MSZIP/LZX/Quantum folder state across
+  `iFolder` continuation sentinels. The ordinary single-source reader still
+  lists continuation metadata and returns structured `Unsupported` on payload.
 - **XAR** (`xar.rs`): the 28-byte big-endian header locates the zlib-compressed TOC
   (inflated with `DataFormat::Zlib`, capped at `min(toc_length_uncompressed,
   metadata_bytes)` and length-verified) and the heap (`heap_start = header.size +
@@ -372,9 +367,11 @@ change, or versioned release candidate is part of this snapshot.
   each entry's `/`-joined path, emitting a directory before its children, bounded by
   `entries` / `path_bytes` / a nesting-depth cap. Regular files stream their heap
   blob per entry (seek-per-blob for the unordered/shared-heap model) as stored
-  (`octet-stream`, `S == L` enforced) or zlib (`x-gzip`, RFC-1950 — decoded as zlib,
-  NOT gzip), with the decoded length verified against `<length>`. `x-bzip2` and any
-  unknown encoding are structured `Unsupported`; version ≠ 1 is `Unsupported`.
+  (`octet-stream`, `S == L` enforced), zlib (`x-gzip`, RFC-1950 — decoded as zlib,
+  NOT gzip), or feature-gated bzip2 (`x-bzip2`), with the decoded length verified
+  against `<length>`. The bzip2 path is caller-driven and enforces codec-memory,
+  truncation/corruption, and decoded-size limits before allocation. Unknown
+  encodings are structured `Unsupported`; version ≠ 1 is `Unsupported`.
 - Write is rejected without a code path of its own: the decode-only capability makes
   `format_encoder` return a typed `Capability` error, and `SeekArchiveWriter::with_format`
   falls through its default arm to `Unsupported` for `FormatId::Cab`/`Xar`.
@@ -382,17 +379,23 @@ change, or versioned release candidate is part of this snapshot.
   are plain generic structs over `R: Read + Seek` with concrete enums (no trait
   objects), stream payload in ≤ 64 KiB chunks, and return a structured `StreamError`
   for every malformed/truncated/unsupported/limit case (never a panic/unwrap).
-- Evidence: `tests/interop_cab_meta.rs` and `tests/interop_xar_meta.rs` build valid
-  archives with first-party in-code raw container builders using `flate2`, read
-  them back through the RM-301 harness, and assert content round trips over
-  multi-file/nested/empty corpora, plus negatives for an unsupported compression
-  method and a truncated/out-of-range header. This proves independent container
+- Evidence: `tests/interop_cab_meta.rs` and `tests/interop_xar_meta.rs` combine
+  first-party raw builders with byte-exact external fixtures and assert content
+  round trips over multi-file/nested/empty corpora. CAB LZX uses a three-CFDATA
+  Microsoft makecab fixture (verified with `expand.exe`) and libmspack's mixed
+  MSZIP/LZX/Quantum corpus, proving history persistence, word realignment, and
+  nonzero Microsoft/libmspack CFDATA checksums. The XAR bzip2 case uses an independently produced
+  stream and covers large/empty payloads, corruption, exact decoded length, and
+  memory limits. Negatives also cover an unsupported compression method and a
+  truncated/out-of-range header. This proves independent container
   framing, not codec independence on portable builds: `flate2` and arca's inflater
   share the `miniz_oxide` implementation family there. A three-lens adversarial review
   (panic/bounds, spec-correctness, malformed-input) with an independent verification
   pass was run over both modules before commit. Per-format `PROVENANCE.md` registers
   the in-code raw builder and documents the external independent producers
-  (makecab/gcab/cabextract for CAB; the `xar` CLI / `bsdtar --format=xar` for XAR).
+  (Microsoft makecab/expand and the libmspack corpus for CAB; the `xar` CLI /
+  `bsdtar --format=xar` for XAR). `gcab` is not claimed as LZX evidence because
+  its writer does not produce CAB LZX folders.
 ## RM-304
 
 - RM-304 lifts the RM-301 interoperability harness from content-only evidence to
@@ -440,7 +443,11 @@ change, or versioned release candidate is part of this snapshot.
   that arca reads back, with a graceful skip when none is installed. Metadata
   fidelity round-trips mode/uid/gid/mtime and a symlink target through arca's
   DEFAULT Rock Ridge emission (PX/TF/SL, emitted unconditionally by `iso_stream.rs`
-  and auto-detected by the reader), read via the seek reader.
+  and auto-detected by the reader), read via the seek reader. The follow-on
+  continuation slice emits CE records when system-use fields exceed a directory
+  record, packs their data into a dedicated region, and follows CE chains with
+  image-range, cycle, nesting, in-flight, and metadata limits. A multi-sector
+  split-SL fixture plus out-of-range and low-budget failures keep the claim gated.
 - New dev-dependencies (test-only, no effect on the shipped crate's portable/C-free
   profile): `tar = "0.4"` and `ar = "0.9"`, both pure-Rust independent
   producers/consumers. Per-format `PROVENANCE.md` registries record each producer,

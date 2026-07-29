@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {},
             }
         }
-        Ok::<_, libarchive_oxide::StreamError>(())
+        Ok::<_, libarchive_oxide::Error>(())
     })?;
     Ok(())
 }

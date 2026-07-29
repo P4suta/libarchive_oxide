@@ -6,13 +6,16 @@
 name = "xtask"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 publish = false
 license.workspace = true
 
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
+
+[dependencies]
+libarchive_oxide-core = { path = "../libarchive_oxide-core" }
 
 [lints]
 workspace = true

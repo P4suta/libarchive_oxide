@@ -2,9 +2,10 @@
 
 ## North star
 
-`libarchive_oxide` aims to become a safe artifact engine for OCI layers,
-packages, and mainstream archive CLI workflows. It is not a promise to clone
-every historical libarchive format or symbol.
+`libarchive_oxide` aims to become a safe Rust-first artifact engine for OCI
+layers, packages, and archive CLI workflows. Format interoperability follows
+libarchive where practical, but C symbols and libarchive ABI compatibility are
+not part of this project.
 
 The preferred product surface is a high-level Rust engine with
 `inspect -> plan -> apply/create`, finite resource limits, extraction policy,
@@ -25,9 +26,9 @@ gates pass:
 - accurately scoped read-only RAR5, CAB, XAR, and UDF providers;
 - OCI layer and package-profile conformance, including tar+gzip and tar+zstd,
   Debian/RPM payload codecs, and ZIP-based package families;
-- a stable Rust API, stable C ABI, and a deliberately limited compatibility
-  shim for frequently used libarchive calls;
-- bounded-memory, malformed-input, fuzz, interoperability, ABI, and performance
+- a coherent Rust API and a versioned CLI JSON contract, without freezing
+  SemVer while the design is still converging;
+- bounded-memory, malformed-input, fuzz, interoperability, and performance
   gates described below.
 
 The [support matrix](support-matrix.md) is authoritative for what works now.
@@ -50,15 +51,18 @@ The [support matrix](support-matrix.md) is authoritative for what works now.
   filesystem capabilities.
 - Introduce `ArchiveEngine`, `ArchiveSession`, inspections, session-bound
   plans, apply reports, bounded events, and create options.
-- Add compile-time providers and explicit registration while retaining static
-  built-in dispatch.
-- Add `RangeSource`/`AsyncRangeSource`, a Linux reference filesystem adapter,
+- Add object-safe format/codec providers with duplicate-safe explicit
+  registration and built-in defaults.
+- Add `ReadAt`/`AsyncRangeSource`, a Linux reference filesystem adapter,
   a unified `oxarchive` CLI, portable/native codec profiles, bzip2, and
   comparable benchmarks.
 
-Provider registration in this campaign is implemented as associated-type static
-chains shared by Pipeline, reader, engine/session, and create; see
-[ADR-0006](adr/0006-compile-time-providers.md).
+The original associated-type provider chains in
+[ADR-0006](adr/0006-compile-time-providers.md) were superseded by the boxed,
+object-safe registry in
+[ADR-0015](adr/0015-object-safe-provider-registry.md). Pipeline,
+reader, engine/session, and creation now share that extensible registry
+contract.
 Filesystem application is implemented as a shared policy/limit driver plus a
 compile-time capability-reporting adapter. The Linux reference adapter and
 atomicity/finding contract are specified by
@@ -85,14 +89,14 @@ exit 0/1/2 are specified by
 - Complete producer corpora and metadata round trips for tar/cpio/ar/ISO.
 - Implement CAB and XAR read-only providers and settle legal/spec/fixture
   feasibility for RAR5 and UDF.
-- Publish a C ABI preview and limited shim only after its ownership and safety
-  contracts have passed dedicated tests.
+- Keep provider and sans-I/O seams sufficient for a separate future C-facing
+  project without exposing a C ABI here.
 
 ### Campaign 4: replacement candidate
 
-- Complete the read-only compatibility providers and C shim.
-- Run at least two release candidates after Rust API and C ABI freeze.
-- Declare 1.0 only if every Modern Archive Profile gate passes.
+- Complete the read-only compatibility providers and continuous quality gates.
+- Keep publishing, release candidates, version bumps, and compatibility
+  freezes outside this implementation program.
 
 No calendar date or version number overrides these completion gates.
 
@@ -103,13 +107,13 @@ No calendar date or version number overrides these completion gates.
 - Regress and fuzz malformed lengths, truncation, checksum/auth failures,
   overlaps, traversal, symlink races, decompression bombs, and huge entry
   counts.
-- Keep a 10 GiB streaming soak bounded; excluding codec dictionaries, target
-  at most 64 MiB additional RSS and no growth proportional to payload size.
+- Keep a 10 GiB tar/gzip/xz/zstd streaming soak bounded at no more than
+  128 MiB peak RSS and with no growth proportional to payload size.
 - Target native performance within 20% of libarchive and portable performance
-  within 2x on representative operations. A sustained regression over 5%
+  within 2x on representative operations. A sustained regression over 10%
   requires explicit review.
-- Verify protocol arithmetic, C boundary behavior, C11/C++17 headers, ABI
-  snapshots, MSRV, 32-bit, big-endian, WASI inspection, and no_std core.
+- Verify protocol arithmetic, MSRV, 32-bit, big-endian, WASI inspection, and
+  no_std core/codecs.
 
 ## Explicit non-goals
 

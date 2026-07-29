@@ -392,9 +392,7 @@ fn zip_store_and_deflate_payloads_stream_without_whole_entry_vecs() {
     );
     #[cfg(feature = "bzip2")]
     assert_eq!(collect(zip_fixture(ZipMethod::Bzip2)), vec![b'a'; 200_000]);
-    // Zstd round-trip needs an encoder: native-codecs only. Portable read
-    // coverage is provided by the raw-zstd fixture tests below.
-    #[cfg(feature = "native-codecs")]
+    #[cfg(feature = "zstd")]
     assert_eq!(collect(zip_fixture(ZipMethod::Zstd)), vec![b'a'; 200_000]);
     // LZMA read+write both use lzma-rust2 (both profiles).
     #[cfg(feature = "xz")]
@@ -408,7 +406,7 @@ fn common_writer_streams_unknown_size_zip_with_data_descriptors() {
         let mut v = vec![ZipMethod::Store, ZipMethod::Deflate];
         #[cfg(feature = "bzip2")]
         v.push(ZipMethod::Bzip2);
-        #[cfg(feature = "native-codecs")]
+        #[cfg(feature = "zstd")]
         v.push(ZipMethod::Zstd);
         #[cfg(feature = "xz")]
         v.push(ZipMethod::Lzma);
@@ -552,18 +550,18 @@ fn zip_unicode_and_timestamp_extras_are_typed_and_preserved() {
     assert_eq!(metadata.path().as_bytes(), "正確.txt".as_bytes());
     assert_eq!(metadata.comment(), Some("正確なコメント".as_bytes()));
     assert_eq!(
-        metadata.times().modified.map(|value| value.secs),
+        metadata.times().modified.map(Timestamp::seconds),
         Some(1_700_000_001)
     );
     assert_eq!(
-        metadata.times().accessed.map(|value| value.secs),
+        metadata.times().accessed.map(Timestamp::seconds),
         Some(1_700_000_002)
     );
     assert_eq!(
-        metadata.times().created.map(|value| value.secs),
+        metadata.times().created.map(Timestamp::seconds),
         Some(1_700_000_003)
     );
-    assert_eq!(metadata.times().changed.map(|value| value.secs), Some(33));
+    assert_eq!(metadata.times().changed.map(Timestamp::seconds), Some(33));
     for id in [0x7075_u16, 0x6375, 0x5455, 0x000a] {
         assert!(
             metadata
@@ -633,8 +631,8 @@ fn zip_infozip_unix_extras_are_typed_as_owner() {
     // deliberately NOT read from the central directory (avoids a positional guess).
     assert_eq!(read.owner().uid, None);
     assert_eq!(read.owner().gid, None);
-    assert_eq!(read.times().accessed.map(|value| value.secs), Some(77));
-    assert_eq!(read.times().modified.map(|value| value.secs), Some(88));
+    assert_eq!(read.times().accessed.map(Timestamp::seconds), Some(77));
+    assert_eq!(read.times().modified.map(Timestamp::seconds), Some(88));
 }
 
 #[test]
@@ -661,8 +659,8 @@ fn zip_preserved_time_extras_do_not_synthesize_a_second_timestamp() {
         let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("t.txt"))
             .size(Some(0))
             .times(EntryTimes {
-                modified: Some(Timestamp { secs: 66, nanos: 0 }),
-                accessed: Some(Timestamp { secs: 55, nanos: 0 }),
+                modified: Some(Timestamp::from_seconds(66)),
+                accessed: Some(Timestamp::from_seconds(55)),
                 ..EntryTimes::default()
             })
             .extension(Extension::new("zip-extra", id.to_le_bytes().to_vec(), raw))
@@ -685,7 +683,7 @@ fn zip_preserved_time_extras_do_not_synthesize_a_second_timestamp() {
                 .any(|extension| extension.key() == 0x5455_u16.to_le_bytes()),
             "no derived Extended Timestamp should be synthesized when {id:#06x} times exist"
         );
-        assert_eq!(read.times().modified.map(|value| value.secs), Some(66));
+        assert_eq!(read.times().modified.map(Timestamp::seconds), Some(66));
     }
 }
 
@@ -702,14 +700,8 @@ fn zip_owner_and_timestamps_round_trip_as_derived_extras() {
             ..Owner::default()
         })
         .times(EntryTimes {
-            modified: Some(Timestamp {
-                secs: 1_700_000_100,
-                nanos: 0,
-            }),
-            accessed: Some(Timestamp {
-                secs: 1_700_000_200,
-                nanos: 0,
-            }),
+            modified: Some(Timestamp::from_seconds(1_700_000_100)),
+            accessed: Some(Timestamp::from_seconds(1_700_000_200)),
             ..EntryTimes::default()
         })
         .build();
@@ -723,11 +715,11 @@ fn zip_owner_and_timestamps_round_trip_as_derived_extras() {
     assert_eq!(read.owner().uid, Some(4242));
     assert_eq!(read.owner().gid, Some(2424));
     assert_eq!(
-        read.times().modified.map(|value| value.secs),
+        read.times().modified.map(Timestamp::seconds),
         Some(1_700_000_100)
     );
     assert_eq!(
-        read.times().accessed.map(|value| value.secs),
+        read.times().accessed.map(Timestamp::seconds),
         Some(1_700_000_200)
     );
     for id in [0x5455_u16, 0x7855] {
@@ -749,10 +741,7 @@ fn zip_preserved_extended_timestamp_is_not_duplicated() {
     let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("dup.txt"))
         .size(Some(0))
         .times(EntryTimes {
-            modified: Some(Timestamp {
-                secs: 999,
-                nanos: 0,
-            }),
+            modified: Some(Timestamp::from_seconds(999)),
             ..EntryTimes::default()
         })
         .extension(Extension::new(
@@ -773,7 +762,7 @@ fn zip_preserved_extended_timestamp_is_not_duplicated() {
         .count();
     assert_eq!(count, 1, "Extended Timestamp extra was duplicated");
     // The preserved raw field wins: its modification time is 123, not the typed 999.
-    assert_eq!(read.times().modified.map(|value| value.secs), Some(123));
+    assert_eq!(read.times().modified.map(Timestamp::seconds), Some(123));
 }
 
 #[test]
@@ -932,10 +921,7 @@ fn common_iso_writer_streams_payload_and_roundtrips_rock_ridge_metadata() {
     let output = ObservedCursor::new(Rc::clone(&maximum_written_position));
     let mut writer =
         SeekArchiveWriter::with_format(output, FormatId::Iso9660, Limits::default()).unwrap();
-    let timestamp = Timestamp {
-        secs: 1_721_390_096,
-        nanos: 120_000_000,
-    };
+    let timestamp = Timestamp::new(1_721_390_096, 120_000_000).expect("valid timestamp");
     let file = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("sub/pretty.txt"))
         .size(None)
         .mode(Some(0o640))
@@ -1498,24 +1484,12 @@ fn zip_zstd_bomb_is_bounded_by_limits() {
     );
 }
 
-// Portable (zstd read, no native encoder): selecting ZipMethod::Zstd for WRITE
-// must degrade to a structured Unsupported error at entry-open, never a panic.
+// Portable method-93 production is a real streaming writer, not a deferred
+// Unsupported selection.
 #[cfg(all(feature = "zstd", not(feature = "native-codecs")))]
 #[test]
-fn zip_zstd_write_without_encoder_is_structured_unsupported() {
-    let mut writer = ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Zstd, Limits::default());
-    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("payload.bin"))
-        .size(Some(4))
-        .build();
-    let error = writer
-        .start_entry(&metadata)
-        .expect_err("portable zstd write must be rejected");
-    assert_eq!(
-        error
-            .archive_error()
-            .map(libarchive_oxide_core::ArchiveError::kind),
-        Some(ErrorKind::Unsupported)
-    );
+fn portable_zip_zstd_write_roundtrips() {
+    assert_eq!(collect(zip_fixture(ZipMethod::Zstd)), vec![b'a'; 200_000]);
 }
 
 // Feature-off: method 93 falls through to the structured Unsupported error and

@@ -8,14 +8,12 @@ use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use cap_std::fs::Dir;
 use futures_io::{AsyncRead as FuturesRead, AsyncSeek as FuturesSeek, AsyncWrite as FuturesWrite};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 use crate::async_seek::{AsyncSeekArchiveReader, AsyncSeekArchiveWriter};
 use crate::async_stream::{AsyncArchiveReader, AsyncArchiveWriter};
-use crate::extractor::{ExtractionMessage, run_extraction_worker};
-use crate::{ExtractionPolicy, ExtractionReport, ReaderEvent, StreamError};
+use crate::{ReaderEvent, StreamError};
 #[cfg(feature = "aes")]
 use crate::{SecretBytes, ZipMethod};
 use libarchive_oxide_core::filter::FilterId;
@@ -122,15 +120,41 @@ impl<R: AsyncRead + Unpin> TokioArchiveReader<R> {
         ))
     }
 
+    /// Creates a Tokio reader for an explicit sequential format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the format is not a readable sequential format.
+    pub fn with_format(reader: R, format: FormatId) -> Result<Self, ArchiveError> {
+        AsyncArchiveReader::with_format(TokioIo::new(reader), format).map(Self)
+    }
+
+    /// Creates an explicit-format Tokio reader with custom limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the format is not a readable sequential format.
+    pub fn with_format_and_limits(
+        reader: R,
+        format: FormatId,
+        limits: Limits,
+    ) -> Result<Self, ArchiveError> {
+        AsyncArchiveReader::with_format_and_limits(TokioIo::new(reader), format, limits).map(Self)
+    }
+
     /// Produces the next structural event.
     pub async fn next_event(&mut self) -> Result<ReaderEvent<'_>, StreamError> {
         self.0.next_event().await
     }
 
-    /// Returns the wrapped Tokio input.
-    #[must_use]
-    pub fn into_inner(self) -> R {
-        self.0.into_inner().into_inner()
+    /// Returns the wrapped Tokio input when ownership is recoverable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error if codec construction failed after consuming
+    /// ownership of an inner adapter.
+    pub fn into_inner(self) -> Result<R, ArchiveError> {
+        self.0.into_inner().map(TokioIo::into_inner)
     }
 }
 
@@ -322,161 +346,4 @@ impl<W: AsyncWrite + AsyncSeek + Unpin> TokioSeekArchiveWriter<W> {
     pub fn abort(self) -> W {
         self.0.abort().into_inner()
     }
-}
-
-/// Secure Tokio extraction adapter.
-///
-/// Archive reads remain asynchronous. Capability-based filesystem operations
-/// run on one blocking worker behind a bounded channel, so neither the Tokio
-/// executor nor memory grows with archive size.
-#[derive(Debug)]
-pub struct TokioExtractor {
-    root: Dir,
-    policy: ExtractionPolicy,
-    limits: Limits,
-}
-
-impl TokioExtractor {
-    /// Creates a safe-policy extractor rooted at a directory capability.
-    #[must_use]
-    pub fn new(root: Dir) -> Self {
-        Self::with_policy_and_limits(root, ExtractionPolicy::safe(), Limits::default())
-    }
-
-    /// Creates an extractor with an explicit restore policy.
-    #[must_use]
-    pub const fn with_policy(root: Dir, policy: ExtractionPolicy) -> Self {
-        Self::with_policy_and_limits(root, policy, Limits::safe())
-    }
-
-    /// Creates a safe-policy extractor with explicit resource budgets.
-    #[must_use]
-    pub const fn with_limits(root: Dir, limits: Limits) -> Self {
-        Self::with_policy_and_limits(root, ExtractionPolicy::safe(), limits)
-    }
-
-    /// Creates an extractor with explicit policy and resource budgets.
-    #[must_use]
-    pub const fn with_policy_and_limits(
-        root: Dir,
-        policy: ExtractionPolicy,
-        limits: Limits,
-    ) -> Self {
-        Self {
-            root,
-            policy,
-            limits,
-        }
-    }
-
-    /// Returns the resource budgets enforced by this extractor.
-    #[must_use]
-    pub const fn limits(&self) -> Limits {
-        self.limits
-    }
-
-    /// Extracts from a sequential Tokio archive reader.
-    pub async fn extract<R: AsyncRead + Unpin>(
-        self,
-        reader: &mut TokioArchiveReader<R>,
-    ) -> Result<ExtractionReport, StreamError> {
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        let worker = tokio::task::spawn_blocking(move || {
-            run_extraction_worker(self.root, self.policy, self.limits, receiver)
-        });
-        produce_extraction(sender, reader, worker).await
-    }
-
-    /// Extracts from a seek-capable Tokio archive reader.
-    pub async fn extract_seek<R: AsyncRead + AsyncSeek + Unpin>(
-        self,
-        reader: &mut TokioSeekArchiveReader<R>,
-    ) -> Result<ExtractionReport, StreamError> {
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        let worker = tokio::task::spawn_blocking(move || {
-            run_extraction_worker(self.root, self.policy, self.limits, receiver)
-        });
-        produce_seek_extraction(sender, reader, worker).await
-    }
-}
-
-async fn produce_extraction<R: AsyncRead + Unpin>(
-    sender: tokio::sync::mpsc::Sender<ExtractionMessage>,
-    reader: &mut TokioArchiveReader<R>,
-    worker: tokio::task::JoinHandle<Result<ExtractionReport, StreamError>>,
-) -> Result<ExtractionReport, StreamError> {
-    let mut worker = Some(worker);
-    loop {
-        let event = match reader.next_event().await {
-            Ok(event) => event,
-            Err(error) => {
-                drop(sender);
-                let _ = join_extraction_worker(worker.take()).await;
-                return Err(error);
-            },
-        };
-        let Some((message, done)) = owned_extraction_message(event) else {
-            continue;
-        };
-        if sender.send(message).await.is_err() {
-            return join_extraction_worker(worker.take()).await;
-        }
-        if done {
-            drop(sender);
-            return join_extraction_worker(worker.take()).await;
-        }
-    }
-}
-
-async fn produce_seek_extraction<R: AsyncRead + AsyncSeek + Unpin>(
-    sender: tokio::sync::mpsc::Sender<ExtractionMessage>,
-    reader: &mut TokioSeekArchiveReader<R>,
-    worker: tokio::task::JoinHandle<Result<ExtractionReport, StreamError>>,
-) -> Result<ExtractionReport, StreamError> {
-    let mut worker = Some(worker);
-    loop {
-        let event = match reader.next_event().await {
-            Ok(event) => event,
-            Err(error) => {
-                drop(sender);
-                let _ = join_extraction_worker(worker.take()).await;
-                return Err(error);
-            },
-        };
-        let Some((message, done)) = owned_extraction_message(event) else {
-            continue;
-        };
-        if sender.send(message).await.is_err() {
-            return join_extraction_worker(worker.take()).await;
-        }
-        if done {
-            drop(sender);
-            return join_extraction_worker(worker.take()).await;
-        }
-    }
-}
-
-fn owned_extraction_message(event: ReaderEvent<'_>) -> Option<(ExtractionMessage, bool)> {
-    match event {
-        ReaderEvent::ArchiveMetadata(_) => None,
-        ReaderEvent::Entry(metadata) => Some((ExtractionMessage::Entry(Box::new(metadata)), false)),
-        ReaderEvent::Data(bytes) => Some((ExtractionMessage::Data(bytes.to_vec()), false)),
-        ReaderEvent::EndEntry => Some((ExtractionMessage::EndEntry, false)),
-        ReaderEvent::Done => Some((ExtractionMessage::Done, true)),
-    }
-}
-
-async fn join_extraction_worker(
-    worker: Option<tokio::task::JoinHandle<Result<ExtractionReport, StreamError>>>,
-) -> Result<ExtractionReport, StreamError> {
-    let worker = worker.ok_or_else(|| {
-        StreamError::io(io::Error::other(
-            "Tokio extraction worker was already joined",
-        ))
-    })?;
-    worker.await.map_err(|error| {
-        StreamError::io(io::Error::other(format!(
-            "Tokio extraction worker failed: {error}",
-        )))
-    })?
 }

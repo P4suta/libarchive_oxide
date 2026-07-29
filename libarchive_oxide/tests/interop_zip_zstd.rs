@@ -7,15 +7,11 @@
 //! Reuses the RM-301 harness (`tests/common/mod.rs`). The whole file is gated on the `zstd`
 //! feature, which is enabled on BOTH codec profiles (portable-codecs and native-codecs).
 //!
-//! Profile asymmetry (stated honestly, mirrored in campaign-3-evidence.md):
-//!
 //! * READ is proven on BOTH profiles by TWO independent external producers — the `zip` crate with
 //!   `CompressionMethod::Zstd`, and a first-party raw-ZIP builder embedding a raw zstd frame from
 //!   the independent-C `zstd` crate (dev-dep `zstd-codec`). arca reads each back byte-identical.
-//! * WRITE + a THIRD producer (arca itself emitting method-93 members) are proven ONLY on
-//!   native-codecs (`#[cfg(feature = "native-codecs")]`), because the portable `ruzstd` path is
-//!   deliberately decode-only for ZIP production. Both the `zip` crate and the independent-C `zstd`
-//!   crate decode arca's members back to identical content.
+//! * WRITE is proven on BOTH profiles. Both the `zip` crate and the independent-C `zstd`
+//!   crate decode arca's method-93 members back to identical content.
 #![cfg(feature = "zstd")]
 #![allow(
     clippy::unwrap_used,
@@ -27,10 +23,8 @@
 
 use std::io::Cursor;
 
-#[cfg(feature = "native-codecs")]
-use libarchive_oxide::{ArchiveWriter, ZipMethod};
+use libarchive_oxide::{ArchiveWriter, BackendPreference, ZipMethod};
 use libarchive_oxide_core::EntryKind;
-#[cfg(feature = "native-codecs")]
 use libarchive_oxide_core::{ArchivePath, EntryMetadata, Limits};
 
 mod common;
@@ -51,12 +45,21 @@ fn zip_entries() -> Vec<LogicalEntry> {
 }
 
 // ---------------------------------------------------------------------------
-// Producer 1 (native only): arca's own streaming ZIP writer (system under test).
+// Producer 1: arca's own streaming ZIP writer (system under test).
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "native-codecs")]
 fn arca_zip_zstd(entries: &[LogicalEntry]) -> Vec<u8> {
-    let mut writer = ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Zstd, Limits::default());
+    arca_zip_zstd_with_backend(entries, BackendPreference::Auto, Limits::default())
+        .expect("default zstd backend")
+}
+
+fn arca_zip_zstd_with_backend(
+    entries: &[LogicalEntry],
+    backend: BackendPreference,
+    limits: Limits,
+) -> Result<Vec<u8>, libarchive_oxide::Error> {
+    let mut writer =
+        ArchiveWriter::with_zip_method_and_backend(Vec::new(), ZipMethod::Zstd, limits, backend);
     for e in entries {
         let mode = if e.kind == EntryKind::Dir {
             0o755
@@ -67,15 +70,15 @@ fn arca_zip_zstd(entries: &[LogicalEntry]) -> Vec<u8> {
             .size(None)
             .mode(Some(mode))
             .build();
-        writer.start_entry(&metadata).unwrap();
+        writer.start_entry(&metadata)?;
         if !e.content.is_empty() {
             for chunk in e.content.chunks(97) {
-                writer.write_data(chunk).unwrap();
+                writer.write_data(chunk)?;
             }
         }
-        writer.end_entry().unwrap();
+        writer.end_entry()?;
     }
-    writer.finish().unwrap()
+    writer.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +237,6 @@ fn raw_zip_zstd(entries: &[LogicalEntry]) -> Vec<u8> {
 #[test]
 fn zip_zstd_interop() {
     let entries = zip_entries();
-    #[allow(unused_mut)]
     let mut producers = vec![
         ProducerCase {
             name: "zip@8.6.0",
@@ -245,8 +247,7 @@ fn zip_zstd_interop() {
             encode: raw_zip_zstd,
         },
     ];
-    // WRITE evidence + third producer: arca as a producer, native-codecs only.
-    #[cfg(feature = "native-codecs")]
+    // WRITE evidence + third producer: arca on the selected runtime backend.
     producers.push(ProducerCase {
         name: "arca",
         encode: arca_zip_zstd,
@@ -279,9 +280,8 @@ fn zip_zstd_interop() {
         ],
     );
 
-    // On native-codecs, arca's own method-93 output is also read back as Zstd by the `zip`
-    // consumer (WRITE-side codec-method evidence).
-    #[cfg(feature = "native-codecs")]
+    // Arca's own method-93 output is read back as Zstd by the `zip` consumer
+    // (WRITE-side codec-method evidence).
     for shape in zip_crate_decode(&arca_zip_zstd(&entries)) {
         if shape.kind() == EntryKind::File && !shape.content().is_empty() {
             shape.assert_method(CompressionMethod::Zstd);
@@ -290,14 +290,13 @@ fn zip_zstd_interop() {
 }
 
 // ---------------------------------------------------------------------------
-// WRITE evidence (native-codecs only): arca produces method-93 members that the
+// WRITE evidence: arca produces method-93 members that the
 // `zip` crate AND the independent-C `zstd` crate decode to identical content.
 // ---------------------------------------------------------------------------
 
 /// Extracts the single file member's raw compressed frame, method code, and
 /// declared content from an arca-produced ZIP by parsing the central directory
 /// (arca writes data descriptors, so authoritative sizes live there).
-#[cfg(feature = "native-codecs")]
 fn extract_single_member(zip: &[u8]) -> (u16, Vec<u8>, u32) {
     let read_u16 = |o: usize| u16::from_le_bytes([zip[o], zip[o + 1]]);
     let read_u32 = |o: usize| u32::from_le_bytes([zip[o], zip[o + 1], zip[o + 2], zip[o + 3]]);
@@ -338,9 +337,21 @@ fn extract_single_member(zip: &[u8]) -> (u16, Vec<u8>, u32) {
 /// Produces a single-file arca ZIP with a KNOWN entry size so the central
 /// directory stores plain (non-zip64) 32-bit sizes, keeping [`extract_single_member`]
 /// simple. WRITE bytes are still genuine arca method-93 output.
-#[cfg(feature = "native-codecs")]
 fn arca_single_file_known_size(name: &[u8], content: &[u8]) -> Vec<u8> {
-    let mut writer = ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Zstd, Limits::default());
+    arca_single_file_known_size_with_backend(name, content, BackendPreference::Auto)
+}
+
+fn arca_single_file_known_size_with_backend(
+    name: &[u8],
+    content: &[u8],
+    backend: BackendPreference,
+) -> Vec<u8> {
+    let mut writer = ArchiveWriter::with_zip_method_and_backend(
+        Vec::new(),
+        ZipMethod::Zstd,
+        Limits::default(),
+        backend,
+    );
     let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_bytes(name.to_vec()))
         .size(Some(content.len() as u64))
         .mode(Some(0o644))
@@ -353,7 +364,6 @@ fn arca_single_file_known_size(name: &[u8], content: &[u8]) -> Vec<u8> {
     writer.finish().unwrap()
 }
 
-#[cfg(feature = "native-codecs")]
 #[test]
 fn zip_zstd_write_is_decoded_by_independent_libzstd_and_zip_crate() {
     let content = b"arca-produced zstd member for independent decode\n".repeat(64);
@@ -374,4 +384,83 @@ fn zip_zstd_write_is_decoded_by_independent_libzstd_and_zip_crate() {
     assert_eq!(uncomp as usize, content.len());
     let plain = zstd_codec::stream::decode_all(Cursor::new(frame)).unwrap();
     assert_eq!(plain, content, "independent libzstd decode of arca member");
+}
+
+#[test]
+#[cfg(feature = "portable-codecs")]
+fn portable_zip_zstd_is_streaming_and_bounded() {
+    let content = (0_u8..=251)
+        .cycle()
+        .take(3 * 1024 * 1024)
+        .collect::<Vec<_>>();
+    let archive = arca_single_file_known_size_with_backend(
+        b"large.bin",
+        &content,
+        BackendPreference::Portable,
+    );
+    let decoded = zip_crate_decode(&archive);
+    let file = decoded
+        .iter()
+        .find(|shape| shape.kind() == EntryKind::File)
+        .expect("file member");
+    assert_eq!(file.content(), content);
+    file.assert_method(CompressionMethod::Zstd);
+
+    // Raw blocks add three bytes per 1 KiB plus one frame header and terminal
+    // block. This guards against accidental whole-entry framing or buffering.
+    let (_, frame, _) = extract_single_member(&archive);
+    assert!(frame.len() <= content.len() + (content.len() / 1024 + 2) * 3 + 6);
+}
+
+#[test]
+#[cfg(feature = "portable-codecs")]
+fn portable_zip_zstd_honors_codec_memory_limit_before_output() {
+    let limits = Limits::default().with_codec_memory(Some(1023));
+    let error = arca_zip_zstd_with_backend(
+        &[LogicalEntry::file(b"limited.bin".to_vec(), b"x".to_vec())],
+        BackendPreference::Portable,
+        limits,
+    )
+    .expect_err("portable zstd window must honor codec memory");
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(libarchive_oxide_core::ErrorKind::Limit)
+    );
+}
+
+#[cfg(all(feature = "portable-codecs", feature = "native-codecs"))]
+#[test]
+fn runtime_backend_preference_selects_both_zip_zstd_encoders() {
+    let content = b"backend coexistence\n".repeat(512);
+    let entries = vec![LogicalEntry::file(b"backend.bin".to_vec(), content)];
+    let expected = entries
+        .iter()
+        .map(|entry| EntryShape::new(entry.path.clone(), entry.kind, entry.content.clone()))
+        .collect::<Vec<_>>();
+    for backend in [BackendPreference::Portable, BackendPreference::Native] {
+        let archive =
+            arca_zip_zstd_with_backend(&entries, backend, Limits::default()).expect("backend");
+        assert_consumers_accept(
+            &archive,
+            &expected,
+            &[
+                ConsumerCase {
+                    name: "arca",
+                    decode: read_with_arca,
+                },
+                ConsumerCase {
+                    name: "zip@8.6.0",
+                    decode: zip_crate_decode,
+                },
+            ],
+        );
+        let decoded = zip_crate_decode(&archive);
+        decoded
+            .iter()
+            .find(|shape| shape.kind() == EntryKind::File)
+            .expect("file")
+            .assert_method(CompressionMethod::Zstd);
+    }
 }

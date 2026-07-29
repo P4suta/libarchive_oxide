@@ -17,8 +17,8 @@ pub enum ZipMethod {
     Bzip2,
     /// Encode bytes as Zstandard (method 93).
     ///
-    /// Reading is available on both codec profiles; writing requires the
-    /// `native-codecs` profile (the portable `ruzstd` path is decode-only).
+    /// Both codec profiles support streaming output. The portable backend
+    /// emits bounded raw-block frames; the native backend applies compression.
     #[cfg(feature = "zstd")]
     Zstd,
     /// Encode bytes as LZMA (method 14).

@@ -14,13 +14,14 @@ use libarchive_oxide_core::{
     Limits, ProbeResult,
 };
 
+use crate::BackendPreference;
 #[cfg(feature = "aes")]
 use crate::SecretBytes;
 use crate::filtered_io::SyncFilterWriter;
 pub(crate) use crate::provider::BuiltinFormatEncoder as RuntimeEncoder;
 use crate::provider::{
-    BuiltinCodecProviders, BuiltinFormatProviders, ProviderArchiveEncoder, ProviderSet,
-    StaticCodecProviders, StaticFormatProviders, filter_name,
+    BuiltinCodecProviders, BuiltinFormatProviders, ProviderArchiveEncoder, ProviderCapability,
+    ProviderSet, StaticCodecProviders, StaticFormatProviders, filter_name,
 };
 use crate::zip::ZipMethod;
 
@@ -63,19 +64,128 @@ pub enum ReaderEvent<'a> {
     Done,
 }
 
+/// One streaming archive entry borrowed from an [`ArchiveReader`].
+///
+/// Read to EOF, or call [`Self::finish`], before requesting the next entry.
+pub struct Entry<'a, R, F = BuiltinFormatProviders, C = BuiltinCodecProviders>
+where
+    R: Read,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    reader: &'a mut ArchiveReader<R, F, C>,
+    metadata: EntryMetadata,
+    pending: Vec<u8>,
+    pending_position: usize,
+    ended: bool,
+}
+
+impl<R, F, C> fmt::Debug for Entry<'_, R, F, C>
+where
+    R: Read,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Entry")
+            .field("metadata", &self.metadata)
+            .field(
+                "pending",
+                &self.pending.len().saturating_sub(self.pending_position),
+            )
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R, F, C> Entry<'_, R, F, C>
+where
+    R: Read,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    /// Validated metadata for this entry.
+    #[must_use]
+    pub const fn metadata(&self) -> &EntryMetadata {
+        &self.metadata
+    }
+
+    /// Drains the entry body and verifies its end marker.
+    pub fn finish(mut self) -> io::Result<()> {
+        let mut buffer = vec![0_u8; BUFFER];
+        while self.read(&mut buffer)? != 0 {}
+        Ok(())
+    }
+}
+
+impl<R, F, C> Read for Entry<'_, R, F, C>
+where
+    R: Read,
+    F: StaticFormatProviders,
+    C: StaticCodecProviders,
+{
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.ended {
+            return Ok(0);
+        }
+        if self.pending_position != self.pending.len() {
+            let count = (self.pending.len() - self.pending_position).min(output.len());
+            output[..count].copy_from_slice(
+                &self.pending[self.pending_position..self.pending_position + count],
+            );
+            self.pending_position += count;
+            if self.pending_position == self.pending.len() {
+                self.pending.clear();
+                self.pending_position = 0;
+            }
+            return Ok(count);
+        }
+        loop {
+            match self.reader.next_event().map_err(io::Error::other)? {
+                ReaderEvent::Data(data) => {
+                    let count = data.len().min(output.len());
+                    output[..count].copy_from_slice(&data[..count]);
+                    if count != data.len() {
+                        self.pending.extend_from_slice(&data[count..]);
+                    }
+                    return Ok(count);
+                },
+                ReaderEvent::EndEntry => {
+                    self.ended = true;
+                    return Ok(0);
+                },
+                ReaderEvent::ArchiveMetadata(_) => {},
+                ReaderEvent::Entry(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "archive began another entry before ending the current entry",
+                    ));
+                },
+                ReaderEvent::Done => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "archive ended before the current entry end marker",
+                    ));
+                },
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ErrorSource {
     Archive(ArchiveError),
     Io(io::Error),
 }
 
-/// Error from a synchronous archive stream.
+/// Unified error for archive semantics and adapter I/O.
 #[derive(Debug)]
-pub struct StreamError {
+pub struct Error {
     source: ErrorSource,
 }
 
-impl StreamError {
+impl Error {
     pub(crate) fn archive(error: ArchiveError) -> Self {
         Self {
             source: ErrorSource::Archive(error),
@@ -86,6 +196,27 @@ impl StreamError {
         Self {
             source: ErrorSource::Io(error),
         }
+    }
+
+    /// Stable classification covering both archive and I/O failures.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        match &self.source {
+            ErrorSource::Archive(error) => error.kind(),
+            ErrorSource::Io(_) => ErrorKind::Io,
+        }
+    }
+
+    /// Archive format context when available.
+    #[must_use]
+    pub fn format(&self) -> Option<&'static str> {
+        self.archive_error().and_then(ArchiveError::format)
+    }
+
+    /// Entry index and archive-native path when available.
+    #[must_use]
+    pub fn entry(&self) -> Option<(u64, &[u8])> {
+        self.archive_error().and_then(ArchiveError::entry)
     }
 
     /// Archive error details, if this was a parsing/policy failure.
@@ -107,7 +238,7 @@ impl StreamError {
     }
 }
 
-impl fmt::Display for StreamError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.source {
             ErrorSource::Archive(error) => error.fmt(f),
@@ -116,7 +247,7 @@ impl fmt::Display for StreamError {
     }
 }
 
-impl std::error::Error for StreamError {
+impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(match &self.source {
             ErrorSource::Archive(error) => error,
@@ -125,11 +256,19 @@ impl std::error::Error for StreamError {
     }
 }
 
-impl From<ArchiveError> for StreamError {
+impl From<ArchiveError> for Error {
     fn from(value: ArchiveError) -> Self {
         Self::archive(value)
     }
 }
+
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Self {
+        Self::io(value)
+    }
+}
+
+pub(crate) type StreamError = Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerState {
@@ -210,6 +349,7 @@ where
     filter_depth: usize,
     decoder: Option<F::Decoder>,
     format: Option<FormatId>,
+    forced_format: Option<FormatId>,
     event_data: Vec<u8>,
     decoder_scratch: Vec<u8>,
     decoder_stalled: bool,
@@ -249,21 +389,77 @@ impl Pipeline<BuiltinFormatProviders, BuiltinCodecProviders> {
     /// Creates a pipeline with explicit resource limits.
     #[must_use]
     pub fn new(limits: Limits) -> Self {
+        Self::with_backend(limits, crate::BackendPreference::Auto)
+    }
+
+    /// Creates a pipeline with explicit limits and codec backend preference.
+    #[must_use]
+    pub fn with_backend(limits: Limits, backend: crate::BackendPreference) -> Self {
         Self::with_filter_mode(
             limits,
             FilterInputMode::Detect,
-            BuiltinFormatProviders,
-            BuiltinCodecProviders,
+            BuiltinFormatProviders::new(backend),
+            BuiltinCodecProviders::new(backend),
         )
     }
 
-    pub(crate) fn after_filter_adapters(limits: Limits) -> Self {
+    /// Creates a caller-driven pipeline with an explicit sequential format.
+    ///
+    /// Outer filters are still detected incrementally. The format hint is
+    /// applied only after those filters have been decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested format is not a readable sequential
+    /// built-in format.
+    pub fn with_format(limits: Limits, format: FormatId) -> Result<Self, ArchiveError> {
+        Self::with_backend_and_format(limits, crate::BackendPreference::Auto, format)
+    }
+
+    /// Creates an explicit-format pipeline with a runtime codec backend choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested format is not a readable sequential
+    /// built-in format.
+    pub fn with_backend_and_format(
+        limits: Limits,
+        backend: crate::BackendPreference,
+        format: FormatId,
+    ) -> Result<Self, ArchiveError> {
+        Self::with_filter_mode(
+            limits,
+            FilterInputMode::Detect,
+            BuiltinFormatProviders::new(backend),
+            BuiltinCodecProviders::new(backend),
+        )
+        .force_format(format)
+    }
+
+    pub(crate) fn after_filter_adapters_with_backend(
+        limits: Limits,
+        backend: crate::BackendPreference,
+    ) -> Self {
         Self::with_filter_mode(
             limits,
             FilterInputMode::Predecoded,
-            BuiltinFormatProviders,
-            BuiltinCodecProviders,
+            BuiltinFormatProviders::new(backend),
+            BuiltinCodecProviders::new(backend),
         )
+    }
+
+    pub(crate) fn after_filter_adapters_with_format(
+        limits: Limits,
+        backend: crate::BackendPreference,
+        format: FormatId,
+    ) -> Result<Self, ArchiveError> {
+        Self::with_filter_mode(
+            limits,
+            FilterInputMode::Predecoded,
+            BuiltinFormatProviders::new(backend),
+            BuiltinCodecProviders::new(backend),
+        )
+        .force_format(format)
     }
 }
 
@@ -277,6 +473,22 @@ where
     pub fn with_providers(limits: Limits, providers: ProviderSet<F, C>) -> Self {
         let (formats, codecs) = providers.into_chains();
         Self::with_filter_mode(limits, FilterInputMode::Detect, formats, codecs)
+    }
+
+    /// Creates a pipeline from registered providers and an explicit format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the identifier is not a readable sequential format
+    /// in the provider set.
+    pub fn with_providers_and_format(
+        limits: Limits,
+        providers: ProviderSet<F, C>,
+        format: FormatId,
+    ) -> Result<Self, ArchiveError> {
+        let (formats, codecs) = providers.into_chains();
+        Self::with_filter_mode(limits, FilterInputMode::Detect, formats, codecs)
+            .force_format(format)
     }
 
     fn with_filter_mode(
@@ -317,11 +529,36 @@ where
             filter_depth,
             decoder: None,
             format: None,
+            forced_format: None,
             event_data: Vec::with_capacity(capacity),
             decoder_scratch: vec![0; capacity],
             decoder_stalled: false,
             phase: PipelinePhase::Reading,
             filter_input,
+        }
+    }
+
+    fn force_format(mut self, format: FormatId) -> Result<Self, ArchiveError> {
+        match self.formats.format_capability(format) {
+            ProviderCapability::Available(capabilities)
+                if capabilities.can_decode()
+                    && !capabilities.requires_seek(libarchive_oxide_core::Direction::Read) =>
+            {
+                self.forced_format = Some(format);
+                Ok(self)
+            },
+            ProviderCapability::Available(capabilities)
+                if capabilities.requires_seek(libarchive_oxide_core::Direction::Read) =>
+            {
+                Err(ArchiveError::new(ErrorKind::Capability)
+                    .with_context("explicit streaming format requires a seekable reader"))
+            },
+            ProviderCapability::Available(_) => Err(ArchiveError::new(ErrorKind::Unsupported)
+                .with_context("explicit streaming format is not readable")),
+            ProviderCapability::Disabled => Err(ArchiveError::new(ErrorKind::Capability)
+                .with_context("explicit streaming format is disabled in this build")),
+            ProviderCapability::Unknown => Err(ArchiveError::new(ErrorKind::Unsupported)
+                .with_context("explicit streaming format is not registered")),
         }
     }
 
@@ -612,13 +849,20 @@ where
                 ));
                 continue;
             }
-            if !self.plain_exhausted() {
-                if let ProbeResult::NeedMore { minimum } = filter_probe {
-                    if matches!(self.fill_plain(minimum)?, Drive::NeedInput) {
-                        return Ok(Drive::NeedInput);
-                    }
-                    continue;
+            if !self.plain_exhausted()
+                && let ProbeResult::NeedMore { minimum } = filter_probe
+            {
+                if matches!(self.fill_plain(minimum)?, Drive::NeedInput) {
+                    return Ok(Drive::NeedInput);
                 }
+                continue;
+            }
+
+            if let Some(format) = self.forced_format {
+                let selection = self.formats.select_format(format)?;
+                self.install_decoder(format, selection)?;
+                self.forced_format = None;
+                return Ok(Drive::Ready);
             }
 
             match self.formats.probe_format(self.plain())? {
@@ -632,6 +876,17 @@ where
                     }
                 },
                 _ => {
+                    if self.plain_exhausted()
+                        && self.plain().is_empty()
+                        && matches!(
+                            self.formats.format_capability(FormatId::Empty),
+                            ProviderCapability::Available(_)
+                        )
+                    {
+                        let selection = self.formats.select_format(FormatId::Empty)?;
+                        self.install_decoder(FormatId::Empty, selection)?;
+                        return Ok(Drive::Ready);
+                    }
                     if self.plain_exhausted()
                         && self.plain().len() >= 2 * 512
                         && self.plain()[..2 * 512].iter().all(|byte| *byte == 0)
@@ -797,6 +1052,7 @@ where
         }
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) fn into_providers(self) -> ProviderSet<F, C> {
         ProviderSet::from_chains(self.formats, self.codecs)
     }
@@ -824,6 +1080,7 @@ where
     pipeline: Pipeline<F, C>,
     read_buffer: Vec<u8>,
     event_data: Vec<u8>,
+    backend: BackendPreference,
 }
 
 impl<R, F, C> fmt::Debug for ArchiveReader<R, F, C>
@@ -866,33 +1123,38 @@ enum ReaderInput<R: Read> {
 }
 
 impl<R: Read> ReaderInput<R> {
-    fn initialize(input: R, limits: Limits) -> io::Result<Self> {
+    fn initialize(input: R, limits: Limits, backend: BackendPreference) -> io::Result<Self> {
         let depth = limits.filter_depth().unwrap_or(4).min(4);
         if depth == 0 {
             return Ok(Self::Plain(input));
         }
-        let one = crate::filtered_io::FilterReader::with_limits(input, limits)?;
+        let one = crate::filtered_io::FilterReader::with_backend(input, limits, backend)?;
         if depth == 1 {
             return Ok(Self::One(Box::new(one)));
         }
-        let two = crate::filtered_io::FilterReader::with_limits(one, limits)?;
+        let two = crate::filtered_io::FilterReader::with_backend(one, limits, backend)?;
         if depth == 2 {
             return Ok(Self::Two(Box::new(two)));
         }
-        let three = crate::filtered_io::FilterReader::with_limits(two, limits)?;
+        let three = crate::filtered_io::FilterReader::with_backend(two, limits, backend)?;
         if depth == 3 {
             return Ok(Self::Three(Box::new(three)));
         }
-        let four = crate::filtered_io::FilterReader::with_limits(three, limits)?;
+        let four = crate::filtered_io::FilterReader::with_backend(three, limits, backend)?;
         Ok(Self::Four(Box::new(four)))
     }
 
-    fn read(&mut self, output: &mut [u8], limits: Limits) -> io::Result<usize> {
+    fn read(
+        &mut self,
+        output: &mut [u8],
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> io::Result<usize> {
         if let Self::Uninitialized(input) = self {
             let input = input
                 .take()
                 .ok_or_else(|| io::Error::other("archive input disappeared during detection"))?;
-            *self = Self::initialize(input, limits)?;
+            *self = Self::initialize(input, limits, backend)?;
         }
         match self {
             Self::Plain(input) => input.read(output),
@@ -906,22 +1168,26 @@ impl<R: Read> ReaderInput<R> {
         }
     }
 
-    #[allow(clippy::expect_used)]
-    fn into_inner(self) -> R {
+    fn into_inner(self) -> Result<R, ArchiveError> {
         match self {
-            Self::Uninitialized(input) => {
-                input.expect("uninitialized archive reader always owns its input")
-            },
-            Self::Plain(input) => input,
-            Self::One(input) => (*input).into_inner(),
-            Self::Two(input) => (*input).into_inner().into_inner(),
-            Self::Three(input) => (*input).into_inner().into_inner().into_inner(),
-            Self::Four(input) => (*input).into_inner().into_inner().into_inner().into_inner(),
+            Self::Uninitialized(Some(input)) | Self::Plain(input) => Ok(input),
+            Self::Uninitialized(None) => Err(ArchiveError::new(ErrorKind::Protocol)
+                .with_context("archive input is unavailable after filter initialization failed")),
+            Self::One(input) => Ok((*input).into_inner()),
+            Self::Two(input) => Ok((*input).into_inner().into_inner()),
+            Self::Three(input) => Ok((*input).into_inner().into_inner().into_inner()),
+            Self::Four(input) => Ok((*input).into_inner().into_inner().into_inner().into_inner()),
         }
     }
 }
 
 impl<R: Read> ArchiveReader<R, BuiltinFormatProviders, BuiltinCodecProviders> {
+    /// Opens a streaming archive reader with safe default limits.
+    #[must_use]
+    pub fn open(reader: R) -> Self {
+        Self::new(reader)
+    }
+
     /// Builds a bounded reader with the safe default limits.
     #[must_use]
     pub fn new(reader: R) -> Self {
@@ -931,12 +1197,67 @@ impl<R: Read> ArchiveReader<R, BuiltinFormatProviders, BuiltinCodecProviders> {
     /// Builds a bounded reader with explicit limits.
     #[must_use]
     pub fn with_limits(reader: R, limits: Limits) -> Self {
+        Self::with_backend(reader, limits, BackendPreference::Auto)
+    }
+
+    /// Builds a bounded reader using the selected portable or native codec backend.
+    #[must_use]
+    pub fn with_backend(reader: R, limits: Limits, backend: BackendPreference) -> Self {
         Self {
             reader: ReaderInput::Uninitialized(Some(reader)),
-            pipeline: Pipeline::after_filter_adapters(limits),
+            pipeline: Pipeline::after_filter_adapters_with_backend(limits, backend),
             read_buffer: vec![0; BUFFER],
             event_data: Vec::with_capacity(BUFFER),
+            backend,
         }
+    }
+
+    /// Builds a reader for an explicitly selected sequential format.
+    ///
+    /// This is required for signatureless formats such as [`FormatId::Raw`].
+    /// Outer compression filters are still detected automatically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the format is unknown, disabled, write-only, or
+    /// requires a seekable input.
+    pub fn with_format(reader: R, format: FormatId) -> Result<Self, ArchiveError> {
+        Self::with_format_and_limits(reader, format, Limits::default())
+    }
+
+    /// Builds an explicit-format reader with caller-supplied limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the format cannot be decoded by the sequential
+    /// built-in provider.
+    pub fn with_format_and_limits(
+        reader: R,
+        format: FormatId,
+        limits: Limits,
+    ) -> Result<Self, ArchiveError> {
+        Self::with_backend_and_format(reader, format, limits, BackendPreference::Auto)
+    }
+
+    /// Builds an explicit-format reader with a runtime codec backend choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the format cannot be decoded by the sequential
+    /// built-in provider.
+    pub fn with_backend_and_format(
+        reader: R,
+        format: FormatId,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
+        Ok(Self {
+            reader: ReaderInput::Uninitialized(Some(reader)),
+            pipeline: Pipeline::after_filter_adapters_with_format(limits, backend, format)?,
+            read_buffer: vec![0; BUFFER],
+            event_data: Vec::with_capacity(BUFFER),
+            backend,
+        })
     }
 }
 
@@ -946,6 +1267,31 @@ where
     F: StaticFormatProviders,
     C: StaticCodecProviders,
 {
+    /// Returns the next entry as a bounded [`Read`] adapter.
+    pub fn next_entry(&mut self) -> Result<Option<Entry<'_, R, F, C>>, StreamError> {
+        loop {
+            match self.next_event()? {
+                ReaderEvent::ArchiveMetadata(_) => {},
+                ReaderEvent::Entry(metadata) => {
+                    return Ok(Some(Entry {
+                        reader: self,
+                        metadata,
+                        pending: Vec::new(),
+                        pending_position: 0,
+                        ended: false,
+                    }));
+                },
+                ReaderEvent::Done => return Ok(None),
+                ReaderEvent::Data(_) | ReaderEvent::EndEntry => {
+                    return Err(StreamError::archive(
+                        ArchiveError::new(ErrorKind::Protocol)
+                            .with_context("previous entry was not read to its end marker"),
+                    ));
+                },
+            }
+        }
+    }
+
     /// Builds a bounded reader that uses one statically registered provider set.
     #[must_use]
     pub fn with_providers(reader: R, limits: Limits, providers: ProviderSet<F, C>) -> Self {
@@ -954,7 +1300,29 @@ where
             pipeline: Pipeline::with_providers(limits, providers),
             read_buffer: vec![0; BUFFER],
             event_data: Vec::with_capacity(BUFFER),
+            backend: BackendPreference::Auto,
         }
+    }
+
+    /// Builds an explicit-format reader from one registered provider set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested identifier is not a readable
+    /// sequential format in the provider set.
+    pub fn with_providers_and_format(
+        reader: R,
+        format: FormatId,
+        limits: Limits,
+        providers: ProviderSet<F, C>,
+    ) -> Result<Self, ArchiveError> {
+        Ok(Self {
+            reader: ReaderInput::Plain(reader),
+            pipeline: Pipeline::with_providers_and_format(limits, providers, format)?,
+            read_buffer: vec![0; BUFFER],
+            event_data: Vec::with_capacity(BUFFER),
+            backend: BackendPreference::Auto,
+        })
     }
     /// Produces the next structural event.
     pub fn next_event(&mut self) -> Result<ReaderEvent<'_>, StreamError> {
@@ -982,7 +1350,11 @@ where
                     }
                     let n = self
                         .reader
-                        .read(&mut self.read_buffer[..capacity], self.pipeline.limits())
+                        .read(
+                            &mut self.read_buffer[..capacity],
+                            self.pipeline.limits(),
+                            self.backend,
+                        )
                         .map_err(StreamError::io)?;
                     if n == 0 {
                         self.pipeline.finish_input().map_err(StreamError::archive)?;
@@ -1010,13 +1382,18 @@ where
         }
     }
 
-    pub(crate) fn into_parts(self) -> (R, ProviderSet<F, C>) {
-        (self.reader.into_inner(), self.pipeline.into_providers())
+    #[cfg(not(target_os = "wasi"))]
+    pub(crate) fn into_parts(self) -> Result<(R, ProviderSet<F, C>), ArchiveError> {
+        Ok((self.reader.into_inner()?, self.pipeline.into_providers()))
     }
 
-    /// Returns the wrapped input.
-    #[must_use]
-    pub fn into_inner(self) -> R {
+    /// Returns the wrapped input when ownership is still recoverable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error if filter construction consumed the input
+    /// before failing and no reader remains to recover.
+    pub fn into_inner(self) -> Result<R, ArchiveError> {
         self.reader.into_inner()
     }
 
@@ -1043,7 +1420,52 @@ pub struct ArchiveWriter<W: Write> {
     failed: bool,
 }
 
+/// One streaming entry body borrowed from an [`ArchiveWriter`].
+///
+/// Call [`Self::finish`] to emit the entry end marker.
+pub struct EntryWriter<'a, W: Write> {
+    writer: &'a mut ArchiveWriter<W>,
+    finished: bool,
+}
+
+impl<W: Write> fmt::Debug for EntryWriter<'_, W> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EntryWriter")
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W: Write> EntryWriter<'_, W> {
+    /// Finishes the current archive entry.
+    pub fn finish(mut self) -> Result<(), StreamError> {
+        self.writer.end_entry()?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for EntryWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.writer
+            .write_data(bytes)
+            .map(|()| bytes.len())
+            .map_err(io::Error::other)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl<W: Write> ArchiveWriter<W> {
+    /// Creates a streaming tar writer with safe default limits.
+    #[must_use]
+    pub fn create(output: W) -> Self {
+        Self::new(output)
+    }
+
     /// Creates a sequential tar writer.
     #[must_use]
     pub fn new(output: W) -> Self {
@@ -1078,9 +1500,20 @@ impl<W: Write> ArchiveWriter<W> {
 
     /// Creates a sequential ZIP writer with an explicit compression method.
     pub fn with_zip_method(output: W, method: ZipMethod, limits: Limits) -> Self {
+        Self::with_zip_method_and_backend(output, method, limits, BackendPreference::Auto)
+    }
+
+    /// Creates a ZIP writer with an explicit compression method and codec backend.
+    #[must_use]
+    pub fn with_zip_method_and_backend(
+        output: W,
+        method: ZipMethod,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
         Self {
             output: SyncFilterWriter::plain(output),
-            encoder: RuntimeEncoder::zip(limits, method),
+            encoder: RuntimeEncoder::zip_with_backend(limits, method, backend),
             format: FormatId::Zip,
             buffer: vec![0; BUFFER],
             failed: false,
@@ -1106,9 +1539,28 @@ impl<W: Write> ArchiveWriter<W> {
         password: SecretBytes,
         limits: Limits,
     ) -> Self {
+        Self::with_zip_password_and_backend(
+            output,
+            method,
+            password,
+            limits,
+            BackendPreference::Auto,
+        )
+    }
+
+    /// Creates an encrypted ZIP writer with an explicit codec backend.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zip_password_and_backend(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
         Self {
             output: SyncFilterWriter::plain(output),
-            encoder: RuntimeEncoder::encrypted_zip(limits, method, password),
+            encoder: RuntimeEncoder::encrypted_zip_with_backend(limits, method, password, backend),
             format: FormatId::Zip,
             buffer: vec![0; BUFFER],
             failed: false,
@@ -1122,9 +1574,20 @@ impl<W: Write> ArchiveWriter<W> {
         filter: Option<FilterId>,
         limits: Limits,
     ) -> Result<Self, ArchiveError> {
-        let encoder = RuntimeEncoder::sequential(format, limits)?;
+        Self::with_filter_and_backend(output, format, filter, limits, BackendPreference::Auto)
+    }
+
+    /// Creates a sequential writer with an outer filter and explicit codec backend.
+    pub fn with_filter_and_backend(
+        output: W,
+        format: FormatId,
+        filter: Option<FilterId>,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
+        let encoder = RuntimeEncoder::sequential_with_backend(format, limits, backend)?;
         Ok(Self {
-            output: SyncFilterWriter::new(output, filter, limits)?,
+            output: SyncFilterWriter::with_backend(output, filter, limits, backend)?,
             encoder,
             format,
             buffer: vec![0; BUFFER],
@@ -1164,6 +1627,7 @@ impl<W: Write> ArchiveWriter<W> {
     /// Begins an entry. Tar requires `metadata.size()` to be present.
     pub fn start_entry(&mut self, metadata: &EntryMetadata) -> Result<(), StreamError> {
         self.ensure_live()?;
+        metadata.validate().map_err(StreamError::archive)?;
         let mut accepted = false;
         while !accepted {
             let step = self
@@ -1180,6 +1644,18 @@ impl<W: Write> ArchiveWriter<W> {
             }
         }
         Ok(())
+    }
+
+    /// Begins an entry and returns its body as a [`Write`] adapter.
+    pub fn start_entry_writer(
+        &mut self,
+        metadata: &EntryMetadata,
+    ) -> Result<EntryWriter<'_, W>, StreamError> {
+        self.start_entry(metadata)?;
+        Ok(EntryWriter {
+            writer: self,
+            finished: false,
+        })
     }
 
     /// Streams entry body bytes.
@@ -1512,6 +1988,7 @@ where
     /// Begins one entry.
     pub fn start_entry(&mut self, metadata: &EntryMetadata) -> Result<(), StreamError> {
         self.ensure_live()?;
+        metadata.validate().map_err(StreamError::archive)?;
         loop {
             let step = self.encoder_step(EncodeCommand::BeginEntry(metadata))?;
             self.emit(step.produced)?;

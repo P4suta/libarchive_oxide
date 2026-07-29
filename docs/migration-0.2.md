@@ -36,8 +36,8 @@ v0.2 intentionally has no source-compatible v0.1 shim.
 - Enable `async` for futures-io or `tokio` for Tokio.
 - Use `AsyncArchiveReader` / `AsyncArchiveWriter` for sequential futures-io,
   and `AsyncSeekArchiveReader` / `AsyncSeekArchiveWriter` for seek formats.
-- Tokio equivalents use the `Tokio*` prefix. `TokioExtractor` moves blocking
-  capability-filesystem work behind a bounded channel and `spawn_blocking`.
+- Tokio reader and writer equivalents use the `Tokio*` prefix. They are I/O
+  adapters and do not provide a second filesystem-extraction policy path.
 - Every adapter drives the same archive state machines; dropping/cancelling a
   writer never performs an implicit finish.
 
@@ -52,13 +52,16 @@ v0.2 intentionally has no source-compatible v0.1 shim.
 
 ## Extraction
 
-- Construct `Extractor` with a `cap_std::fs::Dir`.
-- `ExtractionPolicy::safe()` rejects absolute/traversing paths, pre-existing
-  destination objects, links, and special files.
-- Inspect every `EntryOutcome` in the returned `ExtractionReport`; policy
-  rejection is not reported as silent success.
-- High-level session apply can use `apply_with_adapter` for a downstream
-  `FilesystemAdapter`. Existing `apply(plan, cap_std::fs::Dir)` remains valid.
+- `ExtractionPolicy`, `Extractor`, and `TokioExtractor` were removed. Use the
+  root `Policy` as the single extraction configuration.
+- Call `ArchiveEngine::prepare`, `ArchiveSession::plan(Policy::safe())`, then
+  `apply(plan, cap_std::fs::Dir)`. Planning consumes the complete immutable
+  snapshot and fixes path identities and collisions before filesystem startup.
+- Use `apply_with_adapter` for a downstream `FilesystemAdapter`. It consumes
+  the same opaque, session-bound plan; there is no direct event-to-filesystem
+  entrypoint that can bypass preflight.
+- Inspect every `EntryOutcome` in `ApplyReport::extraction`; policy rejection
+  is not reported as silent success.
   Inspect `ApplyReport::filesystem_findings` when restoration fidelity matters;
   unsupported, refused, partial, and OS-error attributes are never implicit
   success.
@@ -80,6 +83,10 @@ v0.2 intentionally has no source-compatible v0.1 shim.
 - `oxarchive --json inspect` is JSON Lines, not one collected JSON object.
   Consume `inspect_start`, `inspect_entry*`, and the required
   `inspect_complete` success sentinel.
+- Encrypted ZIP/7z reads and encrypted ZIP creation take secrets only through
+  `--password-file FILE` or the no-echo, TTY-only `--password-prompt`.
+  Command-line values (`--password[=...]` and legacy `-P...`) are rejected
+  before I/O.
 - Exit meanings are 0 success, 1 operational failure, and 2 usage/unsupported
   option. Diagnostics use stderr. A stdout archive can be partial on exit 1;
   JSON is never mixed with binary archive output.

@@ -5,36 +5,77 @@
 //! Built-in archive format identifiers and core implementations.
 
 use crate::protocol::ProbeResult;
+use core::fmt;
 
 pub(crate) mod ar;
 pub(crate) mod cpio;
+pub(crate) mod empty;
+pub(crate) mod raw;
 pub(crate) mod tar;
+pub(crate) mod warc;
 
-/// Stable, extensible identifier for a built-in archive format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum FormatId {
-    /// POSIX tar and its ustar/PAX/GNU dialects.
-    Tar,
-    /// cpio.
-    Cpio,
-    /// Unix ar and thin ar.
-    Ar,
-    /// ZIP.
-    Zip,
-    /// 7-Zip.
-    SevenZip,
-    /// ISO 9660.
-    Iso9660,
-    /// Universal Disk Format (read-only).
-    Udf,
-    /// Microsoft Cabinet (read-only).
-    Cab,
-    /// XAR extensible archive (read-only).
-    Xar,
-}
+/// Stable, extensible archive-format identifier.
+///
+/// Built-in identifiers are exposed as associated constants. Downstream
+/// providers can allocate an identifier in the custom range with
+/// [`FormatId::custom`], which rejects values reserved for this crate.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct FormatId(u32);
 
+#[allow(non_upper_case_globals)]
 impl FormatId {
+    const CUSTOM_BIT: u32 = 1 << 31;
+
+    /// POSIX tar and its ustar/PAX/GNU dialects.
+    pub const Tar: Self = Self(1);
+    /// cpio.
+    pub const Cpio: Self = Self(2);
+    /// Unix ar and thin ar.
+    pub const Ar: Self = Self(3);
+    /// ZIP.
+    pub const Zip: Self = Self(4);
+    /// 7-Zip.
+    pub const SevenZip: Self = Self(5);
+    /// ISO 9660.
+    pub const Iso9660: Self = Self(6);
+    /// Universal Disk Format (read-only).
+    pub const Udf: Self = Self(7);
+    /// Microsoft Cabinet (read-only).
+    pub const Cab: Self = Self(8);
+    /// XAR extensible archive (read-only).
+    pub const Xar: Self = Self(9);
+    /// Canonical zero-byte archive (read-only).
+    pub const Empty: Self = Self(10);
+    /// Explicit single-entry raw byte stream (read-only).
+    pub const Raw: Self = Self(11);
+    /// WARC 1.0 and 1.1 (read-only).
+    pub const Warc: Self = Self(12);
+
+    /// Creates a downstream identifier from the collision-free custom range.
+    ///
+    /// Values below `0x8000_0000` are reserved for built-in formats.
+    #[must_use]
+    pub const fn custom(value: u32) -> Option<Self> {
+        if value & Self::CUSTOM_BIT == Self::CUSTOM_BIT {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the stable numeric representation.
+    #[must_use]
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this identifier belongs to the downstream custom range.
+    #[must_use]
+    pub const fn is_custom(self) -> bool {
+        self.0 & Self::CUSTOM_BIT == Self::CUSTOM_BIT
+    }
+
     /// Probes every built-in archive format using one common three-way
     /// incremental contract.
     #[must_use]
@@ -43,6 +84,8 @@ impl FormatId {
         const UDF_SIGNATURE_END: usize = 17 * 2048 + 6;
 
         for (identifier, signature) in [
+            (Self::Warc, b"WARC/1.0\r\n".as_slice()),
+            (Self::Warc, b"WARC/1.1\r\n".as_slice()),
             (Self::Zip, b"PK\x03\x04".as_slice()),
             (Self::Zip, b"PK\x05\x06".as_slice()),
             (
@@ -85,6 +128,8 @@ impl FormatId {
 
         let mut minimum = usize::MAX;
         for signature in [
+            b"WARC/1.0\r\n".as_slice(),
+            b"WARC/1.1\r\n".as_slice(),
             b"PK\x03\x04".as_slice(),
             b"PK\x05\x06".as_slice(),
             [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c].as_slice(),
@@ -112,5 +157,26 @@ impl FormatId {
         } else {
             ProbeResult::NeedMore { minimum }
         }
+    }
+}
+
+impl fmt::Debug for FormatId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match *self {
+            Self::Tar => "Tar",
+            Self::Cpio => "Cpio",
+            Self::Ar => "Ar",
+            Self::Zip => "Zip",
+            Self::SevenZip => "SevenZip",
+            Self::Iso9660 => "Iso9660",
+            Self::Udf => "Udf",
+            Self::Cab => "Cab",
+            Self::Xar => "Xar",
+            Self::Empty => "Empty",
+            Self::Raw => "Raw",
+            Self::Warc => "Warc",
+            _ => return write!(formatter, "FormatId({:#010x})", self.0),
+        };
+        formatter.write_str(name)
     }
 }

@@ -16,6 +16,10 @@ additions semver-breaking.
 
 - Keep `libarchive_oxide-core` on `no_std + alloc`, zero dependencies, safe
   Rust, and static dispatch.
+- Keep portable codec state machines in the separate
+  `libarchive_oxide-codecs` crate. It is also `no_std + alloc`; algorithm
+  dependencies are additive opt-in features and native-library adapters remain
+  in the std flagship crate.
 - Use `ArchiveDecoder` and `ArchiveEncoder` as the only format protocols.
 - Use one EOF-aware `Codec` protocol for outer filters.
 - Keep actual I/O out of core. Sync, futures-io, and Tokio adapters drive the
