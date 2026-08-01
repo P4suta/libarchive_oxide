@@ -57,7 +57,7 @@ quick-xml = { version = "0.41", default-features = false }
 ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
 sha2 = "0.11"
 sha3 = "0.11"
-spki = { version = "0.7", default-features = false, features = ["alloc"] }
+spki = { version = "0.8", default-features = false, features = ["alloc"] }
 subtle = "2.6"
 unicode-normalization = "0.1.24"
 x509-certificate = "0.25"
