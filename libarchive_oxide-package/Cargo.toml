@@ -45,7 +45,7 @@ xz = ["gzip", "libarchive_oxide/xz"]
 lz4 = ["gzip", "libarchive_oxide/lz4"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 bcder = "0.7.7"
 # Its default `http` feature performs timestamp-protocol requests; verification
 # in this crate is deliberately offline.
