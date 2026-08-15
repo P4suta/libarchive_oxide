@@ -52,9 +52,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.42"
+version = "0.4.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
+checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -472,9 +472,9 @@ checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
 
 [[package]]
 name = "futures-io"
-version = "0.3.33"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4577ecaa3c4f96589d473f679a71b596316f6641bc350038b962a5daf0085d7a"
+checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
 name = "futures-lite"
@@ -695,7 +695,7 @@ dependencies = [
  "libarchive_oxide-fuzz-cases",
  "lz4",
  "lz4_flex",
- "lzma-rust2 0.18.0",
+ "lzma-rust2 0.18.1",
  "miniz_oxide",
  "pbkdf2",
  "ppmd-rust",
@@ -737,7 +737,7 @@ dependencies = [
  "flate2",
  "libarchive_oxide-core",
  "lz4_flex",
- "lzma-rust2 0.18.0",
+ "lzma-rust2 0.18.1",
  "miniz_oxide",
  "ruzstd",
  "sha2",
@@ -758,7 +758,7 @@ dependencies = [
  "libarchive_oxide-codecs",
  "libarchive_oxide-core",
  "libarchive_oxide-package",
- "lzma-rust2 0.18.0",
+ "lzma-rust2 0.18.1",
 ]
 
 [[package]]
@@ -857,9 +857,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-rust2"
-version = "0.18.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12931b17820a3a0c48e46359d2be49ef57b5d50509fd5baba43e6c654977aa66"
+checksum = "243cb2271683c2855cad62142cbf38199db439b1b1e1ccdd5a011342894dd7cc"
 dependencies = [
  "sha2",
 ]
@@ -1115,9 +1115,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-rust2"
-version = "0.21.3"
+version = "0.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b5d71c87d24cb22976f3f6e6c2c9296ef1f6958394e2b868d56ca01b082798a"
+checksum = "20acd38118edb830eb5a0bfacaf83c687b9995f48d6983cdac3cb18ce1d571cc"
 dependencies = [
  "aes",
  "bzip2",
@@ -1126,7 +1126,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "js-sys",
- "lzma-rust2 0.16.5",
+ "lzma-rust2 0.18.1",
  "ppmd-rust",
  "sha2",
  "wasm-bindgen",
