@@ -52,9 +52,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.42"
+version = "0.4.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
+checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -149,9 +149,9 @@ dependencies = [
 
 [[package]]
 name = "cap-fs-ext"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b"
+checksum = "56ff379b70af8e08307a8f65e7040c7301cb4a572538ade16b4984f0da77847f"
 dependencies = [
  "cap-primitives",
  "cap-std",
@@ -161,9 +161,9 @@ dependencies = [
 
 [[package]]
 name = "cap-primitives"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdadbd7c002d3a484b35243669abdae85a0ebaded5a61117169dc3400f9a7ff0"
+checksum = "8b5f74729fd2f44701d1a8eb47e906cdb3ccd9ec0f02baad85a744b791940b18"
 dependencies = [
  "ambient-authority",
  "fs-set-times",
@@ -179,9 +179,9 @@ dependencies = [
 
 [[package]]
 name = "cap-std"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"
+checksum = "c1ec78e242cfa2cfe276807ac2ecc00315a6c97786977414bcd1c3963b6c91b8"
 dependencies = [
  "cap-primitives",
  "io-extras",
@@ -247,9 +247,9 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "compcol"
-version = "0.6.8"
+version = "0.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28b37ce533aa0fddc1e6820e331968ba72aa48b5c8bbb2bebdc03d48b6ed0f16"
+checksum = "c11ff3545f0554bd738d69ab7d4556713f7b986706563b0554a89339cee83396"
 
 [[package]]
 name = "compression-codecs"
@@ -313,9 +313,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
 dependencies = [
  "cfg-if",
 ]
@@ -472,9 +472,9 @@ checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
 
 [[package]]
 name = "futures-io"
-version = "0.3.33"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4577ecaa3c4f96589d473f679a71b596316f6641bc350038b962a5daf0085d7a"
+checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
 name = "futures-lite"
