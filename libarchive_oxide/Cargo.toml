@@ -132,7 +132,7 @@ lzma-rust2 = { version = "0.18.0", default-features = false, features = ["std"],
 ppmd-rust = { version = "1.4.0", optional = true }
 # Safe streaming CAB Quantum decoder. Keep the patch release exact: 0.6.8
 # contains the signed frame-accounting fix required at 32 KiB boundaries.
-compcol = { version = "=0.6.8", default-features = false, features = ["quantum"], optional = true }
+compcol = { version = "=0.6.11", default-features = false, features = ["quantum"], optional = true }
 # WinZip AE-2 requires SHA-1. `zeroize` wipes the expanded AES key schedule on drop,
 # so a folder/member key never lingers in freed memory after the decoder is dropped
 # (defense in depth for both the 7z CBC and the ZIP AE-2 CTR paths).
