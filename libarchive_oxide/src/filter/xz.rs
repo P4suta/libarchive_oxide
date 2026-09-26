@@ -110,6 +110,11 @@ impl Read for InputPipe {
             if self.ended {
                 return Ok(written);
             }
+            // The upstream XZ padding parser expects a full read of at most three bytes.
+            // Larger reads may return short, or the owner can wait for an event while this worker waits for input.
+            if written != 0 && output.len() > 3 {
+                return Ok(written);
+            }
             self.events.send(WorkerEvent::NeedInput).map_err(|_| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "XZ codec owner was dropped")
             })?;
@@ -1049,11 +1054,48 @@ pub(crate) fn encode_frame(input: &[u8]) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::task::{Wake, Waker};
+    use std::thread;
+    use std::time::Duration;
 
-    use super::wake_cell;
+    use super::{EventSink, InputPipe, wake_cell};
+
+    #[test]
+    fn input_pipe_returns_available_bytes_without_waiting_to_fill_buffer() {
+        let (input_sender, input) = mpsc::sync_channel(1);
+        let (event_sender, _events) = mpsc::sync_channel(1);
+        let pipe = InputPipe {
+            receiver: input,
+            events: EventSink {
+                sender: event_sender,
+                waker: Arc::new(Mutex::new(None)),
+            },
+            current: vec![1, 2, 3],
+            position: 0,
+            ended: false,
+        };
+        let (result_sender, result) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut output = [0; 8];
+            let read = pipe.read(&mut output).expect("input pipe read");
+            result_sender
+                .send((read, output))
+                .expect("read result sent");
+        });
+
+        let available = result.recv_timeout(Duration::from_secs(5));
+        drop(input_sender);
+        worker.join().expect("reader thread");
+        assert_eq!(
+            available.expect("short read returned promptly"),
+            (3, [1, 2, 3, 0, 0, 0, 0, 0])
+        );
+    }
 
     struct LockProbe {
         cell: Arc<Mutex<Option<Waker>>>,
