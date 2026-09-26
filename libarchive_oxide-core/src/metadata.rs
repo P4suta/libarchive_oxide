@@ -77,8 +77,10 @@ impl ArchivePath {
             PathEncoding::Utf16Le => {
                 let units = self
                     .raw
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]));
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|unit| u16::from_le_bytes(*unit));
                 char::decode_utf16(units)
                     .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
                     .collect()
@@ -683,14 +685,12 @@ fn validate_encoded_path(raw: &[u8], encoding: PathEncoding) -> Result<(), Archi
             Ok(())
         },
         PathEncoding::Utf16Le => {
-            if (raw.len() & 1) != 0 {
+            let (units, remainder) = raw.as_chunks::<2>();
+            if !remainder.is_empty() {
                 return Err(ArchiveError::new(ErrorKind::Malformed)
                     .with_context("UTF-16LE path has an odd byte length"));
             }
-            let units = raw
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
-            for decoded in char::decode_utf16(units) {
+            for decoded in char::decode_utf16(units.iter().map(|unit| u16::from_le_bytes(*unit))) {
                 decoded.map_err(|_| {
                     ArchiveError::new(ErrorKind::Malformed)
                         .with_context("UTF-16LE path contains an unpaired surrogate")

@@ -1332,8 +1332,7 @@ fn find_signer_certificate(
                     }
                     let encoded = extension.value.clone().into_bytes();
                     Constructed::decode(encoded.as_ref(), Mode::Der, OctetString::take_from)
-                        .ok()
-                        .is_some_and(|actual| actual.to_bytes().as_ref() == identifier)
+                        .is_ok_and(|actual| actual.to_bytes().as_ref() == identifier)
                 })
             },
         };

@@ -2289,7 +2289,10 @@ impl<'a, R: Read + Seek> UdfParser<'a, R> {
             ));
         }
         let mut previous_original = None;
-        for raw in descriptor[SPARING_TABLE_HEADER_SIZE..used].chunks_exact(SPARING_ENTRY_SIZE) {
+        for raw in descriptor[SPARING_TABLE_HEADER_SIZE..used]
+            .as_chunks::<SPARING_ENTRY_SIZE>()
+            .0
+        {
             let original_packet = le_u32(raw, 0)?;
             let mapped_packet = le_u32(raw, 4)?;
             if previous_original.is_some_and(|previous| {
@@ -2944,7 +2947,7 @@ impl<'a, R: Read + Seek> UdfParser<'a, R> {
         entries
             .try_reserve_exact(entry_count)
             .map_err(|_| udf_error(ErrorKind::Limit, "UDF VAT entry allocation failed"))?;
-        for entry in entry_bytes.chunks_exact(4) {
+        for entry in entry_bytes.as_chunks::<4>().0 {
             entries.push(optional_u32(le_u32(entry, 0)?));
         }
         Ok((entries, previous_icb))
@@ -3448,7 +3451,8 @@ impl<'a, R: Read + Seek> UdfParser<'a, R> {
         let mut depth = 0_usize;
         loop {
             let mut continuation = None;
-            for (descriptor_index, descriptor) in descriptors.chunks_exact(8).enumerate() {
+            for (descriptor_index, descriptor) in descriptors.as_chunks::<8>().0.iter().enumerate()
+            {
                 let raw_length = le_u32(descriptor, 0)?;
                 let extent_type = raw_length >> 30;
                 let extent_length = u64::from(raw_length & 0x3fff_ffff);
@@ -3890,7 +3894,7 @@ impl<'a, R: Read + Seek> UdfParser<'a, R> {
                         )
                     })?,
             )?;
-            for descriptor in allocation.chunks_exact(8) {
+            for descriptor in allocation.as_chunks::<8>().0 {
                 let raw_length = le_u32(descriptor, 0)?;
                 let extent_type = raw_length >> 30;
                 let extent_length = u64::from(raw_length & 0x3fff_ffff);
@@ -6526,7 +6530,9 @@ fn decode_compressed_unicode(value: &[u8]) -> Result<Vec<u8>, StreamError> {
                 ));
             }
             let units = encoded
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
             for character in char::decode_utf16(units) {
                 decoded.push(character.map_err(|_| {

@@ -368,7 +368,7 @@ fn parse_sha256(value: &str) -> Result<[u8; 32], CliError> {
     }
     let bytes = hex.as_bytes();
     let mut digest = [0u8; 32];
-    for (target, pair) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (target, pair) in digest.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
         *target = (high << 4) | low;
