@@ -766,8 +766,12 @@ mod asynchronous {
             ReadAt::identity(self)
         }
 
-        async fn read_range(&mut self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
-            ReadAt::read_at(self, offset, output)
+        fn read_range(
+            &mut self,
+            offset: u64,
+            output: &mut [u8],
+        ) -> impl std::future::Future<Output = io::Result<usize>> {
+            std::future::ready(ReadAt::read_at(self, offset, output))
         }
     }
 

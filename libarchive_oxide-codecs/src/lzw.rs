@@ -284,7 +284,7 @@ impl Codec for CompressDecoder {
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use libarchive_oxide_core::{Codec as _, ErrorKind};
+    use libarchive_oxide_core::ErrorKind;
 
     use super::*;
     use crate::test_support::{drive_codec, try_drive_codec};

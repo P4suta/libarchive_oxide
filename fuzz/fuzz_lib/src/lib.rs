@@ -193,7 +193,7 @@ fn decode_hex_corpus_seed(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut decoded = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.chunks_exact(2) {
+    for pair in hex.as_chunks::<2>().0 {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
         decoded.push((high << 4) | low);
@@ -383,7 +383,7 @@ pub fn package_app(data: &[u8]) {
     let input = decoded.as_deref().unwrap_or(data);
     if let Some((&0xfe, mutations)) = input.split_first() {
         let mut idsig = CTS_APK_V4_IDSIG.to_vec();
-        for mutation in mutations.chunks_exact(5).take(64) {
+        for mutation in mutations.as_chunks::<5>().0.iter().take(64) {
             let Some(offset_bytes) = mutation.get(..4) else {
                 continue;
             };

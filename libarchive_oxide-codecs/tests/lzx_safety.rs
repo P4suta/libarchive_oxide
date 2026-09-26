@@ -32,7 +32,7 @@ fn uncompressed_block(data: &[u8], include_stream_header: bool) -> Vec<u8> {
     }
 
     let mut encoded = Vec::new();
-    for word_bits in bits.chunks_exact(16) {
+    for word_bits in bits.as_chunks::<16>().0 {
         let mut word = 0_u16;
         for bit in word_bits {
             word = (word << 1) | u16::from(*bit);

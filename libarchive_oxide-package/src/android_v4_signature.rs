@@ -845,7 +845,7 @@ fn hash_memory_pages(source: &[u8], salt: &[u8], output: &mut [u8]) -> Result<()
             "APK v4 source tree level is not page-aligned".to_string(),
         ));
     }
-    for (page_index, page) in source.chunks_exact(BLOCK_SIZE).enumerate() {
+    for (page_index, page) in source.as_chunks::<BLOCK_SIZE>().0.iter().enumerate() {
         let mut hasher = Sha256::new();
         hasher.update(salt);
         hasher.update(page);
