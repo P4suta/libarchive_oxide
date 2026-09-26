@@ -167,7 +167,7 @@ fn decode_hex<const N: usize>(encoded: &[u8]) -> Option<[u8; N]> {
         return None;
     }
     let mut decoded = [0_u8; N];
-    for (index, pair) in encoded.chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = hex_nibble(pair[0])?
             .checked_mul(16)?
             .checked_add(hex_nibble(pair[1])?)?;

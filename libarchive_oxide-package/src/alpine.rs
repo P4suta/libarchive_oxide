@@ -643,7 +643,7 @@ fn parse_datahash(value: &[u8]) -> Option<[u8; 32]> {
         return None;
     }
     let mut digest = [0_u8; 32];
-    for (index, pair) in value.chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_chunks::<2>().0.iter().enumerate() {
         let high = decode_lower_hex(pair[0])?;
         let low = decode_lower_hex(pair[1])?;
         digest[index] = (high << 4) | low;
