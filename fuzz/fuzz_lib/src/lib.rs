@@ -1225,7 +1225,12 @@ fn assert_graph_typed(error: &Error) {
         Some(
             ErrorKind::Malformed | ErrorKind::Unsupported | ErrorKind::Integrity | ErrorKind::Limit,
         ) => {},
-        other => panic!("7z coder-graph fuzz surfaced a non-typed / unexpected error: {other:?}"),
+        other => panic!(
+            "7z coder-graph fuzz surfaced a non-typed / unexpected error: archive={other:?}, io={:?}",
+            error
+                .io_error()
+                .map(|source| (source.kind(), source.to_string()))
+        ),
     }
 }
 
@@ -1339,4 +1344,29 @@ pub fn run_target(name: &str, data: &[u8]) {
 fn entries_from_bytes(data: &[u8]) -> Vec<FuzzEntry> {
     let mut input = arbitrary::Unstructured::new(data);
     Vec::<FuzzEntry>::arbitrary(&mut input).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_7z_graph;
+
+    #[test]
+    fn seven_graph_fuzz_failure_remains_typed() {
+        read_7z_graph(&[
+            0, 1, 33, 0, 0, 141, 255, 2, 254, 255, 255, 114, 0, 117, 0, 252, 255, 6, 0, 1, 1, 0, 0,
+            141, 255, 253, 255, 254, 16, 0, 4, 253, 137, 20, 0, 253, 255, 6, 0, 1, 1, 0, 0, 141,
+            255, 254, 253, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 209, 209, 209, 209, 209, 209, 209, 209,
+            209, 209, 209, 209, 209, 209, 209, 209, 61, 61, 61, 61, 61, 61, 61, 61, 61, 133, 45,
+            61, 61, 61, 61, 61, 61, 16, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 209, 209, 209, 209,
+            209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209,
+            209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209,
+            209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 209, 197, 61, 61, 61,
+            61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 133, 45, 61, 61, 61, 61, 61, 61, 16, 0, 4,
+            255, 255, 255, 255, 255, 255, 255, 255, 61, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 240, 197, 162, 109, 255, 253, 137, 20, 0, 61, 61, 45, 61, 61, 61, 61,
+            61, 255, 255, 255, 255, 255, 5, 13, 0, 112, 0, 46, 0, 98, 0, 105, 0, 110, 0, 0, 0, 0,
+            0,
+        ]);
+    }
 }

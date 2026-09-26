@@ -1875,7 +1875,9 @@ fn validate_dictionary(dictionary: u32, limits: Limits) -> core::result::Result<
 fn seven_decode_error(error: std::io::Error) -> StreamError {
     if matches!(
         error.kind(),
-        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+        std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::UnexpectedEof
     ) {
         seven_error(ErrorKind::Malformed, "LZMA payload decode failed")
     } else {
@@ -3582,6 +3584,20 @@ fn usize_of(v: u64) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_invalid_input_is_a_typed_malformed_error() {
+        let error = seven_decode_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid decoder property",
+        ));
+
+        assert_eq!(
+            error.archive_error().map(ArchiveError::kind),
+            Some(ErrorKind::Malformed)
+        );
+        assert!(error.io_error().is_none());
+    }
 
     #[test]
     fn every_built_in_coder_dispatch_has_a_capability_record() {
