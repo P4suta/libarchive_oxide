@@ -252,10 +252,11 @@ impl Folder {
     /// pack stream — the shape [`build_folder_reader`] can fold into a decode chain.
     fn is_linear_chain(&self) -> bool {
         self.packed_indices.len() == 1
-            && self
-                .coders
-                .iter()
-                .all(|coder| coder.num_in == 1 && coder.num_out == 1)
+            && self.coders.iter().all(|coder| {
+                coder.num_in == 1
+                    && coder.num_out == 1
+                    && !matches!(coder.method, CoderMethod::Bcj2)
+            })
     }
 }
 
@@ -2225,8 +2226,14 @@ fn read_coder(r: &mut ByteReader<'_>) -> Result<Coder> {
     } else {
         Vec::new()
     };
+    let method = classify_method(&codec, &props)?;
+    if matches!(method, CoderMethod::Bcj2) && (num_in != 4 || num_out != 1) {
+        return Err(HeaderError::Malformed(
+            "7z: BCJ2 junction must have four inputs and one output",
+        ));
+    }
     Ok(Coder {
-        method: classify_method(&codec, &props)?,
+        method,
         num_in,
         num_out,
     })
@@ -3667,6 +3674,25 @@ mod tests {
         assert!(matches!(
             classify_method(&METHOD_BCJ2, &[0]),
             Err(HeaderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn bcj2_requires_four_inputs_during_header_parse() {
+        let mut invalid = ByteReader::new(&[0x04, 0x03, 0x03, 0x01, 0x1B]);
+        assert!(matches!(
+            read_coder(&mut invalid),
+            Err(HeaderError::Malformed(_))
+        ));
+
+        let mut valid = ByteReader::new(&[0x14, 0x03, 0x03, 0x01, 0x1B, 4, 1, 0, 0, 0, 0]);
+        assert!(matches!(
+            read_coder(&mut valid),
+            Ok(Coder {
+                method: CoderMethod::Bcj2,
+                num_in: 4,
+                num_out: 1
+            })
         ));
     }
 }
