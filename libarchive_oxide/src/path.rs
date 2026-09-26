@@ -195,14 +195,11 @@ pub fn sanitize_archive_path(path: &ArchivePath) -> Option<PathBuf> {
     match path.encoding() {
         PathEncoding::Bytes | PathEncoding::Utf8 => sanitize(path.as_bytes()),
         PathEncoding::Utf16Le => {
-            let mut chunks = path.as_bytes().chunks_exact(2);
-            let units: Vec<u16> = chunks
-                .by_ref()
-                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-                .collect();
-            if !chunks.remainder().is_empty() {
+            let (chunks, remainder) = path.as_bytes().as_chunks::<2>();
+            if !remainder.is_empty() {
                 return None;
             }
+            let units: Vec<u16> = chunks.iter().copied().map(u16::from_le_bytes).collect();
             let text = String::from_utf16(&units).ok()?;
             #[cfg(unix)]
             {

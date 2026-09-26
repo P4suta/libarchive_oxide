@@ -1504,12 +1504,11 @@ fn validate_cfdata_sizes(
 /// Computes the CAB XOR checksum, including its big-endian-packed tail.
 fn cab_checksum(data: &[u8], seed: u32) -> u32 {
     let mut checksum = seed;
-    let mut words = data.chunks_exact(4);
-    for word in &mut words {
-        checksum ^= u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+    let (words, tail) = data.as_chunks::<4>();
+    for word in words {
+        checksum ^= u32::from_le_bytes(*word);
     }
-    let tail_value = words
-        .remainder()
+    let tail_value = tail
         .iter()
         .fold(0_u32, |value, byte| (value << 8) | u32::from(*byte));
     checksum ^ tail_value

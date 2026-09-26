@@ -3536,7 +3536,9 @@ fn filetime_to_timestamp(ft: u64) -> Timestamp {
 /// Decodes null-stripped UTF-16LE code units into raw UTF-8 bytes (lossy for unpaired surrogates).
 fn utf16le_to_bytes(raw: &[u8]) -> Vec<u8> {
     let units = raw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]));
     let s: String = char::decode_utf16(units)
         .map(|r| r.unwrap_or('\u{FFFD}'))

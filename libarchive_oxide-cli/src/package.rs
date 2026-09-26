@@ -398,7 +398,7 @@ fn parse_sha256_pin(value: &str) -> Result<[u8; 32], CliError> {
         ));
     }
     let mut fingerprint = [0_u8; 32];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0]).ok_or_else(|| {
             CliError::usage("--trusted-signer-sha256 contains a non-hexadecimal digit")
         })?;
