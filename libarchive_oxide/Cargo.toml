@@ -179,7 +179,7 @@ zstd-codec = { package = "zstd", version = "0.13.3" }
 sha2 = "0.11"
 # `bzip2` is on by default; `deflate` and `zstd` are enabled so the 7z differential
 # tests can produce Deflate/Zstd folders for arca's reuse-codec decode path.
-sevenz-rust2 = { version = "0.21.3", features = ["deflate", "zstd"] }
+sevenz-rust2 = { version = "0.22.2", features = ["deflate", "zstd"] }
 # Independent batch BCJ2 splitter/oracle used only to produce interoperability fixtures. The
 # production reader uses lzma-rust2's bounded streaming junction.
 compcol = { version = "0.6.8", default-features = false, features = ["bcj2"] }
