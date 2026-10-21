@@ -13,6 +13,7 @@ feature-depth = 1
 
 [advisories]
 version = 2
+db-path = "target/advisory-dbs"
 yanked = "deny"
 ignore = []
 

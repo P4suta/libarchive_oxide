@@ -1636,7 +1636,7 @@ fn zip_lzma_empty_member_roundtrips_through_seek_reader() {
             _ => {},
         }
     }
-    assert!(body.is_empty());
+    assert_eq!(body.len(), 0);
 }
 
 #[cfg(feature = "xz")]

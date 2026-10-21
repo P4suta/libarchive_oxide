@@ -441,7 +441,7 @@ mod tests {
         let params = AesParams::parse(&[8]).unwrap();
         assert_eq!(params.ncp, 8);
         assert_eq!(params.salt_len, 0);
-        assert!(params.salt[..params.salt_len].is_empty());
+        assert_eq!(params.salt[..params.salt_len], []);
         assert_eq!(params.iv, [0; BLOCK]);
     }
 

@@ -535,7 +535,7 @@ fn cpio_hardlinks_roundtrip_as_typed_links() {
         entries[1].0.link_target().map(ArchivePath::as_bytes),
         Some(b"target".as_slice())
     );
-    assert!(entries[1].1.is_empty());
+    assert_eq!(entries[1].1, [] as [u8; 0]);
 }
 
 #[test]

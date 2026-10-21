@@ -46,7 +46,7 @@ fn explicit_empty_raw_differs_from_the_canonical_empty_archive() {
     let mut entry = raw.next_entry().expect("raw entry").expect("one entry");
     let mut decoded = Vec::new();
     entry.read_to_end(&mut decoded).expect("empty raw body");
-    assert!(decoded.is_empty());
+    assert_eq!(decoded.len(), 0);
     drop(entry);
     assert!(raw.next_entry().expect("raw done").is_none());
 

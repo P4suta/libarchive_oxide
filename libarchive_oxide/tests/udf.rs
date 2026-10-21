@@ -3275,7 +3275,7 @@ fn udf_reads_independent_mkudffs_sparable_fixture() {
         ".libarchive-oxide-udf-streams/system/s-%2AUDF%20Non-Allocatable%20Space"
     );
     assert_eq!(entries[0].kind, EntryKind::File);
-    assert!(entries[0].data.is_empty());
+    assert_eq!(entries[0].data.len(), 0);
 
     let mut range = RangeArchiveReader::new(MemoryRange::new(image)).unwrap();
     assert_eq!(range.format(), FormatId::Udf);

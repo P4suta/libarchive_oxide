@@ -750,7 +750,7 @@ fn create_infers_extension_and_list_extract_aliases_use_the_unified_engine() {
 
     let stdout_without_format = run_in("oxarchive", &["create", "-", "input.txt"], dir.path());
     assert_eq!(code(&stdout_without_format), 2, "{stdout_without_format:?}");
-    assert!(stdout_without_format.stdout.is_empty());
+    assert_eq!(stdout_without_format.stdout.len(), 0);
 }
 
 #[test]
@@ -855,7 +855,7 @@ fn create_stdout_and_unsafe_path_failures_follow_the_partial_output_contract() {
         !output.stdout.is_empty(),
         "first entry should already be streamed"
     );
-    assert!(!output.stderr.is_empty());
+    assert_ne!(output.stderr.len(), 0);
 
     let output = run_in(
         "oxarchive",
@@ -863,7 +863,7 @@ fn create_stdout_and_unsafe_path_failures_follow_the_partial_output_contract() {
         dir.path(),
     );
     assert_eq!(code(&output), 2, "{output:?}");
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
 
     dir.write("outside.txt", b"outside");
     std::fs::create_dir_all(dir.join("work")).expect("work directory");
@@ -896,5 +896,5 @@ fn inspect_json_stream_omits_completion_after_a_late_parser_error() {
             .iter()
             .all(|record| record["type"] != "inspect_complete")
     );
-    assert!(!output.stderr.is_empty());
+    assert_ne!(output.stderr.len(), 0);
 }

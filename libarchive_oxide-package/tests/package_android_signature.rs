@@ -173,7 +173,7 @@ fn every_cms_signer_info_must_verify() {
         good.findings()
     );
     assert_eq!(good.integrity(), VerificationDimension::Verified);
-    assert!(!good.signer_fingerprints().is_empty());
+    assert_ne!(good.signer_fingerprints().len(), 0);
 
     let wrong = verify(AOSP_V1_BAD_SIGNER_INFO);
     assert_eq!(

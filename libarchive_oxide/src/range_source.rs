@@ -169,22 +169,30 @@ impl MetricTracker {
     }
 
     fn record_request(&self) -> io::Result<()> {
-        self.requests
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
+        Self::increment(&self.requests, 1)
             .map(|_| ())
             .map_err(|_| range_error(RangeReadError::new(RangeReadErrorKind::MetricsOverflow)))
     }
 
     fn record_bytes(&self, bytes: usize) -> io::Result<()> {
         let bytes = usize_to_u64(bytes)?;
-        self.transferred_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(bytes)
-            })
+        Self::increment(&self.transferred_bytes, bytes)
             .map(|_| ())
             .map_err(|_| range_error(RangeReadError::new(RangeReadErrorKind::MetricsOverflow)))
+    }
+
+    #[rustversion::before(1.95)]
+    fn increment(counter: &AtomicU64, amount: u64) -> Result<u64, u64> {
+        counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(amount)
+        })
+    }
+
+    #[rustversion::since(1.95)]
+    fn increment(counter: &AtomicU64, amount: u64) -> Result<u64, u64> {
+        counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(amount)
+        })
     }
 }
 
@@ -1282,4 +1290,32 @@ pub(crate) fn range_error(error: RangeReadError) -> io::Error {
         | RangeReadErrorKind::SourceUnavailable => io::ErrorKind::Other,
     };
     io::Error::new(kind, error)
+}
+
+#[cfg(test)]
+mod metric_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn metric_updates_stop_at_the_exact_counter_boundary() {
+        let tracker = MetricTracker {
+            requests: Arc::new(AtomicU64::new(u64::MAX - 1)),
+            transferred_bytes: Arc::new(AtomicU64::new(u64::MAX - 1)),
+        };
+        let shared = tracker.clone();
+        assert!(tracker.record_request().is_ok());
+        assert!(tracker.record_bytes(1).is_ok());
+        for result in [tracker.record_request(), tracker.record_bytes(1)] {
+            let kind = result
+                .as_ref()
+                .err()
+                .and_then(io::Error::get_ref)
+                .and_then(|error| error.downcast_ref::<RangeReadError>())
+                .map(|error| error.kind());
+            assert_eq!(kind, Some(RangeReadErrorKind::MetricsOverflow));
+        }
+        assert!(tracker.record_bytes(0).is_ok());
+        assert_eq!(shared.snapshot().requests(), u64::MAX);
+        assert_eq!(shared.snapshot().transferred_bytes(), u64::MAX);
+    }
 }

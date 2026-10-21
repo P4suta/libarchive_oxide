@@ -159,9 +159,9 @@ struct RepeatedFilteredTar {
 impl RepeatedFilteredTar {
     fn new(header: Vec<u8>, payload: Vec<u8>, trailer: Vec<u8>) -> Self {
         assert_eq!(SOAK_PAYLOAD % FILTER_FRAME_PAYLOAD, 0);
-        assert!(!header.is_empty());
-        assert!(!payload.is_empty());
-        assert!(!trailer.is_empty());
+        assert_ne!(header.len(), 0);
+        assert_ne!(payload.len(), 0);
+        assert_ne!(trailer.len(), 0);
         assert!(
             header
                 .len()

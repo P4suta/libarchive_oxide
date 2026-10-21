@@ -26,6 +26,10 @@ use libarchive_oxide_core::{
 
 use crate::filter::Crc32;
 
+#[cfg(test)]
+use super::worker::testing::{DriveCheckpoint, DriveSchedule};
+use super::worker::{InputMessage, QUEUE_DEPTH, WorkerEvent, WorkerProgress};
+
 const BUFFER: usize = 64 * 1024;
 const MAX_STAGED: usize = BUFFER;
 const INPUT_WAIT: Duration = Duration::from_millis(10);
@@ -36,17 +40,6 @@ const LZIP_MAGIC: &[u8; 4] = b"LZIP";
 const LZIP_VERSION: u8 = 1;
 const MIN_DICTIONARY: u32 = 4 * 1024;
 const MAX_DICTIONARY: u32 = 512 * 1024 * 1024;
-
-enum InputMessage {
-    Data(Vec<u8>),
-    End,
-}
-
-#[derive(Debug)]
-enum WorkerEvent {
-    NeedInput,
-    Output(Vec<u8>),
-}
 
 #[derive(Clone)]
 struct EventSink {
@@ -211,12 +204,14 @@ pub(crate) struct LzipDecoder {
     input_disconnected: bool,
     done: bool,
     failure: Option<ArchiveError>,
+    #[cfg(test)]
+    schedule: Option<Arc<DriveSchedule>>,
 }
 
 impl LzipDecoder {
     pub(crate) fn new(limits: Limits) -> Result<Self, ArchiveError> {
-        let (sender, input) = mpsc::sync_channel(2);
-        let (event_sender, events) = mpsc::sync_channel(2);
+        let (sender, input) = mpsc::sync_channel(QUEUE_DEPTH);
+        let (event_sender, events) = mpsc::sync_channel(QUEUE_DEPTH);
         let waker_cell = Arc::new(Mutex::new(None));
         let cancel = Arc::new(AtomicBool::new(false));
         let sink = EventSink {
@@ -245,6 +240,8 @@ impl LzipDecoder {
             input_disconnected: false,
             done: false,
             failure: None,
+            #[cfg(test)]
+            schedule: None,
         })
     }
 
@@ -349,6 +346,10 @@ impl LzipDecoder {
             Ok(()) => Ok(true),
             Err(TrySendError::Full(InputMessage::Data(bytes))) => {
                 self.pending_input = bytes;
+                #[cfg(test)]
+                if let Some(schedule) = &self.schedule {
+                    schedule.pause(DriveCheckpoint::InputFull);
+                }
                 Ok(false)
             },
             Err(TrySendError::Disconnected(InputMessage::Data(bytes))) => {
@@ -400,29 +401,36 @@ impl LzipDecoder {
         match event {
             WorkerEvent::NeedInput => 0,
             WorkerEvent::Output(bytes) => {
-                debug_assert!(self.pending_output.is_empty());
+                debug_assert_eq!(self.pending_output.len(), 0);
                 self.pending_output = bytes;
                 self.drain_output(output)
             },
         }
     }
 
-    fn poll_event(&mut self, output: &mut [u8]) -> Result<Option<usize>, ArchiveError> {
+    fn poll_event(&mut self, output: &mut [u8]) -> Result<Option<WorkerProgress>, ArchiveError> {
         let event = match self.events.get_mut() {
             Ok(events) => events.try_recv(),
             Err(_) => return Err(self.fail(malformed("lzip event receiver was poisoned"))),
         };
         match event {
-            Ok(event) => Ok(Some(self.handle_event(event, output))),
+            Ok(WorkerEvent::NeedInput) => Ok(Some(WorkerProgress::NeedInput)),
+            Ok(event @ WorkerEvent::Output(_)) => Ok(Some(WorkerProgress::Output(
+                self.handle_event(event, output),
+            ))),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 self.finish_worker()?;
-                Ok(Some(0))
+                Ok(Some(WorkerProgress::Finished))
             },
         }
     }
 
     fn wait_event(&mut self, output: &mut [u8]) -> Result<usize, ArchiveError> {
+        #[cfg(test)]
+        if let Some(schedule) = &self.schedule {
+            schedule.pause(DriveCheckpoint::Waiting);
+        }
         let event = match self.events.get_mut() {
             Ok(events) => events.recv(),
             Err(_) => return Err(self.fail(malformed("lzip event receiver was poisoned"))),
@@ -456,6 +464,7 @@ impl LzipDecoder {
             Some(waker) => {
                 self.register_waker(waker);
                 self.poll_event(output)
+                    .map(|event| event.map(WorkerProgress::produced))
             },
         }
     }
@@ -484,7 +493,7 @@ impl LzipDecoder {
 
         let mut consumed = 0;
         let mut produced = self.drain_output(output);
-        loop {
+        'driving: loop {
             if self.done {
                 return Ok(Some(CodecStep {
                     consumed,
@@ -496,7 +505,7 @@ impl LzipDecoder {
                 let Some(read) = self.poll_event(&mut output[produced..])? else {
                     break;
                 };
-                produced += read;
+                produced += read.produced();
                 if self.done || !self.pending_output.is_empty() {
                     break;
                 }
@@ -527,7 +536,11 @@ impl LzipDecoder {
                 let Some(read) = self.poll_event(&mut output[produced..])? else {
                     break;
                 };
-                produced += read;
+                match read {
+                    WorkerProgress::NeedInput => continue 'driving,
+                    WorkerProgress::Output(bytes) => produced += bytes,
+                    WorkerProgress::Finished => {},
+                }
                 if self.done || !self.pending_output.is_empty() {
                     break;
                 }
@@ -862,6 +875,32 @@ mod tests {
     use std::task::{Wake, Waker};
 
     use super::wake_cell;
+
+    #[test]
+    fn input_request_retries_retained_bytes_before_waiting() {
+        super::super::worker::testing::assert_retained_input_progress(
+            super::LZIP_MAGIC,
+            |channels| {
+                let mut decoder = super::LzipDecoder {
+                    sender: Some(channels.sender),
+                    events: Mutex::new(channels.events),
+                    waker_cell: Arc::new(Mutex::new(None)),
+                    worker: Mutex::new(None),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    pending_input: channels.retained,
+                    pending_output: Vec::new(),
+                    output_position: 0,
+                    end_sent: false,
+                    input_disconnected: false,
+                    done: false,
+                    failure: None,
+                    schedule: Some(channels.schedule),
+                };
+                let mut output = [0_u8; 1];
+                decoder.drive(&[], &mut output, super::EndOfInput::More, None)
+            },
+        );
+    }
 
     struct LockProbe {
         cell: Arc<Mutex<Option<Waker>>>,
