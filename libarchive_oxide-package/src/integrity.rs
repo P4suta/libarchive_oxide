@@ -26,6 +26,7 @@ const MAX_MANIFEST_HEADERS: usize = 262_144;
 const MAX_MANIFEST_SECTIONS: usize = 65_536;
 const MAX_MANIFEST_VALUE_BYTES: usize = 65_535;
 const METADATA_FALLBACK: usize = 64 * 1024 * 1024;
+const WHEEL_RECORD_FIELD_COUNT: usize = 3;
 
 #[derive(Debug)]
 pub(crate) struct ZipVerification {
@@ -790,7 +791,7 @@ fn parse_wheel_rows(
             continue;
         }
         let fields = match csv_fields(line) {
-            Ok(fields) if fields.len() == 3 => fields,
+            Ok(fields) if fields.len() == WHEEL_RECORD_FIELD_COUNT => fields,
             Ok(_) => {
                 findings.push(integrity_finding(
                     "wheel",
@@ -810,7 +811,7 @@ fn parse_wheel_rows(
                 continue;
             },
         };
-        let [path, hash, size]: [Vec<u8>; 3] = match fields.try_into() {
+        let [path, hash, size]: [Vec<u8>; WHEEL_RECORD_FIELD_COUNT] = match fields.try_into() {
             Ok(fields) => fields,
             Err(_) => continue,
         };

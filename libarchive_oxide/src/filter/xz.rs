@@ -15,22 +15,15 @@ use libarchive_oxide_core::{
     ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput, ErrorKind, Limits,
 };
 
+#[cfg(test)]
+use super::worker::testing::{DriveCheckpoint, DriveSchedule};
+use super::worker::{InputMessage, QUEUE_DEPTH, WorkerEvent, WorkerProgress};
+
 const BUFFER: usize = 64 * 1024;
 const MAX_HEADER: usize = 1024;
 const MAX_STAGED: usize = BUFFER + MAX_HEADER + 32;
 const XZ_MAGIC: &[u8; 6] = &[0xfd, b'7', b'z', b'X', b'Z', 0];
 const INDEX_RECORD_BYTES: usize = size_of::<u64>() * 2;
-
-enum InputMessage {
-    Data(Vec<u8>),
-    End,
-}
-
-#[derive(Debug)]
-enum WorkerEvent {
-    NeedInput,
-    Output(Vec<u8>),
-}
 
 /// Cloneable worker-event sender that wakes the async owner around every send.
 ///
@@ -517,12 +510,14 @@ pub(crate) struct XzDecoder {
     end_sent: bool,
     done: bool,
     failure: Option<ArchiveError>,
+    #[cfg(test)]
+    schedule: Option<Arc<DriveSchedule>>,
 }
 
 impl XzDecoder {
     pub(crate) fn new(limits: Limits) -> Result<Self, ArchiveError> {
-        let (sender, input) = mpsc::sync_channel(2);
-        let (event_sender, events) = mpsc::sync_channel(2);
+        let (sender, input) = mpsc::sync_channel(QUEUE_DEPTH);
+        let (event_sender, events) = mpsc::sync_channel(QUEUE_DEPTH);
         let waker_cell = Arc::new(Mutex::new(None));
         let sink = EventSink {
             sender: event_sender,
@@ -548,6 +543,8 @@ impl XzDecoder {
             end_sent: false,
             done: false,
             failure: None,
+            #[cfg(test)]
+            schedule: None,
         })
     }
 
@@ -610,6 +607,10 @@ impl XzDecoder {
             Ok(()) => Ok(true),
             Err(TrySendError::Full(InputMessage::Data(bytes))) => {
                 self.pending_input = bytes;
+                #[cfg(test)]
+                if let Some(schedule) = &self.schedule {
+                    schedule.pause(DriveCheckpoint::InputFull);
+                }
                 Ok(false)
             },
             Err(TrySendError::Disconnected(_)) => {
@@ -654,22 +655,29 @@ impl XzDecoder {
         }
     }
 
-    fn poll_event(&mut self, output: &mut [u8]) -> Result<Option<usize>, ArchiveError> {
+    fn poll_event(&mut self, output: &mut [u8]) -> Result<Option<WorkerProgress>, ArchiveError> {
         let event = match self.events.get_mut() {
             Ok(events) => events.try_recv(),
             Err(_) => return Err(self.fail(malformed("XZ event receiver was poisoned"))),
         };
         match event {
-            Ok(event) => Ok(Some(self.handle_event(event, output))),
+            Ok(WorkerEvent::NeedInput) => Ok(Some(WorkerProgress::NeedInput)),
+            Ok(event @ WorkerEvent::Output(_)) => Ok(Some(WorkerProgress::Output(
+                self.handle_event(event, output),
+            ))),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 self.finish_worker()?;
-                Ok(Some(0))
+                Ok(Some(WorkerProgress::Finished))
             },
         }
     }
 
     fn wait_event(&mut self, output: &mut [u8]) -> Result<usize, ArchiveError> {
+        #[cfg(test)]
+        if let Some(schedule) = &self.schedule {
+            schedule.pause(DriveCheckpoint::Waiting);
+        }
         let event = match self.events.get_mut() {
             Ok(events) => events.recv(),
             Err(_) => return Err(self.fail(malformed("XZ event receiver was poisoned"))),
@@ -710,6 +718,7 @@ impl XzDecoder {
             Some(waker) => {
                 self.register_waker(waker);
                 self.poll_event(output)
+                    .map(|event| event.map(WorkerProgress::produced))
             },
         }
     }
@@ -764,7 +773,7 @@ impl XzDecoder {
 
         let mut consumed = 0;
         let mut produced = self.drain_output(output);
-        loop {
+        'driving: loop {
             if self.done {
                 return Ok(Some(CodecStep {
                     consumed,
@@ -776,7 +785,7 @@ impl XzDecoder {
                 let Some(read) = self.poll_event(&mut output[produced..])? else {
                     break;
                 };
-                produced += read;
+                produced += read.produced();
                 if self.done || !self.pending_output.is_empty() {
                     break;
                 }
@@ -820,7 +829,11 @@ impl XzDecoder {
                 let Some(read) = self.poll_event(&mut output[produced..])? else {
                     break;
                 };
-                produced += read;
+                match read {
+                    WorkerProgress::NeedInput => continue 'driving,
+                    WorkerProgress::Output(bytes) => produced += bytes,
+                    WorkerProgress::Finished => {},
+                }
                 if self.done || !self.pending_output.is_empty() {
                     break;
                 }
@@ -1062,7 +1075,33 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{EventSink, InputPipe, wake_cell};
+    use super::{EventSink, InputPipe, XzDecoder, XzValidator, wake_cell};
+    use libarchive_oxide_core::{EndOfInput, Limits};
+
+    #[test]
+    fn input_request_retries_retained_bytes_before_waiting() {
+        super::super::worker::testing::assert_retained_input_progress(
+            super::XZ_MAGIC,
+            |channels| {
+                let mut decoder = XzDecoder {
+                    sender: Some(channels.sender),
+                    events: Mutex::new(channels.events),
+                    waker_cell: Arc::new(Mutex::new(None)),
+                    worker: Mutex::new(None),
+                    validator: XzValidator::new(Limits::default()),
+                    pending_input: channels.retained,
+                    pending_output: Vec::new(),
+                    output_position: 0,
+                    end_sent: false,
+                    done: false,
+                    failure: None,
+                    schedule: Some(channels.schedule),
+                };
+                let mut output = [0_u8; 1];
+                decoder.drive(&[], &mut output, EndOfInput::More, None)
+            },
+        );
+    }
 
     #[test]
     fn input_pipe_returns_available_bytes_without_waiting_to_fill_buffer() {

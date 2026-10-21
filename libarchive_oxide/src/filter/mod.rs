@@ -15,6 +15,8 @@ pub mod gzip;
 pub(crate) mod lz4;
 #[cfg(feature = "lzip")]
 pub(crate) mod lzip;
+#[cfg(any(feature = "lzip", feature = "xz"))]
+mod worker;
 #[cfg(feature = "xz")]
 pub(crate) mod xz;
 #[cfg(feature = "zstd")]
