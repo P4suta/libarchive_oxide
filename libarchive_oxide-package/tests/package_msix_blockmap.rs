@@ -250,7 +250,7 @@ fn microsoft_multiblock_signed_fixture_verifies_only_integrity() {
         "AppxSignature.p7x presence is not CMS validity"
     );
     assert_eq!(report.trust(), VerificationDimension::NotEvaluated);
-    assert!(report.signer_fingerprints().is_empty());
+    assert_eq!(report.signer_fingerprints().len(), 0);
 }
 
 #[test]

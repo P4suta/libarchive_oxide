@@ -700,6 +700,7 @@ dependencies = [
  "pbkdf2",
  "ppmd-rust",
  "rustix",
+ "rustversion",
  "sevenz-rust2",
  "sha1",
  "sha2",

@@ -1045,7 +1045,7 @@ mod tests {
 
         assert_eq!(progress.checked, 1);
         assert!(!progress.unsupported);
-        assert!(findings.is_empty());
+        assert_eq!(findings.len(), 0);
     }
 
     #[test]

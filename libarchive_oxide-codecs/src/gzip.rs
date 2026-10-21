@@ -1132,7 +1132,7 @@ mod tests {
             1,
             1,
         );
-        assert!(independent_decode(&empty_stream).is_empty());
+        assert_eq!(independent_decode(&empty_stream), [] as [u8; 0]);
 
         let mut codec = RawDeflateEncoder::with_limits(Limits::safe()).unwrap();
         let step = codec
@@ -1166,7 +1166,7 @@ mod tests {
             assert_eq!(finish_step.status, CodecStatus::NeedOutput);
             assert_ne!(finish_step.produced, 0);
         }
-        assert!(independent_decode(&finish_output).is_empty());
+        assert_eq!(independent_decode(&finish_output), [] as [u8; 0]);
     }
 
     #[test]

@@ -647,7 +647,7 @@ impl XzDecoder {
         match event {
             WorkerEvent::NeedInput => 0,
             WorkerEvent::Output(bytes) => {
-                debug_assert!(self.pending_output.is_empty());
+                debug_assert_eq!(self.pending_output.len(), 0);
                 self.pending_output = bytes;
                 self.drain_output(output)
             },

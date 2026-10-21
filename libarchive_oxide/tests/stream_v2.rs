@@ -732,7 +732,7 @@ fn streaming_writer_round_trips_without_archive_buffering() {
 #[test]
 fn empty_tar_is_resolved_at_eof_without_waiting_for_an_iso_descriptor() {
     let archive = ArchiveWriter::new(Vec::new()).finish().unwrap();
-    assert!(collect(archive).is_empty());
+    assert_eq!(collect(archive).len(), 0);
 }
 
 #[test]

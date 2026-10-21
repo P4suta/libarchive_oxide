@@ -99,7 +99,7 @@ fn sevenz_rust2_reads_arca_output() {
         reader.read_file("d/b.txt").unwrap(),
         b"the quick brown fox\n".repeat(50)
     );
-    assert!(reader.read_file("d/empty.txt").unwrap().is_empty());
+    assert_eq!(reader.read_file("d/empty.txt").unwrap().len(), 0);
 }
 
 #[test]

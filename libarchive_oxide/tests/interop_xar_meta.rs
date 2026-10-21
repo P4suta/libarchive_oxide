@@ -307,7 +307,7 @@ fn xar_bzip2_streams_and_enforces_integrity_and_memory_limits() {
 
     let empty = read_with_arca(&bzip2_xar(b"", false));
     assert_eq!(empty.len(), 1);
-    assert!(empty[0].content().is_empty());
+    assert_eq!(empty[0].content().len(), 0);
 
     let short_length = bzip2_xar_with_length(&content, content.len() - 1, false);
     let error = read_all(&short_length).expect_err("declared decoded length must be exact");
