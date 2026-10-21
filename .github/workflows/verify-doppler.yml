@@ -6,6 +6,10 @@
 name: Verify credential access
 
 'on':
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/verify-doppler.yml
   workflow_dispatch:
 
 permissions: {}
@@ -17,7 +21,9 @@ concurrency:
 jobs:
   automation_0:
     name: Verify automation access
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: release
@@ -45,7 +51,7 @@ jobs:
         run: exit 1
 
       - name: Verify a read-only repository token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ steps.credentials.outputs.GITHUB_APP_CLIENT_ID }}
           private-key: ${{ steps.credentials.outputs.GITHUB_APP_PRIVATE_KEY }}
