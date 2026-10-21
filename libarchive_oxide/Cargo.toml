@@ -120,20 +120,20 @@ libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
 libarchive_oxide-codecs = { path = "../libarchive_oxide-codecs", version = "0.2.0", default-features = false, features = ["gzip"] }
 rustversion = "1.0.23"
 # Feature-gated codecs.
-miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
+miniz_oxide = { version = "0.9.0", default-features = false, features = ["with-alloc"] }
 deflate64 = { version = "0.1.12", default-features = false, optional = true }
 compression-codecs = { version = "0.4.38", default-features = false, optional = true }
 bzip2 = { version = "0.6.1", optional = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib"], optional = true }
 xz-codec = { package = "xz2", version = "0.1.7", optional = true }
 # Shared by xz and 7z.
-lzma-rust2 = { version = "0.18.0", default-features = false, features = ["std"], optional = true }
+lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std"], optional = true }
 # PPMd7 (variant H) with the 7z range coder. The adapter validates the archive
 # properties and codec-memory budget before this dependency allocates its model.
 ppmd-rust = { version = "1.4.0", optional = true }
 # Safe streaming CAB Quantum decoder. Keep the patch release exact: 0.6.8
 # contains the signed frame-accounting fix required at 32 KiB boundaries.
-compcol = { version = "=0.6.8", default-features = false, features = ["quantum"], optional = true }
+compcol = { version = "=0.7.3", default-features = false, features = ["quantum"], optional = true }
 # WinZip AE-2 requires SHA-1. `zeroize` wipes the expanded AES key schedule on drop,
 # so a folder/member key never lingers in freed memory after the decoder is dropped
 # (defense in depth for both the 7z CBC and the ZIP AE-2 CTR paths).
@@ -172,18 +172,18 @@ flate2 = "1"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
 # Independent liblz4 consumer used only to validate our Pure-Rust writer output.
 lz4-codec = { package = "lz4", version = "1.28.1" }
-lzma-rust2 = "0.18.0"
+lzma-rust2 = "0.23.0"
 # Independent liblzma producer/consumer used only for XZ interoperability tests.
 xz-codec = { package = "xz2", version = "0.1.7" }
-zstd-codec = { package = "zstd", version = "0.13.3" }
+zstd-codec = { package = "zstd", version = "0.14.0" }
 # Independent SHA-256 reference for OCI layer digest/diffID tests.
 sha2 = "0.11"
 # `bzip2` is on by default; `deflate` and `zstd` are enabled so the 7z differential
 # tests can produce Deflate/Zstd folders for arca's reuse-codec decode path.
-sevenz-rust2 = { version = "0.21.3", features = ["deflate", "zstd"] }
+sevenz-rust2 = { version = "0.24.0", features = ["deflate", "zstd"] }
 # Independent batch BCJ2 splitter/oracle used only to produce interoperability fixtures. The
 # production reader uses lzma-rust2's bounded streaming junction.
-compcol = { version = "0.6.8", default-features = false, features = ["bcj2"] }
+compcol = { version = "0.7.0", default-features = false, features = ["bcj2"] }
 zip = { version = "9.0.5", default-features = false, features = ["deflate", "aes-crypto", "bzip2", "zstd", "lzma"] }
 # Independent tar/ar producers and consumers used only for RM-304 interop tests.
 tar = { version = "0.4", default-features = false }
