@@ -1248,6 +1248,10 @@ fn cargo() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
     use super::{
         check_manual_only_workflow, check_release_policy_contents, require_toml_assignment,
         section_between,
@@ -1298,6 +1302,72 @@ git_tag_enable = true
     const VALID_WORKSPACE_MANIFEST: &str = r#"[workspace.package]
 version = "0.2.0"
 "#;
+
+    fn assert_summary(payload: &str, expected_count: usize, expected: &str, accepted: bool) {
+        let predicate =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/required-results.jq");
+        let mut child = Command::new("jq")
+            .args(["-e", "--arg", "expected_result", expected])
+            .args(["--argjson", "expected_count", &expected_count.to_string()])
+            .arg("-f")
+            .arg(predicate)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the pinned jq");
+        let mut input = child.stdin.take().expect("piped summary input");
+        input
+            .write_all(payload.as_bytes())
+            .expect("write summary input");
+        drop(input);
+        let output = child.wait_with_output().expect("collect summary verdict");
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(!accepted)),
+            "count={expected_count}, expected={expected}, input={payload}, stderr={}",
+            std::str::from_utf8(&output.stderr).expect("jq diagnostics are UTF-8")
+        );
+    }
+
+    #[test]
+    fn required_summary_rejects_missing_failed_and_skipped_work() {
+        assert_summary(r#"["success","success"]"#, 2, "success", true);
+        for payload in [
+            "[]",
+            r#"["success"]"#,
+            r#"["success","success","success"]"#,
+            r#"["success","failure"]"#,
+            r#"["success","cancelled"]"#,
+            r#"["success","skipped"]"#,
+            r#"["success",null]"#,
+            r#"["success","unknown"]"#,
+            "null",
+            "true",
+            "{}",
+            r#"{"fast":"success","ci-required":"success"}"#,
+        ] {
+            assert_summary(payload, 2, "success", false);
+        }
+    }
+
+    #[test]
+    fn full_summary_requires_every_job_to_match_its_phase() {
+        for expected in ["success", "skipped"] {
+            let mut states = vec![format!("\"{expected}\""); 19];
+            assert_summary(&format!("[{}]", states.join(",")), 19, expected, true);
+            for index in 0..states.len() {
+                for invalid in ["failure", "cancelled", "unknown", "success", "skipped"] {
+                    if invalid == expected {
+                        continue;
+                    }
+                    states[index] = format!("\"{invalid}\"");
+                    assert_summary(&format!("[{}]", states.join(",")), 19, expected, false);
+                }
+                states[index] = format!("\"{expected}\"");
+            }
+        }
+    }
 
     #[test]
     fn workflow_trigger_section_is_bounded() {

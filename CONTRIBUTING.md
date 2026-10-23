@@ -2,8 +2,8 @@
 
 ## Setup
 
-Tools are declared in `mise.toml`. Rust is configured by
-`rust-toolchain.toml`.
+Tools are declared in `mise.toml`.
+Rust is pinned in both `mise.toml` and `rust-toolchain.toml`.
 
 ```sh
 mise install
@@ -14,13 +14,8 @@ Do not bypass hooks with `--no-verify`.
 
 The hooks use two layers:
 
-- `pre-commit` formats and spell-checks staged files, then runs both codec-profile
-  host Clippy plus Linux- and macOS-target Clippy before provider-registry and
-  license checks;
-- `pre-push` runs `just ci`, which mirrors every practical CI gate
-  available on a developer machine, including all-feature tests, rustdoc,
-  bare-metal `no_std`, dependency policy, packaged-crate consumer validation,
-  release policy, workflow lint, and the workspace MSRV.
+- `pre-commit` formats and spell-checks staged files, then checks portable host Clippy and licenses.
+- `pre-push` runs `just ci`, the same portable gate used by pull requests and merge groups.
 
 Run the same suites explicitly when needed:
 
@@ -30,8 +25,8 @@ just ci
 lefthook run local-ci
 ```
 
-The remote CI remains authoritative for the Linux/macOS/Windows matrix,
-CodeQL, nightly libFuzzer, and big-endian s390x/QEMU execution.
+The ordinary gate checks formatting, strict portable Clippy, workspace regressions, doctests, dependencies, licenses, generated documentation, release policy, and workflows.
+It runs on one Linux runner without duplicating checks after merge.
 
 ## Required checks
 
@@ -39,38 +34,25 @@ CodeQL, nightly libFuzzer, and big-endian s390x/QEMU execution.
 just ci
 ```
 
-Individual recipes such as `just test`, `just no-std`, `just deny`, and
-`just shear` run the same commands independently. Portable repository-specific policy and CI
-orchestration that branches, loops, or constructs command matrices lives in
-the safe-Rust `xtask` crate instead of shell scripts. Straight-line tool calls
-remain visible in `Justfile` and workflow setup steps rather than being wrapped
-without adding portability or validation.
+`just test-portable` runs the portable workspace tests through nextest's non-fail-fast CI profile, followed by doctests.
+The committed malformed-input corpus remains part of those regressions.
+Individual recipes run the same commands independently.
+Repository-specific orchestration lives in the safe-Rust `xtask` crate.
 
-`just test` uses cargo-nextest for normal unit and integration tests, then runs
-`cargo test --doc` for each maximal codec profile because nextest does not run
-doctests. `just test-ci` selects the non-fail-fast CI profile used by all three
-host operating systems. Adversarial corpus mutations run as target-specific
-tests in a group capped at four processes, so failures identify one fuzz target
-without unbounded high-core-count fan-out.
+Full verification runs before the protected publisher on the exact workflow revision.
+It includes both codec profiles on Linux, macOS, and Windows, the feature matrix, MSRV, 32-bit Windows, bare-metal and WASI builds, packaged consumers, CodeQL, bounded libFuzzer, big-endian emulation, and the four 10 GiB streaming checks.
+These checks cover platform compatibility, untrusted archive inputs, and bounded streaming memory before distribution.
+They also remain available through a manual CI dispatch with `full` enabled.
 
-`just fuzz-ci` runs the nightly panic-abort and bounded two-profile libFuzzer
-campaign when `FUZZ_TARGET` is set. `just big-endian-ci` runs the exact optimized
-s390x/QEMU selection used remotely; both require their CI tools to be installed.
+```sh
+just release-check
+```
 
-`just package-smoke` builds the exact `.crate` contents in a fresh external
-consumer workspace. `just release-policy` is a non-publishing static check that
-keeps the workspace at the completion-phase version, rejects a SemVer freeze,
-and requires every publisher (including the bootstrap publisher) to remain
-manual-only behind its typed confirmation and protected Environment.
-
-CI also runs:
-
-- tests on Linux, macOS, and Windows;
-- MSRV verification;
-- `s390x-unknown-linux-gnu` tests under QEMU;
-- bounded libFuzzer runs;
-- cargo-deny supply-chain policy and strict cargo-shear dependency hygiene;
-- CodeQL, actionlint, and offline high-severity zizmor workflow auditing.
+This command runs the full checks supported on the current developer host.
+The nightly fuzzing and QEMU recipes require their documented CI tools.
+`just package-smoke` builds the exact packaged sources in a fresh external consumer workspace.
+`just release-policy` checks version and manual draft-first publication policy without publishing.
+No verification command grants release authorization.
 
 ## Design constraints
 

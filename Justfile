@@ -27,6 +27,10 @@ lint:
     cargo clippy --workspace --all-targets --no-default-features --features {{portable_features}} -- -D warnings
     cargo clippy --workspace --all-targets --no-default-features --features {{native_features}} -- -D warnings
 
+# Lint the portable workspace used for ordinary changes.
+lint-portable:
+    cargo clippy --locked --workspace --all-targets --no-default-features --features {{portable_features}} -- -D warnings
+
 # Compile Linux-only library code even when the developer host is Windows or macOS.
 lint-linux:
     rustup target add x86_64-unknown-linux-gnu
@@ -52,6 +56,11 @@ test-ci:
     cargo test --workspace --doc --no-default-features --features {{portable_features}}
     cargo nextest run --profile ci --workspace --no-default-features --features {{native_features}}
     cargo test --workspace --doc --no-default-features --features {{native_features}}
+
+# Run portable regressions and doctests without a platform or codec matrix.
+test-portable:
+    cargo nextest run --locked --profile ci --workspace --no-default-features --features {{portable_features}}
+    cargo test --locked --workspace --doc --no-default-features --features {{portable_features}}
 
 # Stream logical 10 GiB tar/gzip/xz/zstd archives without materializing them.
 # Separate test processes make Linux's peak-RSS <= 128 MiB verdict codec-specific.
@@ -169,9 +178,13 @@ msrv:
     cargo msrv verify --path xtask
 
 # Fast deterministic checks used during the edit/commit loop.
-check: fmt-check typos lint lint-linux lint-macos feature-matrix registry shear reuse license-sync codec-policy capability-docs release-policy actionlint zizmor
+check: fmt-check typos lint-portable shear reuse license-sync codec-policy capability-docs release-policy actionlint zizmor
     @echo "fast local checks passed"
 
-# Every practical CI gate available on a developer machine.
-ci: fmt-check typos lint lint-linux lint-macos feature-matrix test-ci streaming-soak doc registry no-std wasi deny shear reuse license-sync package-licenses package-smoke codec-policy capability-docs release-policy actionlint zizmor msrv
+# Verify ordinary changes through the same gate as pull requests.
+ci: check test-portable deny
     @echo "local CI passed"
+
+# Run the complete checks supported on a developer machine before a release.
+release-check: fmt-check typos lint lint-linux lint-macos feature-matrix test-ci streaming-soak doc registry no-std wasi deny shear reuse license-sync package-licenses package-smoke codec-policy capability-docs release-policy actionlint zizmor msrv
+    @echo "local release checks passed"
