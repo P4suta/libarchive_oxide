@@ -481,24 +481,21 @@ fn validate_nuspec_xml(body: &[u8], limits: Limits) -> Result<(), Failure> {
                 let name = element.name();
                 let name = name.as_ref();
                 match depth {
-                    1 if name == b"package" && !root_seen && !root_closed => root_seen = true,
-                    2 if root_seen && name == b"metadata" && !metadata_seen => metadata_seen = true,
+                    1 if name == "package" && !root_seen && !root_closed => root_seen = true,
+                    2 if root_seen && name == "metadata" && !metadata_seen => metadata_seen = true,
                     3 if metadata_seen => {
                         let required = match name {
-                            b"id" => Some(Required::Id),
-                            b"version" => Some(Required::Version),
-                            b"authors" => Some(Required::Authors),
-                            b"description" => Some(Required::Description),
+                            "id" => Some(Required::Id),
+                            "version" => Some(Required::Version),
+                            "authors" => Some(Required::Authors),
+                            "description" => Some(Required::Description),
                             _ => None,
                         };
                         if let Some(required) = required {
                             if !seen.insert(required) {
                                 return Err(Failure::invalid(
                                     PackageFindingCode::InvalidPackageMetadata,
-                                    format!(
-                                        "NuGet .nuspec repeats required <{}> metadata",
-                                        String::from_utf8_lossy(name)
-                                    ),
+                                    format!("NuGet .nuspec repeats required <{name}> metadata"),
                                 ));
                             }
                             active = Some((required, depth, false));
@@ -515,15 +512,12 @@ fn validate_nuspec_xml(body: &[u8], limits: Limits) -> Result<(), Failure> {
             },
             Event::Empty(element) => {
                 let name = element.name();
-                if matches!(
-                    name.as_ref(),
-                    b"id" | b"version" | b"authors" | b"description"
-                ) {
+                if matches!(name.as_ref(), "id" | "version" | "authors" | "description") {
                     return Err(Failure::invalid(
                         PackageFindingCode::InvalidPackageMetadata,
                         format!(
                             "NuGet .nuspec required <{}> metadata is empty",
-                            String::from_utf8_lossy(name.as_ref())
+                            name.as_ref()
                         ),
                     ));
                 }
@@ -533,10 +527,17 @@ fn validate_nuspec_xml(body: &[u8], limits: Limits) -> Result<(), Failure> {
                     active = Some((
                         required,
                         required_depth,
-                        nonempty || text.as_ref().iter().any(|byte| !byte.is_ascii_whitespace()),
+                        nonempty
+                            || text
+                                .as_ref()
+                                .bytes()
+                                .any(|byte| !byte.is_ascii_whitespace()),
                     ));
                 } else if (depth == 0 || root_closed)
-                    && text.as_ref().iter().any(|byte| !byte.is_ascii_whitespace())
+                    && text
+                        .as_ref()
+                        .bytes()
+                        .any(|byte| !byte.is_ascii_whitespace())
                 {
                     return Err(Failure::invalid(
                         PackageFindingCode::InvalidPackageMetadata,
@@ -549,10 +550,17 @@ fn validate_nuspec_xml(body: &[u8], limits: Limits) -> Result<(), Failure> {
                     active = Some((
                         required,
                         required_depth,
-                        nonempty || text.as_ref().iter().any(|byte| !byte.is_ascii_whitespace()),
+                        nonempty
+                            || text
+                                .as_ref()
+                                .bytes()
+                                .any(|byte| !byte.is_ascii_whitespace()),
                     ));
                 } else if (depth == 0 || root_closed)
-                    && text.as_ref().iter().any(|byte| !byte.is_ascii_whitespace())
+                    && text
+                        .as_ref()
+                        .bytes()
+                        .any(|byte| !byte.is_ascii_whitespace())
                 {
                     return Err(Failure::invalid(
                         PackageFindingCode::InvalidPackageMetadata,
@@ -569,7 +577,7 @@ fn validate_nuspec_xml(body: &[u8], limits: Limits) -> Result<(), Failure> {
                             PackageFindingCode::InvalidPackageMetadata,
                             format!(
                                 "NuGet .nuspec required <{}> metadata is empty",
-                                String::from_utf8_lossy(element.name().as_ref())
+                                element.name().as_ref()
                             ),
                         ));
                     }
