@@ -8,6 +8,6 @@
 # `thumbv7em-none-eabi`; add that target with `rustup target add` (CI does).
 
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
