@@ -50,14 +50,10 @@ jobs:
       RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.99.1
-          components: rustfmt, clippy
       - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
           version: 2026.10.11
-          install_args: just jq typos actionlint zizmor uv cargo-binstall cargo:cargo-deny cargo:cargo-shear cargo:cargo-nextest
+          install_args: rust just jq typos actionlint zizmor uv cargo-binstall cargo:cargo-deny cargo:cargo-shear cargo:cargo-nextest
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: portable-${{ hashFiles('Cargo.lock') }}
