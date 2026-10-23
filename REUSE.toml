@@ -13,6 +13,7 @@ path = [
   ".gitignore",
   "fuzz/.gitignore",
   ".github/CODEOWNERS",
+  ".github/renovate.json",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 libarchive_oxide contributors"
