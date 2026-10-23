@@ -117,16 +117,30 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
+        with:
+          toolchain: 1.99.1
+      - uses: release-plz/action@7ef5e4d4b0420630cfcaeb182c01e13651d4c577 # v0.5.145
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
+  verify:
+    name: verify exact release source
+    if: inputs.operation == 'publish' && vars.RELEASE_ENABLED == 'true'
+    needs: authorize
+    uses: ./.github/workflows/ci.yml
+    with:
+      full: true
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+
   release-plz-release:
     name: release-plz publish crates and draft release
     if: inputs.operation == 'publish' && vars.RELEASE_ENABLED == 'true'
-    needs: authorize
+    needs: [authorize, verify]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -163,7 +177,10 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.99.1
       - name: verify the expected tag against the workspace version
         env:
           EXPECTED_TAG: ${{ inputs.expected_tag }}
@@ -179,7 +196,7 @@ jobs:
             echo "::error::tag $EXPECTED_TAG already exists"
             exit 1
           fi
-      - uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
+      - uses: release-plz/action@7ef5e4d4b0420630cfcaeb182c01e13651d4c577 # v0.5.145
         with:
           command: release
         env:

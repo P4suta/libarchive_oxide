@@ -582,7 +582,7 @@ fn parse_block_map(
                 format!("AppxBlockMap.xml is not well-formed XML: {error}"),
             )
         })?;
-        let done = parser.event(&reader, event)?;
+        let done = parser.event(event)?;
         buffer.clear();
         if done {
             return parser.finish();
@@ -634,7 +634,7 @@ impl<'a> BlockMapParser<'a> {
         }
     }
 
-    fn event(&mut self, reader: &Reader<&[u8]>, event: Event<'_>) -> Result<bool, Failure> {
+    fn event(&mut self, event: Event<'_>) -> Result<bool, Failure> {
         match event {
             Event::Decl(declaration) => {
                 if self.document != DocumentState::BeforeRoot || self.declaration_seen {
@@ -643,17 +643,17 @@ impl<'a> BlockMapParser<'a> {
                 self.xml_version = match declaration.version().map_err(|error| {
                     Self::invalid(format!("XML declaration has an invalid version: {error}"))
                 })? {
-                    version if version.as_ref() == b"1.0" => XmlVersion::Explicit1_0,
-                    version if version.as_ref() == b"1.1" => XmlVersion::Explicit1_1,
+                    version if version.as_ref() == "1.0" => XmlVersion::Explicit1_0,
+                    version if version.as_ref() == "1.1" => XmlVersion::Explicit1_1,
                     _ => return Err(Self::invalid("XML declaration uses an unknown version")),
                 };
                 self.declaration_seen = true;
             },
-            Event::Start(element) => self.start(reader, &element, false)?,
-            Event::Empty(element) => self.start(reader, &element, true)?,
-            Event::End(element) => self.end(element.name().as_ref())?,
+            Event::Start(element) => self.start(&element, false)?,
+            Event::Empty(element) => self.start(&element, true)?,
+            Event::End(element) => self.end(element.name().as_ref().as_bytes())?,
             Event::Text(text) => {
-                if !text.as_ref().iter().all(u8::is_ascii_whitespace) {
+                if !text.as_ref().as_bytes().iter().all(u8::is_ascii_whitespace) {
                     return Err(Self::invalid("block-map elements may not contain text"));
                 }
             },
@@ -668,12 +668,7 @@ impl<'a> BlockMapParser<'a> {
         Ok(false)
     }
 
-    fn start(
-        &mut self,
-        reader: &Reader<&[u8]>,
-        element: &BytesStart<'_>,
-        empty: bool,
-    ) -> Result<(), Failure> {
+    fn start(&mut self, element: &BytesStart<'_>, empty: bool) -> Result<(), Failure> {
         self.depth = self
             .depth
             .checked_add(1)
@@ -700,7 +695,7 @@ impl<'a> BlockMapParser<'a> {
         }
 
         let qualified = element.name();
-        let name = qualified.as_ref();
+        let name = qualified.as_ref().as_bytes();
         if let Some(prefix) = element_prefix(name) {
             if self.depth > 1 && self.ignorable_prefixes.contains(prefix) {
                 if empty {
@@ -722,14 +717,14 @@ impl<'a> BlockMapParser<'a> {
                         "BlockMap root must occur exactly once and contain files",
                     ));
                 }
-                self.parse_root_attributes(reader, element)?;
+                self.parse_root_attributes(element)?;
                 self.document = DocumentState::InRoot;
             },
             2 if name == b"File" && self.document == DocumentState::InRoot => {
                 if self.current.is_some() || self.block_open {
                     return Err(Self::invalid("File elements overlap"));
                 }
-                let file = self.parse_file_attributes(reader, element)?;
+                let file = self.parse_file_attributes(element)?;
                 self.current = Some(file);
                 if empty {
                     self.close_file()?;
@@ -740,7 +735,7 @@ impl<'a> BlockMapParser<'a> {
                 if self.block_open {
                     return Err(Self::invalid("Block elements may not nest"));
                 }
-                let block = Self::parse_block_attributes(reader, element, self.xml_version)?;
+                let block = Self::parse_block_attributes(element, self.xml_version)?;
                 let Some(file) = self.current.as_mut() else {
                     return Err(Failure::invalid(
                         Some(BLOCK_MAP_NAME.to_vec()),
@@ -803,12 +798,8 @@ impl<'a> BlockMapParser<'a> {
         Ok(())
     }
 
-    fn parse_root_attributes(
-        &mut self,
-        reader: &Reader<&[u8]>,
-        element: &BytesStart<'_>,
-    ) -> Result<(), Failure> {
-        let attributes = decoded_attributes(reader, element, 35, self.xml_version)?;
+    fn parse_root_attributes(&mut self, element: &BytesStart<'_>) -> Result<(), Failure> {
+        let attributes = decoded_attributes(element, 35, self.xml_version)?;
         let mut namespace: Option<String> = None;
         let mut hash_method: Option<String> = None;
         let mut ignorable: Option<String> = None;
@@ -876,11 +867,7 @@ impl<'a> BlockMapParser<'a> {
         Ok(())
     }
 
-    fn parse_file_attributes(
-        &mut self,
-        reader: &Reader<&[u8]>,
-        element: &BytesStart<'_>,
-    ) -> Result<BlockMapFile, Failure> {
+    fn parse_file_attributes(&mut self, element: &BytesStart<'_>) -> Result<BlockMapFile, Failure> {
         if self
             .limits
             .entries()
@@ -891,7 +878,7 @@ impl<'a> BlockMapParser<'a> {
             ));
         }
         let (raw_name, raw_size, raw_local_header_size) =
-            Self::file_attribute_values(reader, element, self.xml_version)?;
+            Self::file_attribute_values(element, self.xml_version)?;
         let name = normalize_block_map_name(&raw_name, self.limits)?;
         if is_excluded_footprint(&name) {
             return Err(Failure::invalid(
@@ -911,11 +898,10 @@ impl<'a> BlockMapParser<'a> {
     }
 
     fn file_attribute_values(
-        reader: &Reader<&[u8]>,
         element: &BytesStart<'_>,
         xml_version: XmlVersion,
     ) -> Result<(String, String, String), Failure> {
-        let attributes = decoded_attributes(reader, element, 3, xml_version)?;
+        let attributes = decoded_attributes(element, 3, xml_version)?;
         let mut name: Option<String> = None;
         let mut size: Option<String> = None;
         let mut local_header_size: Option<String> = None;
@@ -1012,11 +998,10 @@ impl<'a> BlockMapParser<'a> {
     }
 
     fn parse_block_attributes(
-        reader: &Reader<&[u8]>,
         element: &BytesStart<'_>,
         xml_version: XmlVersion,
     ) -> Result<Block, Failure> {
-        let attributes = decoded_attributes(reader, element, 2, xml_version)?;
+        let attributes = decoded_attributes(element, 2, xml_version)?;
         let mut hash: Option<String> = None;
         let mut compressed_size: Option<String> = None;
         for (key, value) in attributes {
@@ -1095,7 +1080,6 @@ impl<'a> BlockMapParser<'a> {
 }
 
 fn decoded_attributes(
-    reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
     maximum: usize,
     xml_version: XmlVersion,
@@ -1115,7 +1099,7 @@ fn decoded_attributes(
                 format!("invalid or duplicate XML attribute: {error}"),
             )
         })?;
-        let name = attribute.key.as_ref().to_vec();
+        let name = attribute.key.as_ref().as_bytes().to_vec();
         if !seen.insert(name.clone()) {
             return Err(Failure::invalid(
                 Some(BLOCK_MAP_NAME.to_vec()),
@@ -1123,7 +1107,7 @@ fn decoded_attributes(
             ));
         }
         let value = attribute
-            .decoded_and_normalized_value(xml_version, reader.decoder())
+            .normalized_value(xml_version)
             .map_err(|error| {
                 Failure::invalid(
                     Some(BLOCK_MAP_NAME.to_vec()),

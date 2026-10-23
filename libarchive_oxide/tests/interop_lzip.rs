@@ -153,6 +153,41 @@ fn concatenated_members_decode_and_trailing_data_is_rejected() {
     );
 }
 
+#[test]
+fn buffered_small_members_keep_every_member_boundary() {
+    let mut encoded = Vec::new();
+    let mut expected = Vec::new();
+    for member in 0_u8..17 {
+        let plain = [member; 17];
+        encoded.extend_from_slice(&lzip_member(&plain));
+        expected.extend_from_slice(&plain);
+    }
+    for input_chunk in [1, 7, 4096] {
+        assert_eq!(
+            decode_filter(encoded.clone(), input_chunk, 5).unwrap(),
+            expected,
+            "input={input_chunk}"
+        );
+    }
+}
+
+#[test]
+fn buffered_later_member_checksum_corruption_is_rejected() {
+    let mut encoded = lzip_member(b"first valid member");
+    let mut later = lzip_member(b"later member with a corrupt checksum");
+    let trailer = later.len() - LZIP_TRAILER_SIZE;
+    later[trailer] ^= 1;
+    encoded.extend_from_slice(&later);
+    for input_chunk in [1, 4096] {
+        let error = decode_filter(encoded.clone(), input_chunk, 5).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("CRC32 mismatch"),
+            "input={input_chunk}: {error}"
+        );
+    }
+}
+
 fn strict_member() -> Vec<u8> {
     lzip_member(b"strict-envelope")
 }

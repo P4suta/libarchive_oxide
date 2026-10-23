@@ -2,32 +2,25 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# CI for libarchive_oxide (safe-Rust unified archive library).
-#
-# Layout under test: five publishable crates + an excluded fuzz sub-workspace.
-#   - libarchive_oxide-core   no_std + alloc, zero external deps (sans-I/O state machines).
-#   - libarchive_oxide-codecs no_std + alloc, additive portable codec state machines.
-#   - libarchive_oxide        the std flagship (auto-detection, FS extraction, safe paths, codecs).
-#   - libarchive_oxide-package ecosystem package rules and offline verification.
-#   - libarchive_oxide-cli    the unified oxarchive command.
-#   - xtask                   portable repository-policy checks used by Just and CI.
-#   - fuzz/                   cargo-fuzz targets; outside the workspace, nightly-only.
-#
-# Policy:
-#   - Every third-party action is SHA-pinned (Dependabot bumps them weekly); the comment records
-#     the human-readable version. `dtolnay/rust-toolchain@stable` is likewise pinned by commit.
-#   - `Swatinem/rust-cache` over raw `actions/cache` for the cargo state.
-#   - A single `ci-required` aggregation gate is the one status context branch protection references,
-#     so the ruleset never desyncs as jobs are added or renamed.
+# Ordinary changes run the portable gate.
+# Full verification gates an explicit release request on the same source revision.
 
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
   merge_group:
   workflow_dispatch:
+    inputs:
+      full:
+        description: Run release verification, including platform and codec matrices
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      full:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,20 +40,27 @@ env:
   # turn CI red for a reason invisible to every local gate. Those jobs still fail on real errors.
 
 jobs:
-  fmt:
-    name: rustfmt
+  fast:
+    name: portable checks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -D warnings
+      NEXTEST_TEST_THREADS: 4
+      RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
-          components: rustfmt
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+          version: 2026.10.11
+          install_args: rust just jq typos actionlint zizmor uv cargo-binstall cargo:cargo-deny cargo:cargo-shear cargo:cargo-nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          tool: just@1.50.0
-      - run: just fmt-check
+          key: portable-${{ hashFiles('Cargo.lock') }}
+      - run: just ci
 
   clippy:
+    if: inputs.full
     name: clippy
     runs-on: ubuntu-latest
     env:
@@ -70,13 +70,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: just@1.50.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          tool: just@1.59.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: just lint
+      - run: just lint-linux lint-macos
 
   test:
+    if: inputs.full
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # Each maximal profile includes the bounded, target-sharded invariant replay, followed by
@@ -102,15 +105,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: just@1.50.0,nextest@0.9.140
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: just@1.59.0,nextest@0.9.149
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.11
+          install_args: jq
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Nextest runs the normal conformance and committed fuzz-replay corpus process-per-test
       # through both maximal profiles. Cargo follows each profile with its doctests.
       - run: just test-ci
 
   streaming-soak:
+    if: inputs.full
     name: 10 GiB tar/gzip/xz/zstd soak (peak RSS <= 128 MiB)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -120,16 +130,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: just@1.50.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: just@1.59.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Each test synthesizes a raw tar or repeats one small compressed frame on demand, consumes
       # all 10 GiB through ArchiveReader, and reads Linux VmHWM after completion. No archive-sized
       # file, compressed fixture, or allocation is ever created.
       - run: just streaming-soak
 
   feature-matrix:
+    if: inputs.full
     name: feature matrix (cargo-hack, all targets)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -138,13 +151,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: just@1.50.0,cargo-hack@0.6.45
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: just@1.59.0,cargo-hack@0.6.45
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: just feature-matrix
 
   check-32-bit-windows:
+    if: inputs.full
     name: check (i686 Windows, portable + native)
     runs-on: windows-latest
     env:
@@ -154,13 +170,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: i686-pc-windows-msvc
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: just@1.50.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          tool: just@1.59.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: just check-32-bit-windows
 
   no_std:
+    if: inputs.full
     name: no_std (thumbv7em)
     runs-on: ubuntu-latest
     env:
@@ -170,15 +188,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: thumbv7em-none-eabi
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: just@1.50.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          tool: just@1.59.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Core and all portable codec features must stay no_std + alloc. Building both for a
       # bare-metal target with no std available proves the physical crate boundary.
       - run: just no-std
 
   wasi:
+    if: inputs.full
     name: WASI inspection stack (wasm32-wasip1)
     runs-on: ubuntu-latest
     env:
@@ -188,50 +208,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: wasm32-wasip1
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: just@1.50.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          tool: just@1.59.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # This is compile-only: archive inspection and portable codecs must remain
       # usable without enabling native libraries or filesystem extraction.
       - run: just wasi
 
   doc:
+    if: inputs.full
     name: doc (rustdoc, warnings are errors)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: just@1.50.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: just@1.59.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Intra-doc links and doctests across the whole public surface. Keep in sync with docs.yml
       # (which additionally deploys the result to Pages).
       - env:
           RUSTDOCFLAGS: -D warnings
         run: just doc
 
-  typos:
-    name: typos
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
-
   msrv:
+    if: inputs.full
     name: msrv (workspace 1.88, including no_std)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-msrv@0.19.3
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: just@1.50.0
+          tool: cargo-msrv@0.19.6
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: just@1.59.0
       # `cargo-msrv verify` reads each crate's declared `rust-version` and proves it actually builds
       # on that floor (installing the toolchain via rustup). Every workspace member uses the
       # same 1.88 floor; core and portable codecs are additionally built as no_std + alloc.
@@ -239,73 +259,40 @@ jobs:
         run: just msrv
 
   registry:
+    if: inputs.full
     name: object-safe registry conformance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: just@1.50.0
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: just@1.59.0
       # Boxed downstream providers retain the common bounded incremental protocol,
       # duplicate-ID rejection, and capability semantics.
       - run: just registry
 
-  reuse:
-    name: reuse (SPDX/REUSE compliance)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: just@1.50.0
-      # Run REUSE through `uvx` exactly as `just reuse` does locally, instead of the
-      # `fsfe/reuse-action` Docker action. That action pulled `fsfe/reuse` from Docker Hub at run
-      # time, whose image-manifest fetch intermittently timed out and turned `ci-required` red for a
-      # network reason unrelated to compliance. PyPI (uv/reuse) is far more reliable than anonymous
-      # Docker Hub pulls, and running the same command as local keeps CI and the dev box from drifting.
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
-        with:
-          version: 0.13.1
-      - run: just reuse
-
   license-sync:
-    name: crate package, codec and release policy
+    if: inputs.full
+    name: packaged licenses and external consumers
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: just@1.50.0
-      - run: just license-sync
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: just@1.59.0
       - name: verify license texts are packaged
         run: just package-licenses
       - name: compile packaged crates from an external consumer
         run: just package-smoke
-      - name: verify portable exclusion and explicit native codec backends
-        run: just codec-policy
-      - name: verify generated capability documentation
-        run: just capability-docs
-      - name: verify manual draft-first release policy
-        run: just release-policy
-
-  deny:
-    name: dependency policy (cargo-deny + cargo-shear)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-deny@0.20.2,cargo-shear@1.13.3
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: just@1.50.0
-      - run: just deny
-      - run: just shear
 
   fuzz:
+    if: inputs.full
     name: fuzz (nightly, build + short run)
     runs-on: ubuntu-latest
     # The 27-target inventory receives 30 seconds per portable target and 10
@@ -320,8 +307,11 @@ jobs:
       RUSTFLAGS: -C overflow-checks=yes
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-fuzz@0.13.2
       # libFuzzer needs nightly + the sanitizer runtime. Pin the dated official
@@ -337,6 +327,7 @@ jobs:
         run: cargo run --quiet -p xtask -- fuzz-ci
 
   big-endian:
+    if: inputs.full
     name: big-endian (s390x, qemu)
     # The archive formats carry big fields (zip is little-endian, tar is ASCII-octal, cpio/7z/iso
     # mix endian): a byte-order bug hides on the little-endian CI matrix. `cross` runs both library
@@ -354,8 +345,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cross@0.2.5
       - name: compile big-endian s390x test binaries
@@ -363,39 +356,18 @@ jobs:
       - name: test suite on big-endian s390x under qemu
         run: cargo run --quiet -p xtask -- big-endian-ci
 
-  actionlint:
-    name: actionlint + zizmor (workflow self-check)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: just@1.50.0,zizmor@1.28.0
-      - name: actionlint
-        env:
-          ACTIONLINT_VERSION: 1.7.12
-          # Official digest published on the v1.7.12 GitHub Release asset.
-          ACTIONLINT_LINUX_AMD64_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
-        run: |
-          asset="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          archive="$RUNNER_TEMP/$asset"
-          curl --fail --show-error --location --retry 5 --retry-connrefused \
-            --output "$archive" \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$asset"
-          printf '%s  %s\n' "$ACTIONLINT_LINUX_AMD64_SHA256" "$archive" |
-            sha256sum --check --strict -
-          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -color
-      - name: zizmor (offline, high severity)
-        run: just zizmor
+  codeql:
+    if: inputs.full
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
 
-  # Single aggregation gate. `if: always()` makes failures and cancellations
-  # visible through the one branch-protection status.
   ci-required:
     name: ci-required
     if: always()
     needs:
-      - fmt
       - clippy
       - test
       - streaming-soak
@@ -404,43 +376,48 @@ jobs:
       - no_std
       - wasi
       - doc
-      - typos
       - msrv
       - registry
-      - reuse
       - license-sync
-      - deny
       - fuzz
       - big-endian
-      - actionlint
+      - codeql
     runs-on: ubuntu-latest
     steps:
-      - name: verify all required jobs passed (skipped counts as pass)
-        run: |-
-          results="${{ join(needs.*.result, ' ') }}"
-          echo "needs results: $results"
-          for r in $results; do
-            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
-              echo "::error::a required job did not pass ($r)"
-              exit 1
-            fi
-          done
-          echo "all required jobs passed"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.11
+          install_args: jq
+      - name: require the expected verification phase
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+          EXPECTED_RESULT: ${{ inputs.full && 'success' || 'skipped' }}
+        run: |
+          jq -e --argjson expected_count 14 --arg expected_result "$EXPECTED_RESULT" \
+            -f .github/required-results.jq <<< "$RESULTS"
 
   # The one status check branch protection requires,
   # named the same in every P4suta repository.
-  # It passes only when every job it needs succeeded or was skipped.
+  # Both the portable gate and the phase summary must succeed.
   required:
     name: required
     if: always()
-    needs: [ci-required]
+    needs: [fast, ci-required]
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      contents: read
     steps:
-      - name: Fail unless every needed job succeeded or was skipped
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.11
+          install_args: jq
+      - name: require successful portable and phase checks
         env:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           echo "${RESULTS}"
-          jq -e 'all(.[]; IN("success", "skipped"))' <<< "${RESULTS}"
+          jq -e --argjson expected_count 2 --arg expected_result success \
+            -f .github/required-results.jq <<< "$RESULTS"

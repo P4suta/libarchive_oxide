@@ -11,6 +11,7 @@
 //! `lzma_rust2::LzipReader`: that adapter treats any failed next-member header
 //! as clean EOF, while this reader rejects corrupt and truncated members.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,16 +84,37 @@ struct InputPipe {
     receiver: Receiver<InputMessage>,
     events: EventSink,
     cancel: Arc<AtomicBool>,
+    read_ahead: VecDeque<u8>,
     current: Vec<u8>,
     position: usize,
     end_received: bool,
     eof_read: bool,
 }
 
+impl InputPipe {
+    fn restore_read_ahead(&mut self, bytes: Vec<u8>) -> io::Result<()> {
+        let pending = self
+            .read_ahead
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| out_of_memory("lzip read-ahead size overflow"))?;
+        if pending > MAX_STAGED {
+            return Err(out_of_memory("lzip read-ahead exceeds the staging limit"));
+        }
+        for byte in bytes.into_iter().rev() {
+            self.read_ahead.push_front(byte);
+        }
+        Ok(())
+    }
+}
+
 impl Read for InputPipe {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {
             return Ok(0);
+        }
+        if !self.read_ahead.is_empty() {
+            return self.read_ahead.read(output);
         }
         let mut written = 0;
         loop {
@@ -672,6 +694,7 @@ fn decode_worker(
             receiver: input,
             events: events.clone(),
             cancel: Arc::clone(&cancel),
+            read_ahead: VecDeque::new(),
             current: Vec::new(),
             position: 0,
             end_received: false,
@@ -737,8 +760,14 @@ fn decode_worker(
                 ensure_worker_active(&cancel)?;
             }
 
-            let counting = decoder.into_inner();
-            let (mut next_pipe, compressed_size) = counting.into_parts();
+            let (counting, unread) = decoder.into_parts();
+            let (mut next_pipe, fetched_size) = counting.into_parts();
+            let unread_size = u64::try_from(unread.len())
+                .map_err(|_| invalid_data("lzip read-ahead size overflow"))?;
+            let compressed_size = fetched_size
+                .checked_sub(unread_size)
+                .ok_or_else(|| invalid_data("lzip read-ahead exceeds fetched input"))?;
+            next_pipe.restore_read_ahead(unread)?;
             let mut trailer = [0_u8; TRAILER_SIZE];
             next_pipe.read_exact(&mut trailer).map_err(|error| {
                 if error.kind() == io::ErrorKind::UnexpectedEof {
