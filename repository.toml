@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name = "libarchive_oxide"
+summary = "Read and write archives with a Rust library and command-line tool"
+install = """
+git clone https://github.com/P4suta/libarchive_oxide.git
+cd libarchive_oxide
+mise install rust
+mise x -- cargo install --path libarchive_oxide-cli --locked
+"""
+usage_language = "sh"
+usage = "oxarchive capabilities --json"
+documentation_index = true
+copyright = "2026 libarchive_oxide contributors"
+license = "MIT OR Apache-2.0"
+
+[preserved_licenses]
+mit_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+apache_sha256 = "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff"
+
+[[consent]]
+contributor = "Yasunobu"
+evidence = "https://github.com/P4suta/libarchive_oxide/commit/f70d71458a1863457b7e2e368c7286be7dfcc9ee"
