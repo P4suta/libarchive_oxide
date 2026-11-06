@@ -127,13 +127,13 @@ bzip2 = { version = "0.6.1", optional = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib"], optional = true }
 xz-codec = { package = "xz2", version = "0.1.7", optional = true }
 # Shared by xz and 7z.
-lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std"], optional = true }
+lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std"], optional = true }
 # PPMd7 (variant H) with the 7z range coder. The adapter validates the archive
 # properties and codec-memory budget before this dependency allocates its model.
 ppmd-rust = { version = "1.4.0", optional = true }
 # Safe streaming CAB Quantum decoder. Keep the patch release exact: 0.6.8
 # contains the signed frame-accounting fix required at 32 KiB boundaries.
-compcol = { version = "=0.7.5", default-features = false, features = ["quantum"], optional = true }
+compcol = { version = "=0.7.8", default-features = false, features = ["quantum"], optional = true }
 # WinZip AE-2 requires SHA-1. `zeroize` wipes the expanded AES key schedule on drop,
 # so a folder/member key never lingers in freed memory after the decoder is dropped
 # (defense in depth for both the 7z CBC and the ZIP AE-2 CTR paths).
@@ -172,7 +172,7 @@ flate2 = "1"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
 # Independent liblz4 consumer used only to validate our Pure-Rust writer output.
 lz4-codec = { package = "lz4", version = "1.28.1" }
-lzma-rust2 = "0.23.0"
+lzma-rust2 = "0.25.0"
 # Independent liblzma producer/consumer used only for XZ interoperability tests.
 xz-codec = { package = "xz2", version = "0.1.7" }
 zstd-codec = { package = "zstd", version = "0.14.0" }
