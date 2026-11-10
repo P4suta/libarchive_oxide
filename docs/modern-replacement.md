@@ -23,7 +23,8 @@ gates pass:
 - read/write tar (v7/ustar/pax/GNU), major cpio dialects, GNU/BSD ar,
   ZIP/ZIP64 with mainstream ZIPX methods, practical 7z, and ISO 9660 with Rock
   Ridge and Joliet;
-- accurately scoped read-only RAR5, CAB, XAR, and UDF providers;
+- accurately scoped read-only RAR 3.x/4.x, RAR5, CAB, and UDF providers plus bounded XAR
+  Store read/write;
 - OCI layer and package-profile conformance, including tar+gzip and tar+zstd,
   Debian/RPM payload codecs, and ZIP-based package families;
 - a coherent Rust API and a versioned CLI JSON contract, without freezing
@@ -51,26 +52,20 @@ The [support matrix](support-matrix.md) is authoritative for what works now.
   filesystem capabilities.
 - Introduce `ArchiveEngine`, `ArchiveSession`, inspections, session-bound
   plans, apply reports, bounded events, and create options.
-- Add object-safe format/codec providers with duplicate-safe explicit
-  registration and built-in defaults.
+- Add associated-type format/codec providers with explicit static composition
+  and built-in defaults.
 - Add `ReadAt`/`AsyncRangeSource`, a Linux reference filesystem adapter,
   a unified `oxarchive` CLI, portable/native codec profiles, bzip2, and
   comparable benchmarks.
 
-The original associated-type provider chains in
-[ADR-0006](adr/0006-compile-time-providers.md) were superseded by the boxed,
-object-safe registry in
-[ADR-0015](adr/0015-object-safe-provider-registry.md). Pipeline,
-reader, engine/session, and creation now share that extensible registry
-contract.
-Filesystem application is implemented as a shared policy/limit driver plus a
-compile-time capability-reporting adapter. The Linux reference adapter and
-atomicity/finding contract are specified by
-[ADR-0007](adr/0007-capability-filesystem.md).
+The associated-type provider chains in [ADR-0006](adr/0006-compile-time-providers.md) are the canonical extension model restored by [ADR-0034](adr/0034-static-dispatch-only.md).
+Pipeline,
+reader, engine/session, and creation share the same concrete chain.
+The short-lived boxed registry decision is retained only as historical context in [ADR-0015](adr/0015-object-safe-provider-registry.md).
+Filesystem application is implemented as a shared policy/limit driver plus a compile-time capability-reporting adapter.
+The Linux reference adapter and atomicity/finding contract are specified by [ADR-0007](adr/0007-capability-filesystem.md).
 Unified creation and inspection use the shared engine/options/event paths.
-Atomic file publication, JSON Lines completion records, standard streams, and
-exit 0/1/2 are specified by
-[ADR-0008](adr/0008-bounded-cli-streams.md).
+Atomic file publication, JSON Lines completion records, standard streams, and exit 0/1/2 are specified by [ADR-0008](adr/0008-bounded-cli-streams.md).
 
 ### Campaign 2: OCI and packages
 
@@ -87,8 +82,8 @@ exit 0/1/2 are specified by
 - Expand ZIP methods, AES, and extras; expand 7z folders, coder graphs, solid
   archives, filters, methods, and AES.
 - Complete producer corpora and metadata round trips for tar/cpio/ar/ISO.
-- Implement CAB and XAR read-only providers and settle legal/spec/fixture
-  feasibility for RAR5 and UDF.
+- Implement CAB read and XAR read plus bounded Store writing, and settle
+  legal/spec/fixture feasibility for RAR5 and UDF.
 - Keep provider and sans-I/O seams sufficient for a separate future C-facing
   project without exposing a C ABI here.
 

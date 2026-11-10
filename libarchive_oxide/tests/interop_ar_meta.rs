@@ -184,6 +184,34 @@ fn ar_content_interop() {
     );
 }
 
+#[test]
+fn ar_reserved_control_names_use_bsd_inline_members_for_independent_consumers() {
+    let entries = [b"/".as_slice(), b"/SYM64", b"/123", b"#1/7"]
+        .into_iter()
+        .map(|name| LogicalEntry::file(name.to_vec(), b"x".to_vec()))
+        .collect::<Vec<_>>();
+    let expected = entries
+        .iter()
+        .map(|entry| EntryShape::new(entry.path.clone(), EntryKind::File, entry.content.clone()))
+        .collect::<Vec<_>>();
+    let encoded = arca_ar(&entries);
+
+    assert_consumers_accept(
+        &encoded,
+        &expected,
+        &[
+            ConsumerCase {
+                name: "arca",
+                decode: read_seq_with_arca,
+            },
+            ConsumerCase {
+                name: "ar@0.9",
+                decode: arcrate_decode,
+            },
+        ],
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Metadata fidelity: mode / uid / gid / mtime round trip. ar carries no symlink
 // or directory metadata, so those are out of scope for this format.

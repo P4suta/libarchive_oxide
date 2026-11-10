@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use libarchive_oxide_core::{ArchiveError, FormatId, Limits};
+use libarchive_oxide_core::{ArchiveError, ErrorKind, FormatId, Limits};
 
 use crate::{ReaderEvent, SecretBytes, SeekArchiveReader, StreamError};
 
@@ -741,7 +741,7 @@ pub trait VolumeResolver: Send + Sync {
 
 #[derive(Default)]
 struct VolumeState {
-    resolved: BTreeMap<VolumeId, Option<Arc<dyn ReadAt>>>,
+    resolved: BTreeMap<VolumeId, Arc<dyn ReadAt>>,
     total_bytes: u64,
 }
 
@@ -805,7 +805,36 @@ impl VolumeSet {
         Arc::clone(&self.primary)
     }
 
-    /// Resolves and caches a logical volume while enforcing all source budgets.
+    /// Encoded source and volume budgets enforced by this set.
+    #[must_use]
+    pub const fn limits(&self) -> SourceLimits {
+        self.limits
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    pub(crate) fn snapshot_sources(&self) -> io::Result<Vec<(VolumeId, Arc<dyn ReadAt>)>> {
+        let state = self.lock_state()?;
+        let additional = state.resolved.len();
+        let count = additional
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("volume snapshot count overflow"))?;
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(count)
+            .map_err(|_| io::Error::other("volume snapshot allocation failed"))?;
+        sources.push((VolumeId::new(0), self.primary()));
+        sources.extend(
+            state
+                .resolved
+                .iter()
+                .map(|(id, source)| (*id, Arc::clone(source))),
+        );
+        Ok(sources)
+    }
+
+    /// Resolves and caches an existing logical volume while enforcing all source budgets.
+    ///
+    /// Resolver absence is not cached and does not consume the physical-volume budget.
     pub fn resolve(&self, volume: VolumeId) -> io::Result<Option<Arc<dyn ReadAt>>> {
         if volume.get() == 0 {
             return Ok(Some(self.primary()));
@@ -814,20 +843,7 @@ impl VolumeSet {
         {
             let state = self.lock_state()?;
             if let Some(cached) = state.resolved.get(&volume) {
-                return Ok(cached.clone());
-            }
-            let observed = u32::try_from(state.resolved.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(2);
-            if self.limits.volumes().is_some_and(|limit| observed > limit) {
-                return Err(range_error(
-                    RangeReadError::new(RangeReadErrorKind::VolumeCountExceeded)
-                        .for_volume(volume)
-                        .with_budget(
-                            u64::from(observed),
-                            u64::from(self.limits.volumes().unwrap_or(0)),
-                        ),
-                ));
+                return Ok(Some(Arc::clone(cached)));
             }
         }
 
@@ -839,8 +855,12 @@ impl VolumeSet {
 
         let mut state = self.lock_state()?;
         if let Some(cached) = state.resolved.get(&volume) {
-            return Ok(cached.clone());
+            return Ok(Some(Arc::clone(cached)));
         }
+        let Some(resolved) = resolved else {
+            // Absence is not a physical source and is deliberately not cached: otherwise arbitrary missing identifiers could grow metadata beyond the volume budget.
+            return Ok(None);
+        };
         let observed = u32::try_from(state.resolved.len())
             .unwrap_or(u32::MAX)
             .saturating_add(2);
@@ -854,37 +874,37 @@ impl VolumeSet {
                     ),
             ));
         }
-        if let Some(length) = resolved_length {
-            let total = self
-                .primary
-                .len()
-                .checked_add(state.total_bytes)
-                .and_then(|value| value.checked_add(length))
-                .ok_or_else(|| {
-                    range_error(
-                        RangeReadError::new(RangeReadErrorKind::VolumeBytesExceeded)
-                            .for_volume(volume),
-                    )
-                })?;
-            if self
-                .limits
-                .volume_bytes()
-                .is_some_and(|limit| total > limit)
-            {
-                return Err(range_error(
-                    RangeReadError::new(RangeReadErrorKind::VolumeBytesExceeded)
-                        .for_volume(volume)
-                        .with_budget(total, self.limits.volume_bytes().unwrap_or(0)),
-                ));
-            }
-            state.total_bytes = state.total_bytes.checked_add(length).ok_or_else(|| {
+        let length = resolved_length.ok_or_else(|| {
+            range_error(RangeReadError::new(RangeReadErrorKind::SourceUnavailable))
+        })?;
+        let total = self
+            .primary
+            .len()
+            .checked_add(state.total_bytes)
+            .and_then(|value| value.checked_add(length))
+            .ok_or_else(|| {
                 range_error(
                     RangeReadError::new(RangeReadErrorKind::VolumeBytesExceeded).for_volume(volume),
                 )
             })?;
+        if self
+            .limits
+            .volume_bytes()
+            .is_some_and(|limit| total > limit)
+        {
+            return Err(range_error(
+                RangeReadError::new(RangeReadErrorKind::VolumeBytesExceeded)
+                    .for_volume(volume)
+                    .with_budget(total, self.limits.volume_bytes().unwrap_or(0)),
+            ));
         }
-        state.resolved.insert(volume, resolved.clone());
-        Ok(resolved)
+        state.total_bytes = state.total_bytes.checked_add(length).ok_or_else(|| {
+            range_error(
+                RangeReadError::new(RangeReadErrorKind::VolumeBytesExceeded).for_volume(volume),
+            )
+        })?;
+        state.resolved.insert(volume, Arc::clone(&resolved));
+        Ok(Some(resolved))
     }
 
     /// Resolves a required volume and preserves its identifier in typed context.
@@ -1134,6 +1154,36 @@ pub struct RangeArchiveReader<S: ReadAt> {
 }
 
 impl<S: ReadAt> RangeArchiveReader<S> {
+    /// Opens a range source with the common option model.
+    pub fn with_options(source: S, options: &crate::OpenOptions) -> Result<Self, StreamError> {
+        if options.volumes().is_some() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_context("use a volume reader for OpenOptions containing VolumeSet"),
+            ));
+        }
+        let input =
+            RangeReader::with_source_limits(source, options.limits(), options.source_limits())
+                .map_err(StreamError::io)?;
+        let identity = input.identity().clone();
+        let metrics = input.metrics.clone();
+        let reader = SeekArchiveReader::with_options(input, options)?;
+        if options
+            .format()
+            .is_some_and(|expected| reader.format() != expected)
+        {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_context("detected archive format does not match OpenOptions format"),
+            ));
+        }
+        Ok(Self {
+            reader,
+            identity,
+            metrics,
+        })
+    }
+
     /// Opens a range-backed archive with safe default limits.
     pub fn new(source: S) -> Result<Self, StreamError> {
         Self::with_limits(source, Limits::default())

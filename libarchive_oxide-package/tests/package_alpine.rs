@@ -12,7 +12,7 @@ use std::ops::Range;
 use flate2::Compression;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 use libarchive_oxide_package::{
     AlpineApkValidator, AlpineRsaPublicKey, PackageFindingCode, PackageVerifier, TrustPolicy,
     VerificationDimension,

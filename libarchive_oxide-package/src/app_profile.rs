@@ -30,7 +30,7 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 
 use super::finding::{PackageFinding, PackageFindingCode, Severity, SupportStatus};
 use super::zip_reader::{

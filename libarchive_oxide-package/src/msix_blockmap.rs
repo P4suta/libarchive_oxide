@@ -18,8 +18,8 @@ use std::mem::size_of;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use libarchive_oxide::Limits;
 use libarchive_oxide::{ErrorKind, ReaderEvent, SeekArchiveReader};
-use libarchive_oxide_core::Limits;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use sha2::{Digest, Sha256};

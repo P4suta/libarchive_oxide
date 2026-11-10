@@ -15,13 +15,19 @@
 //!    checks its extent bytes equal the exact content — an independent decode of arca's layout.
 //! 2. **System `xorriso`/`mkisofs`/`genisoimage` → arca** (graceful skip when none is installed): an
 //!    image mastered by a mature external tool is read back with arca, cross-validating the reader.
+//! 3. **arca-mastered multi-extent fixture → libarchive/bsdtar** (graceful skip): both the primary
+//!    and Joliet trees are patched into two noncontiguous sections and extracted independently.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod common;
 
 use std::io::Cursor;
 use std::process::Command;
 
 use libarchive_oxide::{ReaderEvent, SeekArchiveReader, SeekArchiveWriter};
 use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Limits};
+
+use common::multi_extent_iso_fixture;
 
 const SECTOR: usize = 2048;
 
@@ -166,6 +172,77 @@ fn iso_tool() -> Option<&'static str> {
         }
     }
     None
+}
+
+fn bsdtar_tool() -> Option<&'static str> {
+    for tool in ["bsdtar", "tar"] {
+        let Ok(output) = Command::new(tool).arg("--version").output() else {
+            continue;
+        };
+        let mut version = output.stdout;
+        version.extend_from_slice(&output.stderr);
+        if version
+            .windows(b"bsdtar".len())
+            .any(|bytes| bytes.eq_ignore_ascii_case(b"bsdtar"))
+        {
+            return Some(tool);
+        }
+    }
+    None
+}
+
+fn assert_libarchive_reads_iso_fixture(image_bytes: &[u8], name: &str, expected: &[u8]) {
+    let Some(tool) = bsdtar_tool() else {
+        eprintln!("skipping: no bsdtar/libarchive consumer installed");
+        return;
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("multi.iso");
+    std::fs::write(&image, image_bytes).unwrap();
+    let listing = Command::new(tool).arg("-tf").arg(&image).output().unwrap();
+    assert!(
+        listing.status.success(),
+        "{tool} rejected the multi-extent fixture while listing: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listed = String::from_utf8_lossy(&listing.stdout);
+    let path = listed
+        .lines()
+        .find(|path| path.contains(name))
+        .unwrap_or_else(|| panic!("{tool} did not list {name}: {listed:?}"));
+    let output = Command::new(tool)
+        .arg("-xOf")
+        .arg(&image)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{tool} rejected the multi-extent fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout.len(),
+        expected.len(),
+        "{tool} extracted an unexpected payload length"
+    );
+    if let Some((offset, (actual, expected))) = output
+        .stdout
+        .iter()
+        .zip(expected)
+        .enumerate()
+        .find(|(_, (actual, expected))| actual != expected)
+    {
+        panic!(
+            "{tool} payload mismatch at {offset}: actual={actual:#04x}, expected={expected:#04x}"
+        );
+    }
+}
+
+#[test]
+fn libarchive_reads_the_first_party_multi_extent_fixture() {
+    assert_libarchive_reads_iso_fixture(&multi_extent_iso_fixture(), "SPLIT.BIN", b"firstsecond");
 }
 
 #[test]

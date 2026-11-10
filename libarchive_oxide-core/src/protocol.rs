@@ -8,15 +8,7 @@ use core::fmt;
 
 use crate::metadata::{ArchiveMetadata, EntryMetadata};
 use crate::{ArchiveError, ErrorKind};
-
-/// Whether the supplied input is the final input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndOfInput {
-    /// Additional input may arrive.
-    More,
-    /// No additional input will arrive.
-    End,
-}
+pub use libarchive_oxide_protocol::{Codec, CodecStatus, CodecStep, EndOfInput};
 
 /// Three-way incremental detection result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,83 +23,6 @@ pub enum ProbeResult<T> {
     },
     /// The candidate did not match.
     NoMatch,
-}
-
-/// What a byte codec needs after one call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CodecStatus {
-    /// Supply additional input.
-    NeedInput,
-    /// Supply additional output capacity.
-    NeedOutput,
-    /// One complete codec stream ended.
-    Done,
-}
-
-/// Progress made by a byte codec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CodecStep {
-    /// Input bytes consumed.
-    pub consumed: usize,
-    /// Output bytes produced.
-    pub produced: usize,
-    /// Required next action.
-    pub status: CodecStatus,
-}
-
-impl CodecStep {
-    /// Validates counts and progress against the provided buffers.
-    pub fn validate(self, input_len: usize, output_len: usize) -> Result<Self, ArchiveError> {
-        if self.consumed > input_len || self.produced > output_len {
-            return Err(ArchiveError::new(ErrorKind::Protocol)
-                .with_context("codec reported out-of-range progress"));
-        }
-        if self.consumed == 0 && self.produced == 0 {
-            let valid_wait = matches!(self.status, CodecStatus::NeedInput) && input_len == 0;
-            let valid_backpressure =
-                matches!(self.status, CodecStatus::NeedOutput) && output_len == 0;
-            if !valid_wait && !valid_backpressure && !matches!(self.status, CodecStatus::Done) {
-                return Err(
-                    ArchiveError::new(ErrorKind::Protocol).with_context("codec made no progress")
-                );
-            }
-        }
-        Ok(self)
-    }
-}
-
-/// Incremental byte-to-byte codec.
-pub trait Codec {
-    /// Processes input, including finalization when `end` is [`EndOfInput::End`].
-    fn process(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        end: EndOfInput,
-    ) -> Result<CodecStep, ArchiveError>;
-
-    /// Non-blocking, executor-safe drive used by async adapters.
-    ///
-    /// Unlike [`process`](Codec::process) this must never block the calling
-    /// thread. `Ok(None)` means "would block": the codec has arranged for
-    /// `waker` to be woken once it can make progress, and the caller should
-    /// return `Poll::Pending` and poll again after the wake. The default
-    /// delegates to [`process`](Codec::process), which is correct for every
-    /// codec that never blocks a caller — in-process pull decoders and codecs
-    /// that signal backpressure through [`CodecStatus`] rather than a blocking
-    /// wait. Only a codec that would otherwise block a thread (e.g. one backed
-    /// by a worker thread and a blocking channel) needs to override this.
-    fn poll_process(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        end: EndOfInput,
-        waker: &core::task::Waker,
-    ) -> Result<Option<CodecStep>, ArchiveError> {
-        let _ = waker;
-        self.process(input, output, end).map(Some)
-    }
 }
 
 /// A borrowed entry-data window.
@@ -147,6 +62,11 @@ pub enum DecodeEvent<'a> {
     NeedInput,
     /// Supply a non-empty scratch/output buffer.
     NeedOutput,
+    /// Internal bounded work completed without producing a public event.
+    ///
+    /// The caller removes [`DecodeStep::consumed`] bytes and immediately drives the decoder again with the remaining input.
+    /// Unlike [`DecodeEvent::NeedInput`], this event never requests additional input.
+    Progress,
     /// Archive-level metadata was discovered or updated.
     ArchiveMetadata(ArchiveMetadata),
     /// A new entry begins.
@@ -181,6 +101,7 @@ impl DecodeStep<'_> {
             let semantic_progress = match &self.event {
                 DecodeEvent::NeedInput
                 | DecodeEvent::NeedOutput
+                | DecodeEvent::Progress
                 | DecodeEvent::ArchiveMetadata(_)
                 | DecodeEvent::Entry(_)
                 | DecodeEvent::EndEntry

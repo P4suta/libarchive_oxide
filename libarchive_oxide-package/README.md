@@ -74,6 +74,15 @@ hashing. Their uncompressed `ALT` forms are also checked when the payload is
 both declared and detected as uncompressed; compressed `ALT` coverage remains
 explicitly unsupported.
 
+RPM v4 `DSAHEADER`/`RSAHEADER`, RPM 6 `OPENPGPHEADER`, and legacy v3/v4 header-plus-payload `OpenPGP` signatures are verified offline with caller- supplied `RpmOpenPgpPublicKey` certificates.
+Header-only signatures authenticate the exact serialized main header.
+Legacy signatures add the compressed payload through one incremental hash state per signature, so payload size does not determine memory use.
+At most 64 independent signatures and 256 KiB per public-key input are accepted.
+Primary keys and signing subkeys are supported;
+every applicable signature must verify.
+The verifier emits SHA-256 of the native primary-key fingerprint as its canonical signer identity.
+Supplying the certificate enables verification but does not grant trust, perform key discovery, or apply network/revocation policy.
+
 NuGet signature format v1 is verified offline over the specification's
 canonical classic-ZIP byte stream. The verifier accepts RSA/SHA-256,
 RSA/SHA-384, and RSA/SHA-512 author or repository primary signatures, validates
@@ -92,16 +101,16 @@ use libarchive_oxide_package::{
 };
 
 let key_id = b"alpine-devel@example.org-12345678.rsa.pub".to_vec();
-let key = AlpineRsaPublicKey::from_pem(key_id, std::fs::read("signer.rsa.pub")?)?;
+let pem = std::fs::read("signer.rsa.pub").expect("read Alpine public key");
+let key = AlpineRsaPublicKey::from_pem(key_id, pem).expect("parse Alpine public key");
 let pin = key.fingerprint_sha256();
 let report = PackageVerifier::new(
     TrustPolicy::offline().with_trusted_signer_sha256(pin),
 )
 .with_alpine_rsa_public_key(key)
-.alpine_apk(File::open("package.apk")?);
+.alpine_apk(File::open("package.apk").expect("open Alpine package"));
 assert_eq!(report.signature_validity(), VerificationDimension::Verified);
 assert_eq!(report.trust(), VerificationDimension::Verified);
-# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ```rust,no_run
@@ -110,13 +119,12 @@ use std::fs::File;
 use libarchive_oxide_package::{PackageVerifier, VerificationDimension};
 
 let report = PackageVerifier::default().android_apk_with_v4_sidecar(
-    File::open("application.apk")?,
-    File::open("application.apk.idsig")?,
+    File::open("application.apk").expect("open Android package"),
+    File::open("application.apk.idsig").expect("open Android v4 sidecar"),
 );
-let v4 = report.android_apk_v4().ok_or("missing Android v4 report")?;
+let v4 = report.android_apk_v4().expect("Android v4 report");
 assert_eq!(v4.integrity(), VerificationDimension::Verified);
 assert_eq!(v4.signature_validity(), VerificationDimension::Verified);
-# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 CMS input, APK Signing Block values, APK v4 sidecar headers/signing infos/Merkle
@@ -130,8 +138,25 @@ Android v2/v3 DSA, ECDSA-with-SHA-512/P-521, RSA keys outside the current
 remain explicit `unsupported`; they are never silently approximated. This
 verifier authenticates the v3/v3.1 signer ranges and their rotation boundary,
 and consolidates the signature-algorithm winners for those authenticated
-ranges. It does not yet parse binary `AndroidManifest.xml` SDK declarations or
-prove installability across the manifest's complete Android platform range.
+ranges. Android reports also decode the root binary `AndroidManifest.xml`
+under the shared metadata and nesting limits and expose independent manifest
+validity plus effective numeric `minSdkVersion` and `targetSdkVersion` values.
+Development codenames without an explicit offline mapping are typed
+`unsupported`. `AndroidApkCompatibilityReport` independently checks that the
+verified v1/v2/v3/v3.1 scheme set covers pre-API-24 and API-24..27 minimum-SDK
+ranges and the target-SDK-30 v2-or-newer rule. A valid signature can therefore
+have invalid platform coverage without changing signature validity or trust.
+Other platform policy and complete installability across every declared
+Android version are not claimed.
+IPA verification sparsely reads thin/universal Mach-O headers, load commands,
+and bounded embedded signatures, then streams every signed code page. It
+validates SHA-1/SHA-256/SHA-256-truncated/SHA-384 `CodeDirectory` hashes,
+sealed `Info.plist`/requirements/entitlements/`CodeResources` slots, exact
+ordinary-resource coverage, every CMS signer, and signed hash-agility v1/v2
+bindings for alternative code directories. The executable is not retained in
+`Limits::metadata_bytes`; only sparse headers and signature metadata are.
+Signer validity does not grant trust. Nested-code and symlink resource rules
+remain explicit `unsupported` results.
 The interoperability suite uses OpenJDK `jarsigner`
 output and official AOSP CTS/`apksig` v1/v2/v3/v3.1/v4/v4.1 fixtures,
 including multiple signer files, multiple CMS `SignerInfo` records, malformed
@@ -146,8 +171,10 @@ Microsoft MSIX SDK fixtures cover stored/deflated and multi-block inputs.
 The encrypted/delta 2015 and 2017 BlockMap vocabularies are a typed
 `unsupported` result rather than being parsed as the implemented 2010
 vocabulary.
-`AppxSignature.p7x` is detected but its CMS signature remains
-`not-evaluated`; signature detection by itself never produces cryptographic
-success.
+`AppxSignature.p7x` is verified offline when present. The bounded verifier
+checks `PKCX`, Authenticode CMS and the signer certificate, strict SHA-256 APPX
+records, AXPC raw local records, canonical pre-signature AXCD classic/ZIP64
+records, and AXCT/AXBM/optional AXCI footprint hashes. Signature validity does
+not grant trust; callers must explicitly pin the reported signer fingerprint.
 
 Licensed under either MIT or Apache-2.0, at your option.

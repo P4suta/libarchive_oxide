@@ -19,6 +19,18 @@ impl SecretBytes {
         Self(bytes.into())
     }
 
+    /// Number of secret bytes without exposing their value.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the secret is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Borrows the secret for a cryptographic operation.
     #[must_use]
     #[cfg(feature = "aes")]

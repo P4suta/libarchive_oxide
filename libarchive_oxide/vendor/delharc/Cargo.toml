@@ -1,0 +1,40 @@
+[package]
+name = "libarchive_oxide-delharc"
+version = "0.8.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Rafal Michalski <royaltm75@gmail.com>"]
+description = "A library for parsing and extracting files from LHA/LZH archives."
+homepage = "https://github.com/royaltm/rust-delharc"
+repository = "https://github.com/royaltm/rust-delharc"
+license = "MIT OR Apache-2.0"
+exclude = ["Cargo.toml.orig"]
+
+[lib]
+name = "delharc"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "lh1", "lz", "pm"]
+extend = []
+fast-tree-build = []
+lh1 = []
+lhx = []
+lz = []
+no-unsafe-assertions = []
+pm = []
+std = ["chrono/std", "chrono/clock"]
+
+[dependencies]
+bitflags = "2.13"
+bytemuck = { version = "1.25", features = [
+  "derive",
+  "min_const_generics",
+  "extern_crate_alloc",
+  "align_offset",
+] }
+chrono = { version = "0.4", default-features = false }
+memchr = { version = "2", default-features = false }
+
+[dev-dependencies]
+rand = "0.10.2"

@@ -15,7 +15,7 @@
 
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
-use libarchive_oxide::advanced::legacy::ProviderSet;
+use libarchive_oxide::advanced::ProviderSet;
 #[cfg(feature = "async")]
 use libarchive_oxide::advanced::{AsyncRangeArchiveReader, AsyncRangeSource};
 use libarchive_oxide::advanced::{ProviderCapability, RangeArchiveReader, ReadAt, SourceIdentity};

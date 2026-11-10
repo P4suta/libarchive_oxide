@@ -37,6 +37,39 @@ fn zip_fixture(method: ZipMethod) -> Vec<u8> {
 }
 
 #[test]
+fn zip_seek_reader_exposes_nonstructural_dos_attributes_as_file_flags() {
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+    let attributes = FILE_ATTRIBUTE_HIDDEN
+        | FILE_ATTRIBUTE_SYSTEM
+        | FILE_ATTRIBUTE_DIRECTORY
+        | FILE_ATTRIBUTE_ARCHIVE;
+    let mut archive = zip_fixture(ZipMethod::Store);
+    let central = archive
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .expect("ZIP central directory");
+    let mut external = u32::from_le_bytes(archive[central + 38..central + 42].try_into().unwrap());
+    external |= attributes;
+    archive[central + 38..central + 42].copy_from_slice(&external.to_le_bytes());
+
+    let mut reader = SeekArchiveReader::new(Cursor::new(archive)).expect("reader");
+    assert!(matches!(
+        reader.next_event().expect("archive metadata"),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    let ReaderEvent::Entry(metadata) = reader.next_event().expect("entry") else {
+        panic!("expected ZIP entry");
+    };
+    assert_eq!(
+        metadata.file_flags(),
+        u64::from(attributes & !FILE_ATTRIBUTE_DIRECTORY)
+    );
+}
+
+#[test]
 fn zip_archive_comment_roundtrips() {
     let mut writer = ArchiveWriter::with_format(Vec::new(), FormatId::Zip).unwrap();
     writer
@@ -53,9 +86,33 @@ fn zip_archive_comment_roundtrips() {
 }
 
 #[test]
+fn zip_writer_rejects_empty_typed_comments_before_entry_output() {
+    let mut writer =
+        SeekArchiveWriter::with_format(Cursor::new(Vec::new()), FormatId::Zip, Limits::default())
+            .unwrap();
+    let error = writer
+        .set_archive_metadata(&ArchiveMetadata::new().with_comment(Vec::new()))
+        .expect_err("ZIP cannot distinguish an empty archive comment from no comment");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("empty.txt"))
+        .size(Some(0))
+        .comment(Some(Vec::new()))
+        .build();
+    let mut writer =
+        SeekArchiveWriter::with_format(Cursor::new(Vec::new()), FormatId::Zip, Limits::default())
+            .unwrap();
+    let error = writer
+        .start_entry(&metadata)
+        .expect_err("ZIP cannot distinguish an empty file comment from no comment");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
+
+#[test]
 fn iso_volume_metadata_roundtrips() {
+    let volume_name = vec![b'V'; 32];
     let metadata = ArchiveMetadata::new()
-        .with_volume_name(ArchivePath::from_utf8("MY_VOLUME"))
+        .with_volume_name(ArchivePath::from_bytes(volume_name.clone()))
         .with_extension(Extension::new(
             "iso9660-volume",
             b"system-id".to_vec(),
@@ -79,7 +136,7 @@ fn iso_volume_metadata_roundtrips() {
         ReaderEvent::ArchiveMetadata(metadata) => {
             assert_eq!(
                 metadata.volume_name().map(ArchivePath::as_bytes),
-                Some(b"MY_VOLUME".as_slice())
+                Some(volume_name.as_slice())
             );
             assert!(metadata.extensions().iter().any(|extension| {
                 extension.namespace() == "iso9660-volume"
@@ -88,6 +145,201 @@ fn iso_volume_metadata_roundtrips() {
             }));
         },
         other => panic!("expected ISO archive metadata, got {other:?}"),
+    }
+}
+
+#[test]
+fn iso_archive_metadata_rejects_unrepresentable_volume_properties() {
+    let cases = [
+        ArchiveMetadata::new().with_volume_name(ArchivePath::from_utf8("lowercase")),
+        ArchiveMetadata::new().with_volume_name(ArchivePath::from_bytes(vec![b'V'; 33])),
+        ArchiveMetadata::new().with_extension(Extension::new(
+            "iso9660-volume",
+            b"unknown".to_vec(),
+            b"opaque".to_vec(),
+        )),
+        ArchiveMetadata::new()
+            .with_extension(Extension::new(
+                "iso9660-volume",
+                b"system-id".to_vec(),
+                b"FIRST".to_vec(),
+            ))
+            .with_extension(Extension::new(
+                "iso9660-volume",
+                b"system-id".to_vec(),
+                b"SECOND".to_vec(),
+            )),
+        ArchiveMetadata::new().with_extension(Extension::new(
+            "iso9660-volume",
+            b"system-id".to_vec(),
+            vec![b'S'; 33],
+        )),
+        ArchiveMetadata::new().with_extension(Extension::new(
+            "iso9660-volume",
+            b"application-id".to_vec(),
+            vec![b'A'; 129],
+        )),
+        ArchiveMetadata::new().with_extension(Extension::new(
+            "iso9660-volume",
+            b"system-id".to_vec(),
+            Vec::new(),
+        )),
+        ArchiveMetadata::new().with_extension(Extension::new(
+            "iso9660-volume",
+            b"system-id".to_vec(),
+            b"TRAILING\0".to_vec(),
+        )),
+        ArchiveMetadata::new().with_extension(Extension::new(
+            "iso9660-volume",
+            b"application-id".to_vec(),
+            b"TRAILING ".to_vec(),
+        )),
+    ];
+
+    for metadata in cases {
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::Iso9660,
+            Limits::default(),
+        )
+        .unwrap();
+        let error = writer
+            .set_archive_metadata(&metadata)
+            .expect_err("unrepresentable ISO volume metadata must fail closed");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error:?}");
+    }
+}
+
+fn minimum_seek_archive_metadata_budget(format: FormatId, metadata: &ArchiveMetadata) -> usize {
+    let (mut low, mut high) = (0_usize, 4_096_usize);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            format,
+            Limits::default().with_metadata_bytes(Some(middle)),
+        )
+        .unwrap();
+        match writer.set_archive_metadata(metadata) {
+            Ok(()) => high = middle,
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::Limit, "{format:?}: {error:?}");
+                low = middle + 1;
+            },
+        }
+    }
+    low
+}
+
+#[test]
+fn iso_archive_metadata_replacement_uses_only_the_current_budget() {
+    let first = ArchiveMetadata::new().with_extension(Extension::new(
+        "iso9660-volume",
+        b"application-id".to_vec(),
+        b"FIRST_APPLICATION".to_vec(),
+    ));
+    let second = ArchiveMetadata::new().with_extension(Extension::new(
+        "iso9660-volume",
+        b"application-id".to_vec(),
+        b"FINAL_APPLICATION".to_vec(),
+    ));
+    let budget = minimum_seek_archive_metadata_budget(FormatId::Iso9660, &first);
+    let mut writer = SeekArchiveWriter::with_format(
+        Cursor::new(Vec::new()),
+        FormatId::Iso9660,
+        Limits::default().with_metadata_bytes(Some(budget)),
+    )
+    .unwrap();
+    writer.set_archive_metadata(&first).unwrap();
+    writer
+        .set_archive_metadata(&second)
+        .expect("replacing equal-cost metadata must not double-count its budget");
+    drop(writer);
+
+    let mut writer = SeekArchiveWriter::with_format(
+        Cursor::new(Vec::new()),
+        FormatId::Iso9660,
+        Limits::default(),
+    )
+    .unwrap();
+    writer.set_archive_metadata(&first).unwrap();
+    writer.set_archive_metadata(&second).unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+
+    let mut reader = SeekArchiveReader::new(Cursor::new(archive)).unwrap();
+    match reader.next_event().unwrap() {
+        ReaderEvent::ArchiveMetadata(metadata) => {
+            assert!(metadata.extensions().iter().any(|extension| {
+                extension.key() == b"application-id" && extension.value() == b"FINAL_APPLICATION"
+            }));
+        },
+        event => panic!("expected ISO archive metadata, got {event:?}"),
+    }
+}
+
+#[test]
+fn iso_rejects_unrepresentable_entry_extensions() {
+    let cases = [
+        Extension::new("foreign", b"ZZ".to_vec(), vec![b'Z', b'Z', 4, 1]),
+        Extension::new("iso-system-use", b"ZZ".to_vec(), vec![1, 2, 3]),
+        Extension::new("iso-system-use", b"PX".to_vec(), vec![b'P', b'X', 4, 1]),
+    ];
+
+    for extension in cases {
+        let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("entry.bin"))
+            .size(Some(0))
+            .extension(extension)
+            .build();
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::Iso9660,
+            Limits::default(),
+        )
+        .unwrap();
+        let error = writer
+            .start_entry(&metadata)
+            .expect_err("unrepresentable ISO entry extension must fail closed");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error:?}");
+    }
+}
+
+#[cfg(feature = "sevenz")]
+#[test]
+fn sevenz_archive_metadata_replacement_uses_only_the_current_budget() {
+    let first = ArchiveMetadata::new().with_extension(Extension::new(
+        "7z-archive-property",
+        vec![0x7f],
+        b"FIRST".to_vec(),
+    ));
+    let second = ArchiveMetadata::new().with_extension(Extension::new(
+        "7z-archive-property",
+        vec![0x7f],
+        b"FINAL".to_vec(),
+    ));
+    let budget = minimum_seek_archive_metadata_budget(FormatId::SevenZip, &first);
+    let mut writer = SeekArchiveWriter::with_format(
+        Cursor::new(Vec::new()),
+        FormatId::SevenZip,
+        Limits::default().with_metadata_bytes(Some(budget)),
+    )
+    .unwrap();
+    writer.set_archive_metadata(&first).unwrap();
+    writer
+        .set_archive_metadata(&second)
+        .expect("replacing equal-cost metadata must not double-count its budget");
+    let archive = writer.finish().unwrap().into_inner();
+
+    let mut reader = SeekArchiveReader::new(Cursor::new(archive)).unwrap();
+    match reader.next_event().unwrap() {
+        ReaderEvent::ArchiveMetadata(metadata) => {
+            assert!(
+                metadata
+                    .extensions()
+                    .iter()
+                    .any(|extension| extension.key() == [0x7f] && extension.value() == b"FINAL")
+            );
+        },
+        event => panic!("expected 7z archive metadata, got {event:?}"),
     }
 }
 
@@ -147,6 +399,38 @@ fn sevenz_unknown_files_property_roundtrips() {
             }));
         },
         other => panic!("expected 7z archive metadata, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "sevenz")]
+#[test]
+fn sevenz_writer_rejects_reserved_raw_properties_before_entry_output() {
+    let archive_end = ArchiveMetadata::new().with_extension(Extension::new(
+        "7z-archive-property",
+        vec![0x00],
+        b"cannot follow an end marker".to_vec(),
+    ));
+    let reserved_file_properties = [
+        0x00_u64, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x18,
+    ];
+    let cases = std::iter::once(archive_end).chain(reserved_file_properties.map(|property| {
+        ArchiveMetadata::new().with_extension(Extension::new(
+            "7z-files-property",
+            property.to_le_bytes().to_vec(),
+            b"container-owned".to_vec(),
+        ))
+    }));
+    for metadata in cases {
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::SevenZip,
+            Limits::default(),
+        )
+        .unwrap();
+        let error = writer
+            .set_archive_metadata(&metadata)
+            .expect_err("7z writer must reject raw properties it cannot reproduce");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error:?}");
     }
 }
 
@@ -300,6 +584,228 @@ fn rock_ridge_iso_fixture() -> Vec<u8> {
     image
 }
 
+fn multi_extent_iso_fixture() -> Vec<u8> {
+    const SECTOR: usize = 2048;
+    let mut image = vec![0; 24 * SECTOR];
+    let mut pvd = [0_u8; SECTOR];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    pvd[80..88].copy_from_slice(&iso_both_u32(24));
+    pvd[120..124].copy_from_slice(&iso_both_u16(1));
+    pvd[124..128].copy_from_slice(&iso_both_u16(1));
+    pvd[128..132].copy_from_slice(&iso_both_u16(2048));
+    let root = iso_record(&[0], 20, 2048, 0x02, &[]);
+    pvd[156..156 + root.len()].copy_from_slice(&root);
+    image[16 * SECTOR..17 * SECTOR].copy_from_slice(&pvd);
+    image[17 * SECTOR] = 255;
+    image[17 * SECTOR + 1..17 * SECTOR + 6].copy_from_slice(b"CD001");
+    image[17 * SECTOR + 6] = 1;
+
+    let mut records = Vec::new();
+    records.extend_from_slice(&iso_record(&[0], 20, 2048, 0x02, &[]));
+    records.extend_from_slice(&iso_record(&[1], 20, 2048, 0x02, &[]));
+    records.extend_from_slice(&iso_record(b"SPLIT.BIN;1", 21, 5, 0x80, &[]));
+    records.extend_from_slice(&iso_record(b"SPLIT.BIN;1", 23, 6, 0, &[]));
+    image[20 * SECTOR..20 * SECTOR + records.len()].copy_from_slice(&records);
+    image[21 * SECTOR..21 * SECTOR + 5].copy_from_slice(b"first");
+    image[22 * SECTOR..23 * SECTOR].fill(0xa5);
+    image[23 * SECTOR..23 * SECTOR + 6].copy_from_slice(b"second");
+    image
+}
+
+fn multi_extent_record_starts(image: &[u8]) -> Vec<usize> {
+    image
+        .windows(b"SPLIT.BIN;1".len())
+        .enumerate()
+        .filter_map(|(position, bytes)| {
+            if bytes == b"SPLIT.BIN;1" {
+                Some(position.checked_sub(33).unwrap())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn multi_extent_extended_attribute_iso_fixture() -> Vec<u8> {
+    const SECTOR: usize = 2048;
+    let mut image = multi_extent_iso_fixture();
+    image.resize(25 * SECTOR, 0);
+    image[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(25));
+    let records = multi_extent_record_starts(&image);
+    for record in &records {
+        image[*record + 1] = 1;
+        image[*record + 25] |= 0x10;
+    }
+
+    let mut first_attributes = [0_u8; SECTOR];
+    first_attributes[0..4].copy_from_slice(&iso_both_u16(110));
+    first_attributes[4..8].copy_from_slice(&iso_both_u16(111));
+    first_attributes[8..10].copy_from_slice(&0xffaa_u16.to_be_bytes());
+    first_attributes[180] = 1;
+    first_attributes[246..250].copy_from_slice(&iso_both_u16(0));
+    image[21 * SECTOR..22 * SECTOR].copy_from_slice(&first_attributes);
+    image[22 * SECTOR..22 * SECTOR + 5].copy_from_slice(b"first");
+
+    let mut final_attributes = [0_u8; SECTOR];
+    final_attributes[0..4].copy_from_slice(&iso_both_u16(120));
+    final_attributes[4..8].copy_from_slice(&iso_both_u16(121));
+    final_attributes[8..10].copy_from_slice(&0xfeaa_u16.to_be_bytes());
+    final_attributes[180] = 1;
+    final_attributes[246..250].copy_from_slice(&iso_both_u16(0));
+    image[23 * SECTOR..24 * SECTOR].copy_from_slice(&final_attributes);
+    image[24 * SECTOR..24 * SECTOR + 6].copy_from_slice(b"second");
+    image
+}
+
+fn interleaved_iso_fixture() -> (Vec<u8>, Vec<u8>) {
+    const SECTOR: usize = 2048;
+    let payload = (0_u8..=250).cycle().take(5000).collect::<Vec<_>>();
+    let mut image = vec![0; 27 * SECTOR];
+    let mut pvd = [0_u8; SECTOR];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    pvd[80..88].copy_from_slice(&iso_both_u32(27));
+    pvd[120..124].copy_from_slice(&iso_both_u16(1));
+    pvd[124..128].copy_from_slice(&iso_both_u16(1));
+    pvd[128..132].copy_from_slice(&iso_both_u16(2048));
+    let root = iso_record(&[0], 20, 2048, 0x02, &[]);
+    pvd[156..156 + root.len()].copy_from_slice(&root);
+    image[16 * SECTOR..17 * SECTOR].copy_from_slice(&pvd);
+    image[17 * SECTOR] = 255;
+    image[17 * SECTOR + 1..17 * SECTOR + 6].copy_from_slice(b"CD001");
+    image[17 * SECTOR + 6] = 1;
+
+    let mut records = Vec::new();
+    records.extend_from_slice(&iso_record(&[0], 20, 2048, 0x02, &[]));
+    records.extend_from_slice(&iso_record(&[1], 20, 2048, 0x02, &[]));
+    let mut file = iso_record(b"STRIPED.BIN;1", 21, 5000, 0, &[]);
+    file[26] = 1;
+    file[27] = 1;
+    records.extend_from_slice(&file);
+    image[20 * SECTOR..20 * SECTOR + records.len()].copy_from_slice(&records);
+    image[21 * SECTOR..22 * SECTOR].copy_from_slice(&payload[..SECTOR]);
+    image[22 * SECTOR..23 * SECTOR].fill(0xa5);
+    image[23 * SECTOR..24 * SECTOR].copy_from_slice(&payload[SECTOR..2 * SECTOR]);
+    image[24 * SECTOR..25 * SECTOR].fill(0x5a);
+    image[25 * SECTOR..25 * SECTOR + payload.len() - 2 * SECTOR]
+        .copy_from_slice(&payload[2 * SECTOR..]);
+    (image, payload)
+}
+
+fn interleaved_record_start(image: &[u8]) -> usize {
+    image
+        .windows(b"STRIPED.BIN;1".len())
+        .position(|bytes| bytes == b"STRIPED.BIN;1")
+        .unwrap()
+        .checked_sub(33)
+        .unwrap()
+}
+
+fn extended_attribute_iso_fixture() -> (Vec<u8>, Vec<u8>) {
+    const SECTOR: usize = 2048;
+    let (mut image, payload) = interleaved_iso_fixture();
+    let record = interleaved_record_start(&image);
+    image[record + 1] = 1;
+    image[record + 25] |= 0x10;
+    image[record + 26] = 0;
+    image[record + 27] = 0;
+
+    let mut attributes = [0_u8; SECTOR];
+    attributes[0..4].copy_from_slice(&iso_both_u16(1000));
+    attributes[4..8].copy_from_slice(&iso_both_u16(1001));
+    attributes[8..10].copy_from_slice(&0xfeaa_u16.to_be_bytes());
+    attributes[10..27].copy_from_slice(b"2026081501020300\0");
+    attributes[27..44].copy_from_slice(b"2026081602030400\x04");
+    attributes[84..116].fill(b' ');
+    attributes[180] = 1;
+    attributes[181] = 3;
+    attributes[246..250].copy_from_slice(&iso_both_u16(4));
+    attributes[250..254].copy_from_slice(b"meta");
+    attributes[254..257].copy_from_slice(b"esc");
+    image[21 * SECTOR..22 * SECTOR].copy_from_slice(&attributes);
+    image[22 * SECTOR..22 * SECTOR + payload.len()].copy_from_slice(&payload);
+    (image, payload)
+}
+
+fn root_extended_attribute_iso_fixture() -> (Vec<u8>, Vec<u8>) {
+    const SECTOR: usize = 2048;
+    let (mut image, payload) = interleaved_iso_fixture();
+    let file_record = interleaved_record_start(&image) - 20 * SECTOR;
+    let mut directory = [0_u8; SECTOR];
+    directory.copy_from_slice(&image[20 * SECTOR..21 * SECTOR]);
+    directory[1] = 1;
+    let dotdot = usize::from(directory[0]);
+    directory[dotdot + 1] = 1;
+    directory[file_record + 2..file_record + 10].copy_from_slice(&iso_both_u32(22));
+    directory[file_record + 26] = 0;
+    directory[file_record + 27] = 0;
+
+    let mut attributes = [0_u8; SECTOR];
+    attributes[8..10].copy_from_slice(&0xaaaa_u16.to_be_bytes());
+    attributes[180] = 1;
+    attributes[246..250].copy_from_slice(&iso_both_u16(0));
+    image[16 * SECTOR + 157] = 1;
+    image[20 * SECTOR..21 * SECTOR].copy_from_slice(&attributes);
+    image[21 * SECTOR..22 * SECTOR].copy_from_slice(&directory);
+    image[22 * SECTOR..22 * SECTOR + payload.len()].copy_from_slice(&payload);
+    (image, payload)
+}
+
+fn directory_extended_attribute_iso_fixture() -> (Vec<u8>, Vec<u8>) {
+    const SECTOR: usize = 2048;
+    let payload = b"nested extended-attribute payload".to_vec();
+    let mut image = vec![0; 24 * SECTOR];
+    let mut pvd = [0_u8; SECTOR];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    pvd[80..88].copy_from_slice(&iso_both_u32(24));
+    pvd[120..124].copy_from_slice(&iso_both_u16(1));
+    pvd[124..128].copy_from_slice(&iso_both_u16(1));
+    pvd[128..132].copy_from_slice(&iso_both_u16(2048));
+    let root = iso_record(&[0], 20, 2048, 0x02, &[]);
+    pvd[156..156 + root.len()].copy_from_slice(&root);
+    image[16 * SECTOR..17 * SECTOR].copy_from_slice(&pvd);
+    image[17 * SECTOR] = 255;
+    image[17 * SECTOR + 1..17 * SECTOR + 6].copy_from_slice(b"CD001");
+    image[17 * SECTOR + 6] = 1;
+
+    let mut root_records = Vec::new();
+    root_records.extend_from_slice(&iso_record(&[0], 20, 2048, 0x02, &[]));
+    root_records.extend_from_slice(&iso_record(&[1], 20, 2048, 0x02, &[]));
+    let mut directory = iso_record(b"SUB", 21, 2048, 0x12, &[]);
+    directory[1] = 1;
+    root_records.extend_from_slice(&directory);
+    image[20 * SECTOR..20 * SECTOR + root_records.len()].copy_from_slice(&root_records);
+
+    let mut attributes = [0_u8; SECTOR];
+    attributes[0..4].copy_from_slice(&iso_both_u16(2000));
+    attributes[4..8].copy_from_slice(&iso_both_u16(2001));
+    attributes[8..10].copy_from_slice(&0xffaa_u16.to_be_bytes());
+    attributes[180] = 1;
+    attributes[246..250].copy_from_slice(&iso_both_u16(0));
+    image[21 * SECTOR..22 * SECTOR].copy_from_slice(&attributes);
+
+    let mut child_records = Vec::new();
+    let mut dot = iso_record(&[0], 21, 2048, 0x12, &[]);
+    dot[1] = 1;
+    child_records.extend_from_slice(&dot);
+    child_records.extend_from_slice(&iso_record(&[1], 20, 2048, 0x02, &[]));
+    child_records.extend_from_slice(&iso_record(
+        b"FILE.TXT;1",
+        23,
+        u32::try_from(payload.len()).unwrap(),
+        0,
+        &[],
+    ));
+    image[22 * SECTOR..22 * SECTOR + child_records.len()].copy_from_slice(&child_records);
+    image[23 * SECTOR..23 * SECTOR + payload.len()].copy_from_slice(&payload);
+    (image, payload)
+}
+
 #[cfg(feature = "sevenz")]
 fn sevenz_fixture() -> Vec<u8> {
     let mut writer = SeekArchiveWriter::with_format(
@@ -397,6 +903,10 @@ fn zip_store_and_deflate_payloads_stream_without_whole_entry_vecs() {
     // LZMA read+write both use lzma-rust2 (both profiles).
     #[cfg(feature = "xz")]
     assert_eq!(collect(zip_fixture(ZipMethod::Lzma)), vec![b'a'; 200_000]);
+    #[cfg(feature = "xz")]
+    assert_eq!(collect(zip_fixture(ZipMethod::Xz)), vec![b'a'; 200_000]);
+    #[cfg(feature = "ppmd")]
+    assert_eq!(collect(zip_fixture(ZipMethod::Ppmd8)), vec![b'a'; 200_000]);
 }
 
 #[test]
@@ -410,6 +920,10 @@ fn common_writer_streams_unknown_size_zip_with_data_descriptors() {
         v.push(ZipMethod::Zstd);
         #[cfg(feature = "xz")]
         v.push(ZipMethod::Lzma);
+        #[cfg(feature = "xz")]
+        v.push(ZipMethod::Xz);
+        #[cfg(feature = "ppmd")]
+        v.push(ZipMethod::Ppmd8);
         v
     };
     for method in methods {
@@ -421,15 +935,12 @@ fn common_writer_streams_unknown_size_zip_with_data_descriptors() {
 }
 
 #[test]
-fn sequential_zip_reports_seek_required() {
+fn sequential_zip_reads_supported_methods() {
     let mut reader = ArchiveReader::new(Cursor::new(zip_fixture(ZipMethod::Store)));
-    let error = reader.next_event().unwrap_err();
-    assert_eq!(
-        error
-            .archive_error()
-            .map(libarchive_oxide_core::ArchiveError::kind),
-        Some(ErrorKind::Capability)
-    );
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::Entry(_)
+    ));
 }
 
 #[test]
@@ -495,6 +1006,19 @@ fn zip_unicode_extra(id: u16, original: &[u8], utf8: &[u8]) -> Extension {
     Extension::new("zip-extra", id.to_le_bytes().to_vec(), value)
 }
 
+fn replace_u16_all(bytes: &mut [u8], from: u16, to: u16) -> usize {
+    let from = from.to_le_bytes();
+    let to = to.to_le_bytes();
+    let mut replacements = 0;
+    for index in 0..bytes.len().saturating_sub(1) {
+        if bytes[index..index + 2] == from {
+            bytes[index..index + 2].copy_from_slice(&to);
+            replacements += 1;
+        }
+    }
+    replacements
+}
+
 fn filetime(seconds: i64) -> u64 {
     u64::try_from(i128::from(seconds) + 11_644_473_600).unwrap() * 10_000_000
 }
@@ -513,13 +1037,20 @@ fn zip_unicode_and_timestamp_extras_are_typed_and_preserved() {
     for seconds in [1_700_000_001_i64, 1_700_000_002, 1_700_000_003] {
         ntfs.extend_from_slice(&filetime(seconds).to_le_bytes());
     }
-    let metadata =
-        EntryMetadata::builder(EntryKind::File, ArchivePath::from_bytes(raw_name.to_vec()))
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_bytes(raw_name.to_vec()))
             .size(None)
             .comment(Some(raw_comment.to_vec()))
-            .extension(zip_unicode_extra(0x7075, raw_name, "正確.txt".as_bytes()))
+            .times(EntryTimes {
+                modified: Some(Timestamp::from_seconds(1_700_000_001)),
+                accessed: Some(Timestamp::from_seconds(1_700_000_002)),
+                changed: Some(Timestamp::from_seconds(33)),
+                created: Some(Timestamp::from_seconds(1_700_000_003)),
+            })
+            // Write inert private IDs first, then patch the completed raw fixture below.
+            // The public writer now correctly refuses metadata whose applicable Unicode extra would override its typed path/comment.
+            .extension(zip_unicode_extra(0xcafe, raw_name, "正確.txt".as_bytes()))
             .extension(zip_unicode_extra(
-                0x6375,
+                0xcaff,
                 raw_comment,
                 "正確なコメント".as_bytes(),
             ))
@@ -539,7 +1070,10 @@ fn zip_unicode_and_timestamp_extras_are_typed_and_preserved() {
     writer.start_entry(&metadata).unwrap();
     writer.write_data(b"body").unwrap();
     writer.end_entry().unwrap();
-    let mut reader = SeekArchiveReader::new(Cursor::new(writer.finish().unwrap())).unwrap();
+    let mut archive = writer.finish().unwrap();
+    assert_eq!(replace_u16_all(&mut archive, 0xcafe, 0x7075), 2);
+    assert_eq!(replace_u16_all(&mut archive, 0xcaff, 0x6375), 2);
+    let mut reader = SeekArchiveReader::new(Cursor::new(archive)).unwrap();
     assert!(matches!(
         reader.next_event().unwrap(),
         ReaderEvent::ArchiveMetadata(_)
@@ -599,6 +1133,11 @@ fn zip_infozip_unix_extras_are_typed_as_owner() {
 
     let new_meta = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("new.txt"))
         .size(Some(0))
+        .owner(Owner {
+            uid: Some(1000),
+            gid: Some(1001),
+            ..Owner::default()
+        })
         .extension(Extension::new(
             "zip-extra",
             0x7855_u16.to_le_bytes().to_vec(),
@@ -615,6 +1154,11 @@ fn zip_infozip_unix_extras_are_typed_as_owner() {
 
     let old_meta = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("old.txt"))
         .size(Some(0))
+        .times(EntryTimes {
+            modified: Some(Timestamp::from_seconds(88)),
+            accessed: Some(Timestamp::from_seconds(77)),
+            ..EntryTimes::default()
+        })
         .extension(Extension::new(
             "zip-extra",
             0x5855_u16.to_le_bytes().to_vec(),
@@ -661,6 +1205,7 @@ fn zip_preserved_time_extras_do_not_synthesize_a_second_timestamp() {
             .times(EntryTimes {
                 modified: Some(Timestamp::from_seconds(66)),
                 accessed: Some(Timestamp::from_seconds(55)),
+                created: (id == 0x000a).then_some(Timestamp::from_seconds(44)),
                 ..EntryTimes::default()
             })
             .extension(Extension::new("zip-extra", id.to_le_bytes().to_vec(), raw))
@@ -735,13 +1280,13 @@ fn zip_owner_and_timestamps_round_trip_as_derived_extras() {
 #[test]
 fn zip_preserved_extended_timestamp_is_not_duplicated() {
     // An entry that already carries a raw Extended Timestamp must not gain a
-    // second, writer-synthesized copy even when typed times are also present.
+    // second, writer-synthesized copy when its typed projection is coherent.
     let mut raw_timestamp = vec![0x01_u8];
     raw_timestamp.extend_from_slice(&123_i32.to_le_bytes());
     let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("dup.txt"))
         .size(Some(0))
         .times(EntryTimes {
-            modified: Some(Timestamp::from_seconds(999)),
+            modified: Some(Timestamp::from_seconds(123)),
             ..EntryTimes::default()
         })
         .extension(Extension::new(
@@ -761,7 +1306,6 @@ fn zip_preserved_extended_timestamp_is_not_duplicated() {
         .filter(|extension| extension.key() == 0x5455_u16.to_le_bytes())
         .count();
     assert_eq!(count, 1, "Extended Timestamp extra was duplicated");
-    // The preserved raw field wins: its modification time is 123, not the typed 999.
     assert_eq!(read.times().modified.map(Timestamp::seconds), Some(123));
 }
 
@@ -804,7 +1348,6 @@ fn zip_symlink_payload_is_exposed_as_a_typed_link_target() {
     let mut writer =
         ArchiveWriter::with_zip_method(Vec::new(), ZipMethod::Store, Limits::default());
     writer.start_entry(&metadata).unwrap();
-    writer.write_data(target).unwrap();
     writer.end_entry().unwrap();
 
     let mut reader = SeekArchiveReader::new(Cursor::new(writer.finish().unwrap())).unwrap();
@@ -857,6 +1400,672 @@ fn iso_index_and_file_extents_stream_through_the_seek_api() {
             .map(libarchive_oxide_core::ArchiveError::kind),
         Some(ErrorKind::Capability)
     );
+}
+
+#[test]
+fn iso_multi_extent_file_streams_noncontiguous_sections_in_record_order() {
+    let mut reader = SeekArchiveReader::new(Cursor::new(multi_extent_iso_fixture()))
+        .expect("open multi-extent ISO image");
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    let ReaderEvent::Entry(metadata) = reader.next_event().unwrap() else {
+        panic!("multi-extent file metadata expected");
+    };
+    assert_eq!(metadata.path().as_bytes(), b"SPLIT.BIN");
+    assert_eq!(metadata.size(), Some(11));
+
+    let mut payload = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => payload.extend_from_slice(bytes),
+            ReaderEvent::EndEntry => break,
+            event => panic!("unexpected multi-extent event: {event:?}"),
+        }
+    }
+    assert_eq!(payload, b"firstsecond");
+    assert!(matches!(reader.next_event().unwrap(), ReaderEvent::Done));
+
+    let mut mixed = multi_extent_iso_fixture();
+    let records = multi_extent_record_starts(&mixed);
+    mixed[records[0] + 26] = 1;
+    let mut reader = SeekArchiveReader::new(Cursor::new(mixed)).unwrap();
+    let mut payload = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => payload.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(payload, b"firstsecond");
+}
+
+#[test]
+fn iso_multi_extent_file_uses_final_extended_attributes_and_retains_each_record() {
+    let mut reader =
+        SeekArchiveReader::new(Cursor::new(multi_extent_extended_attribute_iso_fixture())).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    let ReaderEvent::Entry(metadata) = reader.next_event().unwrap() else {
+        panic!("multi-extent EA metadata expected");
+    };
+    assert_eq!(metadata.mode(), Some(0o540));
+    assert_eq!(metadata.owner().uid, Some(120));
+    assert_eq!(metadata.owner().gid, Some(121));
+    assert_eq!(
+        metadata
+            .extensions()
+            .iter()
+            .filter(|extension| extension.namespace() == "iso-extended-attribute")
+            .count(),
+        2
+    );
+    let mut payload = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => payload.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(payload, b"firstsecond");
+}
+
+#[test]
+fn iso_multi_extent_file_requires_a_matching_final_record() {
+    let mut unterminated = multi_extent_iso_fixture();
+    let records = multi_extent_record_starts(&unterminated);
+    assert_eq!(records.len(), 2);
+    unterminated[records[1] + 25] |= 0x80;
+    let error = SeekArchiveReader::new(Cursor::new(unterminated)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut mismatched = multi_extent_iso_fixture();
+    let records = multi_extent_record_starts(&mismatched);
+    mismatched[records[1] + 33] = b'X';
+    let error = SeekArchiveReader::new(Cursor::new(mismatched)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_directory_identifier_padding_must_be_zero() {
+    let mut archive = rock_ridge_iso_fixture();
+    let identifier = b"FILE.TXT;1";
+    let position = archive
+        .windows(identifier.len())
+        .position(|bytes| bytes == identifier)
+        .unwrap();
+    archive[position + identifier.len()] = 1;
+    let error = SeekArchiveReader::new(Cursor::new(archive)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_directory_records_must_not_cross_a_logical_block() {
+    const SECTOR: usize = 2048;
+    let mut image = vec![0; 25 * SECTOR];
+    let mut pvd = [0_u8; SECTOR];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    pvd[80..88].copy_from_slice(&iso_both_u32(25));
+    pvd[120..124].copy_from_slice(&iso_both_u16(1));
+    pvd[124..128].copy_from_slice(&iso_both_u16(1));
+    pvd[128..132].copy_from_slice(&iso_both_u16(2048));
+    let root = iso_record(&[0], 20, 4096, 0x02, &[]);
+    pvd[156..156 + root.len()].copy_from_slice(&root);
+    image[16 * SECTOR..17 * SECTOR].copy_from_slice(&pvd);
+    image[17 * SECTOR] = 255;
+    image[17 * SECTOR + 1..17 * SECTOR + 6].copy_from_slice(b"CD001");
+    image[17 * SECTOR + 6] = 1;
+
+    let mut records = Vec::new();
+    records.extend_from_slice(&iso_record(&[0], 20, 4096, 0x02, &[]));
+    records.extend_from_slice(&iso_record(&[1], 20, 4096, 0x02, &[]));
+    for index in 0..7 {
+        let identifier = format!("F{index}");
+        let mut system_use = vec![0; 214];
+        system_use[..4].copy_from_slice(&[b'Z', b'Z', 214, 1]);
+        let filler = iso_record(identifier.as_bytes(), 24, 0, 0, &system_use);
+        assert_eq!(filler.len(), 250);
+        records.extend_from_slice(&filler);
+    }
+    let mut system_use = vec![0; 184];
+    system_use[..4].copy_from_slice(&[b'Z', b'Z', 184, 1]);
+    let filler = iso_record(b"F7", 24, 0, 0, &system_use);
+    assert_eq!(filler.len(), 220);
+    records.extend_from_slice(&filler);
+    assert_eq!(records.len(), 2038);
+    records.extend_from_slice(&iso_record(b"FILE.TXT;1", 24, 7, 0, &[]));
+    image[20 * SECTOR..20 * SECTOR + records.len()].copy_from_slice(&records);
+    image[24 * SECTOR..24 * SECTOR + 7].copy_from_slice(b"payload");
+
+    let error = SeekArchiveReader::new(Cursor::new(image)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_directory_block_padding_must_be_zero() {
+    let (mut image, _) = interleaved_iso_fixture();
+    let record = interleaved_record_start(&image);
+    let padding_start = record + usize::from(image[record]);
+    assert_eq!(image[padding_start], 0);
+    image[padding_start + 17] = 0x7f;
+    let error = SeekArchiveReader::new(Cursor::new(image)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_extents_stay_within_the_declared_volume_space() {
+    const SECTOR: usize = 2048;
+
+    let mut trailing_extent = multi_extent_iso_fixture();
+    trailing_extent[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(23));
+    let error = SeekArchiveReader::new(Cursor::new(trailing_extent)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut truncated_volume = multi_extent_iso_fixture();
+    truncated_volume[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(25));
+    let error = SeekArchiveReader::new(Cursor::new(truncated_volume)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut root_outside = multi_extent_iso_fixture();
+    root_outside[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(20));
+    let error = SeekArchiveReader::new(Cursor::new(root_outside)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut empty_volume = multi_extent_iso_fixture();
+    empty_volume[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(0));
+    let error = SeekArchiveReader::new(Cursor::new(empty_volume)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut inconsistent_endian = multi_extent_iso_fixture();
+    inconsistent_endian[16 * SECTOR + 80..16 * SECTOR + 84].copy_from_slice(&24_u32.to_le_bytes());
+    inconsistent_endian[16 * SECTOR + 84..16 * SECTOR + 88].copy_from_slice(&25_u32.to_be_bytes());
+    let error = SeekArchiveReader::new(Cursor::new(inconsistent_endian)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut trailing_bytes = multi_extent_iso_fixture();
+    trailing_bytes.extend_from_slice(&[0xa5; SECTOR]);
+    SeekArchiveReader::new(Cursor::new(trailing_bytes)).unwrap();
+
+    let (mut interleaved, _) = interleaved_iso_fixture();
+    interleaved[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(25));
+    let error = SeekArchiveReader::new(Cursor::new(interleaved)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_volume_descriptor_set_stays_within_the_declared_volume_space() {
+    const SECTOR: usize = 2048;
+    let mut image = multi_extent_iso_fixture();
+    image[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(17));
+    image[16 * SECTOR + 158..16 * SECTOR + 166].copy_from_slice(&iso_both_u32(1));
+
+    let mut root = Vec::new();
+    root.extend_from_slice(&iso_record(&[0], 1, 2048, 0x02, &[]));
+    root.extend_from_slice(&iso_record(&[1], 1, 2048, 0x02, &[]));
+    image[SECTOR..SECTOR + root.len()].copy_from_slice(&root);
+
+    let error = SeekArchiveReader::new(Cursor::new(image)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_root_directory_extent_stays_within_the_declared_volume_space() {
+    const SECTOR: usize = 2048;
+    let mut image = multi_extent_iso_fixture();
+    image[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(21));
+    image[16 * SECTOR + 166..16 * SECTOR + 174].copy_from_slice(&iso_both_u32(4096));
+    image[20 * SECTOR..22 * SECTOR].fill(0);
+
+    let mut root = Vec::new();
+    root.extend_from_slice(&iso_record(&[0], 20, 4096, 0x02, &[]));
+    root.extend_from_slice(&iso_record(&[1], 20, 4096, 0x02, &[]));
+    image[20 * SECTOR..20 * SECTOR + root.len()].copy_from_slice(&root);
+
+    let error = SeekArchiveReader::new(Cursor::new(image)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_joliet_tree_uses_its_own_declared_volume_space() {
+    const SECTOR: usize = 2048;
+    let mut image = iso_fixture();
+    assert_eq!(image[17 * SECTOR], 2);
+    let primary_root_lba = u32::from_le_bytes(
+        image[16 * SECTOR + 158..16 * SECTOR + 162]
+            .try_into()
+            .unwrap(),
+    );
+    image[usize::try_from(primary_root_lba).unwrap() * SECTOR] = 34;
+    image[17 * SECTOR + 80..17 * SECTOR + 88].copy_from_slice(&iso_both_u32(19));
+
+    let error = SeekArchiveReader::new(Cursor::new(image)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_joliet_logical_block_size_is_validated() {
+    const SECTOR: usize = 2048;
+    let mut image = iso_fixture();
+    assert_eq!(image[17 * SECTOR], 2);
+    let primary_root_lba = u32::from_le_bytes(
+        image[16 * SECTOR + 158..16 * SECTOR + 162]
+            .try_into()
+            .unwrap(),
+    );
+    image[usize::try_from(primary_root_lba).unwrap() * SECTOR] = 34;
+    image[17 * SECTOR + 128..17 * SECTOR + 132].copy_from_slice(&iso_both_u16(4096));
+
+    let error = SeekArchiveReader::new(Cursor::new(image)).unwrap_err();
+    assert_eq!(
+        error.archive_error().unwrap().kind(),
+        ErrorKind::Unsupported
+    );
+
+    let mut inconsistent_endian = iso_fixture();
+    inconsistent_endian[17 * SECTOR + 130..17 * SECTOR + 132]
+        .copy_from_slice(&4096_u16.to_be_bytes());
+    let error = SeekArchiveReader::new(Cursor::new(inconsistent_endian)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_descriptor_root_record_geometry_is_validated() {
+    const SECTOR: usize = 2048;
+
+    let mut zero_length = multi_extent_iso_fixture();
+    zero_length[16 * SECTOR + 156] = 0;
+    let error = SeekArchiveReader::new(Cursor::new(zero_length)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut invalid_identifier = multi_extent_iso_fixture();
+    invalid_identifier[16 * SECTOR + 188] = 0;
+    let error = SeekArchiveReader::new(Cursor::new(invalid_identifier)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut not_a_directory = multi_extent_iso_fixture();
+    not_a_directory[16 * SECTOR + 181] = 0;
+    let error = SeekArchiveReader::new(Cursor::new(not_a_directory)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut interleaved = multi_extent_iso_fixture();
+    interleaved[16 * SECTOR + 182] = 1;
+    let error = SeekArchiveReader::new(Cursor::new(interleaved)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_entry_on_another_volume_is_not_read_from_the_local_offset() {
+    const SECTOR: usize = 2048;
+    let mut image = multi_extent_iso_fixture();
+    image[16 * SECTOR + 120..16 * SECTOR + 124].copy_from_slice(&iso_both_u16(2));
+    let records = multi_extent_record_starts(&image);
+    image[records[0] + 28..records[0] + 32].copy_from_slice(&iso_both_u16(2));
+
+    let error = SeekArchiveReader::new(Cursor::new(image)).unwrap_err();
+    assert_eq!(
+        error.archive_error().unwrap().kind(),
+        ErrorKind::Unsupported
+    );
+
+    let mut later_section = multi_extent_iso_fixture();
+    later_section[16 * SECTOR + 120..16 * SECTOR + 124].copy_from_slice(&iso_both_u16(2));
+    let records = multi_extent_record_starts(&later_section);
+    later_section[records[1] + 28..records[1] + 32].copy_from_slice(&iso_both_u16(2));
+    let error = SeekArchiveReader::new(Cursor::new(later_section)).unwrap_err();
+    assert_eq!(
+        error.archive_error().unwrap().kind(),
+        ErrorKind::Unsupported
+    );
+
+    let mut local_member = multi_extent_iso_fixture();
+    local_member[16 * SECTOR + 120..16 * SECTOR + 124].copy_from_slice(&iso_both_u16(2));
+    SeekArchiveReader::new(Cursor::new(local_member)).unwrap();
+}
+
+#[test]
+fn iso_volume_set_identifiers_are_structurally_valid() {
+    const SECTOR: usize = 2048;
+
+    let mut empty_set = multi_extent_iso_fixture();
+    empty_set[16 * SECTOR + 120..16 * SECTOR + 124].copy_from_slice(&iso_both_u16(0));
+    let error = SeekArchiveReader::new(Cursor::new(empty_set)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut sequence_outside_set = multi_extent_iso_fixture();
+    sequence_outside_set[16 * SECTOR + 124..16 * SECTOR + 128].copy_from_slice(&iso_both_u16(2));
+    let error = SeekArchiveReader::new(Cursor::new(sequence_outside_set)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut inconsistent_endian = multi_extent_iso_fixture();
+    inconsistent_endian[16 * SECTOR + 120..16 * SECTOR + 122].copy_from_slice(&2_u16.to_le_bytes());
+    let error = SeekArchiveReader::new(Cursor::new(inconsistent_endian)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut root_mismatch = multi_extent_iso_fixture();
+    root_mismatch[16 * SECTOR + 184..16 * SECTOR + 188].copy_from_slice(&iso_both_u16(2));
+    let error = SeekArchiveReader::new(Cursor::new(root_mismatch)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let mut record_endian = multi_extent_iso_fixture();
+    let record = multi_extent_record_starts(&record_endian)[0];
+    record_endian[record + 30..record + 32].copy_from_slice(&2_u16.to_be_bytes());
+    let error = SeekArchiveReader::new(Cursor::new(record_endian)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+}
+
+#[test]
+fn iso_multi_extent_file_checks_each_extent_and_aggregate_limits() {
+    let mut outside = multi_extent_iso_fixture();
+    let records = multi_extent_record_starts(&outside);
+    outside[records[1] + 2..records[1] + 10].copy_from_slice(&iso_both_u32(24));
+    let error = SeekArchiveReader::new(Cursor::new(outside)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let limits = Limits::default().with_entry_bytes(Some(10));
+    let error = SeekArchiveReader::with_limits(Cursor::new(multi_extent_iso_fixture()), limits)
+        .unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+
+    let limits = Limits::default().with_decoded_total(Some(10));
+    let mut reader =
+        SeekArchiveReader::with_limits(Cursor::new(multi_extent_iso_fixture()), limits).unwrap();
+    let error = loop {
+        match reader.next_event() {
+            Ok(ReaderEvent::Done) => panic!("decoded-total limit unexpectedly accepted 11 bytes"),
+            Ok(_) => {},
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+}
+
+#[test]
+fn iso_multi_extent_file_can_be_skipped_without_reading_section_gaps() {
+    let mut reader = SeekArchiveReader::new(Cursor::new(multi_extent_iso_fixture())).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::Entry(_)
+    ));
+    reader.skip_entry().unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::EndEntry
+    ));
+    assert!(matches!(reader.next_event().unwrap(), ReaderEvent::Done));
+}
+
+#[test]
+fn iso_interleaved_file_streams_units_without_physical_gaps() {
+    let (image, expected) = interleaved_iso_fixture();
+    let mut reader = SeekArchiveReader::new(Cursor::new(image)).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    let ReaderEvent::Entry(metadata) = reader.next_event().unwrap() else {
+        panic!("interleaved ISO file metadata expected");
+    };
+    assert_eq!(metadata.path().as_bytes(), b"STRIPED.BIN");
+    assert_eq!(metadata.size(), Some(expected.len() as u64));
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::EndEntry => break,
+            event => panic!("unexpected interleaved ISO event: {event:?}"),
+        }
+    }
+    assert_eq!(decoded, expected);
+    assert!(matches!(reader.next_event().unwrap(), ReaderEvent::Done));
+}
+
+#[test]
+fn iso_extended_attribute_record_shifts_payload_and_types_metadata() {
+    let (image, expected) = extended_attribute_iso_fixture();
+    let mut reader = SeekArchiveReader::new(Cursor::new(image)).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    let ReaderEvent::Entry(metadata) = reader.next_event().unwrap() else {
+        panic!("ISO extended-attribute file metadata expected");
+    };
+    assert_eq!(metadata.path().as_bytes(), b"STRIPED.BIN");
+    assert_eq!(metadata.size(), Some(expected.len() as u64));
+    assert_eq!(metadata.mode(), Some(0o540));
+    assert_eq!(metadata.owner().uid, Some(1000));
+    assert_eq!(metadata.owner().gid, Some(1001));
+    assert_eq!(
+        metadata.times().created,
+        Some(Timestamp::from_seconds(1_786_755_723))
+    );
+    assert_eq!(
+        metadata.times().modified,
+        Some(Timestamp::from_seconds(1_786_842_184))
+    );
+    let extended = metadata
+        .extensions()
+        .iter()
+        .find(|extension| {
+            extension.namespace() == "iso-extended-attribute" && extension.key() == b"record"
+        })
+        .expect("raw ISO extended-attribute record");
+    assert_eq!(extended.value().len(), 257);
+    assert_eq!(&extended.value()[250..254], b"meta");
+    assert_eq!(&extended.value()[254..], b"esc");
+
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::EndEntry => break,
+            event => panic!("unexpected extended-attribute ISO event: {event:?}"),
+        }
+    }
+    assert_eq!(decoded, expected);
+    assert!(matches!(reader.next_event().unwrap(), ReaderEvent::Done));
+}
+
+#[test]
+fn iso_root_extended_attribute_allocation_shifts_the_directory() {
+    let (image, expected) = root_extended_attribute_iso_fixture();
+    let mut reader = SeekArchiveReader::new(Cursor::new(image)).unwrap();
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn iso_directory_extended_attribute_shifts_children_and_types_metadata() {
+    let (image, expected) = directory_extended_attribute_iso_fixture();
+    let mut reader = SeekArchiveReader::new(Cursor::new(image)).unwrap();
+    let mut decoded = Vec::new();
+    let mut saw_directory = false;
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Entry(metadata) if metadata.path().as_bytes() == b"SUB/" => {
+                saw_directory = true;
+                assert_eq!(metadata.kind(), EntryKind::Dir);
+                assert_eq!(metadata.mode(), Some(0o500));
+                assert_eq!(metadata.owner().uid, Some(2000));
+                assert_eq!(metadata.owner().gid, Some(2001));
+            },
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert!(saw_directory);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn iso_extended_attribute_record_validates_structure_and_limits() {
+    const SECTOR: usize = 2048;
+
+    let (mut unknown_version, _) = extended_attribute_iso_fixture();
+    unknown_version[21 * SECTOR + 180] = 2;
+    let error = SeekArchiveReader::new(Cursor::new(unknown_version)).unwrap_err();
+    assert_eq!(
+        error.archive_error().unwrap().kind(),
+        ErrorKind::Unsupported
+    );
+
+    let (mut oversized_fields, _) = extended_attribute_iso_fixture();
+    oversized_fields[21 * SECTOR + 246..21 * SECTOR + 250].copy_from_slice(&iso_both_u16(1800));
+    let error = SeekArchiveReader::new(Cursor::new(oversized_fields)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (mut invalid_permissions, _) = extended_attribute_iso_fixture();
+    let permissions = 0xfeaa_u16 & !0x0002;
+    invalid_permissions[21 * SECTOR + 8..21 * SECTOR + 10]
+        .copy_from_slice(&permissions.to_be_bytes());
+    let error = SeekArchiveReader::new(Cursor::new(invalid_permissions)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (mut missing_record, _) = extended_attribute_iso_fixture();
+    let record = interleaved_record_start(&missing_record);
+    missing_record[record + 1] = 0;
+    let error = SeekArchiveReader::new(Cursor::new(missing_record)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (mut unprotected_owner, _) = extended_attribute_iso_fixture();
+    let record = interleaved_record_start(&unprotected_owner);
+    unprotected_owner[record + 25] &= !0x10;
+    let error = SeekArchiveReader::new(Cursor::new(unprotected_owner)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (mut record_mismatch, _) = extended_attribute_iso_fixture();
+    record_mismatch[21 * SECTOR + 78] = 1;
+    let error = SeekArchiveReader::new(Cursor::new(record_mismatch)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (mut invalid_date, _) = extended_attribute_iso_fixture();
+    invalid_date[21 * SECTOR + 10..21 * SECTOR + 27].copy_from_slice(b"2026131501020300\0");
+    let error = SeekArchiveReader::new(Cursor::new(invalid_date)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (mut outside_volume, _) = extended_attribute_iso_fixture();
+    outside_volume[16 * SECTOR + 80..16 * SECTOR + 88].copy_from_slice(&iso_both_u32(21));
+    let error = SeekArchiveReader::new(Cursor::new(outside_volume)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (plain, _) = interleaved_iso_fixture();
+    let (extended, _) = extended_attribute_iso_fixture();
+    let minimum_metadata_budget = |image: &[u8]| {
+        let (mut low, mut high) = (0_usize, 4096_usize);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match SeekArchiveReader::with_limits(
+                Cursor::new(image.to_vec()),
+                Limits::default().with_metadata_bytes(Some(middle)),
+            ) {
+                Ok(_) => high = middle,
+                Err(error) => {
+                    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+                    low = middle + 1;
+                },
+            }
+        }
+        low
+    };
+    let plain_budget = minimum_metadata_budget(&plain);
+    let extended_budget = minimum_metadata_budget(&extended);
+    assert_eq!(extended_budget - plain_budget, 257);
+    SeekArchiveReader::with_limits(
+        Cursor::new(plain),
+        Limits::default().with_metadata_bytes(Some(plain_budget)),
+    )
+    .expect("the same entry without EA fits its exact metadata budget");
+    let error = SeekArchiveReader::with_limits(
+        Cursor::new(extended),
+        Limits::default().with_metadata_bytes(Some(plain_budget)),
+    )
+    .unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+
+    let (mut bounded, payload) = extended_attribute_iso_fixture();
+    let record = interleaved_record_start(&bounded);
+    bounded[record + 1] = 2;
+    bounded[21 * SECTOR + 246..21 * SECTOR + 250].copy_from_slice(&iso_both_u16(3000));
+    bounded[23 * SECTOR..23 * SECTOR + payload.len()].copy_from_slice(&payload);
+    let limits = Limits::default().with_in_flight_bytes(Some(SECTOR));
+    let error = SeekArchiveReader::with_limits(Cursor::new(bounded), limits).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+}
+
+#[test]
+fn iso_interleaved_file_validates_layout_and_resource_limits() {
+    let (mut missing_unit, _) = interleaved_iso_fixture();
+    let record = interleaved_record_start(&missing_unit);
+    missing_unit[record + 26] = 0;
+    let error = SeekArchiveReader::new(Cursor::new(missing_unit)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (mut outside, _) = interleaved_iso_fixture();
+    let record = interleaved_record_start(&outside);
+    outside[record + 2..record + 10].copy_from_slice(&iso_both_u32(23));
+    let error = SeekArchiveReader::new(Cursor::new(outside)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (mut dot_interleaved, _) = interleaved_iso_fixture();
+    dot_interleaved[20 * 2048 + 26] = 1;
+    let error = SeekArchiveReader::new(Cursor::new(dot_interleaved)).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
+
+    let (image, _) = interleaved_iso_fixture();
+    let limits = Limits::default().with_entry_bytes(Some(4999));
+    let error = SeekArchiveReader::with_limits(Cursor::new(image), limits).unwrap_err();
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+
+    let (image, _) = interleaved_iso_fixture();
+    let limits = Limits::default().with_decoded_total(Some(4999));
+    let mut reader = SeekArchiveReader::with_limits(Cursor::new(image), limits).unwrap();
+    let error = loop {
+        match reader.next_event() {
+            Ok(ReaderEvent::Done) => panic!("decoded-total limit accepted interleaved payload"),
+            Ok(_) => {},
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Limit);
+}
+
+#[test]
+fn iso_interleaved_file_skip_uses_its_physical_end() {
+    let (image, _) = interleaved_iso_fixture();
+    let mut reader = SeekArchiveReader::new(Cursor::new(image)).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::Entry(_)
+    ));
+    reader.skip_entry().unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::EndEntry
+    ));
+    assert!(matches!(reader.next_event().unwrap(), ReaderEvent::Done));
 }
 
 #[test]
@@ -939,7 +2148,7 @@ fn common_iso_writer_streams_payload_and_roundtrips_rock_ridge_metadata() {
         .extension(Extension::new(
             "iso-system-use",
             b"ZZ".to_vec(),
-            vec![1, 2, 3],
+            vec![b'Z', b'Z', 7, 1, 1, 2, 3],
         ))
         .build();
     writer.start_entry(&file).unwrap();
@@ -989,12 +2198,9 @@ fn common_iso_writer_streams_payload_and_roundtrips_rock_ridge_metadata() {
                 assert_eq!(metadata.inode(), Some(42));
                 assert_eq!(metadata.times().modified, Some(timestamp));
                 assert_eq!(metadata.times().accessed, Some(timestamp));
-                assert!(
-                    metadata
-                        .extensions()
-                        .iter()
-                        .any(|extension| extension.key() == b"ZZ")
-                );
+                assert!(metadata.extensions().iter().any(|extension| {
+                    extension.key() == b"ZZ" && extension.value() == [b'Z', b'Z', 7, 1, 1, 2, 3]
+                }));
             },
             ReaderEvent::Entry(metadata) if metadata.path().as_bytes() == b"sub/latest" => {
                 seen_link = true;
@@ -1020,6 +2226,326 @@ fn common_iso_writer_streams_payload_and_roundtrips_rock_ridge_metadata() {
     }
     assert!(seen_file && seen_link && seen_device);
     assert_eq!(body, b"streaming payload".repeat(256));
+}
+
+#[test]
+fn iso_writer_rejects_unrepresentable_timestamp_range_and_precision() {
+    for timestamp in [
+        Timestamp::from_seconds(253_402_300_800),
+        Timestamp::new(1_700_000_000, 1).unwrap(),
+    ] {
+        let metadata =
+            EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("invalid-time.bin"))
+                .size(Some(0))
+                .times(EntryTimes {
+                    modified: Some(timestamp),
+                    ..EntryTimes::default()
+                })
+                .build();
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::Iso9660,
+            Limits::default(),
+        )
+        .unwrap();
+        let error = writer
+            .start_entry(&metadata)
+            .expect_err("ISO writer must reject a timestamp it cannot encode exactly");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+}
+
+#[test]
+fn iso_timestamp_year_boundaries_roundtrip() {
+    for (index, timestamp) in [
+        Timestamp::from_seconds(-62_167_219_200),
+        Timestamp::new(253_402_300_799, 990_000_000).unwrap(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let metadata = EntryMetadata::builder(
+            EntryKind::File,
+            ArchivePath::from_utf8(format!("boundary-{index}.bin")),
+        )
+        .size(Some(0))
+        .times(EntryTimes {
+            modified: Some(timestamp),
+            ..EntryTimes::default()
+        })
+        .build();
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::Iso9660,
+            Limits::default(),
+        )
+        .unwrap();
+        writer.start_entry(&metadata).unwrap();
+        writer.end_entry().unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+        let mut reader = SeekArchiveReader::new(Cursor::new(archive)).unwrap();
+        assert!(matches!(
+            reader.next_event().unwrap(),
+            ReaderEvent::ArchiveMetadata(_)
+        ));
+        let ReaderEvent::Entry(decoded) = reader.next_event().unwrap() else {
+            panic!("ISO boundary entry missing");
+        };
+        assert_eq!(decoded.times().modified, Some(timestamp));
+    }
+}
+
+#[test]
+fn iso_writer_rejects_unrepresentable_typed_fields_before_entry_output() {
+    let base =
+        |kind| EntryMetadata::builder(kind, ArchivePath::from_utf8("entry.bin")).size(Some(0));
+    let cases = vec![
+        base(EntryKind::Hardlink)
+            .link_target(Some(ArchivePath::from_utf8("target.bin")))
+            .build(),
+        base(EntryKind::File)
+            .owner(Owner {
+                user: Some(b"alice".to_vec()),
+                ..Owner::default()
+            })
+            .build(),
+        base(EntryKind::File)
+            .owner(Owner {
+                uid: Some(u64::from(u32::MAX) + 1),
+                ..Owner::default()
+            })
+            .build(),
+        base(EntryKind::File).mode(Some(0o10_000)).build(),
+        base(EntryKind::File)
+            .inode_and_links(Some(u64::from(u32::MAX) + 1), Some(1))
+            .build(),
+        base(EntryKind::File)
+            .inode_and_links(Some(1), Some(u64::from(u32::MAX) + 1))
+            .build(),
+        base(EntryKind::File)
+            .devices(Some(Device { major: 1, minor: 2 }), None)
+            .build(),
+        base(EntryKind::Char)
+            .devices(
+                None,
+                Some(Device {
+                    major: u64::from(u32::MAX) + 1,
+                    minor: 0,
+                }),
+            )
+            .build(),
+        base(EntryKind::File).file_flags(1).build(),
+        base(EntryKind::File)
+            .comment(Some(b"comment".to_vec()))
+            .build(),
+    ];
+    for metadata in cases {
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::Iso9660,
+            Limits::default(),
+        )
+        .unwrap();
+        let error = writer
+            .start_entry(&metadata)
+            .expect_err("ISO direct writer must fail closed on lossy typed metadata");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error:?}");
+    }
+}
+
+#[test]
+fn iso_writer_rejects_oversized_declared_file_before_entry_output() {
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("large.bin"))
+        .size(Some(u64::from(u32::MAX) + 1))
+        .build();
+    let mut writer = SeekArchiveWriter::with_format(
+        Cursor::new(Vec::new()),
+        FormatId::Iso9660,
+        Limits::default().with_entry_bytes(None),
+    )
+    .unwrap();
+    let error = writer
+        .start_entry(&metadata)
+        .expect_err("ISO declared file size must fit its u32 directory record");
+    assert_eq!(error.kind(), ErrorKind::Limit);
+}
+
+#[cfg(feature = "sevenz")]
+#[test]
+fn sevenz_writer_rejects_unrepresentable_timestamp_range_and_precision() {
+    for timestamp in [
+        Timestamp::from_seconds(-11_644_473_601),
+        Timestamp::from_seconds(i64::MAX),
+        Timestamp::new(1_700_000_000, 1).unwrap(),
+    ] {
+        let metadata =
+            EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("invalid-time.bin"))
+                .size(Some(0))
+                .times(EntryTimes {
+                    modified: Some(timestamp),
+                    ..EntryTimes::default()
+                })
+                .build();
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::SevenZip,
+            Limits::default(),
+        )
+        .unwrap();
+        let error = writer
+            .start_entry(&metadata)
+            .expect_err("7z writer must reject a timestamp it cannot encode exactly");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+}
+
+#[cfg(feature = "sevenz")]
+#[test]
+fn sevenz_filetime_boundaries_roundtrip() {
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const FILETIME_EPOCH_DIFF: i64 = 11_644_473_600;
+    let maximum = Timestamp::new(
+        i64::try_from(u64::MAX / TICKS_PER_SECOND).unwrap() - FILETIME_EPOCH_DIFF,
+        u32::try_from(u64::MAX % TICKS_PER_SECOND).unwrap() * 100,
+    )
+    .unwrap();
+    for (index, timestamp) in [Timestamp::from_seconds(-FILETIME_EPOCH_DIFF), maximum]
+        .into_iter()
+        .enumerate()
+    {
+        let metadata = EntryMetadata::builder(
+            EntryKind::File,
+            ArchivePath::from_utf8(format!("filetime-{index}.bin")),
+        )
+        .size(Some(0))
+        .times(EntryTimes {
+            modified: Some(timestamp),
+            ..EntryTimes::default()
+        })
+        .build();
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::SevenZip,
+            Limits::default(),
+        )
+        .unwrap();
+        writer.start_entry(&metadata).unwrap();
+        writer.end_entry().unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+        let mut reader = SeekArchiveReader::new(Cursor::new(archive)).unwrap();
+        assert!(matches!(
+            reader.next_event().unwrap(),
+            ReaderEvent::ArchiveMetadata(_)
+        ));
+        let ReaderEvent::Entry(decoded) = reader.next_event().unwrap() else {
+            panic!("7z FILETIME boundary entry missing");
+        };
+        assert_eq!(decoded.times().modified, Some(timestamp));
+    }
+}
+
+#[cfg(feature = "sevenz")]
+#[test]
+fn sevenz_windows_file_attributes_roundtrip_as_typed_file_flags() {
+    const FILE_ATTRIBUTE_READONLY: u64 = 0x0000_0001;
+    const FILE_ATTRIBUTE_HIDDEN: u64 = 0x0000_0002;
+    const FILE_ATTRIBUTE_SYSTEM: u64 = 0x0000_0004;
+    const FILE_ATTRIBUTE_ARCHIVE: u64 = 0x0000_0020;
+    let file_flags = FILE_ATTRIBUTE_READONLY
+        | FILE_ATTRIBUTE_HIDDEN
+        | FILE_ATTRIBUTE_SYSTEM
+        | FILE_ATTRIBUTE_ARCHIVE;
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("attributes.bin"))
+            .size(Some(0))
+            .mode(Some(0o640))
+            .file_flags(file_flags)
+            .build();
+    let mut writer = SeekArchiveWriter::with_format(
+        Cursor::new(Vec::new()),
+        FormatId::SevenZip,
+        Limits::default(),
+    )
+    .expect("writer");
+    writer.start_entry(&metadata).expect("start entry");
+    writer.end_entry().expect("end entry");
+    let archive = writer.finish().expect("finish").into_inner();
+
+    let mut reader = SeekArchiveReader::new(Cursor::new(archive)).expect("reader");
+    assert!(matches!(
+        reader.next_event().expect("archive metadata"),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    let ReaderEvent::Entry(decoded) = reader.next_event().expect("entry") else {
+        panic!("7z file-attribute entry missing");
+    };
+    assert_eq!(decoded.mode(), Some(0o640));
+    assert_eq!(decoded.file_flags(), file_flags);
+}
+
+#[cfg(feature = "sevenz")]
+#[test]
+fn sevenz_writer_rejects_unrepresentable_typed_entry_metadata() {
+    let base =
+        |kind| EntryMetadata::builder(kind, ArchivePath::from_utf8("entry.bin")).size(Some(0));
+    let cases = vec![
+        base(EntryKind::Char).build(),
+        base(EntryKind::File)
+            .owner(Owner {
+                uid: Some(1),
+                ..Owner::default()
+            })
+            .build(),
+        base(EntryKind::File).mode(Some(0)).build(),
+        base(EntryKind::File)
+            .inode_and_links(Some(1), Some(1))
+            .build(),
+        base(EntryKind::File)
+            .devices(Some(Device { major: 1, minor: 2 }), None)
+            .build(),
+        base(EntryKind::File)
+            .xattr(b"user.test".to_vec(), b"value".to_vec())
+            .build(),
+        base(EntryKind::File).acl(b"acl".to_vec()).build(),
+        base(EntryKind::File).file_flags(1_u64 << 32).build(),
+        base(EntryKind::File).file_flags(0x0000_0010).build(),
+        base(EntryKind::File).file_flags(0x0000_8000).build(),
+        base(EntryKind::File).encrypted(true).build(),
+        base(EntryKind::File)
+            .comment(Some(b"comment".to_vec()))
+            .build(),
+        base(EntryKind::File)
+            .extension(Extension::new(
+                "7z-entry-property",
+                b"key".to_vec(),
+                b"value".to_vec(),
+            ))
+            .build(),
+        EntryMetadata::builder(
+            EntryKind::File,
+            ArchivePath::from_bytes(vec![0xff, b'.', b'b', b'i', b'n']),
+        )
+        .size(Some(0))
+        .build(),
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("nul\0name"))
+            .size(Some(0))
+            .build(),
+        EntryMetadata::builder(EntryKind::Dir, ArchivePath::from_utf8("dir"))
+            .size(Some(1))
+            .build(),
+    ];
+    for metadata in cases {
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::SevenZip,
+            Limits::default(),
+        )
+        .unwrap();
+        let error = writer
+            .start_entry(&metadata)
+            .expect_err("7z direct writer must fail closed on lossy typed metadata");
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error:?}");
+    }
 }
 
 #[cfg(feature = "sevenz")]

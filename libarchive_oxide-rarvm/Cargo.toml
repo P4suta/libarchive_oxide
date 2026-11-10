@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+[package]
+name = "libarchive_oxide-rarvm"
+version.workspace = true
+description = "bounded Safe-Rust RAR3 standard VM filters for libarchive_oxide"
+edition.workspace = true
+rust-version.workspace = true
+license = "BSD-2-Clause"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/libarchive_oxide-rarvm"
+keywords = ["archive", "compression", "rar", "no-std", "embedded"]
+categories = ["compression", "no-std"]
+
+[lints]
+workspace = true

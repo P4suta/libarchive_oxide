@@ -23,20 +23,20 @@ features = ["portable-codecs"]
 [features]
 default = ["portable-codecs"]
 portable-codecs = [
-    "gzip",
-    "bzip2",
-    "zstd",
-    "xz",
-    "lz4",
-    "libarchive_oxide/portable-codecs",
+  "gzip",
+  "bzip2",
+  "zstd",
+  "xz",
+  "lz4",
+  "libarchive_oxide/portable-codecs",
 ]
 native-codecs = [
-    "gzip",
-    "bzip2",
-    "zstd",
-    "xz",
-    "lz4",
-    "libarchive_oxide/native-codecs",
+  "gzip",
+  "bzip2",
+  "zstd",
+  "xz",
+  "lz4",
+  "libarchive_oxide/native-codecs",
 ]
 gzip = ["libarchive_oxide/gzip"]
 bzip2 = ["gzip", "libarchive_oxide/bzip2"]
@@ -47,16 +47,22 @@ lz4 = ["gzip", "libarchive_oxide/lz4"]
 [dependencies]
 base64 = "0.22"
 bcder = "0.7.7"
-# Its default `http` feature performs timestamp-protocol requests; verification
-# in this crate is deliberately offline.
+# Its default `http` feature performs timestamp-protocol requests; verification in this crate is deliberately offline.
 cryptographic-message-syntax = { version = "0.28", default-features = false }
+digest_010 = { package = "digest", version = "0.10" }
+md5_010 = { package = "md-5", version = "0.10.6" }
 libarchive_oxide = { path = "../libarchive_oxide", version = "0.2.0", default-features = false }
-libarchive_oxide-codecs = { path = "../libarchive_oxide-codecs", version = "0.2.0", default-features = false, features = ["gzip"] }
-libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
 quick-xml = { version = "0.42", default-features = false }
+plist = { version = "1.10", default-features = false }
+pgp = { version = "0.21", default-features = false }
+ripemd_010 = { package = "ripemd", version = "0.1.3" }
 ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
+sha1 = "0.11"
+sha1_checked_010 = { package = "sha1-checked", version = "0.10" }
 sha2 = "0.11"
 sha3 = "0.12"
+sha2_010 = { package = "sha2", version = "0.10.9" }
+sha3_010 = { package = "sha3", version = "0.10.9" }
 spki = { version = "0.7", default-features = false, features = ["alloc"] }
 subtle = "2.6"
 unicode-normalization = "0.1.24"

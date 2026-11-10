@@ -96,10 +96,22 @@ The Linux reference path implements:
   and character/block device nodes; and
 - temporary-sibling atomic regular-file publication.
 
-Named owner lookup, metadata-change time, birth time, and filesystem flags are
-not silently approximated. They produce `Unsupported`, `Partial`, `Refused`,
-or `OsError` findings. Special files remain disabled unless policy explicitly
-enables them, even when the adapter reports platform support.
+On Windows, creation/birth time is restored for regular files through the staged open file handle.
+Deferred directories are reopened as `.` relative to their retained directory capability with only the Win32 `FILE_WRITE_ATTRIBUTES` access mask before applying the time.
+No ambient path or project-owned unsafe code is introduced.
+Regular-file `file_flags` restore `HIDDEN`, `SYSTEM`, and `ARCHIVE` at staged-file creation.
+A lone `READONLY` request is applied after atomic publication so temporary-link cleanup remains possible.
+`READONLY` combined with those create-time attributes, and every other Windows attribute bit, produces an explicit `Partial` finding instead of silently clearing an attribute through the stable Rust permissions API.
+
+On macOS, extended attributes are restored through the staged file descriptor or retained deferred-directory descriptor.
+Attribute names must be nonempty and NUL-free; each requested name receives its own finding.
+This includes the `com.apple.ResourceFork` representation used by macOS for resource-fork content.
+The implementation uses the same bounded metadata already retained by the parser and the existing Safe Rust `rustix` facade.
+
+Named owner lookup, metadata-change time, creation time on non-Windows targets,
+and remaining filesystem flags are not silently approximated.
+They produce `Unsupported`, `Partial`, `Refused`, or `OsError` findings.
+Special files remain disabled unless policy explicitly enables them, even when the adapter reports platform support.
 
 ## Evidence
 
@@ -108,10 +120,16 @@ typed OS errors, identity mismatch before adapter dispatch, unsafe paths,
 destination races, atomic publication, and a deterministic Unix ancestor-swap
 attack between payload write and commit. Windows tests additionally cover
 case and Unicode-normalization collisions, trailing dots/spaces, reserved
-devices, ADS syntax, and temporary-sibling cleanup on refusal. Linux tests verify
-mode/time/xattr/ACL/numeric ownership, sparse logical bytes, and allocated block
-usage. The published-package smoke consumer implements `FilesystemAdapter`
-using only public APIs.
+devices, ADS syntax, temporary-sibling cleanup on refusal, file and deferred-
+directory creation-time restoration, and a pre-1601 conversion failure. Linux
+tests verify mode/time/xattr/ACL/numeric ownership, sparse logical bytes, and
+allocated block usage. macOS tests verify regular-file and deferred-directory
+xattrs, resource-fork bytes, per-attribute findings, and invalid-name refusal.
+Windows unit tests additionally verify applied create-time attributes, a lone
+post-publication `READONLY`, preservation plus `Partial` reporting for the
+incompatible combination, and unsupported-bit reporting.
+The published-package smoke consumer implements `FilesystemAdapter` using only
+public APIs.
 
 ```sh
 cargo test -p libarchive_oxide --test filesystem_adapter \

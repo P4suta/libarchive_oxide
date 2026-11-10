@@ -13,7 +13,7 @@ pub(crate) mod delta;
 pub mod gzip;
 #[cfg(feature = "lz4")]
 pub(crate) mod lz4;
-#[cfg(feature = "lzip")]
+#[cfg(any(feature = "lzip", feature = "lzma", feature = "xz", feature = "ppmd"))]
 pub(crate) mod lzip;
 #[cfg(any(feature = "lzip", feature = "xz"))]
 mod worker;

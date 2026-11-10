@@ -15,8 +15,6 @@ use libarchive_oxide_core::{
 };
 
 use crate::BackendPreference;
-#[cfg(feature = "aes")]
-use crate::SecretBytes;
 use crate::filtered_io::SyncFilterWriter;
 pub(crate) use crate::provider::BuiltinFormatEncoder as RuntimeEncoder;
 use crate::provider::{
@@ -24,6 +22,8 @@ use crate::provider::{
     ProviderSet, StaticCodecProviders, StaticFormatProviders, filter_name,
 };
 use crate::zip::ZipMethod;
+#[cfg(feature = "aes")]
+use crate::{AesStrength, SecretBytes};
 
 const BUFFER: usize = 64 * 1024;
 const DETECTION_MINIMUM: usize = 17 * 2048 + 6;
@@ -198,6 +198,18 @@ impl Error {
         }
     }
 
+    pub(crate) fn io_or_archive(error: io::Error) -> Self {
+        if let Some(archive) = archive_error_from_io(&error) {
+            return Self::archive(archive);
+        }
+        if error.kind() == io::ErrorKind::Unsupported {
+            return Self::archive(
+                ArchiveError::new(ErrorKind::Unsupported).with_context(error.to_string()),
+            );
+        }
+        Self::io(error)
+    }
+
     /// Stable classification covering both archive and I/O failures.
     #[must_use]
     pub fn kind(&self) -> ErrorKind {
@@ -236,6 +248,25 @@ impl Error {
             ErrorSource::Archive(_) => None,
         }
     }
+}
+
+pub(crate) fn archive_error_from_io(error: &io::Error) -> Option<ArchiveError> {
+    let mut source = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if let Some(archive) = current.downcast_ref::<ArchiveError>() {
+            return Some(archive.clone());
+        }
+        if let Some(nested) = current.downcast_ref::<io::Error>() {
+            source = nested
+                .get_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static));
+            continue;
+        }
+        source = current.source();
+    }
+    None
 }
 
 impl fmt::Display for Error {
@@ -309,6 +340,7 @@ enum PipelinePhase {
 #[allow(clippy::large_enum_variant)]
 enum OwnedPipelineEvent {
     NeedInput,
+    Progress,
     ArchiveMetadata(ArchiveMetadata),
     Entry(EntryMetadata),
     Data,
@@ -355,6 +387,7 @@ where
     decoder_stalled: bool,
     phase: PipelinePhase,
     filter_input: FilterInputMode,
+    passwords: Vec<crate::SecretBytes>,
 }
 
 impl<S, D> CodecLayer<S, D> {
@@ -491,6 +524,23 @@ where
             .force_format(format)
     }
 
+    pub(crate) fn with_providers_and_options(
+        limits: Limits,
+        providers: ProviderSet<F, C>,
+        format: Option<FormatId>,
+        filter: Option<FilterId>,
+    ) -> Result<Self, ArchiveError> {
+        let (formats, codecs) = providers.into_chains();
+        let mut pipeline = Self::with_filter_mode(limits, FilterInputMode::Detect, formats, codecs);
+        if let Some(filter) = filter {
+            pipeline = pipeline.force_filter(filter)?;
+        }
+        match format {
+            Some(format) => pipeline.force_format(format),
+            None => Ok(pipeline),
+        }
+    }
+
     fn with_filter_mode(
         limits: Limits,
         filter_input: FilterInputMode,
@@ -535,7 +585,13 @@ where
             decoder_stalled: false,
             phase: PipelinePhase::Reading,
             filter_input,
+            passwords: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_passwords(mut self, passwords: Vec<crate::SecretBytes>) -> Self {
+        self.passwords = passwords;
+        self
     }
 
     fn force_format(mut self, format: FormatId) -> Result<Self, ArchiveError> {
@@ -560,6 +616,23 @@ where
             ProviderCapability::Unknown => Err(ArchiveError::new(ErrorKind::Unsupported)
                 .with_context("explicit streaming format is not registered")),
         }
+    }
+
+    fn force_filter(mut self, filter: FilterId) -> Result<Self, ArchiveError> {
+        if self.filter_depth == 0 {
+            return Err(ArchiveError::new(ErrorKind::Limit).with_context(
+                "an explicit outer filter exceeds the configured zero filter-depth limit",
+            ));
+        }
+        let selection = self.codecs.select_codec(filter)?;
+        let codec = self.codecs.codec_decoder(selection.clone(), self.limits)?;
+        self.layers.push(CodecLayer::new(
+            filter,
+            selection,
+            codec,
+            self.layer_capacity,
+        ));
+        Ok(self)
     }
 
     /// Available capacity for [`Pipeline::feed`].
@@ -816,7 +889,11 @@ where
         format: FormatId,
         selection: F::Selection,
     ) -> Result<(), ArchiveError> {
-        self.decoder = Some(self.formats.format_decoder(selection, self.limits)?);
+        self.decoder = Some(self.formats.format_decoder(
+            selection,
+            self.limits,
+            core::mem::take(&mut self.passwords),
+        )?);
         self.format = Some(format);
         Ok(())
     }
@@ -952,7 +1029,7 @@ where
 
             let input_len = self.plain().len();
             let output_len = self.decoder_scratch.len();
-            let end = if self.plain_finished() {
+            let end = if self.plain_exhausted() {
                 EndOfInput::End
             } else {
                 EndOfInput::More
@@ -990,6 +1067,7 @@ where
                     return Err(ArchiveError::new(ErrorKind::Protocol)
                         .with_context("decoder requested more than the configured output buffer"));
                 },
+                DecodeEvent::Progress => OwnedPipelineEvent::Progress,
                 DecodeEvent::ArchiveMetadata(metadata) => {
                     OwnedPipelineEvent::ArchiveMetadata(metadata)
                 },
@@ -1012,7 +1090,7 @@ where
 
             match event {
                 OwnedPipelineEvent::NeedInput => {
-                    if self.plain_finished() {
+                    if self.plain_exhausted() {
                         return Err(ArchiveError::new(ErrorKind::Malformed)
                             .with_context("archive ended before the decoder reached Done"));
                     }
@@ -1034,6 +1112,7 @@ where
                         }
                     }
                 },
+                OwnedPipelineEvent::Progress => {},
                 OwnedPipelineEvent::ArchiveMetadata(metadata) => {
                     return Ok(PipelineEvent::ArchiveMetadata(metadata));
                 },
@@ -1144,6 +1223,35 @@ impl<R: Read> ReaderInput<R> {
         Ok(Self::Four(Box::new(four)))
     }
 
+    fn with_filter(
+        input: R,
+        filter: FilterId,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> io::Result<Self> {
+        let depth = limits.filter_depth().unwrap_or(4).min(4);
+        if depth == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an explicit outer filter exceeds the configured zero filter-depth limit",
+            ));
+        }
+        let one = crate::filtered_io::FilterReader::with_filter(input, filter, limits)?;
+        if depth == 1 {
+            return Ok(Self::One(Box::new(one)));
+        }
+        let two = crate::filtered_io::FilterReader::with_backend(one, limits, backend)?;
+        if depth == 2 {
+            return Ok(Self::Two(Box::new(two)));
+        }
+        let three = crate::filtered_io::FilterReader::with_backend(two, limits, backend)?;
+        if depth == 3 {
+            return Ok(Self::Three(Box::new(three)));
+        }
+        let four = crate::filtered_io::FilterReader::with_backend(three, limits, backend)?;
+        Ok(Self::Four(Box::new(four)))
+    }
+
     fn read(
         &mut self,
         output: &mut [u8],
@@ -1179,9 +1287,61 @@ impl<R: Read> ReaderInput<R> {
             Self::Four(input) => Ok((*input).into_inner().into_inner().into_inner().into_inner()),
         }
     }
+
+    fn source_ref(&self) -> Result<&R, ArchiveError> {
+        match self {
+            Self::Uninitialized(Some(input)) | Self::Plain(input) => Ok(input),
+            Self::Uninitialized(None) => Err(ArchiveError::new(ErrorKind::Protocol)
+                .with_context("archive input is unavailable after filter initialization failed")),
+            Self::One(input) => Ok(input.source_ref()),
+            Self::Two(input) => Ok(input.source_ref().source_ref()),
+            Self::Three(input) => Ok(input.source_ref().source_ref().source_ref()),
+            Self::Four(input) => Ok(input.source_ref().source_ref().source_ref().source_ref()),
+        }
+    }
 }
 
 impl<R: Read> ArchiveReader<R, BuiltinFormatProviders, BuiltinCodecProviders> {
+    /// Opens a streaming reader with the common option model.
+    ///
+    /// Volume providers are rejected because a forward-only stream cannot resolve multi-volume sources.
+    /// Password candidates are passed to the sequential ZIP and RAR3 decoders and ignored by formats that do not use them.
+    pub fn with_options(reader: R, options: &crate::OpenOptions) -> Result<Self, Error> {
+        if options.volumes().is_some() {
+            return Err(Error::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_context("volume providers require a seek, range, or volume reader"),
+            ));
+        }
+        let passwords = options
+            .password_candidates(crate::PasswordRequest::new(
+                options.format().unwrap_or(FormatId::Zip),
+                None,
+                crate::PasswordPurpose::Header,
+            ))
+            .map_err(Error::io)?;
+        let limits = options.limits();
+        let backend = BackendPreference::Auto;
+        let reader = match options.filter() {
+            Some(filter) => ReaderInput::with_filter(reader, filter, limits, backend)
+                .map_err(Error::io_or_archive)?,
+            None => ReaderInput::Uninitialized(Some(reader)),
+        };
+        let pipeline = match options.format() {
+            Some(format) => Pipeline::after_filter_adapters_with_format(limits, backend, format)
+                .map_err(Error::archive)?,
+            None => Pipeline::after_filter_adapters_with_backend(limits, backend),
+        }
+        .with_passwords(passwords);
+        Ok(Self {
+            reader,
+            pipeline,
+            read_buffer: vec![0; BUFFER],
+            event_data: Vec::with_capacity(BUFFER),
+            backend,
+        })
+    }
+
     /// Opens a streaming archive reader with safe default limits.
     #[must_use]
     pub fn open(reader: R) -> Self {
@@ -1324,6 +1484,43 @@ where
             backend: BackendPreference::Auto,
         })
     }
+
+    pub(crate) fn with_providers_and_options(
+        reader: R,
+        options: &crate::OpenOptions,
+        providers: ProviderSet<F, C>,
+    ) -> Result<Self, Error> {
+        if options.volumes().is_some() {
+            return Err(Error::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_context("volume providers require a seek, range, or volume reader"),
+            ));
+        }
+        let passwords = options
+            .password_candidates(crate::PasswordRequest::new(
+                options.format().unwrap_or(FormatId::Zip),
+                None,
+                crate::PasswordPurpose::Header,
+            ))
+            .map_err(Error::io)?;
+        let limits = options.limits();
+        let pipeline = Pipeline::with_providers_and_options(
+            limits,
+            providers,
+            options.format(),
+            options.filter(),
+        )
+        .map_err(Error::archive)?
+        .with_passwords(passwords);
+        Ok(Self {
+            reader: ReaderInput::Plain(reader),
+            pipeline,
+            read_buffer: vec![0; BUFFER],
+            event_data: Vec::with_capacity(BUFFER),
+            backend: BackendPreference::Auto,
+        })
+    }
+
     /// Produces the next structural event.
     pub fn next_event(&mut self) -> Result<ReaderEvent<'_>, StreamError> {
         loop {
@@ -1355,7 +1552,7 @@ where
                             self.pipeline.limits(),
                             self.backend,
                         )
-                        .map_err(StreamError::io)?;
+                        .map_err(StreamError::io_or_archive)?;
                     if n == 0 {
                         self.pipeline.finish_input().map_err(StreamError::archive)?;
                     } else {
@@ -1395,6 +1592,10 @@ where
     /// before failing and no reader remains to recover.
     pub fn into_inner(self) -> Result<R, ArchiveError> {
         self.reader.into_inner()
+    }
+
+    pub(crate) fn with_source<T>(&self, inspect: impl FnOnce(&R) -> T) -> Result<T, ArchiveError> {
+        self.reader.source_ref().map(inspect)
     }
 
     /// Resource budgets used by this reader.
@@ -1558,9 +1759,92 @@ impl<W: Write> ArchiveWriter<W> {
         limits: Limits,
         backend: BackendPreference,
     ) -> Self {
+        Self::with_zip_password_strength_and_backend(
+            output,
+            method,
+            password,
+            AesStrength::Bits256,
+            limits,
+            backend,
+        )
+    }
+
+    /// Creates a streaming `WinZip` AES AE-2 writer with an explicit key strength.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zip_password_and_strength(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        strength: AesStrength,
+        limits: Limits,
+    ) -> Self {
+        Self::with_zip_password_strength_and_backend(
+            output,
+            method,
+            password,
+            strength,
+            limits,
+            BackendPreference::Auto,
+        )
+    }
+
+    /// Creates a strength-selectable encrypted ZIP writer with a codec backend.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zip_password_strength_and_backend(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        strength: AesStrength,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
         Self {
             output: SyncFilterWriter::plain(output),
-            encoder: RuntimeEncoder::encrypted_zip_with_backend(limits, method, password, backend),
+            encoder: RuntimeEncoder::encrypted_zip_with_backend(
+                limits, method, password, strength, backend,
+            ),
+            format: FormatId::Zip,
+            buffer: vec![0; BUFFER],
+            failed: false,
+        }
+    }
+
+    /// Creates a streaming traditional PKWARE `ZipCrypto` writer.
+    ///
+    /// `ZipCrypto` is cryptographically weak and is provided only for legacy interoperability.
+    /// Prefer `WinZip` AES for new archives.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zipcrypto_password(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        limits: Limits,
+    ) -> Self {
+        Self::with_zipcrypto_password_and_backend(
+            output,
+            method,
+            password,
+            limits,
+            BackendPreference::Auto,
+        )
+    }
+
+    /// Creates a traditional PKWARE `ZipCrypto` writer with a codec backend.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zipcrypto_password_and_backend(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
+        Self {
+            output: SyncFilterWriter::plain(output),
+            encoder: RuntimeEncoder::zipcrypto_with_backend(limits, method, password, backend),
             format: FormatId::Zip,
             buffer: vec![0; BUFFER],
             failed: false,

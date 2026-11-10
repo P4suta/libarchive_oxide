@@ -56,25 +56,21 @@ No verification command grants release authorization.
 
 ## Design constraints
 
-Changes must preserve the architecture ADRs, including
-[ADR-0001](docs/adr/0001-core-architecture.md) and its later superseding
-decisions:
+Changes must preserve the architecture ADRs, including [ADR-0001](docs/adr/0001-core-architecture.md) and its later superseding decisions:
 
-- `libarchive_oxide-core` remains `no_std` + `alloc`;
-- the core has no external dependencies;
+- `libarchive_oxide-protocol` remains dependency-free `no_std` + `alloc`;
+- `libarchive_oxide-core` and `libarchive_oxide-codecs` remain sibling `no_std` + `alloc` crates that depend only on the protocol layer and their explicitly audited algorithm dependencies;
 - formats and filters remain independent;
 - built-in codecs retain bounded incremental state machines;
-- downstream formats, codecs, random-access sources, and volume resolvers use
-  the immutable object-safe registry contracts.
+- package verification and the CLI must use their public flagship/package facades instead of bypassing them to import protocol, core, or codecs;
+- downstream formats and codecs use associated-type provider chains;
+  random-access archive providers use associated concrete decoders, while storage sources and volume resolvers remain application-owned object-safe seams.
 
-Propose a new ADR for a durable, cross-cutting decision. Do not use ADRs for
-implementation details, maintenance tasks, or reversals with no compatibility
-impact.
+Propose a new ADR for a durable, cross-cutting decision.
+Do not use ADRs for implementation details, maintenance tasks, or reversals with no compatibility impact.
 
-Modern Replacement work uses stable `RM-NNN` identifiers and the dedicated
-Issue Form. Link independently mergeable work to its epic in
-[RM-000](https://github.com/P4suta/libarchive_oxide/issues/28), and include
-test, corpus, benchmark, or ABI evidence before closing a completion gate.
+Modern Replacement work uses stable `RM-NNN` identifiers and the dedicated Issue Form.
+Link independently mergeable work to its epic in [RM-000](https://github.com/P4suta/libarchive_oxide/issues/28), and include test, corpus, benchmark, or ABI evidence before closing a completion gate.
 
 ## Tests
 
@@ -83,24 +79,24 @@ test, corpus, benchmark, or ABI evidence before closing a completion gate.
 - Add regression tests for malformed input and extraction controls.
 - Add or update fuzz cases for parser changes.
 
-Tests may skip unavailable external reference tools. CI must still exercise the
-portable assertions.
+Tests may skip unavailable external reference tools.
+CI must still exercise the portable assertions.
 
 ## Compatibility
 
 | Crate | MSRV |
 |---|---:|
+| `libarchive_oxide-protocol` | 1.88 |
 | `libarchive_oxide-core` | 1.88 |
 | `libarchive_oxide-codecs` | 1.88 |
 | `libarchive_oxide` | 1.88 |
 | `libarchive_oxide-package` | 1.88 |
 | `libarchive_oxide-cli` | 1.88 |
 
-During the current pre-1.0 completion program, breaking API and CLI changes are
-allowed when they produce the cleaner design. Do not publish, bump versions,
-create tags or release candidates, or freeze SemVer compatibility unless a
-maintainer explicitly starts that future phase. Tests still cover the CLI
-contract so deliberate changes remain visible.
+During the current pre-1.0 completion program, breaking API and CLI changes are allowed when they produce the cleaner design.
+Do not publish, bump versions,
+create tags or release candidates, or freeze SemVer compatibility unless a maintainer explicitly starts that future phase.
+Tests still cover the CLI contract so deliberate changes remain visible.
 
 ## Commits and pull requests
 
@@ -110,36 +106,32 @@ contract so deliberate changes remain visible.
 - Update user-facing documentation with the implementation.
 - Do not edit released CHANGELOG sections.
 
-Release mechanics are defined by
-[ADR-0002](docs/adr/0002-workspace-releases.md).
+Release mechanics are defined by [ADR-0002](docs/adr/0002-workspace-releases.md).
 
 Releases intentionally require several independent maintainer actions:
 
 1. Dispatch the release workflow with `prepare` and the `PREPARE` confirmation.
 2. Review the generated release PR and manually apply `release-approved`.
-3. After merge, dispatch `publish` with the exact tag and `RELEASE`, then approve
-   the protected `release` Environment deployment.
-4. Dispatch the release-assets workflow with the exact tag and `ASSETS`, approve
-   the Environment deployment, and verify every draft asset.
+3. After merge, dispatch `publish` with the exact tag and `RELEASE`, then approve the protected `release` Environment deployment.
+4. Dispatch the release-assets workflow with the exact tag and `ASSETS`, approve the Environment deployment, and verify every draft asset.
 5. Publish the completed draft Release manually in the GitHub UI.
 
-Never automate the approval label, the Environment review, or final draft
-publication. A maintainer must make each authorization deliberately.
+Never automate the approval label, the Environment review, or final draft publication.
+A maintainer must make each authorization deliberately.
 
 ## License
 
-The repository uses [REUSE](https://reuse.software/). Run:
+The repository uses [REUSE](https://reuse.software/).
+Run:
 
 ```sh
 just reuse
 just license-sync
 ```
 
-New files must declare `MIT OR Apache-2.0` through an SPDX header or
-`REUSE.toml`.
+New files must declare `MIT OR Apache-2.0` through an SPDX header or `REUSE.toml`.
 
-Unless explicitly stated otherwise, submitted contributions are licensed under
-MIT OR Apache-2.0 without additional terms.
+Unless explicitly stated otherwise, submitted contributions are licensed under MIT OR Apache-2.0 without additional terms.
 
 ## Conduct
 

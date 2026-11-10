@@ -14,12 +14,6 @@ use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{ArchiveError, CodecStatus, EndOfInput, ErrorKind, Limits};
 
 use crate::capability::{Backend, BackendPreference};
-#[cfg(any(
-    feature = "zstd",
-    feature = "lz4",
-    feature = "compress",
-    feature = "lzip"
-))]
 use crate::codec_read::CodecReader;
 use crate::filter::gzip::GzipEncoder;
 use crate::pipeline_codec::PipelineCodec;
@@ -27,21 +21,9 @@ use crate::pipeline_codec::PipelineCodec;
 const BUFFER: usize = 64 * 1024;
 
 /// A bounded outer-filter reader: the shared [`CodecReader`] engine driving a [`PipelineCodec`].
-#[cfg(any(
-    feature = "zstd",
-    feature = "lz4",
-    feature = "compress",
-    feature = "lzip"
-))]
 type PipelineRead<R> = CodecReader<R, PipelineCodec>;
 
 /// Builds a [`PipelineRead`] for an outer filter, constructing its [`PipelineCodec`] first.
-#[cfg(any(
-    feature = "zstd",
-    feature = "lz4",
-    feature = "compress",
-    feature = "lzip"
-))]
 fn pipeline_reader<R: Read>(
     input: R,
     filter: FilterId,
@@ -53,6 +35,10 @@ fn pipeline_reader<R: Read>(
         FilterId::Lz4 => "LZ4",
         FilterId::Compress => "compress",
         FilterId::Lzip => "lzip",
+        FilterId::Base64 => "Base64",
+        FilterId::Uuencode => "uuencode",
+        FilterId::Lzop => "lzop",
+        FilterId::Rpm => "RPM",
         _ => "codec",
     };
     let codec = PipelineCodec::with_backend(filter, limits, backend).map_err(codec_archive_io)?;
@@ -92,9 +78,138 @@ enum FilterReaderInner<R: Read> {
     /// Concatenated lzip members.
     #[cfg(feature = "lzip")]
     Lzip(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
+    /// Explicit-only LZMA-alone stream.
+    #[cfg(feature = "lzma")]
+    Lzma(Box<LzmaRead<BufReader<PrefixReader<R>>>>),
+    /// Explicit-only RFC 4648 Base64 stream.
+    Base64(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
+    /// POSIX uuencoded member.
+    Uuencode(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
+    /// RPM package wrapper, yielding its normally compressed cpio payload.
+    Rpm(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
+    /// lzop member stream.
+    #[cfg(feature = "lzop")]
+    Lzop(Box<PipelineRead<BufReader<PrefixReader<R>>>>),
 }
 
 impl<R: Read> FilterReader<R> {
+    /// Decodes an explicitly selected outer filter.
+    ///
+    /// This is required for signatureless filters such as [`FilterId::Base64`] and [`FilterId::Lzma`].
+    /// Framed filters can also be selected explicitly; [`Self::new`] remains the normal auto-detecting path.
+    #[allow(clippy::too_many_lines)] // One ownership-preserving dispatch over built-in filters.
+    pub fn with_filter(input: R, filter: FilterId, limits: Limits) -> io::Result<Self> {
+        let backend = BackendPreference::Auto;
+        let input = BufReader::new(PrefixReader {
+            prefix: [0; 9],
+            prefix_len: 0,
+            prefix_position: 0,
+            input,
+        });
+        let inner = match filter {
+            FilterId::Gzip => {
+                FilterReaderInner::Gzip(Box::new(GzipRead::new(input, limits, backend)?))
+            },
+            FilterId::Bzip2 => {
+                #[cfg(feature = "bzip2")]
+                {
+                    FilterReaderInner::Bzip2(Box::new(bzip2::read::MultiBzDecoder::new(input)))
+                }
+                #[cfg(not(feature = "bzip2"))]
+                return Err(disabled_filter("bzip2"));
+            },
+            FilterId::Zstd => {
+                #[cfg(feature = "zstd")]
+                {
+                    pipeline_reader(input, filter, limits, backend)
+                        .map(Box::new)
+                        .map(FilterReaderInner::Zstd)?
+                }
+                #[cfg(not(feature = "zstd"))]
+                return Err(disabled_filter("zstd"));
+            },
+            FilterId::Xz => {
+                #[cfg(feature = "xz")]
+                {
+                    FilterReaderInner::Xz(Box::new(XzRead::new(input, limits, backend)?))
+                }
+                #[cfg(not(feature = "xz"))]
+                return Err(disabled_filter("XZ"));
+            },
+            FilterId::Lz4 => {
+                #[cfg(feature = "lz4")]
+                {
+                    pipeline_reader(input, filter, limits, backend)
+                        .map(Box::new)
+                        .map(FilterReaderInner::Lz4)?
+                }
+                #[cfg(not(feature = "lz4"))]
+                return Err(disabled_filter("LZ4"));
+            },
+            FilterId::Compress => {
+                #[cfg(feature = "compress")]
+                {
+                    pipeline_reader(input, filter, limits, backend)
+                        .map(Box::new)
+                        .map(FilterReaderInner::Compress)?
+                }
+                #[cfg(not(feature = "compress"))]
+                return Err(disabled_filter("compress/LZW"));
+            },
+            FilterId::Lzip => {
+                #[cfg(feature = "lzip")]
+                {
+                    pipeline_reader(input, filter, limits, backend)
+                        .map(Box::new)
+                        .map(FilterReaderInner::Lzip)?
+                }
+                #[cfg(not(feature = "lzip"))]
+                return Err(disabled_filter("lzip"));
+            },
+            FilterId::Base64 => pipeline_reader(input, filter, limits, backend)
+                .map(Box::new)
+                .map(FilterReaderInner::Base64)?,
+            FilterId::Uuencode => pipeline_reader(input, filter, limits, backend)
+                .map(Box::new)
+                .map(FilterReaderInner::Uuencode)?,
+            FilterId::Rpm => pipeline_reader(input, filter, limits, backend)
+                .map(Box::new)
+                .map(FilterReaderInner::Rpm)?,
+            FilterId::Lzop => {
+                #[cfg(feature = "lzop")]
+                {
+                    pipeline_reader(input, filter, limits, backend)
+                        .map(Box::new)
+                        .map(FilterReaderInner::Lzop)?
+                }
+                #[cfg(not(feature = "lzop"))]
+                return Err(disabled_filter("lzop"));
+            },
+            FilterId::Lzma => {
+                #[cfg(feature = "lzma")]
+                {
+                    FilterReaderInner::Lzma(Box::new(LzmaRead::new(input, limits)?))
+                }
+                #[cfg(not(feature = "lzma"))]
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "LZMA-alone filter is not enabled",
+                ));
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the selected outer filter has no streaming reader",
+                ));
+            },
+        };
+        Ok(Self {
+            inner,
+            decoded: 0,
+            decoded_limit: limits.decoded_total(),
+        })
+    }
+
     /// Detects an enabled outer filter from a buffered prefix.
     pub fn new(input: R) -> io::Result<Self> {
         Self::with_limits(input, Limits::default())
@@ -112,7 +227,7 @@ impl<R: Read> FilterReader<R> {
         limits: Limits,
         backend: BackendPreference,
     ) -> io::Result<Self> {
-        let mut prefix = [0_u8; 6];
+        let mut prefix = [0_u8; 9];
         let mut prefix_len = 0;
         while prefix_len != prefix.len() {
             let read = input.read(&mut prefix[prefix_len..])?;
@@ -170,6 +285,44 @@ impl<R: Read> FilterReader<R> {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "compress/LZW filter is not enabled",
+            ));
+        }
+        if available.starts_with(b"begin ") {
+            return pipeline_reader(input, FilterId::Uuencode, limits, backend)
+                .map(Box::new)
+                .map(FilterReaderInner::Uuencode)
+                .map(|inner| Self {
+                    inner,
+                    decoded: 0,
+                    decoded_limit: limits.decoded_total(),
+                });
+        }
+        if available.starts_with(b"\xed\xab\xee\xdb") {
+            return pipeline_reader(input, FilterId::Rpm, limits, backend)
+                .map(Box::new)
+                .map(FilterReaderInner::Rpm)
+                .map(|inner| Self {
+                    inner,
+                    decoded: 0,
+                    decoded_limit: limits.decoded_total(),
+                });
+        }
+        if available.starts_with(b"\x89LZO\0\r\n\x1a\n") {
+            #[cfg(feature = "lzop")]
+            {
+                return pipeline_reader(input, FilterId::Lzop, limits, backend)
+                    .map(Box::new)
+                    .map(FilterReaderInner::Lzop)
+                    .map(|inner| Self {
+                        inner,
+                        decoded: 0,
+                        decoded_limit: limits.decoded_total(),
+                    });
+            }
+            #[cfg(not(feature = "lzop"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "lzop filter is not enabled",
             ));
         }
         if available.starts_with(b"BZh") {
@@ -261,12 +414,146 @@ impl<R: Read> FilterReader<R> {
             FilterReaderInner::Compress(input) => input.into_inner().into_inner().input,
             #[cfg(feature = "lzip")]
             FilterReaderInner::Lzip(input) => input.into_inner().into_inner().input,
+            #[cfg(feature = "lzma")]
+            FilterReaderInner::Lzma(input) => input.into_inner().into_inner().input,
+            FilterReaderInner::Base64(input) => input.into_inner().into_inner().input,
+            FilterReaderInner::Uuencode(input) => input.into_inner().into_inner().input,
+            FilterReaderInner::Rpm(input) => input.into_inner().into_inner().input,
+            #[cfg(feature = "lzop")]
+            FilterReaderInner::Lzop(input) => input.into_inner().into_inner().input,
+        }
+    }
+
+    /// Borrows the original encoded source below every filter adapter.
+    pub(crate) fn source_ref(&self) -> &R {
+        match &self.inner {
+            FilterReaderInner::Plain(input) => &input.get_ref().input,
+            FilterReaderInner::Gzip(input) => &input.input.get_ref().input,
+            #[cfg(feature = "bzip2")]
+            FilterReaderInner::Bzip2(input) => &input.get_ref().get_ref().input,
+            #[cfg(feature = "zstd")]
+            FilterReaderInner::Zstd(input) => &input.get_ref().get_ref().input,
+            #[cfg(feature = "xz")]
+            FilterReaderInner::Xz(input) => &input.input.get_ref().input,
+            #[cfg(feature = "lz4")]
+            FilterReaderInner::Lz4(input) => &input.get_ref().get_ref().input,
+            #[cfg(feature = "compress")]
+            FilterReaderInner::Compress(input) => &input.get_ref().get_ref().input,
+            #[cfg(feature = "lzip")]
+            FilterReaderInner::Lzip(input) => &input.get_ref().get_ref().input,
+            #[cfg(feature = "lzma")]
+            FilterReaderInner::Lzma(input) => &input.decoder.inner().get_ref().input,
+            FilterReaderInner::Base64(input) => &input.get_ref().get_ref().input,
+            FilterReaderInner::Uuencode(input) => &input.get_ref().get_ref().input,
+            FilterReaderInner::Rpm(input) => &input.get_ref().get_ref().input,
+            #[cfg(feature = "lzop")]
+            FilterReaderInner::Lzop(input) => &input.get_ref().get_ref().input,
         }
     }
 }
 
+#[allow(dead_code)] // Called only when at least one optional filter feature is disabled.
+fn disabled_filter(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{name} filter is not enabled"),
+    )
+}
+
+#[cfg(feature = "lzma")]
+struct LzmaRead<R: Read> {
+    decoder: lzma_rust2::LzmaReader<R>,
+}
+
+#[cfg(feature = "lzma")]
+impl<R: Read> LzmaRead<R> {
+    fn new(mut input: R, limits: Limits) -> io::Result<Self> {
+        let mut header = [0_u8; 13];
+        input.read_exact(&mut header).map_err(|error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                codec_archive_io(
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("lzma")
+                        .with_context("truncated LZMA-alone header"),
+                )
+            } else {
+                error
+            }
+        })?;
+        let properties = header[0];
+        let dictionary = u32::from_le_bytes(header[1..5].try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid LZMA dictionary field")
+        })?);
+        let declared_size =
+            u64::from_le_bytes(header[5..13].try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid LZMA size field")
+            })?);
+        let memory_kib = lzma_rust2::lzma_get_memory_usage_by_props(dictionary, properties)
+            .map_err(|error| {
+                codec_archive_io(
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("lzma")
+                        .with_context(error.to_string()),
+                )
+            })?;
+        let memory = u64::from(memory_kib).saturating_mul(1024);
+        if limits
+            .codec_memory()
+            .is_some_and(|maximum| memory > maximum as u64)
+        {
+            return Err(codec_archive_io(
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("lzma")
+                    .with_context("LZMA dictionary exceeds the configured codec-memory limit"),
+            ));
+        }
+        if declared_size != u64::MAX
+            && limits
+                .decoded_total()
+                .is_some_and(|maximum| declared_size > maximum)
+        {
+            return Err(codec_archive_io(
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("lzma")
+                    .with_context("LZMA declared size exceeds the configured decoded limit"),
+            ));
+        }
+        let decoder = lzma_rust2::LzmaReader::new_with_props(
+            input,
+            declared_size,
+            properties,
+            dictionary,
+            None,
+        )
+        .map_err(|error| {
+            codec_archive_io(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("lzma")
+                    .with_context(error.to_string()),
+            )
+        })?;
+        Ok(Self { decoder })
+    }
+
+    fn into_inner(self) -> R {
+        self.decoder.into_inner()
+    }
+}
+
+#[cfg(feature = "lzma")]
+impl<R: Read> Read for LzmaRead<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        self.decoder
+            .read(output)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
 struct PrefixReader<R> {
-    prefix: [u8; 6],
+    prefix: [u8; 9],
     prefix_len: usize,
     prefix_position: usize,
     input: R,
@@ -491,7 +778,10 @@ impl<R: Read> Read for FilterReader<R> {
                     return if read == 0 {
                         Ok(0)
                     } else {
-                        Err(io::Error::other("decoded stream exceeds configured limit"))
+                        Err(codec_archive_io(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_context("decoded stream exceeds configured limit"),
+                        ))
                     };
                 }
                 usize::try_from(remaining.min(output.len() as u64)).unwrap_or(output.len())
@@ -499,10 +789,11 @@ impl<R: Read> Read for FilterReader<R> {
             None => output.len(),
         };
         let read = read_inner(&mut self.inner, &mut output[..allowed])?;
-        self.decoded = self
-            .decoded
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::other("decoded stream size overflow"))?;
+        self.decoded = self.decoded.checked_add(read as u64).ok_or_else(|| {
+            codec_archive_io(
+                ArchiveError::new(ErrorKind::Limit).with_context("decoded stream size overflow"),
+            )
+        })?;
         Ok(read)
     }
 }
@@ -532,6 +823,13 @@ fn read_inner<R: Read>(input: &mut FilterReaderInner<R>, output: &mut [u8]) -> i
         FilterReaderInner::Compress(input) => input.read(output),
         #[cfg(feature = "lzip")]
         FilterReaderInner::Lzip(input) => input.read(output),
+        #[cfg(feature = "lzma")]
+        FilterReaderInner::Lzma(input) => input.read(output),
+        FilterReaderInner::Base64(input) => input.read(output),
+        FilterReaderInner::Uuencode(input) => input.read(output),
+        FilterReaderInner::Rpm(input) => input.read(output),
+        #[cfg(feature = "lzop")]
+        FilterReaderInner::Lzop(input) => input.read(output),
     }
 }
 
@@ -552,6 +850,13 @@ impl<R: Read> fmt::Debug for FilterReader<R> {
             FilterReaderInner::Compress(_) => "compress",
             #[cfg(feature = "lzip")]
             FilterReaderInner::Lzip(_) => "lzip",
+            #[cfg(feature = "lzma")]
+            FilterReaderInner::Lzma(_) => "lzma",
+            FilterReaderInner::Base64(_) => "base64",
+            FilterReaderInner::Uuencode(_) => "uuencode",
+            FilterReaderInner::Rpm(_) => "rpm",
+            #[cfg(feature = "lzop")]
+            FilterReaderInner::Lzop(_) => "lzop",
         };
         f.debug_tuple("FilterReader").field(&filter).finish()
     }
@@ -653,7 +958,7 @@ impl<R: Read> Read for GzipRead<R> {
             let step = self
                 .decoder
                 .process(&self.buffer[self.start..self.end], output, end)
-                .map_err(archive_io)?;
+                .map_err(codec_archive_io)?;
             self.start += step.consumed;
             if matches!(step.status, CodecStatus::Done) {
                 self.between_members = true;
@@ -675,15 +980,6 @@ impl<R: Read> Read for GzipRead<R> {
             }
         }
     }
-}
-
-fn archive_io(error: ArchiveError) -> io::Error {
-    let kind = match error.kind() {
-        ErrorKind::Limit => io::ErrorKind::Other,
-        ErrorKind::Unsupported => io::ErrorKind::Unsupported,
-        _ => io::ErrorKind::InvalidData,
-    };
-    io::Error::new(kind, error)
 }
 
 fn codec_archive_io(error: ArchiveError) -> io::Error {
@@ -855,6 +1151,214 @@ impl<W: Write> Write for GzipFilterWrite<W> {
         }
     }
 }
+
+pub(crate) struct Base64FilterWrite<W: Write> {
+    output: W,
+    encoder: libarchive_oxide_codecs::base64::Base64Encoder,
+    buffer: Vec<u8>,
+}
+
+pub(crate) struct UuencodeFilterWrite<W: Write> {
+    output: W,
+    encoder: libarchive_oxide_codecs::uuencode::UuencodeEncoder,
+    buffer: Vec<u8>,
+}
+
+#[cfg(feature = "lzop")]
+pub(crate) struct LzopFilterWrite<W: Write> {
+    output: W,
+    encoder: libarchive_oxide_codecs::lzop::LzopEncoder,
+    buffer: Vec<u8>,
+}
+
+#[cfg(feature = "compress")]
+pub(crate) struct CompressFilterWrite<W: Write> {
+    output: W,
+    encoder: libarchive_oxide_codecs::lzw::CompressEncoder,
+    buffer: Vec<u8>,
+}
+
+#[cfg(feature = "compress")]
+impl<W: Write> CompressFilterWrite<W> {
+    pub(crate) fn new(output: W, limits: Limits) -> Result<Self, ArchiveError> {
+        Ok(Self {
+            output,
+            encoder: libarchive_oxide_codecs::lzw::CompressEncoder::with_limits(limits)?,
+            buffer: vec![0; BUFFER],
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        loop {
+            let step = self
+                .encoder
+                .process(&[], &mut self.buffer, EndOfInput::End)
+                .and_then(|step| step.validate(0, self.buffer.len()))
+                .map_err(codec_archive_io)?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.status == CodecStatus::Done {
+                self.output.flush()?;
+                return Ok(self.output);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compress/LZW encoder made no finish progress",
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "compress")]
+impl<W: Write> Write for CompressFilterWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let step = self
+                .encoder
+                .process(bytes, &mut self.buffer, EndOfInput::More)
+                .and_then(|step| step.validate(bytes.len(), self.buffer.len()))
+                .map_err(codec_archive_io)?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.consumed != 0 {
+                return Ok(step.consumed);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compress/LZW encoder made no write progress",
+                ));
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+impl<W: Write> Base64FilterWrite<W> {
+    pub(crate) fn new(output: W, limits: Limits) -> Self {
+        Self {
+            output,
+            encoder: libarchive_oxide_codecs::base64::Base64Encoder::new(limits),
+            buffer: vec![0; BUFFER],
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        loop {
+            let step = self
+                .encoder
+                .process(&[], &mut self.buffer, EndOfInput::End)
+                .and_then(|step| step.validate(0, self.buffer.len()))
+                .map_err(codec_archive_io)?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.status == CodecStatus::Done {
+                self.output.flush()?;
+                return Ok(self.output);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Base64 encoder made no finish progress",
+                ));
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for Base64FilterWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let step = self
+                .encoder
+                .process(bytes, &mut self.buffer, EndOfInput::More)
+                .and_then(|step| step.validate(bytes.len(), self.buffer.len()))
+                .map_err(codec_archive_io)?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.consumed != 0 {
+                return Ok(step.consumed);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Base64 encoder made no write progress",
+                ));
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+impl<W: Write> UuencodeFilterWrite<W> {
+    pub(crate) fn new(output: W, limits: Limits) -> Result<Self, ArchiveError> {
+        Ok(Self {
+            output,
+            encoder: libarchive_oxide_codecs::uuencode::UuencodeEncoder::new(limits)?,
+            buffer: vec![0; BUFFER],
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        loop {
+            let step = self
+                .encoder
+                .process(&[], &mut self.buffer, EndOfInput::End)
+                .and_then(|step| step.validate(0, self.buffer.len()))
+                .map_err(codec_archive_io)?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.status == CodecStatus::Done {
+                self.output.flush()?;
+                return Ok(self.output);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "uuencode encoder made no finish progress",
+                ));
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for UuencodeFilterWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let step = self
+                .encoder
+                .process(bytes, &mut self.buffer, EndOfInput::More)
+                .and_then(|step| step.validate(bytes.len(), self.buffer.len()))
+                .map_err(codec_archive_io)?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.consumed != 0 {
+                return Ok(step.consumed);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "uuencode encoder made no write progress",
+                ));
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
 #[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 pub(crate) fn encode_profile_frame_with_backend(
     filter: FilterId,
@@ -893,6 +1397,68 @@ pub(crate) struct ZstdFrameWrite<W: Write> {
     input: Vec<u8>,
     wrote_frame: bool,
     backend: BackendPreference,
+}
+
+#[cfg(feature = "lzop")]
+impl<W: Write> LzopFilterWrite<W> {
+    pub(crate) fn new(output: W, limits: Limits) -> Result<Self, ArchiveError> {
+        Ok(Self {
+            output,
+            encoder: libarchive_oxide_codecs::lzop::LzopEncoder::new(limits)?,
+            buffer: vec![0; BUFFER],
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        loop {
+            let step = self
+                .encoder
+                .process(&[], &mut self.buffer, EndOfInput::End)
+                .and_then(|step| step.validate(0, self.buffer.len()))
+                .map_err(codec_archive_io)?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.status == CodecStatus::Done {
+                self.output.flush()?;
+                return Ok(self.output);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "lzop encoder made no finish progress",
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "lzop")]
+impl<W: Write> Write for LzopFilterWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let step = self
+                .encoder
+                .process(bytes, &mut self.buffer, EndOfInput::More)
+                .and_then(|step| step.validate(bytes.len(), self.buffer.len()))
+                .map_err(codec_archive_io)?;
+            self.output.write_all(&self.buffer[..step.produced])?;
+            if step.consumed != 0 {
+                return Ok(step.consumed);
+            }
+            if step.produced == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "lzop encoder made no write progress",
+                ));
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
 }
 
 #[cfg(feature = "zstd")]
@@ -1074,6 +1640,24 @@ pub(crate) enum SyncFilterWriter<W: Write> {
         writer: Box<GzipFilterWrite<SharedOutput<W>>>,
         output: SharedOutput<W>,
     },
+    Base64 {
+        writer: Box<Base64FilterWrite<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
+    Uuencode {
+        writer: Box<UuencodeFilterWrite<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
+    #[cfg(feature = "lzop")]
+    Lzop {
+        writer: Box<LzopFilterWrite<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
+    #[cfg(feature = "compress")]
+    Compress {
+        writer: Box<CompressFilterWrite<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
     #[cfg(feature = "bzip2")]
     Bzip2 {
         writer: Box<bzip2::write::BzEncoder<SharedOutput<W>>>,
@@ -1094,6 +1678,16 @@ pub(crate) enum SyncFilterWriter<W: Write> {
         writer: Box<Lz4FrameWrite<SharedOutput<W>>>,
         output: SharedOutput<W>,
     },
+    #[cfg(feature = "lzma")]
+    Lzma {
+        writer: Box<lzma_rust2::LzmaWriter<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
+    #[cfg(feature = "lzip")]
+    Lzip {
+        writer: Box<lzma_rust2::LzipWriter<SharedOutput<W>>>,
+        output: SharedOutput<W>,
+    },
 }
 
 impl<W: Write> SyncFilterWriter<W> {
@@ -1101,6 +1695,24 @@ impl<W: Write> SyncFilterWriter<W> {
         Self::Plain(SharedOutput::new(output))
     }
 
+    #[cfg(feature = "compress")]
+    fn compress(
+        output: SharedOutput<W>,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
+        if matches!(backend, BackendPreference::Native) {
+            return Err(ArchiveError::new(ErrorKind::Capability)
+                .with_format("compress")
+                .with_context("the compress/LZW filter has no native backend"));
+        }
+        Ok(Self::Compress {
+            writer: Box::new(CompressFilterWrite::new(output.clone(), limits)?),
+            output,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // One ownership-preserving writer dispatch over filters.
     pub(crate) fn with_backend(
         output: W,
         filter: Option<FilterId>,
@@ -1111,9 +1723,28 @@ impl<W: Write> SyncFilterWriter<W> {
         let shared = SharedOutput::new(output);
         match filter {
             None => Ok(Self::Plain(shared)),
-            Some(FilterId::Lzip) => Err(ArchiveError::new(ErrorKind::Capability)
-                .with_format("lzip")
-                .with_context("lzip filter is read-only")),
+            #[cfg(feature = "lzip")]
+            Some(FilterId::Lzip) => {
+                if matches!(backend, BackendPreference::Native) {
+                    return Err(ArchiveError::new(ErrorKind::Capability)
+                        .with_format("lzip")
+                        .with_context("the lzip filter has no native backend"));
+                }
+                let options = lzma_rust2::LzipOptions::with_preset(0);
+                let encoder_memory = u64::from(options.lzma_options.get_memory_usage());
+                if limits
+                    .codec_memory()
+                    .is_some_and(|maximum| encoder_memory > maximum as u64)
+                {
+                    return Err(ArchiveError::new(ErrorKind::Limit)
+                        .with_format("lzip")
+                        .with_context("lzip encoder exceeds the configured codec-memory limit"));
+                }
+                Ok(Self::Lzip {
+                    writer: Box::new(lzma_rust2::LzipWriter::new(shared.clone(), options)),
+                    output: shared,
+                })
+            },
             Some(FilterId::Gzip) => Ok(Self::Gzip {
                 writer: Box::new(
                     GzipFilterWrite::with_backend(shared.clone(), limits, backend)
@@ -1121,6 +1752,57 @@ impl<W: Write> SyncFilterWriter<W> {
                 ),
                 output: shared,
             }),
+            Some(FilterId::Base64) => Ok(Self::Base64 {
+                writer: Box::new(Base64FilterWrite::new(shared.clone(), limits)),
+                output: shared,
+            }),
+            Some(FilterId::Uuencode) => Ok(Self::Uuencode {
+                writer: Box::new(UuencodeFilterWrite::new(shared.clone(), limits)?),
+                output: shared,
+            }),
+            #[cfg(feature = "lzop")]
+            Some(FilterId::Lzop) => {
+                if matches!(backend, BackendPreference::Native) {
+                    return Err(ArchiveError::new(ErrorKind::Capability)
+                        .with_format("lzop")
+                        .with_context("the lzop filter has no native backend"));
+                }
+                Ok(Self::Lzop {
+                    writer: Box::new(LzopFilterWrite::new(shared.clone(), limits)?),
+                    output: shared,
+                })
+            },
+            #[cfg(feature = "compress")]
+            Some(FilterId::Compress) => Self::compress(shared, limits, backend),
+            #[cfg(feature = "lzma")]
+            Some(FilterId::Lzma) => {
+                if matches!(backend, BackendPreference::Native) {
+                    return Err(ArchiveError::new(ErrorKind::Capability)
+                        .with_format("lzma")
+                        .with_context("the LZMA-alone filter has no native backend"));
+                }
+                let options = lzma_rust2::LzmaOptions::with_preset(0);
+                // lzma-rust2's encoder estimate is expressed in bytes (its dictionary window dominates the returned value).
+                let encoder_memory = u64::from(options.get_memory_usage());
+                if limits
+                    .codec_memory()
+                    .is_some_and(|maximum| encoder_memory > maximum as u64)
+                {
+                    return Err(ArchiveError::new(ErrorKind::Limit)
+                        .with_format("lzma")
+                        .with_context("LZMA encoder exceeds the configured codec-memory limit"));
+                }
+                let writer = lzma_rust2::LzmaWriter::new_use_header(shared.clone(), &options, None)
+                    .map_err(|error| {
+                        ArchiveError::new(ErrorKind::Capability)
+                            .with_format("lzma")
+                            .with_context(error.to_string())
+                    })?;
+                Ok(Self::Lzma {
+                    writer: Box::new(writer),
+                    output: shared,
+                })
+            },
             #[cfg(feature = "bzip2")]
             Some(FilterId::Bzip2) => Ok(Self::Bzip2 {
                 writer: Box::new(bzip2::write::BzEncoder::new(
@@ -1159,6 +1841,24 @@ impl<W: Write> SyncFilterWriter<W> {
                 drop((*writer).finish()?);
                 output.take()
             },
+            Self::Base64 { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
+            Self::Uuencode { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
+            #[cfg(feature = "lzop")]
+            Self::Lzop { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
+            #[cfg(feature = "compress")]
+            Self::Compress { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
             #[cfg(feature = "bzip2")]
             Self::Bzip2 { writer, output } => {
                 drop((*writer).finish()?);
@@ -1179,6 +1879,16 @@ impl<W: Write> SyncFilterWriter<W> {
                 (*writer).finish_output()?;
                 output.take()
             },
+            #[cfg(feature = "lzma")]
+            Self::Lzma { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
+            #[cfg(feature = "lzip")]
+            Self::Lzip { writer, output } => {
+                drop((*writer).finish()?);
+                output.take()
+            },
         }
     }
 
@@ -1186,6 +1896,24 @@ impl<W: Write> SyncFilterWriter<W> {
         match self {
             Self::Plain(output) => output.take(),
             Self::Gzip { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            Self::Base64 { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            Self::Uuencode { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            #[cfg(feature = "lzop")]
+            Self::Lzop { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            #[cfg(feature = "compress")]
+            Self::Compress { writer, output } => {
                 drop(writer);
                 output.take()
             },
@@ -1209,6 +1937,16 @@ impl<W: Write> SyncFilterWriter<W> {
                 drop(writer);
                 output.take()
             },
+            #[cfg(feature = "lzma")]
+            Self::Lzma { writer, output } => {
+                drop(writer);
+                output.take()
+            },
+            #[cfg(feature = "lzip")]
+            Self::Lzip { writer, output } => {
+                drop(writer);
+                output.take()
+            },
         }
     }
 }
@@ -1218,6 +1956,12 @@ impl<W: Write> Write for SyncFilterWriter<W> {
         match self {
             Self::Plain(output) => output.write(bytes),
             Self::Gzip { writer, .. } => writer.write(bytes),
+            Self::Base64 { writer, .. } => writer.write(bytes),
+            Self::Uuencode { writer, .. } => writer.write(bytes),
+            #[cfg(feature = "lzop")]
+            Self::Lzop { writer, .. } => writer.write(bytes),
+            #[cfg(feature = "compress")]
+            Self::Compress { writer, .. } => writer.write(bytes),
             #[cfg(feature = "bzip2")]
             Self::Bzip2 { writer, .. } => writer.write(bytes),
             #[cfg(feature = "zstd")]
@@ -1226,6 +1970,10 @@ impl<W: Write> Write for SyncFilterWriter<W> {
             Self::Xz { writer, .. } => writer.write(bytes),
             #[cfg(feature = "lz4")]
             Self::Lz4 { writer, .. } => writer.write(bytes),
+            #[cfg(feature = "lzma")]
+            Self::Lzma { writer, .. } => writer.write(bytes),
+            #[cfg(feature = "lzip")]
+            Self::Lzip { writer, .. } => writer.write(bytes),
         }
     }
 
@@ -1233,6 +1981,12 @@ impl<W: Write> Write for SyncFilterWriter<W> {
         match self {
             Self::Plain(output) => output.flush(),
             Self::Gzip { writer, .. } => writer.flush(),
+            Self::Base64 { writer, .. } => writer.flush(),
+            Self::Uuencode { writer, .. } => writer.flush(),
+            #[cfg(feature = "lzop")]
+            Self::Lzop { writer, .. } => writer.flush(),
+            #[cfg(feature = "compress")]
+            Self::Compress { writer, .. } => writer.flush(),
             #[cfg(feature = "bzip2")]
             Self::Bzip2 { writer, .. } => writer.flush(),
             #[cfg(feature = "zstd")]
@@ -1241,6 +1995,10 @@ impl<W: Write> Write for SyncFilterWriter<W> {
             Self::Xz { writer, .. } => writer.flush(),
             #[cfg(feature = "lz4")]
             Self::Lz4 { writer, .. } => writer.flush(),
+            #[cfg(feature = "lzma")]
+            Self::Lzma { writer, .. } => writer.flush(),
+            #[cfg(feature = "lzip")]
+            Self::Lzip { writer, .. } => writer.flush(),
         }
     }
 }
@@ -1250,6 +2008,12 @@ impl<W: Write> fmt::Debug for SyncFilterWriter<W> {
         let filter = match self {
             Self::Plain(_) => "plain",
             Self::Gzip { .. } => "gzip",
+            Self::Base64 { .. } => "base64",
+            Self::Uuencode { .. } => "uuencode",
+            #[cfg(feature = "lzop")]
+            Self::Lzop { .. } => "lzop",
+            #[cfg(feature = "compress")]
+            Self::Compress { .. } => "compress",
             #[cfg(feature = "bzip2")]
             Self::Bzip2 { .. } => "bzip2",
             #[cfg(feature = "zstd")]
@@ -1258,6 +2022,10 @@ impl<W: Write> fmt::Debug for SyncFilterWriter<W> {
             Self::Xz { .. } => "xz",
             #[cfg(feature = "lz4")]
             Self::Lz4 { .. } => "lz4",
+            #[cfg(feature = "lzma")]
+            Self::Lzma { .. } => "lzma",
+            #[cfg(feature = "lzip")]
+            Self::Lzip { .. } => "lzip",
         };
         formatter
             .debug_tuple("SyncFilterWriter")

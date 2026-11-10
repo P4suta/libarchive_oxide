@@ -23,7 +23,7 @@ use cryptographic_message_syntax::asn1::rfc5652::{
     EncapsulatedContentInfo, IssuerAndSerialNumber, OID_CONTENT_TYPE, OID_COUNTER_SIGNATURE,
     OID_ID_DATA, OID_ID_SIGNED_DATA, OID_MESSAGE_DIGEST, SignedAttributes, UnsignedAttributes,
 };
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use ring::signature;

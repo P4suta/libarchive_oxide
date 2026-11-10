@@ -10,7 +10,9 @@
 
 use std::io;
 
-use libarchive_oxide_core::{ArchiveMetadata, EntryMetadata, FormatId, Limits};
+use libarchive_oxide_core::{
+    ArchiveError, ArchiveMetadata, EntryMetadata, ErrorKind, FormatId, Limits,
+};
 
 use crate::async_seek::{DemandReader, is_demand};
 use crate::range_source::{
@@ -55,6 +57,44 @@ pub struct AsyncRangeArchiveReader<S: AsyncRangeSource> {
 }
 
 impl<S: AsyncRangeSource> AsyncRangeArchiveReader<S> {
+    /// Opens an async range source with the common option model.
+    pub async fn with_options(
+        mut source: S,
+        options: &crate::OpenOptions,
+    ) -> Result<Self, StreamError> {
+        if options.volumes().is_some() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_context("use a volume reader for OpenOptions containing VolumeSet"),
+            ));
+        }
+        let identity = source.identity().clone();
+        let length = source.len();
+        validate_source_length(length, options.source_limits(), None).map_err(StreamError::io)?;
+        let demand = DemandReader::new(length, options.limits());
+        let mut metrics = RangeMetrics::default();
+        let reader = loop {
+            match SeekArchiveReader::with_options(demand.clone(), options) {
+                Ok(reader) => break reader,
+                Err(error) if is_demand(&error) => {
+                    fulfill(&mut source, &demand, &identity, length, &mut metrics).await?;
+                },
+                Err(error) => return Err(error),
+            }
+        };
+        demand.clear_cache()?;
+        validate_source(&source, &identity, length)?;
+        Ok(Self {
+            source,
+            reader,
+            demand,
+            identity,
+            length,
+            metrics,
+            event_data: Vec::with_capacity(BUFFER),
+        })
+    }
+
     /// Opens a range-backed archive with safe default limits.
     pub async fn new(source: S) -> Result<Self, StreamError> {
         Self::with_limits(source, Limits::default()).await

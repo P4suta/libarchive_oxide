@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 use libarchive_oxide_core::{
     ArchiveError, ArchiveMetadata, ArchivePath, Codec, CodecStatus, Device, EndOfInput, EntryKind,
@@ -13,11 +14,19 @@ use libarchive_oxide_core::{
     Timestamp,
 };
 
-use crate::filter::gzip::{Crc32, RawInflateDecoder};
-use crate::{ArchiveWriter, ReaderEvent, SecretBytes, StreamError};
+#[cfg(feature = "sevenz")]
+use crate::SevenZipWriteOptions;
 #[cfg(feature = "gzip")]
-use deflate64::{InflateResult, InflaterManaged};
-#[cfg(feature = "zstd")]
+use crate::deflate64::{InflateResult, InflaterManaged};
+use crate::filter::gzip::{Crc32, RawInflateDecoder};
+#[cfg(feature = "aes")]
+use crate::zipaes::ZipAesDecoder;
+#[cfg(feature = "aes")]
+use crate::zipcrypto::ZipCrypto;
+use crate::{ArchiveReader, ArchiveWriter, ReaderEvent, SecretBytes, StreamError};
+#[cfg(not(target_os = "wasi"))]
+use crate::{BackendPreference, XarWriteOptions, ZipMethod};
+#[cfg(any(feature = "aes", feature = "xz", feature = "zstd"))]
 use libarchive_oxide_core::filter::FilterId;
 
 const BUFFER: usize = 64 * 1024;
@@ -59,82 +68,227 @@ fn inflate64_extent_step(
     }
 }
 
-#[cfg(feature = "aes")]
-struct ZipAesDecoder {
-    cipher: ctr::Ctr128LE<aes::Aes256>,
-    mac: hmac::Hmac<sha1::Sha1>,
+#[cfg(all(feature = "aes", any(feature = "xz", feature = "ppmd")))]
+struct ZipAesRead<R> {
+    input: R,
+    crypto: ZipAesDecoder,
+    remaining: u64,
 }
 
-#[cfg(feature = "aes")]
-impl std::fmt::Debug for ZipAesDecoder {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ZipAesDecoder([REDACTED])")
+#[cfg(all(feature = "aes", any(feature = "xz", feature = "ppmd")))]
+impl<R: Read> Read for ZipAesRead<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let output_len = u64::try_from(output.len()).unwrap_or(u64::MAX);
+        let count = usize::try_from(self.remaining.min(output_len)).unwrap_or(output.len());
+        if count == 0 {
+            return Ok(0);
+        }
+        let read = self.input.read(&mut output[..count])?;
+        self.crypto.decrypt(&mut output[..read]);
+        self.remaining -= read as u64;
+        Ok(read)
     }
 }
 
-#[cfg(feature = "aes")]
-impl ZipAesDecoder {
-    fn new(password: &[u8], salt: [u8; 16], verifier: [u8; 2]) -> Result<Self, StreamError> {
-        use ctr::cipher::KeyIvInit;
-        use hmac::digest::KeyInit;
-        use subtle::ConstantTimeEq;
-        use zeroize::Zeroize;
+#[cfg(all(feature = "aes", any(feature = "xz", feature = "ppmd")))]
+impl<R> ZipAesRead<R> {
+    const fn new(input: R, crypto: ZipAesDecoder, remaining: u64) -> Self {
+        Self {
+            input,
+            crypto,
+            remaining,
+        }
+    }
 
-        let mut key_material = [0_u8; 66];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, &salt, 1_000, &mut key_material);
-        if key_material[64..].ct_eq(&verifier).unwrap_u8() != 1 {
-            key_material.zeroize();
+    fn into_parts(self) -> (R, ZipAesDecoder, u64) {
+        (self.input, self.crypto, self.remaining)
+    }
+
+    #[cfg(feature = "ppmd")]
+    const fn get_ref(&self) -> &R {
+        &self.input
+    }
+}
+
+#[cfg(all(feature = "aes", any(feature = "xz", feature = "ppmd")))]
+struct ZipCryptoRead<R> {
+    input: R,
+    crypto: ZipCrypto,
+    remaining: u64,
+}
+
+#[cfg(all(feature = "aes", any(feature = "xz", feature = "ppmd")))]
+impl<R: Read> Read for ZipCryptoRead<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let output_len = u64::try_from(output.len()).unwrap_or(u64::MAX);
+        let count = usize::try_from(self.remaining.min(output_len)).unwrap_or(output.len());
+        if count == 0 {
+            return Ok(0);
+        }
+        let read = self.input.read(&mut output[..count])?;
+        self.crypto.decrypt(&mut output[..read]);
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+#[cfg(all(feature = "aes", any(feature = "xz", feature = "ppmd")))]
+impl<R> ZipCryptoRead<R> {
+    const fn new(input: R, crypto: ZipCrypto, remaining: u64) -> Self {
+        Self {
+            input,
+            crypto,
+            remaining,
+        }
+    }
+
+    fn into_parts(self) -> (R, u64) {
+        (self.input, self.remaining)
+    }
+
+    #[cfg(feature = "ppmd")]
+    const fn get_ref(&self) -> &R {
+        &self.input
+    }
+}
+
+#[cfg(any(feature = "xz", feature = "ppmd"))]
+enum OwnedZipDecoder<R: Read> {
+    #[cfg(feature = "xz")]
+    Lzma(Box<lzma_rust2::LzmaReader<std::io::Take<R>>>),
+    #[cfg(feature = "ppmd")]
+    Ppmd8(Box<ppmd_rust::Ppmd8Decoder<std::io::Take<R>>>),
+    #[cfg(all(feature = "aes", feature = "xz"))]
+    AesLzma(Box<lzma_rust2::LzmaReader<ZipAesRead<R>>>),
+    #[cfg(all(feature = "aes", feature = "ppmd"))]
+    AesPpmd8(Box<ppmd_rust::Ppmd8Decoder<ZipAesRead<R>>>),
+    #[cfg(all(feature = "aes", feature = "xz"))]
+    ZipCryptoLzma(Box<lzma_rust2::LzmaReader<ZipCryptoRead<R>>>),
+    #[cfg(all(feature = "aes", feature = "ppmd"))]
+    ZipCryptoPpmd8(Box<ppmd_rust::Ppmd8Decoder<ZipCryptoRead<R>>>),
+}
+
+#[cfg(any(feature = "xz", feature = "ppmd"))]
+impl<R: Read> Read for OwnedZipDecoder<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(feature = "xz")]
+            Self::Lzma(decoder) => decoder.read(output),
+            #[cfg(feature = "ppmd")]
+            Self::Ppmd8(decoder) => decoder.read(output),
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::AesLzma(decoder) => decoder.read(output),
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::AesPpmd8(decoder) => decoder.read(output),
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::ZipCryptoLzma(decoder) => decoder.read(output),
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::ZipCryptoPpmd8(decoder) => decoder.read(output),
+        }
+    }
+}
+
+#[cfg(any(feature = "xz", feature = "ppmd"))]
+impl<R: Read> OwnedZipDecoder<R> {
+    fn is_zipcrypto(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::ZipCryptoLzma(_) => true,
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::ZipCryptoPpmd8(_) => true,
+            _ => false,
+        }
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // LZMA variants cannot expose R; feature sets may omit them.
+    fn source_ref(&self) -> Option<&R> {
+        match self {
+            #[cfg(feature = "xz")]
+            Self::Lzma(_) => None,
+            #[cfg(feature = "ppmd")]
+            Self::Ppmd8(decoder) => Some(decoder.get_ref().get_ref()),
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::AesLzma(_) => None,
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::AesPpmd8(decoder) => Some(decoder.get_ref().get_ref()),
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::ZipCryptoLzma(_) => None,
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::ZipCryptoPpmd8(decoder) => Some(decoder.get_ref().get_ref()),
+        }
+    }
+
+    fn into_source_unchecked(self) -> R {
+        match self {
+            #[cfg(feature = "xz")]
+            Self::Lzma(decoder) => decoder.into_inner().into_inner(),
+            #[cfg(feature = "ppmd")]
+            Self::Ppmd8(decoder) => decoder.into_inner().into_inner(),
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::AesLzma(decoder) => decoder.into_inner().into_parts().0,
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::AesPpmd8(decoder) => decoder.into_inner().into_parts().0,
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::ZipCryptoLzma(decoder) => decoder.into_inner().into_parts().0,
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::ZipCryptoPpmd8(decoder) => decoder.into_inner().into_parts().0,
+        }
+    }
+
+    #[cfg_attr(not(feature = "aes"), allow(clippy::unnecessary_wraps))]
+    fn finish(self) -> Result<R, StreamError> {
+        match self {
+            #[cfg(feature = "xz")]
+            Self::Lzma(decoder) => Ok(decoder.into_inner().into_inner()),
+            #[cfg(feature = "ppmd")]
+            Self::Ppmd8(decoder) => Ok(decoder.into_inner().into_inner()),
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::AesLzma(decoder) => finish_owned_aes(decoder.into_inner()),
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::AesPpmd8(decoder) => finish_owned_aes(decoder.into_inner()),
+            #[cfg(all(feature = "aes", feature = "xz"))]
+            Self::ZipCryptoLzma(decoder) => finish_owned_zipcrypto(decoder.into_inner()),
+            #[cfg(all(feature = "aes", feature = "ppmd"))]
+            Self::ZipCryptoPpmd8(decoder) => finish_owned_zipcrypto(decoder.into_inner()),
+        }
+    }
+}
+
+#[cfg(all(feature = "aes", any(feature = "xz", feature = "ppmd")))]
+fn finish_owned_aes<R: Read>(mut reader: ZipAesRead<R>) -> Result<R, StreamError> {
+    let mut scratch = vec![0_u8; BUFFER];
+    while reader.remaining != 0 {
+        let read = reader.read(&mut scratch).map_err(StreamError::io)?;
+        if read == 0 {
             return Err(StreamError::archive(
-                ArchiveError::new(ErrorKind::Integrity)
+                ArchiveError::new(ErrorKind::Malformed)
                     .with_format("zip")
-                    .with_context("WinZip AES password verifier mismatch"),
+                    .with_context("truncated AES compressed extent"),
             ));
         }
-        let mut initial_counter = [0_u8; 16];
-        initial_counter[0] = 1;
-        let cipher =
-            ctr::Ctr128LE::<aes::Aes256>::new_from_slices(&key_material[..32], &initial_counter)
-                .map_err(|_| {
-                    StreamError::archive(
-                        ArchiveError::new(ErrorKind::Malformed)
-                            .with_format("zip")
-                            .with_context("WinZip AES cipher initialization failed"),
-                    )
-                })?;
-        let mac = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(&key_material[32..64])
-            .map_err(|_| {
-                StreamError::archive(
-                    ArchiveError::new(ErrorKind::Malformed)
-                        .with_format("zip")
-                        .with_context("WinZip AES MAC initialization failed"),
-                )
-            })?;
-        key_material.zeroize();
-        Ok(Self { cipher, mac })
     }
+    let (mut input, crypto, _) = reader.into_parts();
+    let mut authentication = [0_u8; 10];
+    input
+        .read_exact(&mut authentication)
+        .map_err(StreamError::io)?;
+    crypto.verify(authentication)?;
+    Ok(input)
+}
 
-    fn decrypt(&mut self, bytes: &mut [u8]) {
-        use ctr::cipher::StreamCipher;
-        use hmac::Mac;
-
-        self.mac.update(bytes);
-        self.cipher.apply_keystream(bytes);
-    }
-
-    fn verify(&self, expected: [u8; 10]) -> Result<(), StreamError> {
-        use hmac::Mac;
-        use subtle::ConstantTimeEq;
-
-        let actual = self.mac.clone().finalize().into_bytes();
-        if actual[..10].ct_eq(&expected).unwrap_u8() != 1 {
-            return Err(StreamError::archive(
-                ArchiveError::new(ErrorKind::Integrity)
-                    .with_format("zip")
-                    .with_context("WinZip AES authentication failed"),
+#[cfg(all(feature = "aes", any(feature = "xz", feature = "ppmd")))]
+fn finish_owned_zipcrypto<R: Read>(mut reader: ZipCryptoRead<R>) -> Result<R, StreamError> {
+    let mut scratch = vec![0_u8; BUFFER];
+    while reader.remaining != 0 {
+        let read = reader.read(&mut scratch).map_err(StreamError::io)?;
+        if read == 0 {
+            return Err(zipcrypto_integrity(
+                "truncated or unauthenticated ZipCrypto compressed extent",
             ));
         }
-        Ok(())
     }
+    let (input, _) = reader.into_parts();
+    Ok(input)
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +297,8 @@ struct ZipIndex {
     raw_name: Vec<u8>,
     method: u16,
     flags: u16,
+    #[cfg_attr(not(feature = "aes"), allow(dead_code))]
+    dos_time: u16,
     crc32: u32,
     compressed_size: u64,
     uncompressed_size: u64,
@@ -156,8 +312,16 @@ struct ZipIndex {
 #[derive(Debug, Clone)]
 struct IsoIndex {
     metadata: EntryMetadata,
+    extents: Arc<[IsoExtent]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IsoExtent {
     data_offset: u64,
     size: u64,
+    unit_bytes: u64,
+    gap_bytes: u64,
+    physical_end: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -222,9 +386,28 @@ enum ZipBody {
         end_offset: u64,
     },
     #[cfg(feature = "xz")]
-    Lzma {
-        reader: Box<lzma_rust2::LzmaReader<std::io::Cursor<Vec<u8>>>>,
+    Xz {
+        compressed_unread: u64,
+        compressed: Vec<u8>,
+        compressed_start: usize,
+        decoder: Box<crate::pipeline_codec::PipelineCodec>,
         expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
+    #[cfg(feature = "xz")]
+    Lzma {
+        expected_crc: Option<u32>,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
+    #[cfg(feature = "ppmd")]
+    Ppmd8 {
+        expected_crc: Option<u32>,
         crc: Crc32,
         produced: u64,
         expected_size: u64,
@@ -249,6 +432,21 @@ enum ZipBody {
         expected_size: u64,
         end_offset: u64,
     },
+    #[cfg(all(
+        feature = "aes",
+        any(feature = "bzip2", feature = "zstd", feature = "xz")
+    ))]
+    AesPipeline {
+        method: u16,
+        encrypted_remaining: u64,
+        compressed: Vec<u8>,
+        compressed_start: usize,
+        crypto: ZipAesDecoder,
+        codec: Box<crate::pipeline_codec::PipelineCodec>,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
     #[cfg(all(feature = "aes", feature = "gzip"))]
     AesDeflate64 {
         encrypted_remaining: u64,
@@ -260,12 +458,55 @@ enum ZipBody {
         expected_size: u64,
         end_offset: u64,
     },
+    #[cfg(feature = "aes")]
+    ZipCryptoStored {
+        encrypted_remaining: u64,
+        decoder: ZipCrypto,
+        expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
+    #[cfg(feature = "aes")]
+    ZipCryptoDeflate {
+        encrypted_remaining: u64,
+        compressed: Vec<u8>,
+        compressed_start: usize,
+        decoder: ZipCrypto,
+        inflate: Box<RawInflateDecoder>,
+        expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
+    #[cfg(all(
+        feature = "aes",
+        any(feature = "bzip2", feature = "zstd", feature = "xz")
+    ))]
+    ZipCryptoPipeline {
+        method: u16,
+        encrypted_remaining: u64,
+        compressed: Vec<u8>,
+        compressed_start: usize,
+        crypto: ZipCrypto,
+        codec: Box<crate::pipeline_codec::PipelineCodec>,
+        expected_crc: u32,
+        crc: Crc32,
+        produced: u64,
+        expected_size: u64,
+        end_offset: u64,
+    },
     Unsupported {
         method: u16,
         end_offset: u64,
     },
     Raw {
+        extents: Arc<[IsoExtent]>,
+        extent_index: usize,
         remaining: u64,
+        unit_remaining: u64,
         end_offset: u64,
     },
     EndEntry,
@@ -285,13 +526,31 @@ impl std::fmt::Debug for ZipBody {
             #[cfg(feature = "zstd")]
             Self::Zstd { .. } => "Zstd",
             #[cfg(feature = "xz")]
+            Self::Xz { .. } => "Xz",
+            #[cfg(feature = "xz")]
             Self::Lzma { .. } => "Lzma",
+            #[cfg(feature = "ppmd")]
+            Self::Ppmd8 { .. } => "Ppmd8",
             #[cfg(feature = "aes")]
             Self::AesStored { .. } => "AesStored",
             #[cfg(feature = "aes")]
             Self::AesDeflate { .. } => "AesDeflate",
+            #[cfg(all(
+                feature = "aes",
+                any(feature = "bzip2", feature = "zstd", feature = "xz")
+            ))]
+            Self::AesPipeline { .. } => "AesPipeline",
             #[cfg(all(feature = "aes", feature = "gzip"))]
             Self::AesDeflate64 { .. } => "AesDeflate64",
+            #[cfg(feature = "aes")]
+            Self::ZipCryptoStored { .. } => "ZipCryptoStored",
+            #[cfg(feature = "aes")]
+            Self::ZipCryptoDeflate { .. } => "ZipCryptoDeflate",
+            #[cfg(all(
+                feature = "aes",
+                any(feature = "bzip2", feature = "zstd", feature = "xz")
+            ))]
+            Self::ZipCryptoPipeline { .. } => "ZipCryptoPipeline",
             Self::Unsupported { .. } => "Unsupported",
             Self::Raw { .. } => "Raw",
             Self::EndEntry => "EndEntry",
@@ -303,12 +562,18 @@ impl std::fmt::Debug for ZipBody {
 
 #[derive(Debug)]
 enum SeekDispatch<R: Read + Seek> {
+    Filtered {
+        reader: Box<ArchiveReader<R>>,
+        format: FormatId,
+    },
     Indexed(Box<IndexedArchiveReader<R>>),
     Udf(Box<crate::udf::UdfSeekReader<R>>),
     #[cfg(feature = "sevenz")]
     SevenZ(Box<crate::sevenz::SevenZSeekReader<R>>),
     Cab(Box<crate::cab::CabSeekReader<R>>),
     Xar(Box<crate::xar::XarSeekReader<R>>),
+    #[cfg(feature = "lha")]
+    Lha(Box<crate::lha::LhaSeekReader<R>>),
 }
 
 /// Seek-capable archive reader.
@@ -322,6 +587,118 @@ pub struct SeekArchiveReader<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> SeekArchiveReader<R> {
+    pub(crate) fn with_split_zip(
+        input: R,
+        disk_starts: &[u64],
+        options: &crate::OpenOptions,
+    ) -> Result<Self, StreamError> {
+        if options
+            .format()
+            .is_some_and(|format| format != FormatId::Zip)
+        {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_format("zip")
+                    .with_context("split ZIP reader requires ZIP format selection"),
+            ));
+        }
+        if options.filter().is_some() || options.volumes().is_some() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_format("zip")
+                    .with_context("split ZIP seek adapter received incoherent open options"),
+            ));
+        }
+        let passwords = options
+            .password_candidates(crate::PasswordRequest::new(
+                FormatId::Zip,
+                None,
+                crate::PasswordPurpose::Header,
+            ))
+            .map_err(StreamError::io)?;
+        Ok(Self {
+            inner: SeekDispatch::Indexed(Box::new(IndexedArchiveReader::with_split_zip(
+                input,
+                options.limits(),
+                passwords,
+                disk_starts,
+            )?)),
+        })
+    }
+
+    /// Opens a seek-capable archive with the common option model.
+    pub fn with_options(mut input: R, options: &crate::OpenOptions) -> Result<Self, StreamError> {
+        if options.volumes().is_some() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_context("use a volume reader for OpenOptions containing VolumeSet"),
+            ));
+        }
+        if options.filter().is_some() {
+            let format = options.format().ok_or_else(|| {
+                StreamError::archive(
+                    ArchiveError::new(ErrorKind::Capability).with_context(
+                        "seek and range readers require an explicit archive format when an outer filter is selected",
+                    ),
+                )
+            })?;
+            let reader = ArchiveReader::with_options(input, options)?;
+            return Ok(Self {
+                inner: SeekDispatch::Filtered {
+                    reader: Box::new(reader),
+                    format,
+                },
+            });
+        }
+        let mut signature = [0_u8; 6];
+        let read = read_prefix(&mut input, &mut signature)?;
+        input.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
+        let password_format = options.format().unwrap_or_else(|| {
+            if read == signature.len() && signature == [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c] {
+                FormatId::SevenZip
+            } else {
+                FormatId::Zip
+            }
+        });
+        let passwords = options
+            .password_candidates(crate::PasswordRequest::new(
+                password_format,
+                None,
+                crate::PasswordPurpose::Header,
+            ))
+            .map_err(StreamError::io)?;
+        if options.format() == Some(FormatId::Lha) {
+            #[cfg(feature = "lha")]
+            {
+                return Ok(Self {
+                    inner: SeekDispatch::Lha(Box::new(crate::lha::LhaSeekReader::new(
+                        input,
+                        options.limits(),
+                    )?)),
+                });
+            }
+            #[cfg(not(feature = "lha"))]
+            {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("lha")
+                        .with_context("LHA support is disabled"),
+                ));
+            }
+        }
+        let reader = Self::open(input, options.limits(), passwords)?;
+        if options
+            .format()
+            .is_some_and(|expected| reader.format() != expected)
+        {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_context("detected archive format does not match OpenOptions format"),
+            ));
+        }
+        Ok(reader)
+    }
+
     /// Opens a seek-required archive with safe default limits.
     pub fn new(input: R) -> Result<Self, StreamError> {
         Self::with_limits(input, Limits::default())
@@ -329,12 +706,12 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
 
     /// Opens a seek-required archive with explicit limits.
     pub fn with_limits(input: R, limits: Limits) -> Result<Self, StreamError> {
-        Self::open(input, limits, None)
+        Self::open(input, limits, Vec::new())
     }
 
     /// Opens an archive with a zeroizing password for authenticated ZIP entries.
     pub fn with_password(input: R, password: SecretBytes) -> Result<Self, StreamError> {
-        Self::open(input, Limits::default(), Some(password))
+        Self::open(input, Limits::default(), vec![password])
     }
 
     /// Opens an archive with explicit limits and a zeroizing password.
@@ -343,15 +720,15 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
         limits: Limits,
         password: SecretBytes,
     ) -> Result<Self, StreamError> {
-        Self::open(input, limits, Some(password))
+        Self::open(input, limits, vec![password])
     }
 
     fn open(
         mut input: R,
         limits: Limits,
-        password: Option<SecretBytes>,
+        passwords: Vec<SecretBytes>,
     ) -> Result<Self, StreamError> {
-        let mut signature = [0_u8; 6];
+        let mut signature = [0_u8; 7];
         let read = read_prefix(&mut input, &mut signature)?;
         input.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
         if read >= 4 && &signature[..4] == b"MSCF" {
@@ -364,12 +741,44 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
                 inner: SeekDispatch::Xar(Box::new(crate::xar::XarSeekReader::new(input, limits)?)),
             });
         }
-        if read == signature.len() && signature == [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c] {
+        if read >= 7
+            && matches!(
+                FormatId::probe(&signature[..read]),
+                libarchive_oxide_core::ProbeResult::Match(FormatId::Lha)
+            )
+        {
+            #[cfg(feature = "lha")]
+            {
+                return Ok(Self {
+                    inner: SeekDispatch::Lha(Box::new(crate::lha::LhaSeekReader::new(
+                        input, limits,
+                    )?)),
+                });
+            }
+            #[cfg(not(feature = "lha"))]
+            {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("lha")
+                        .with_context("LHA support is disabled"),
+                ));
+            }
+        }
+        #[cfg(feature = "lha")]
+        if read >= 2
+            && signature[..2] == *b"MZ"
+            && crate::lha::LhaSeekReader::<R>::find_sfx_header(&mut input)?.is_some()
+        {
+            return Ok(Self {
+                inner: SeekDispatch::Lha(Box::new(crate::lha::LhaSeekReader::new(input, limits)?)),
+            });
+        }
+        if read >= 6 && signature[..6] == [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c] {
             #[cfg(feature = "sevenz")]
             {
                 return Ok(Self {
                     inner: SeekDispatch::SevenZ(Box::new(crate::sevenz::SevenZSeekReader::new(
-                        input, limits, password,
+                        input, limits, passwords,
                     )?)),
                 });
             }
@@ -389,7 +798,7 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
         }
         Ok(Self {
             inner: SeekDispatch::Indexed(Box::new(IndexedArchiveReader::with_options(
-                input, limits, password,
+                input, limits, passwords,
             )?)),
         })
     }
@@ -397,24 +806,41 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
     /// Produces the next archive event.
     pub fn next_event(&mut self) -> Result<ReaderEvent<'_>, StreamError> {
         match &mut self.inner {
+            SeekDispatch::Filtered { reader, .. } => reader.next_event(),
             SeekDispatch::Indexed(reader) => reader.next_event(),
             SeekDispatch::Udf(reader) => reader.next_event(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.next_event(),
             SeekDispatch::Cab(reader) => reader.next_event(),
             SeekDispatch::Xar(reader) => reader.next_event(),
+            #[cfg(feature = "lha")]
+            SeekDispatch::Lha(reader) => reader.next_event(),
         }
     }
 
     /// Skips the current payload while preserving solid-stream decoder state.
     pub fn skip_entry(&mut self) -> Result<(), StreamError> {
         match &mut self.inner {
+            SeekDispatch::Filtered { reader, .. } => loop {
+                match reader.next_event()? {
+                    ReaderEvent::Data(_) => {},
+                    ReaderEvent::EndEntry => return Ok(()),
+                    ReaderEvent::ArchiveMetadata(_) | ReaderEvent::Entry(_) | ReaderEvent::Done => {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Protocol)
+                                .with_context("skip_entry called without an open payload"),
+                        ));
+                    },
+                }
+            },
             SeekDispatch::Indexed(reader) => reader.skip_entry(),
             SeekDispatch::Udf(reader) => reader.skip_entry(),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.skip_entry(),
             SeekDispatch::Cab(reader) => reader.skip_entry(),
             SeekDispatch::Xar(reader) => reader.skip_entry(),
+            #[cfg(feature = "lha")]
+            SeekDispatch::Lha(reader) => reader.skip_entry(),
         }
     }
 
@@ -422,12 +848,15 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
     #[must_use]
     pub const fn format(&self) -> FormatId {
         match &self.inner {
+            SeekDispatch::Filtered { format, .. } => *format,
             SeekDispatch::Indexed(reader) => reader.format(),
             SeekDispatch::Udf(_) => FormatId::Udf,
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(_) => FormatId::SevenZip,
             SeekDispatch::Cab(_) => FormatId::Cab,
             SeekDispatch::Xar(_) => FormatId::Xar,
+            #[cfg(feature = "lha")]
+            SeekDispatch::Lha(_) => FormatId::Lha,
         }
     }
 
@@ -440,24 +869,30 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
     #[cfg_attr(not(feature = "sevenz"), allow(clippy::unnecessary_wraps))]
     pub fn into_inner(self) -> Result<R, ArchiveError> {
         match self.inner {
-            SeekDispatch::Indexed(reader) => Ok(reader.into_inner()),
+            SeekDispatch::Filtered { reader, .. } => reader.into_inner(),
+            SeekDispatch::Indexed(reader) => reader.into_inner(),
             SeekDispatch::Udf(reader) => Ok(reader.into_inner()),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.into_inner(),
             SeekDispatch::Cab(reader) => Ok(reader.into_inner()),
             SeekDispatch::Xar(reader) => Ok(reader.into_inner()),
+            #[cfg(feature = "lha")]
+            SeekDispatch::Lha(reader) => reader.into_inner(),
         }
     }
 
     #[cfg_attr(not(feature = "sevenz"), allow(clippy::unnecessary_wraps))]
     pub(crate) fn with_source<T>(&self, inspect: impl FnOnce(&R) -> T) -> Result<T, ArchiveError> {
         match &self.inner {
-            SeekDispatch::Indexed(reader) => Ok(inspect(reader.source_ref())),
+            SeekDispatch::Filtered { reader, .. } => reader.with_source(inspect),
+            SeekDispatch::Indexed(reader) => reader.source_ref().map(inspect),
             SeekDispatch::Udf(reader) => Ok(inspect(reader.source_ref())),
             #[cfg(feature = "sevenz")]
             SeekDispatch::SevenZ(reader) => reader.with_source(inspect),
             SeekDispatch::Cab(reader) => Ok(inspect(reader.source_ref())),
             SeekDispatch::Xar(reader) => Ok(inspect(reader.source_ref())),
+            #[cfg(feature = "lha")]
+            SeekDispatch::Lha(reader) => Ok(reader.with_source(inspect)),
         }
     }
 }
@@ -466,15 +901,18 @@ impl<R: Read + Seek> SeekArchiveReader<R> {
 enum SeekWriterDispatch<W: Write + Seek> {
     Sequential(Box<ArchiveWriter<W>>),
     Iso(Box<crate::iso_stream::IsoSeekWriter<W>>),
+    #[cfg(not(target_os = "wasi"))]
+    Xar(Box<crate::xar::XarSeekWriter<W>>),
     #[cfg(feature = "sevenz")]
     SevenZ(Box<crate::sevenz::SevenZSeekWriter<W>>),
 }
 
 /// Archive writer for destinations with `Write + Seek`.
 ///
-/// Sequential formats reuse [`ArchiveWriter`]. Seek-native formats may retain
-/// bounded metadata indexes and backpatch structural headers, but never retain
-/// regular-file payloads.
+/// Sequential formats reuse [`ArchiveWriter`]. Seek-native formats retain
+/// bounded metadata indexes and may backpatch structural headers. XAR is the
+/// exception for payload handling: its TOC precedes its heap, so the writer uses
+/// a bounded spool that spills regular-file payloads to a temporary file.
 #[derive(Debug)]
 pub struct SeekArchiveWriter<W: Write + Seek> {
     inner: SeekWriterDispatch<W>,
@@ -482,6 +920,66 @@ pub struct SeekArchiveWriter<W: Write + Seek> {
 }
 
 impl<W: Write + Seek> SeekArchiveWriter<W> {
+    #[cfg(not(target_os = "wasi"))]
+    pub(crate) fn with_zip_method_and_backend(
+        output: W,
+        method: ZipMethod,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
+        Self {
+            inner: SeekWriterDispatch::Sequential(Box::new(
+                ArchiveWriter::with_zip_method_and_backend(output, method, limits, backend),
+            )),
+            format: FormatId::Zip,
+        }
+    }
+
+    #[cfg(feature = "sevenz")]
+    pub(crate) fn with_sevenz_options(
+        output: W,
+        options: SevenZipWriteOptions,
+        limits: Limits,
+    ) -> Result<Self, StreamError> {
+        Ok(Self {
+            inner: SeekWriterDispatch::SevenZ(Box::new(
+                crate::sevenz::SevenZSeekWriter::new_with_options(output, limits, options)?,
+            )),
+            format: FormatId::SevenZip,
+        })
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    pub(crate) fn with_xar_options(
+        output: W,
+        options: XarWriteOptions,
+        limits: Limits,
+    ) -> Result<Self, StreamError> {
+        Ok(Self {
+            inner: SeekWriterDispatch::Xar(Box::new(crate::xar::XarSeekWriter::new_with_options(
+                output, limits, options,
+            )?)),
+            format: FormatId::Xar,
+        })
+    }
+
+    #[cfg(all(feature = "sevenz", feature = "aes"))]
+    pub(crate) fn with_sevenz_options_and_password(
+        output: W,
+        options: SevenZipWriteOptions,
+        password: &SecretBytes,
+        limits: Limits,
+    ) -> Result<Self, StreamError> {
+        Ok(Self {
+            inner: SeekWriterDispatch::SevenZ(Box::new(
+                crate::sevenz::SevenZSeekWriter::new_with_options_and_password(
+                    output, limits, options, password,
+                )?,
+            )),
+            format: FormatId::SevenZip,
+        })
+    }
+
     /// Creates a writer for one built-in format with explicit limits.
     pub fn with_format(output: W, format: FormatId, limits: Limits) -> Result<Self, StreamError> {
         let inner = match format {
@@ -510,6 +1008,10 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
             FormatId::Iso9660 => SeekWriterDispatch::Iso(Box::new(
                 crate::iso_stream::IsoSeekWriter::new(output, limits)?,
             )),
+            #[cfg(not(target_os = "wasi"))]
+            FormatId::Xar => {
+                SeekWriterDispatch::Xar(Box::new(crate::xar::XarSeekWriter::new(output, limits)?))
+            },
             FormatId::Udf => {
                 return Err(StreamError::archive(
                     ArchiveError::new(ErrorKind::Unsupported)
@@ -532,6 +1034,8 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
         match &mut self.inner {
             SeekWriterDispatch::Sequential(writer) => writer.set_archive_metadata(metadata),
             SeekWriterDispatch::Iso(writer) => writer.set_archive_metadata(metadata),
+            #[cfg(not(target_os = "wasi"))]
+            SeekWriterDispatch::Xar(writer) => writer.set_archive_metadata(metadata),
             #[cfg(feature = "sevenz")]
             SeekWriterDispatch::SevenZ(writer) => writer.set_archive_metadata(metadata),
         }
@@ -543,6 +1047,8 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
         match &mut self.inner {
             SeekWriterDispatch::Sequential(writer) => writer.start_entry(metadata),
             SeekWriterDispatch::Iso(writer) => writer.start_entry(metadata),
+            #[cfg(not(target_os = "wasi"))]
+            SeekWriterDispatch::Xar(writer) => writer.start_entry(metadata),
             #[cfg(feature = "sevenz")]
             SeekWriterDispatch::SevenZ(writer) => writer.start_entry(metadata),
         }
@@ -553,6 +1059,8 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
         match &mut self.inner {
             SeekWriterDispatch::Sequential(writer) => writer.write_data(bytes),
             SeekWriterDispatch::Iso(writer) => writer.write_data(bytes),
+            #[cfg(not(target_os = "wasi"))]
+            SeekWriterDispatch::Xar(writer) => writer.write_data(bytes),
             #[cfg(feature = "sevenz")]
             SeekWriterDispatch::SevenZ(writer) => writer.write_data(bytes),
         }
@@ -563,6 +1071,8 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
         match &mut self.inner {
             SeekWriterDispatch::Sequential(writer) => writer.end_entry(),
             SeekWriterDispatch::Iso(writer) => writer.end_entry(),
+            #[cfg(not(target_os = "wasi"))]
+            SeekWriterDispatch::Xar(writer) => writer.end_entry(),
             #[cfg(feature = "sevenz")]
             SeekWriterDispatch::SevenZ(writer) => writer.end_entry(),
         }
@@ -573,6 +1083,8 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
         match self.inner {
             SeekWriterDispatch::Sequential(writer) => (*writer).finish(),
             SeekWriterDispatch::Iso(writer) => (*writer).finish(),
+            #[cfg(not(target_os = "wasi"))]
+            SeekWriterDispatch::Xar(writer) => (*writer).finish(),
             #[cfg(feature = "sevenz")]
             SeekWriterDispatch::SevenZ(writer) => (*writer).finish(),
         }
@@ -583,6 +1095,8 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
         match self.inner {
             SeekWriterDispatch::Sequential(writer) => (*writer).abort(),
             SeekWriterDispatch::Iso(writer) => Ok((*writer).abort()),
+            #[cfg(not(target_os = "wasi"))]
+            SeekWriterDispatch::Xar(writer) => Ok((*writer).abort()),
             #[cfg(feature = "sevenz")]
             SeekWriterDispatch::SevenZ(writer) => (*writer).abort(),
         }
@@ -595,9 +1109,8 @@ impl<W: Write + Seek> SeekArchiveWriter<W> {
     }
 }
 
-#[derive(Debug)]
-struct IndexedArchiveReader<R> {
-    input: R,
+struct IndexedArchiveReader<R: Read> {
+    input: Option<R>,
     limits: Limits,
     format: FormatId,
     archive_metadata: Option<ArchiveMetadata>,
@@ -606,23 +1119,173 @@ struct IndexedArchiveReader<R> {
     body: ZipBody,
     event_data: Vec<u8>,
     decoded_total: u64,
+    #[cfg(any(feature = "xz", feature = "ppmd"))]
+    owned_decoder: Option<OwnedZipDecoder<R>>,
     #[cfg_attr(not(feature = "aes"), allow(dead_code))]
-    password: Option<SecretBytes>,
+    passwords: Vec<SecretBytes>,
+}
+
+impl<R: Read> core::fmt::Debug for IndexedArchiveReader<R> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("IndexedArchiveReader")
+            .field("format", &self.format)
+            .field("entries", &self.entries.len())
+            .field("next_entry", &self.next_entry)
+            .field("body", &self.body)
+            .field("decoded_total", &self.decoded_total)
+            .finish_non_exhaustive()
+    }
+}
+
+fn indexed_input_mut<R>(input: &mut Option<R>) -> Result<&mut R, StreamError> {
+    input.as_mut().ok_or_else(|| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("zip")
+                .with_context("archive source is owned by an active payload decoder"),
+        )
+    })
+}
+
+#[cfg(feature = "aes")]
+fn encrypted_pipeline_filter(method: u16) -> Option<FilterId> {
+    match method {
+        #[cfg(feature = "bzip2")]
+        12 => Some(FilterId::Bzip2),
+        #[cfg(feature = "zstd")]
+        93 => Some(FilterId::Zstd),
+        #[cfg(feature = "xz")]
+        95 => Some(FilterId::Xz),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "aes")]
+fn encrypted_owned_method_supported(method: u16) -> bool {
+    match method {
+        #[cfg(feature = "xz")]
+        14 => true,
+        #[cfg(feature = "ppmd")]
+        98 => true,
+        _ => false,
+    }
+}
+
+#[cfg(any(feature = "aes", feature = "xz", feature = "ppmd"))]
+fn zipcrypto_integrity(context: &'static str) -> StreamError {
+    StreamError::archive(
+        ArchiveError::new(ErrorKind::Integrity)
+            .with_format("zip")
+            .with_context(context),
+    )
+}
+
+#[cfg(feature = "aes")]
+fn zipcrypto_validation_error(error: StreamError) -> StreamError {
+    if error.kind() == ErrorKind::Malformed {
+        zipcrypto_integrity("ZipCrypto password or encrypted payload failed validation")
+    } else {
+        error
+    }
+}
+
+#[cfg(all(feature = "aes", feature = "xz"))]
+fn malformed(context: &'static str) -> StreamError {
+    StreamError::archive(
+        ArchiveError::new(ErrorKind::Malformed)
+            .with_format("zip")
+            .with_context(context),
+    )
+}
+
+#[cfg(all(feature = "aes", feature = "xz"))]
+fn read_zip_lzma_properties<R: Read>(
+    input: &mut R,
+    limits: Limits,
+) -> Result<(u8, u32), StreamError> {
+    let malformed = |context: &'static str| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context(context),
+        )
+    };
+    let mut head = [0_u8; 9];
+    input.read_exact(&mut head).map_err(StreamError::io)?;
+    if u16::from_le_bytes([head[2], head[3]]) != 5 {
+        return Err(malformed("ZIP LZMA property size is not 5"));
+    }
+    let dict_size = u32::from_le_bytes([head[5], head[6], head[7], head[8]]);
+    if limits
+        .codec_memory()
+        .is_some_and(|maximum| u64::from(dict_size) > maximum as u64)
+    {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Limit)
+                .with_format("zip")
+                .with_context("LZMA dictionary exceeds codec workspace limit"),
+        ));
+    }
+    Ok((head[4], dict_size))
+}
+
+#[cfg(all(feature = "aes", feature = "ppmd"))]
+fn read_zip_ppmd_parameters<R: Read>(
+    input: &mut R,
+    limits: Limits,
+    compressed_size: u64,
+) -> Result<(u32, u32, u32), StreamError> {
+    let malformed = |context: &'static str| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context(context),
+        )
+    };
+    if compressed_size < 6 {
+        return Err(malformed("ZIP PPMd range stream is truncated"));
+    }
+    let mut parameter_bytes = [0_u8; 2];
+    input
+        .read_exact(&mut parameter_bytes)
+        .map_err(StreamError::io)?;
+    let parameters = u16::from_le_bytes(parameter_bytes);
+    let order = u32::from((parameters & 0x0f) + 1);
+    let memory_mb = u32::from(((parameters >> 4) & 0xff) + 1);
+    let memory_size = memory_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| malformed("ZIP PPMd model size overflows"))?;
+    let restoration = u32::from((parameters >> 12) & 0x0f);
+    if !(2..=16).contains(&order) || restoration > 2 {
+        return Err(malformed("invalid ZIP PPMd parameters"));
+    }
+    if limits
+        .codec_memory()
+        .is_some_and(|maximum| memory_size as usize > maximum)
+    {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Limit)
+                .with_format("zip")
+                .with_context("ZIP PPMd model exceeds codec workspace limit"),
+        ));
+    }
+    Ok((order, memory_size, restoration))
 }
 
 impl<R: Read + Seek> IndexedArchiveReader<R> {
     fn with_options(
         mut input: R,
         limits: Limits,
-        password: Option<SecretBytes>,
+        passwords: Vec<SecretBytes>,
     ) -> Result<Self, StreamError> {
         let mut signature = [0_u8; 6];
         let read = read_prefix(&mut input, &mut signature)?;
         input.seek(SeekFrom::Start(0)).map_err(StreamError::io)?;
         if read >= 4 && (&signature[..4] == b"PK\x03\x04" || &signature[..4] == b"PK\x05\x06") {
-            let (archive_metadata, entries) = parse_zip_index(&mut input, limits)?;
+            let (archive_metadata, entries) = parse_zip_index(&mut input, limits, None)?;
             return Ok(Self {
-                input,
+                input: Some(input),
                 limits,
                 format: FormatId::Zip,
                 archive_metadata: Some(archive_metadata),
@@ -631,7 +1294,9 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 body: ZipBody::Idle,
                 event_data: Vec::with_capacity(BUFFER),
                 decoded_total: 0,
-                password,
+                #[cfg(any(feature = "xz", feature = "ppmd"))]
+                owned_decoder: None,
+                passwords,
             });
         }
         if read == 6 && signature == [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c] {
@@ -649,7 +1314,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
         if iso_read == iso_signature.len() && &iso_signature == b"CD001" {
             let (archive_metadata, entries) = parse_iso_index(&mut input, limits)?;
             return Ok(Self {
-                input,
+                input: Some(input),
                 limits,
                 format: FormatId::Iso9660,
                 archive_metadata: Some(archive_metadata),
@@ -658,13 +1323,38 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 body: ZipBody::Idle,
                 event_data: Vec::with_capacity(BUFFER),
                 decoded_total: 0,
-                password,
+                #[cfg(any(feature = "xz", feature = "ppmd"))]
+                owned_decoder: None,
+                passwords,
             });
         }
         Err(StreamError::archive(
             ArchiveError::new(ErrorKind::Unsupported)
                 .with_context("no seek-capable archive format matched"),
         ))
+    }
+
+    fn with_split_zip(
+        mut input: R,
+        limits: Limits,
+        passwords: Vec<SecretBytes>,
+        disk_starts: &[u64],
+    ) -> Result<Self, StreamError> {
+        let (archive_metadata, entries) = parse_zip_index(&mut input, limits, Some(disk_starts))?;
+        Ok(Self {
+            input: Some(input),
+            limits,
+            format: FormatId::Zip,
+            archive_metadata: Some(archive_metadata),
+            entries: entries.into_iter().map(IndexedEntry::Zip).collect(),
+            next_entry: 0,
+            body: ZipBody::Idle,
+            event_data: Vec::with_capacity(BUFFER),
+            decoded_total: 0,
+            #[cfg(any(feature = "xz", feature = "ppmd"))]
+            owned_decoder: None,
+            passwords,
+        })
     }
 
     /// Produces the next archive event.
@@ -719,7 +1409,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                         )
                     })?;
                     self.event_data.resize(count, 0);
-                    self.input
+                    indexed_input_mut(&mut self.input)?
                         .read_exact(&mut self.event_data)
                         .map_err(StreamError::io)?;
                     crc.update(&self.event_data);
@@ -748,7 +1438,9 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                 )
                             })?;
                         let mut next = vec![0; count];
-                        self.input.read_exact(&mut next).map_err(StreamError::io)?;
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut next)
+                            .map_err(StreamError::io)?;
                         *compressed = next;
                         *compressed_unread -= count as u64;
                         *compressed_start = 0;
@@ -864,7 +1556,9 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                 )
                             })?;
                         compressed.resize(count, 0);
-                        self.input.read_exact(compressed).map_err(StreamError::io)?;
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(compressed)
+                            .map_err(StreamError::io)?;
                         *compressed_unread -= count as u64;
                         *compressed_start = 0;
                     }
@@ -996,7 +1690,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                             })?,
                             0,
                         );
-                        self.input
+                        indexed_input_mut(&mut self.input)?
                             .read_exact(&mut compressed[old_len..])
                             .map_err(StreamError::io)?;
                         *compressed_unread -= count as u64;
@@ -1028,7 +1722,9 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                 )
                             })?;
                         let mut next = vec![0; count];
-                        self.input.read_exact(&mut next).map_err(StreamError::io)?;
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut next)
+                            .map_err(StreamError::io)?;
                         *compressed = next;
                         *compressed_unread -= count as u64;
                         *compressed_start = 0;
@@ -1155,7 +1851,9 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                 )
                             })?;
                         let mut next = vec![0; count];
-                        self.input.read_exact(&mut next).map_err(StreamError::io)?;
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut next)
+                            .map_err(StreamError::io)?;
                         *compressed = next;
                         *compressed_unread -= count as u64;
                         *compressed_start = 0;
@@ -1223,21 +1921,132 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                     }
                 },
                 #[cfg(feature = "xz")]
-                ZipBody::Lzma {
-                    reader,
+                ZipBody::Xz {
+                    compressed_unread,
+                    compressed,
+                    compressed_start,
+                    decoder,
                     expected_crc,
                     crc,
                     produced,
                     expected_size,
                     ..
                 } => {
+                    if *compressed_start == compressed.len() && *compressed_unread != 0 {
+                        let count = usize::try_from((*compressed_unread).min(BUFFER as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context("compressed read size exceeds address space"),
+                                )
+                            })?;
+                        let mut next = vec![0; count];
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut next)
+                            .map_err(StreamError::io)?;
+                        *compressed = next;
+                        *compressed_unread -= count as u64;
+                        *compressed_start = 0;
+                    }
                     self.event_data.resize(BUFFER, 0);
-                    let n = reader.read(&mut self.event_data).map_err(|_| {
+                    let end = if *compressed_unread == 0 {
+                        EndOfInput::End
+                    } else {
+                        EndOfInput::More
+                    };
+                    let step = decoder
+                        .process(&compressed[*compressed_start..], &mut self.event_data, end)
+                        .map_err(StreamError::archive)?;
+                    *compressed_start += step.consumed;
+                    self.event_data.truncate(step.produced);
+                    crc.update(&self.event_data);
+                    *produced = produced.checked_add(step.produced as u64).ok_or_else(|| {
                         StreamError::archive(
-                            ArchiveError::new(ErrorKind::Malformed)
+                            ArchiveError::new(ErrorKind::Limit)
                                 .with_format("zip")
-                                .with_context("truncated or invalid LZMA stream"),
+                                .with_context("XZ output count overflow"),
                         )
+                    })?;
+                    if *produced > *expected_size {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Integrity)
+                                .with_format("zip")
+                                .with_context("XZ output exceeds central-directory size"),
+                        ));
+                    }
+                    let next_total = self
+                        .decoded_total
+                        .checked_add(step.produced as u64)
+                        .ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("decoded total overflow"),
+                            )
+                        })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    if matches!(step.status, CodecStatus::Done) {
+                        if *produced != *expected_size {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("XZ size does not match central directory"),
+                            ));
+                        }
+                        if crc.finalize() != *expected_crc {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("XZ entry CRC32 mismatch"),
+                            ));
+                        }
+                        self.body = ZipBody::EndEntry;
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
+                #[cfg(feature = "xz")]
+                ZipBody::Lzma {
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    end_offset,
+                } => {
+                    let decoder = self.owned_decoder.as_mut().ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Protocol)
+                                .with_format("zip")
+                                .with_context("ZIP LZMA decoder state is missing"),
+                        )
+                    })?;
+                    self.event_data.resize(BUFFER, 0);
+                    let zipcrypto = decoder.is_zipcrypto();
+                    let n = decoder.read(&mut self.event_data).map_err(|_| {
+                        if zipcrypto {
+                            zipcrypto_integrity(
+                                "ZipCrypto LZMA password or payload failed validation",
+                            )
+                        } else {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Malformed)
+                                    .with_format("zip")
+                                    .with_context("truncated or invalid LZMA stream"),
+                            )
+                        }
                     })?;
                     self.event_data.truncate(n);
                     crc.update(&self.event_data);
@@ -1275,18 +2084,198 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                     .with_context("LZMA size does not match central directory"),
                             ));
                         }
-                        if crc.finalize() != *expected_crc {
+                        if expected_crc
+                            .as_ref()
+                            .is_some_and(|expected| crc.finalize() != *expected)
+                        {
                             return Err(StreamError::archive(
                                 ArchiveError::new(ErrorKind::Integrity)
                                     .with_format("zip")
                                     .with_context("LZMA entry CRC32 mismatch"),
                             ));
                         }
+                        let decoder = self.owned_decoder.take().ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Protocol)
+                                    .with_format("zip")
+                                    .with_context("ZIP LZMA decoder disappeared"),
+                            )
+                        })?;
+                        let mut input = decoder.finish()?;
+                        input
+                            .seek(SeekFrom::Start(*end_offset))
+                            .map_err(StreamError::io)?;
+                        self.input = Some(input);
                         self.body = ZipBody::EndEntry;
                     }
                     if !self.event_data.is_empty() {
                         return Ok(ReaderEvent::Data(&self.event_data));
                     }
+                },
+                #[cfg(feature = "ppmd")]
+                ZipBody::Ppmd8 {
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    end_offset,
+                } => {
+                    let decoder = self.owned_decoder.as_mut().ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Protocol)
+                                .with_format("zip")
+                                .with_context("ZIP PPMd decoder state is missing"),
+                        )
+                    })?;
+                    self.event_data.resize(BUFFER, 0);
+                    let zipcrypto = decoder.is_zipcrypto();
+                    let n = decoder.read(&mut self.event_data).map_err(|_| {
+                        if zipcrypto {
+                            zipcrypto_integrity(
+                                "ZipCrypto PPMd password or payload failed validation",
+                            )
+                        } else {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Malformed)
+                                    .with_format("zip")
+                                    .with_context("truncated or invalid ZIP PPMd stream"),
+                            )
+                        }
+                    })?;
+                    self.event_data.truncate(n);
+                    crc.update(&self.event_data);
+                    *produced = produced.checked_add(n as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("PPMd output count overflow"),
+                        )
+                    })?;
+                    if *produced > *expected_size {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Integrity)
+                                .with_format("zip")
+                                .with_context("PPMd output exceeds central-directory size"),
+                        ));
+                    }
+                    let next_total = self.decoded_total.checked_add(n as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total overflow"),
+                        )
+                    })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    if n == 0 {
+                        if *produced != *expected_size {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("PPMd size does not match central directory"),
+                            ));
+                        }
+                        if expected_crc
+                            .as_ref()
+                            .is_some_and(|expected| crc.finalize() != *expected)
+                        {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("PPMd entry CRC32 mismatch"),
+                            ));
+                        }
+                        let decoder = self.owned_decoder.take().ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Protocol)
+                                    .with_format("zip")
+                                    .with_context("ZIP PPMd decoder disappeared"),
+                            )
+                        })?;
+                        let mut input = decoder.finish()?;
+                        input
+                            .seek(SeekFrom::Start(*end_offset))
+                            .map_err(StreamError::io)?;
+                        self.input = Some(input);
+                        self.body = ZipBody::EndEntry;
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
+                #[cfg(feature = "aes")]
+                ZipBody::ZipCryptoStored {
+                    encrypted_remaining,
+                    decoder,
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    if *encrypted_remaining == 0 {
+                        if *produced != *expected_size {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context(
+                                        "ZipCrypto stored size does not match central directory",
+                                    ),
+                            ));
+                        }
+                        if crc.finalize() != *expected_crc {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Integrity)
+                                    .with_format("zip")
+                                    .with_context("ZipCrypto stored entry CRC32 mismatch"),
+                            ));
+                        }
+                        self.body = ZipBody::EndEntry;
+                        continue;
+                    }
+                    let count = usize::try_from((*encrypted_remaining).min(BUFFER as u64))
+                        .map_err(|_| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context(
+                                        "ZipCrypto stored read size exceeds address space",
+                                    ),
+                            )
+                        })?;
+                    self.event_data.resize(count, 0);
+                    indexed_input_mut(&mut self.input)?
+                        .read_exact(&mut self.event_data)
+                        .map_err(StreamError::io)?;
+                    decoder.decrypt(&mut self.event_data);
+                    *encrypted_remaining -= count as u64;
+                    *produced = produced.checked_add(count as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("ZipCrypto stored output count overflow"),
+                        )
+                    })?;
+                    if *produced > *expected_size {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Integrity)
+                                .with_format("zip")
+                                .with_context("ZipCrypto stored payload exceeds declared size"),
+                        ));
+                    }
+                    crc.update(&self.event_data);
+                    self.account_decoded(count)?;
+                    return Ok(ReaderEvent::Data(&self.event_data));
                 },
                 #[cfg(feature = "aes")]
                 ZipBody::AesStored {
@@ -1298,7 +2287,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 } => {
                     if *encrypted_remaining == 0 {
                         let mut authentication = [0_u8; 10];
-                        self.input
+                        indexed_input_mut(&mut self.input)?
                             .read_exact(&mut authentication)
                             .map_err(StreamError::io)?;
                         decoder.verify(authentication)?;
@@ -1323,7 +2312,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                             )
                         })?;
                     self.event_data.resize(count, 0);
-                    self.input
+                    indexed_input_mut(&mut self.input)?
                         .read_exact(&mut self.event_data)
                         .map_err(StreamError::io)?;
                     decoder.decrypt(&mut self.event_data);
@@ -1344,6 +2333,268 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                     }
                     self.account_decoded(count)?;
                     return Ok(ReaderEvent::Data(&self.event_data));
+                },
+                #[cfg(feature = "aes")]
+                ZipBody::ZipCryptoDeflate {
+                    encrypted_remaining,
+                    compressed,
+                    compressed_start,
+                    decoder,
+                    inflate: state,
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    if *compressed_start == compressed.len() && *encrypted_remaining != 0 {
+                        let count = usize::try_from((*encrypted_remaining).min(BUFFER as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context(
+                                            "ZipCrypto deflate read size exceeds address space",
+                                        ),
+                                )
+                            })?;
+                        let mut next = vec![0; count];
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut next)
+                            .map_err(StreamError::io)?;
+                        decoder.decrypt(&mut next);
+                        *compressed = next;
+                        *encrypted_remaining -= count as u64;
+                        *compressed_start = 0;
+                    }
+                    self.event_data.resize(BUFFER, 0);
+                    let input = &compressed[*compressed_start..];
+                    let end = if *encrypted_remaining == 0 {
+                        EndOfInput::End
+                    } else {
+                        EndOfInput::More
+                    };
+                    let step = state
+                        .process(input, &mut self.event_data, end)
+                        .and_then(|step| step.validate(input.len(), self.event_data.len()))
+                        .map_err(StreamError::archive)
+                        .map_err(zipcrypto_validation_error)?;
+                    *compressed_start += step.consumed;
+                    self.event_data.truncate(step.produced);
+                    crc.update(&self.event_data);
+                    *produced = produced.checked_add(step.produced as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("ZipCrypto deflate output count overflow"),
+                        )
+                    })?;
+                    if *produced > *expected_size {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Integrity)
+                                .with_format("zip")
+                                .with_context("ZipCrypto deflate payload exceeds declared size"),
+                        ));
+                    }
+                    let next_total = self
+                        .decoded_total
+                        .checked_add(step.produced as u64)
+                        .ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("decoded total overflow"),
+                            )
+                        })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    match step.status {
+                        CodecStatus::Done => {
+                            if *compressed_start != compressed.len()
+                                || *encrypted_remaining != 0
+                                || *produced != *expected_size
+                            {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Integrity)
+                                        .with_format("zip")
+                                        .with_context(
+                                            "ZipCrypto deflate extent disagrees with central directory",
+                                        ),
+                                ));
+                            }
+                            if crc.finalize() != *expected_crc {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Integrity)
+                                        .with_format("zip")
+                                        .with_context("ZipCrypto deflate entry CRC32 mismatch"),
+                                ));
+                            }
+                            self.body = ZipBody::EndEntry;
+                        },
+                        CodecStatus::NeedInput | CodecStatus::NeedOutput => {
+                            if step.consumed == 0 && step.produced == 0 && *encrypted_remaining == 0
+                            {
+                                return Err(zipcrypto_integrity(
+                                    "truncated or unauthenticated ZipCrypto deflate stream",
+                                ));
+                            }
+                        },
+                        _ => {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Protocol)
+                                    .with_format("zip")
+                                    .with_context(
+                                        "ZipCrypto deflate decoder returned an unknown status",
+                                    ),
+                            ));
+                        },
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
+                #[cfg(all(
+                    feature = "aes",
+                    any(feature = "bzip2", feature = "zstd", feature = "xz")
+                ))]
+                ZipBody::ZipCryptoPipeline {
+                    method,
+                    encrypted_remaining,
+                    compressed,
+                    compressed_start,
+                    crypto,
+                    codec,
+                    expected_crc,
+                    crc,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    if *compressed_start == compressed.len() && *encrypted_remaining != 0 {
+                        let count = usize::try_from((*encrypted_remaining).min(BUFFER as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context(
+                                            "ZipCrypto compressed read size exceeds address space",
+                                        ),
+                                )
+                            })?;
+                        let mut next = vec![0; count];
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut next)
+                            .map_err(StreamError::io)?;
+                        crypto.decrypt(&mut next);
+                        *compressed = next;
+                        *encrypted_remaining -= count as u64;
+                        *compressed_start = 0;
+                    }
+                    self.event_data.resize(BUFFER, 0);
+                    let input = &compressed[*compressed_start..];
+                    let end = if *encrypted_remaining == 0 {
+                        EndOfInput::End
+                    } else {
+                        EndOfInput::More
+                    };
+                    let step = codec
+                        .process(input, &mut self.event_data, end)
+                        .and_then(|step| step.validate(input.len(), self.event_data.len()))
+                        .map_err(StreamError::archive)
+                        .map_err(zipcrypto_validation_error)?;
+                    *compressed_start += step.consumed;
+                    self.event_data.truncate(step.produced);
+                    crc.update(&self.event_data);
+                    *produced = produced.checked_add(step.produced as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("ZipCrypto compressed output count overflow"),
+                        )
+                    })?;
+                    if *produced > *expected_size {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Integrity)
+                                .with_format("zip")
+                                .with_context("ZipCrypto output exceeds central-directory size"),
+                        ));
+                    }
+                    let next_total = self
+                        .decoded_total
+                        .checked_add(step.produced as u64)
+                        .ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("decoded total overflow"),
+                            )
+                        })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    match step.status {
+                        CodecStatus::Done => {
+                            if *compressed_start != compressed.len()
+                                || *encrypted_remaining != 0
+                                || *produced != *expected_size
+                            {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Integrity)
+                                        .with_format("zip")
+                                        .with_context(format!(
+                                            "ZipCrypto method {method} extent disagrees with central directory"
+                                        )),
+                                ));
+                            }
+                            if crc.finalize() != *expected_crc {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Integrity)
+                                        .with_format("zip")
+                                        .with_context("ZipCrypto compressed entry CRC32 mismatch"),
+                                ));
+                            }
+                            self.body = ZipBody::EndEntry;
+                        },
+                        CodecStatus::NeedInput | CodecStatus::NeedOutput => {
+                            if step.consumed == 0 && step.produced == 0 && *encrypted_remaining == 0
+                            {
+                                return Err(zipcrypto_integrity(
+                                    "truncated or unauthenticated ZipCrypto compressed stream",
+                                ));
+                            }
+                        },
+                        _ => {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Protocol)
+                                    .with_format("zip")
+                                    .with_context(
+                                        "ZipCrypto compressed decoder returned an unknown status",
+                                    ),
+                            ));
+                        },
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
                 },
                 #[cfg(feature = "aes")]
                 ZipBody::AesDeflate {
@@ -1368,7 +2619,9 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                 )
                             })?;
                         let mut next = vec![0; count];
-                        self.input.read_exact(&mut next).map_err(StreamError::io)?;
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut next)
+                            .map_err(StreamError::io)?;
                         decoder.decrypt(&mut next);
                         *compressed = next;
                         *encrypted_remaining -= count as u64;
@@ -1438,7 +2691,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                 ));
                             }
                             let mut authentication = [0_u8; 10];
-                            self.input
+                            indexed_input_mut(&mut self.input)?
                                 .read_exact(&mut authentication)
                                 .map_err(StreamError::io)?;
                             decoder.verify(authentication)?;
@@ -1459,6 +2712,135 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                 ArchiveError::new(ErrorKind::Protocol)
                                     .with_format("zip")
                                     .with_context("AES deflate decoder returned an unknown status"),
+                            ));
+                        },
+                    }
+                    if !self.event_data.is_empty() {
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
+                },
+                #[cfg(all(
+                    feature = "aes",
+                    any(feature = "bzip2", feature = "zstd", feature = "xz")
+                ))]
+                ZipBody::AesPipeline {
+                    method,
+                    encrypted_remaining,
+                    compressed,
+                    compressed_start,
+                    crypto,
+                    codec,
+                    produced,
+                    expected_size,
+                    ..
+                } => {
+                    if *compressed_start == compressed.len() && *encrypted_remaining != 0 {
+                        let count = usize::try_from((*encrypted_remaining).min(BUFFER as u64))
+                            .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("zip")
+                                        .with_context(
+                                            "AES compressed read size exceeds address space",
+                                        ),
+                                )
+                            })?;
+                        let mut next = vec![0; count];
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut next)
+                            .map_err(StreamError::io)?;
+                        crypto.decrypt(&mut next);
+                        *compressed = next;
+                        *encrypted_remaining -= count as u64;
+                        *compressed_start = 0;
+                    }
+                    self.event_data.resize(BUFFER, 0);
+                    let input = &compressed[*compressed_start..];
+                    let end = if *encrypted_remaining == 0 {
+                        EndOfInput::End
+                    } else {
+                        EndOfInput::More
+                    };
+                    let step = codec
+                        .process(input, &mut self.event_data, end)
+                        .and_then(|step| step.validate(input.len(), self.event_data.len()))
+                        .map_err(StreamError::archive)?;
+                    *compressed_start += step.consumed;
+                    self.event_data.truncate(step.produced);
+                    *produced = produced.checked_add(step.produced as u64).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("AES compressed output count overflow"),
+                        )
+                    })?;
+                    if *produced > *expected_size {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Integrity)
+                                .with_format("zip")
+                                .with_context("AES output exceeds central-directory size"),
+                        ));
+                    }
+                    let next_total = self
+                        .decoded_total
+                        .checked_add(step.produced as u64)
+                        .ok_or_else(|| {
+                            StreamError::archive(
+                                ArchiveError::new(ErrorKind::Limit)
+                                    .with_format("zip")
+                                    .with_context("decoded total overflow"),
+                            )
+                        })?;
+                    if self
+                        .limits
+                        .decoded_total()
+                        .is_some_and(|limit| next_total > limit)
+                    {
+                        return Err(StreamError::archive(
+                            ArchiveError::new(ErrorKind::Limit)
+                                .with_format("zip")
+                                .with_context("decoded total exceeds configured limit"),
+                        ));
+                    }
+                    self.decoded_total = next_total;
+                    match step.status {
+                        CodecStatus::Done => {
+                            if *compressed_start != compressed.len()
+                                || *encrypted_remaining != 0
+                                || *produced != *expected_size
+                            {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Integrity)
+                                        .with_format("zip")
+                                        .with_context(format!(
+                                            "AES method {method} extent disagrees with central directory"
+                                        )),
+                                ));
+                            }
+                            let mut authentication = [0_u8; 10];
+                            indexed_input_mut(&mut self.input)?
+                                .read_exact(&mut authentication)
+                                .map_err(StreamError::io)?;
+                            crypto.verify(authentication)?;
+                            self.body = ZipBody::EndEntry;
+                        },
+                        CodecStatus::NeedInput | CodecStatus::NeedOutput => {
+                            if step.consumed == 0 && step.produced == 0 && *encrypted_remaining == 0
+                            {
+                                return Err(StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Malformed)
+                                        .with_format("zip")
+                                        .with_context("truncated AES compressed stream"),
+                                ));
+                            }
+                        },
+                        _ => {
+                            return Err(StreamError::archive(
+                                ArchiveError::new(ErrorKind::Protocol)
+                                    .with_format("zip")
+                                    .with_context(
+                                        "AES compressed decoder returned an unknown status",
+                                    ),
                             ));
                         },
                     }
@@ -1489,7 +2871,9 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                                 )
                             })?;
                         compressed.resize(count, 0);
-                        self.input.read_exact(compressed).map_err(StreamError::io)?;
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(compressed)
+                            .map_err(StreamError::io)?;
                         decoder.decrypt(compressed);
                         *encrypted_remaining -= count as u64;
                         *compressed_start = 0;
@@ -1562,7 +2946,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                             ));
                         }
                         let mut authentication = [0_u8; 10];
-                        self.input
+                        indexed_input_mut(&mut self.input)?
                             .read_exact(&mut authentication)
                             .map_err(StreamError::io)?;
                         decoder.verify(authentication)?;
@@ -1611,7 +2995,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                             })?,
                             0,
                         );
-                        self.input
+                        indexed_input_mut(&mut self.input)?
                             .read_exact(&mut compressed[old_len..])
                             .map_err(StreamError::io)?;
                         decoder.decrypt(&mut compressed[old_len..]);
@@ -1629,25 +3013,61 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                             .with_context(format!("payload coder {method} is unsupported")),
                     ));
                 },
-                ZipBody::Raw { remaining, .. } => {
-                    if *remaining == 0 {
-                        self.body = ZipBody::EndEntry;
-                        continue;
+                ZipBody::Raw {
+                    extents,
+                    extent_index,
+                    remaining,
+                    unit_remaining,
+                    ..
+                } => {
+                    let mut finished = false;
+                    while *remaining == 0 {
+                        *extent_index = extent_index.checked_add(1).ok_or_else(|| {
+                            iso_error(ErrorKind::Malformed, "file extent index overflow")
+                        })?;
+                        let Some(extent) = extents.get(*extent_index) else {
+                            finished = true;
+                            break;
+                        };
+                        indexed_input_mut(&mut self.input)?
+                            .seek(SeekFrom::Start(extent.data_offset))
+                            .map_err(StreamError::io)?;
+                        *remaining = extent.size;
+                        *unit_remaining = iso_extent_first_unit(*extent);
                     }
-                    let count = usize::try_from((*remaining).min(BUFFER as u64)).map_err(|_| {
-                        StreamError::archive(
-                            ArchiveError::new(ErrorKind::Limit)
-                                .with_format("iso9660")
-                                .with_context("extent read size exceeds address space"),
-                        )
-                    })?;
-                    self.event_data.resize(count, 0);
-                    self.input
-                        .read_exact(&mut self.event_data)
-                        .map_err(StreamError::io)?;
-                    *remaining -= count as u64;
-                    self.account_decoded(count)?;
-                    return Ok(ReaderEvent::Data(&self.event_data));
+                    if finished {
+                        self.body = ZipBody::EndEntry;
+                    } else {
+                        let extent = extents.get(*extent_index).ok_or_else(|| {
+                            iso_error(ErrorKind::Protocol, "active file extent is absent")
+                        })?;
+                        if *unit_remaining == 0 {
+                            let gap = i64::try_from(extent.gap_bytes).map_err(|_| {
+                                iso_error(ErrorKind::Limit, "interleave gap exceeds seek range")
+                            })?;
+                            indexed_input_mut(&mut self.input)?
+                                .seek(SeekFrom::Current(gap))
+                                .map_err(StreamError::io)?;
+                            *unit_remaining = (*remaining).min(extent.unit_bytes);
+                        }
+                        let count =
+                            usize::try_from((*remaining).min(*unit_remaining).min(BUFFER as u64))
+                                .map_err(|_| {
+                                StreamError::archive(
+                                    ArchiveError::new(ErrorKind::Limit)
+                                        .with_format("iso9660")
+                                        .with_context("extent read size exceeds address space"),
+                                )
+                            })?;
+                        self.event_data.resize(count, 0);
+                        indexed_input_mut(&mut self.input)?
+                            .read_exact(&mut self.event_data)
+                            .map_err(StreamError::io)?;
+                        *remaining -= count as u64;
+                        *unit_remaining -= count as u64;
+                        self.account_decoded(count)?;
+                        return Ok(ReaderEvent::Data(&self.event_data));
+                    }
                 },
                 ZipBody::EndEntry => {
                     self.body = ZipBody::Idle;
@@ -1661,6 +3081,14 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
     /// Skips the current payload, allowing metadata listing even when its
     /// coder is unsupported.
     fn skip_entry(&mut self) -> Result<(), StreamError> {
+        #[cfg(any(feature = "xz", feature = "ppmd"))]
+        let owned_decoder_active = match self.body {
+            #[cfg(feature = "xz")]
+            ZipBody::Lzma { .. } => true,
+            #[cfg(feature = "ppmd")]
+            ZipBody::Ppmd8 { .. } => true,
+            _ => false,
+        };
         let end_offset = match self.body {
             ZipBody::Stored { end_offset, .. }
             | ZipBody::Deflate { end_offset, .. }
@@ -1673,13 +3101,26 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
             #[cfg(feature = "zstd")]
             ZipBody::Zstd { end_offset, .. } => end_offset,
             #[cfg(feature = "xz")]
+            ZipBody::Xz { end_offset, .. } => end_offset,
+            #[cfg(feature = "xz")]
             ZipBody::Lzma { end_offset, .. } => end_offset,
+            #[cfg(feature = "ppmd")]
+            ZipBody::Ppmd8 { end_offset, .. } => end_offset,
             #[cfg(feature = "aes")]
             ZipBody::AesStored { end_offset, .. } | ZipBody::AesDeflate { end_offset, .. } => {
                 end_offset
             },
+            #[cfg(all(
+                feature = "aes",
+                any(feature = "bzip2", feature = "zstd", feature = "xz")
+            ))]
+            ZipBody::AesPipeline { end_offset, .. }
+            | ZipBody::ZipCryptoPipeline { end_offset, .. } => end_offset,
             #[cfg(all(feature = "aes", feature = "gzip"))]
             ZipBody::AesDeflate64 { end_offset, .. } => end_offset,
+            #[cfg(feature = "aes")]
+            ZipBody::ZipCryptoStored { end_offset, .. }
+            | ZipBody::ZipCryptoDeflate { end_offset, .. } => end_offset,
             ZipBody::EndEntry => return Ok(()),
             _ => {
                 return Err(StreamError::archive(
@@ -1689,7 +3130,27 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 ));
             },
         };
-        self.input
+        #[cfg(any(feature = "xz", feature = "ppmd"))]
+        if owned_decoder_active {
+            let decoder = self.owned_decoder.take().ok_or_else(|| {
+                StreamError::archive(
+                    ArchiveError::new(ErrorKind::Protocol)
+                        .with_format("zip")
+                        .with_context("owned ZIP decoder state is missing while skipping"),
+                )
+            })?;
+            let mut input = decoder.into_source_unchecked();
+            input
+                .seek(SeekFrom::Start(end_offset))
+                .map_err(StreamError::io)?;
+            self.input = Some(input);
+        } else {
+            indexed_input_mut(&mut self.input)?
+                .seek(SeekFrom::Start(end_offset))
+                .map_err(StreamError::io)?;
+        }
+        #[cfg(not(any(feature = "xz", feature = "ppmd")))]
+        indexed_input_mut(&mut self.input)?
             .seek(SeekFrom::Start(end_offset))
             .map_err(StreamError::io)?;
         self.body = ZipBody::EndEntry;
@@ -1703,22 +3164,41 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
     }
 
     /// Returns the underlying seekable source.
-    #[must_use]
-    fn into_inner(self) -> R {
-        self.input
+    fn into_inner(self) -> Result<R, ArchiveError> {
+        if let Some(input) = self.input {
+            return Ok(input);
+        }
+        #[cfg(any(feature = "xz", feature = "ppmd"))]
+        if let Some(decoder) = self.owned_decoder {
+            return Ok(decoder.into_source_unchecked());
+        }
+        Err(ArchiveError::new(ErrorKind::Protocol)
+            .with_format("zip")
+            .with_context("seek archive source is unavailable"))
     }
 
-    fn source_ref(&self) -> &R {
-        &self.input
+    fn source_ref(&self) -> Result<&R, ArchiveError> {
+        if let Some(input) = &self.input {
+            return Ok(input);
+        }
+        #[cfg(any(feature = "xz", feature = "ppmd"))]
+        if let Some(decoder) = &self.owned_decoder
+            && let Some(source) = decoder.source_ref()
+        {
+            return Ok(source);
+        }
+        Err(ArchiveError::new(ErrorKind::Protocol)
+            .with_format("zip")
+            .with_context("seek archive source is unavailable"))
     }
 
     #[allow(clippy::too_many_lines)]
     fn prepare_zip_body(&mut self, entry: &ZipIndex) -> Result<(), StreamError> {
-        self.input
+        indexed_input_mut(&mut self.input)?
             .seek(SeekFrom::Start(entry.local_offset))
             .map_err(StreamError::io)?;
         let mut header = [0_u8; 30];
-        self.input
+        indexed_input_mut(&mut self.input)?
             .read_exact(&mut header)
             .map_err(StreamError::io)?;
         if &header[..4] != b"PK\x03\x04" {
@@ -1740,7 +3220,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
         let name_length = usize::from(le16(&header, 26)?);
         let extra_length = u64::from(le16(&header, 28)?);
         let mut local_name = vec![0; name_length];
-        self.input
+        indexed_input_mut(&mut self.input)?
             .read_exact(&mut local_name)
             .map_err(StreamError::io)?;
         if local_name != entry.raw_name {
@@ -1771,7 +3251,7 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                         .with_context("compressed data range overflow"),
                 )
             })?;
-        self.input
+        indexed_input_mut(&mut self.input)?
             .seek(SeekFrom::Start(data_offset))
             .map_err(StreamError::io)?;
         if entry.method == 99 {
@@ -1783,12 +3263,19 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 return Ok(());
             }
         }
-        self.body = if entry.flags & 0x0001 != 0 {
-            ZipBody::Unsupported {
-                method: 99,
-                end_offset,
+        if entry.flags & 0x0001 != 0 {
+            #[cfg(feature = "aes")]
+            return self.prepare_zipcrypto_body(entry, end_offset);
+            #[cfg(not(feature = "aes"))]
+            {
+                self.body = ZipBody::Unsupported {
+                    method: entry.method,
+                    end_offset,
+                };
+                return Ok(());
             }
-        } else {
+        }
+        self.body = {
             match entry.method {
                 0 => ZipBody::Stored {
                     remaining: entry.compressed_size,
@@ -1850,23 +3337,32 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                     end_offset,
                 },
                 #[cfg(feature = "xz")]
+                95 => ZipBody::Xz {
+                    compressed_unread: entry.compressed_size,
+                    compressed: Vec::with_capacity(BUFFER),
+                    compressed_start: 0,
+                    decoder: Box::new(crate::pipeline_codec::PipelineCodec::new(
+                        FilterId::Xz,
+                        self.limits,
+                    )?),
+                    expected_crc: entry.crc32,
+                    crc: Crc32::new(),
+                    produced: 0,
+                    expected_size: entry.uncompressed_size,
+                    end_offset,
+                },
+                #[cfg(feature = "xz")]
                 14 => self.prepare_lzma_body(entry, end_offset)?,
+                #[cfg(feature = "ppmd")]
+                98 => self.prepare_ppmd_body(entry, end_offset)?,
                 method => ZipBody::Unsupported { method, end_offset },
             }
         };
         Ok(())
     }
 
-    /// Parses the 9-byte ZIP-LZMA header, buffers the raw LZMA1 stream, and
-    /// constructs a pull-based [`lzma_rust2::LzmaReader`].
-    ///
-    /// The member payload is buffered once (lzma-rust2 exposes only a
-    /// pull-based LZMA1 reader that owns its source, which cannot borrow the
-    /// shared archive handle). The buffer grows with the *actual* bytes read,
-    /// so a lying `compressed_size` cannot pre-allocate; `dict_size` is
-    /// validated against the codec-memory limit; output stays bounded by
-    /// `decoded_total` in the read loop. `self.input` is already sought to the
-    /// member's data offset.
+    /// Parses the 9-byte ZIP-LZMA header and transfers the seek source into a length-limited pull decoder.
+    /// The source is recovered when the member ends, so compressed input is never buffered as a whole.
     #[cfg(feature = "xz")]
     fn prepare_lzma_body(
         &mut self,
@@ -1882,7 +3378,9 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
         };
         // ZIP-LZMA header: [2] version, [2] prop_size (== 5), [5] props.
         let mut head = [0_u8; 9];
-        self.input.read_exact(&mut head).map_err(StreamError::io)?;
+        indexed_input_mut(&mut self.input)?
+            .read_exact(&mut head)
+            .map_err(StreamError::io)?;
         let prop_size = u16::from_le_bytes([head[2], head[3]]);
         if prop_size != 5 {
             return Err(malformed("ZIP LZMA property size is not 5"));
@@ -1900,33 +3398,257 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                     .with_context("LZMA dictionary exceeds codec workspace limit"),
             ));
         }
-        // Buffer the remaining raw LZMA1 stream. read_to_end grows with actual
-        // bytes, so a lying huge compressed_size yields a short buffer, not a
-        // pre-allocation, and truncation surfaces as a decode error later.
         let payload_len = entry
             .compressed_size
             .checked_sub(9)
             .ok_or_else(|| malformed("ZIP LZMA member is shorter than its 9-byte header"))?;
-        let mut buffer = Vec::new();
-        self.input
-            .by_ref()
-            .take(payload_len)
-            .read_to_end(&mut buffer)
-            .map_err(StreamError::io)?;
-        // Drive the reader with the central-directory uncompressed size
-        // unconditionally: LzmaReader stops at "known size OR end marker,
+        let input = self.input.take().ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("zip")
+                    .with_context("ZIP LZMA source is unavailable"),
+            )
+        })?;
+        // Drive the reader with the central-directory uncompressed size unconditionally: LzmaReader stops at "known size OR end marker,
         // whichever first", decoding both EOS-marker and known-size members.
         let reader = lzma_rust2::LzmaReader::new_with_props(
-            std::io::Cursor::new(buffer),
+            input.take(payload_len),
             entry.uncompressed_size,
             props,
             dict_size,
             None,
         )
         .map_err(|_| malformed("ZIP LZMA decoder setup failed"))?;
+        self.owned_decoder = Some(OwnedZipDecoder::Lzma(Box::new(reader)));
         Ok(ZipBody::Lzma {
-            reader: Box::new(reader),
-            expected_crc: entry.crc32,
+            expected_crc: Some(entry.crc32),
+            crc: Crc32::new(),
+            produced: 0,
+            expected_size: entry.uncompressed_size,
+            end_offset,
+        })
+    }
+
+    /// Parses ZIP method 98's two-byte parameter word and transfers the seek source into a length-limited streaming method-98 decoder.
+    #[cfg(feature = "ppmd")]
+    fn prepare_ppmd_body(
+        &mut self,
+        entry: &ZipIndex,
+        end_offset: u64,
+    ) -> Result<ZipBody, StreamError> {
+        let malformed = |context: &'static str| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context(context),
+            )
+        };
+        let payload_len = entry
+            .compressed_size
+            .checked_sub(2)
+            .ok_or_else(|| malformed("ZIP PPMd member is shorter than its parameter header"))?;
+        let mut parameter_bytes = [0_u8; 2];
+        indexed_input_mut(&mut self.input)?
+            .read_exact(&mut parameter_bytes)
+            .map_err(StreamError::io)?;
+        let parameters = u16::from_le_bytes(parameter_bytes);
+        let order = u32::from((parameters & 0x0f) + 1);
+        let memory_mb = u32::from(((parameters >> 4) & 0xff) + 1);
+        let memory_size = memory_mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| malformed("ZIP PPMd model size overflows"))?;
+        let restoration = (parameters >> 12) & 0x0f;
+        if !(2..=16).contains(&order) || restoration > 2 {
+            return Err(malformed("invalid ZIP PPMd parameters"));
+        }
+        if self
+            .limits
+            .codec_memory()
+            .is_some_and(|maximum| memory_size as usize > maximum)
+        {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("zip")
+                    .with_context("ZIP PPMd model exceeds codec workspace limit"),
+            ));
+        }
+        if payload_len < 4 {
+            return Err(malformed("ZIP PPMd range stream is truncated"));
+        }
+        // Ppmd8Decoder consumes four range-code bytes in its constructor.
+        // Preview them while R is still recoverable, then rewind.
+        // This keeps a malformed header from consuming and dropping the caller's source.
+        let mut range_header = [0_u8; 4];
+        indexed_input_mut(&mut self.input)?
+            .read_exact(&mut range_header)
+            .map_err(StreamError::io)?;
+        if range_header == [0xff; 4] {
+            return Err(malformed("invalid ZIP PPMd range decoder header"));
+        }
+        indexed_input_mut(&mut self.input)?
+            .seek(SeekFrom::Current(-4))
+            .map_err(StreamError::io)?;
+
+        let input = self.input.take().ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("zip")
+                    .with_context("ZIP PPMd source is unavailable"),
+            )
+        })?;
+        let decoder = ppmd_rust::Ppmd8Decoder::new(
+            input.take(payload_len),
+            order,
+            memory_size,
+            restoration.into(),
+        )
+        .map_err(|error| zip_ppmd_setup_error(&error))?;
+        self.owned_decoder = Some(OwnedZipDecoder::Ppmd8(Box::new(decoder)));
+        Ok(ZipBody::Ppmd8 {
+            expected_crc: Some(entry.crc32),
+            crc: Crc32::new(),
+            produced: 0,
+            expected_size: entry.uncompressed_size,
+            end_offset,
+        })
+    }
+
+    #[cfg(all(feature = "aes", feature = "xz"))]
+    fn prepare_zipcrypto_lzma_body(
+        &mut self,
+        entry: &ZipIndex,
+        encrypted_remaining: u64,
+        crypto: ZipCrypto,
+        end_offset: u64,
+    ) -> Result<ZipBody, StreamError> {
+        if encrypted_remaining < 9 {
+            return Err(malformed(
+                "ZIP LZMA member is shorter than its 9-byte header",
+            ));
+        }
+        let input = self.input.take().ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("zip")
+                    .with_context("ZipCrypto LZMA source is unavailable"),
+            )
+        })?;
+        let mut source = ZipCryptoRead::new(input, crypto, encrypted_remaining);
+        let (props, dict_size) = read_zip_lzma_properties(&mut source, self.limits)
+            .map_err(zipcrypto_validation_error)?;
+        let decoder = lzma_rust2::LzmaReader::new_with_props(
+            source,
+            entry.uncompressed_size,
+            props,
+            dict_size,
+            None,
+        )
+        .map_err(|_| zipcrypto_integrity("ZipCrypto LZMA decoder setup failed"))?;
+        self.owned_decoder = Some(OwnedZipDecoder::ZipCryptoLzma(Box::new(decoder)));
+        Ok(ZipBody::Lzma {
+            expected_crc: Some(entry.crc32),
+            crc: Crc32::new(),
+            produced: 0,
+            expected_size: entry.uncompressed_size,
+            end_offset,
+        })
+    }
+
+    #[cfg(all(feature = "aes", feature = "ppmd"))]
+    fn prepare_zipcrypto_ppmd_body(
+        &mut self,
+        entry: &ZipIndex,
+        encrypted_remaining: u64,
+        crypto: ZipCrypto,
+        end_offset: u64,
+    ) -> Result<ZipBody, StreamError> {
+        let input = self.input.take().ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("zip")
+                    .with_context("ZipCrypto PPMd source is unavailable"),
+            )
+        })?;
+        let mut source = ZipCryptoRead::new(input, crypto, encrypted_remaining);
+        let (order, memory_size, restoration) =
+            read_zip_ppmd_parameters(&mut source, self.limits, encrypted_remaining)
+                .map_err(zipcrypto_validation_error)?;
+        let decoder = ppmd_rust::Ppmd8Decoder::new(source, order, memory_size, restoration.into())
+            .map_err(|error| zip_ppmd_setup_error(&error))
+            .map_err(zipcrypto_validation_error)?;
+        self.owned_decoder = Some(OwnedZipDecoder::ZipCryptoPpmd8(Box::new(decoder)));
+        Ok(ZipBody::Ppmd8 {
+            expected_crc: Some(entry.crc32),
+            crc: Crc32::new(),
+            produced: 0,
+            expected_size: entry.uncompressed_size,
+            end_offset,
+        })
+    }
+
+    #[cfg(all(feature = "aes", feature = "xz"))]
+    fn prepare_aes_lzma_body(
+        &mut self,
+        entry: &ZipIndex,
+        encrypted_remaining: u64,
+        crypto: ZipAesDecoder,
+        end_offset: u64,
+    ) -> Result<ZipBody, StreamError> {
+        if encrypted_remaining < 9 {
+            return Err(malformed(
+                "ZIP LZMA member is shorter than its 9-byte header",
+            ));
+        }
+        let input = self.input.take().ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("zip")
+                    .with_context("AES LZMA source is unavailable"),
+            )
+        })?;
+        let mut source = ZipAesRead::new(input, crypto, encrypted_remaining);
+        let (props, dict_size) = read_zip_lzma_properties(&mut source, self.limits)?;
+        let decoder = lzma_rust2::LzmaReader::new_with_props(
+            source,
+            entry.uncompressed_size,
+            props,
+            dict_size,
+            None,
+        )
+        .map_err(|_| malformed("ZIP LZMA decoder setup failed"))?;
+        self.owned_decoder = Some(OwnedZipDecoder::AesLzma(Box::new(decoder)));
+        Ok(ZipBody::Lzma {
+            expected_crc: None,
+            crc: Crc32::new(),
+            produced: 0,
+            expected_size: entry.uncompressed_size,
+            end_offset,
+        })
+    }
+
+    #[cfg(all(feature = "aes", feature = "ppmd"))]
+    fn prepare_aes_ppmd_body(
+        &mut self,
+        entry: &ZipIndex,
+        encrypted_remaining: u64,
+        crypto: ZipAesDecoder,
+        end_offset: u64,
+    ) -> Result<ZipBody, StreamError> {
+        let input = self.input.take().ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("zip")
+                    .with_context("AES PPMd source is unavailable"),
+            )
+        })?;
+        let mut source = ZipAesRead::new(input, crypto, encrypted_remaining);
+        let (order, memory_size, restoration) =
+            read_zip_ppmd_parameters(&mut source, self.limits, encrypted_remaining)?;
+        let decoder = ppmd_rust::Ppmd8Decoder::new(source, order, memory_size, restoration.into())
+            .map_err(|error| zip_ppmd_setup_error(&error))?;
+        self.owned_decoder = Some(OwnedZipDecoder::AesPpmd8(Box::new(decoder)));
+        Ok(ZipBody::Ppmd8 {
+            expected_crc: None,
             crc: Crc32::new(),
             produced: 0,
             expected_size: entry.uncompressed_size,
@@ -1935,11 +3657,147 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
     }
 
     #[cfg(feature = "aes")]
+    fn prepare_zipcrypto_body(
+        &mut self,
+        entry: &ZipIndex,
+        end_offset: u64,
+    ) -> Result<(), StreamError> {
+        let pipeline_filter = encrypted_pipeline_filter(entry.method);
+        if entry.flags & 0x0040 != 0
+            || (!matches!(entry.method, 0 | 8)
+                && pipeline_filter.is_none()
+                && !encrypted_owned_method_supported(entry.method))
+        {
+            self.body = ZipBody::Unsupported {
+                method: entry.method,
+                end_offset,
+            };
+            return Ok(());
+        }
+        let encrypted_remaining = entry.compressed_size.checked_sub(12).ok_or_else(|| {
+            StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context("ZipCrypto payload is shorter than its 12-byte header"),
+            )
+        })?;
+        let mut header = [0_u8; 12];
+        indexed_input_mut(&mut self.input)?
+            .read_exact(&mut header)
+            .map_err(StreamError::io)?;
+        let verifier = if entry.flags & 0x0008 != 0 {
+            (entry.dos_time >> 8) as u8
+        } else {
+            (entry.crc32 >> 24) as u8
+        };
+        let decoder = self.select_zipcrypto_decoder(header, verifier)?;
+        self.body = match entry.method {
+            0 => ZipBody::ZipCryptoStored {
+                encrypted_remaining,
+                decoder,
+                expected_crc: entry.crc32,
+                crc: Crc32::new(),
+                produced: 0,
+                expected_size: entry.uncompressed_size,
+                end_offset,
+            },
+            8 => ZipBody::ZipCryptoDeflate {
+                encrypted_remaining,
+                compressed: Vec::with_capacity(BUFFER),
+                compressed_start: 0,
+                decoder,
+                inflate: Box::new(
+                    RawInflateDecoder::with_limits(self.limits).map_err(StreamError::archive)?,
+                ),
+                expected_crc: entry.crc32,
+                crc: Crc32::new(),
+                produced: 0,
+                expected_size: entry.uncompressed_size,
+                end_offset,
+            },
+            #[cfg(feature = "xz")]
+            14 => {
+                self.prepare_zipcrypto_lzma_body(entry, encrypted_remaining, decoder, end_offset)?
+            },
+            #[cfg(feature = "ppmd")]
+            98 => {
+                self.prepare_zipcrypto_ppmd_body(entry, encrypted_remaining, decoder, end_offset)?
+            },
+            #[cfg(any(feature = "bzip2", feature = "zstd", feature = "xz"))]
+            method => ZipBody::ZipCryptoPipeline {
+                method,
+                encrypted_remaining,
+                compressed: Vec::with_capacity(BUFFER),
+                compressed_start: 0,
+                crypto: decoder,
+                codec: Box::new(crate::pipeline_codec::PipelineCodec::new(
+                    pipeline_filter.ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Protocol)
+                                .with_format("zip")
+                                .with_context("ZipCrypto pipeline method changed after validation"),
+                        )
+                    })?,
+                    self.limits,
+                )?),
+                expected_crc: entry.crc32,
+                crc: Crc32::new(),
+                produced: 0,
+                expected_size: entry.uncompressed_size,
+                end_offset,
+            },
+            #[cfg(not(any(feature = "bzip2", feature = "zstd", feature = "xz")))]
+            _ => {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Protocol)
+                        .with_format("zip")
+                        .with_context("ZipCrypto method changed after validation"),
+                ));
+            },
+        };
+        Ok(())
+    }
+
+    #[cfg(feature = "aes")]
+    fn select_zipcrypto_decoder(
+        &self,
+        encrypted_header: [u8; 12],
+        verifier: u8,
+    ) -> Result<ZipCrypto, StreamError> {
+        use subtle::ConstantTimeEq;
+
+        if self.passwords.is_empty() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Unsupported)
+                    .with_format("zip")
+                    .with_context("ZipCrypto entry requires a password"),
+            ));
+        }
+        for password in &self.passwords {
+            let mut decoder = ZipCrypto::new(password.expose());
+            let mut header = encrypted_header;
+            decoder.decrypt(&mut header);
+            if header[11].ct_eq(&verifier).unwrap_u8() == 1 {
+                return Ok(decoder);
+            }
+        }
+        Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Integrity)
+                .with_format("zip")
+                .with_context("no password candidate matched ZipCrypto verifier"),
+        ))
+    }
+
+    #[cfg(feature = "aes")]
+    #[allow(clippy::too_many_lines)]
     fn prepare_aes_body(&mut self, entry: &ZipIndex, end_offset: u64) -> Result<(), StreamError> {
         match entry.aes_real_method {
             Some(0 | 8) => {},
             #[cfg(feature = "gzip")]
             Some(9) => {},
+            #[cfg(any(feature = "bzip2", feature = "zstd", feature = "xz"))]
+            Some(method) if encrypted_pipeline_filter(method).is_some() => {},
+            Some(method) if encrypted_owned_method_supported(method) => {},
             Some(method) => {
                 self.body = ZipBody::Unsupported { method, end_offset };
                 return Ok(());
@@ -1952,34 +3810,52 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 ));
             },
         }
-        if entry.aes_strength != Some(3) {
-            return Err(StreamError::archive(
-                ArchiveError::new(ErrorKind::Unsupported)
-                    .with_format("zip")
-                    .with_context("only WinZip AES-256 strength is supported"),
-            ));
-        }
-        let encrypted_remaining = entry.compressed_size.checked_sub(28).ok_or_else(|| {
+        let strength = entry.aes_strength.ok_or_else(|| {
             StreamError::archive(
                 ArchiveError::new(ErrorKind::Malformed)
                     .with_format("zip")
-                    .with_context("WinZip AES payload is shorter than its framing"),
+                    .with_context("WinZip AES strength is missing"),
             )
         })?;
-        let password = self.password.as_ref().ok_or_else(|| {
+        let salt_len = match strength {
+            1 => 8,
+            2 => 12,
+            3 => 16,
+            _ => {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("zip")
+                        .with_context("invalid WinZip AES strength code"),
+                ));
+            },
+        };
+        let framing_len = u64::try_from(salt_len + 2 + 10).map_err(|_| {
             StreamError::archive(
-                ArchiveError::new(ErrorKind::Unsupported)
+                ArchiveError::new(ErrorKind::Limit)
                     .with_format("zip")
-                    .with_context("WinZip AES entry requires a password"),
+                    .with_context("WinZip AES framing length exceeds address space"),
             )
         })?;
-        let mut salt = [0_u8; 16];
+        let encrypted_remaining =
+            entry
+                .compressed_size
+                .checked_sub(framing_len)
+                .ok_or_else(|| {
+                    StreamError::archive(
+                        ArchiveError::new(ErrorKind::Malformed)
+                            .with_format("zip")
+                            .with_context("WinZip AES payload is shorter than its framing"),
+                    )
+                })?;
+        let mut salt = vec![0_u8; salt_len];
         let mut verifier = [0_u8; 2];
-        self.input.read_exact(&mut salt).map_err(StreamError::io)?;
-        self.input
+        indexed_input_mut(&mut self.input)?
+            .read_exact(&mut salt)
+            .map_err(StreamError::io)?;
+        indexed_input_mut(&mut self.input)?
             .read_exact(&mut verifier)
             .map_err(StreamError::io)?;
-        let decoder = ZipAesDecoder::new(password.expose(), salt, verifier)?;
+        let decoder = self.select_zip_aes_decoder(&salt, verifier, strength)?;
         self.body = match entry.aes_real_method {
             Some(0) => ZipBody::AesStored {
                 encrypted_remaining,
@@ -2000,6 +3876,14 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 expected_size: entry.uncompressed_size,
                 end_offset,
             },
+            #[cfg(feature = "xz")]
+            Some(14) => {
+                self.prepare_aes_lzma_body(entry, encrypted_remaining, decoder, end_offset)?
+            },
+            #[cfg(feature = "ppmd")]
+            Some(98) => {
+                self.prepare_aes_ppmd_body(entry, encrypted_remaining, decoder, end_offset)?
+            },
             #[cfg(feature = "gzip")]
             Some(9) => ZipBody::AesDeflate64 {
                 encrypted_remaining,
@@ -2011,15 +3895,75 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
                 expected_size: entry.uncompressed_size,
                 end_offset,
             },
-            Some(_) | None => {
+            #[cfg(any(feature = "bzip2", feature = "zstd", feature = "xz"))]
+            Some(method) => ZipBody::AesPipeline {
+                method,
+                encrypted_remaining,
+                compressed: Vec::with_capacity(BUFFER),
+                compressed_start: 0,
+                crypto: decoder,
+                codec: Box::new(crate::pipeline_codec::PipelineCodec::new(
+                    encrypted_pipeline_filter(method).ok_or_else(|| {
+                        StreamError::archive(
+                            ArchiveError::new(ErrorKind::Protocol)
+                                .with_format("zip")
+                                .with_context("AES pipeline method changed after validation"),
+                        )
+                    })?,
+                    self.limits,
+                )?),
+                produced: 0,
+                expected_size: entry.uncompressed_size,
+                end_offset,
+            },
+            #[cfg(not(any(feature = "bzip2", feature = "zstd", feature = "xz")))]
+            Some(_) => {
                 return Err(StreamError::archive(
                     ArchiveError::new(ErrorKind::Protocol)
                         .with_format("zip")
                         .with_context("WinZip AES method changed after validation"),
                 ));
             },
+            None => {
+                return Err(StreamError::archive(
+                    ArchiveError::new(ErrorKind::Protocol)
+                        .with_format("zip")
+                        .with_context("WinZip AES method disappeared"),
+                ));
+            },
         };
         Ok(())
+    }
+
+    #[cfg(feature = "aes")]
+    fn select_zip_aes_decoder(
+        &self,
+        salt: &[u8],
+        verifier: [u8; 2],
+        strength: u8,
+    ) -> Result<ZipAesDecoder, StreamError> {
+        if self.passwords.is_empty() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Unsupported)
+                    .with_format("zip")
+                    .with_context("WinZip AES entry requires a password"),
+            ));
+        }
+        let mut mismatch = None;
+        for password in &self.passwords {
+            match ZipAesDecoder::new(password.expose(), salt, verifier, strength) {
+                Ok(decoder) => return Ok(decoder),
+                Err(error) if error.kind() == ErrorKind::Integrity => mismatch = Some(error),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(mismatch
+            .unwrap_or_else(|| {
+                ArchiveError::new(ErrorKind::Integrity)
+                    .with_format("zip")
+                    .with_context("no password candidate matched WinZip AES verifier")
+            })
+            .into())
     }
 
     #[cfg(not(feature = "aes"))]
@@ -2031,16 +3975,23 @@ impl<R: Read + Seek> IndexedArchiveReader<R> {
     }
 
     fn prepare_iso_body(&mut self, entry: &IsoIndex) -> Result<(), StreamError> {
-        self.input
-            .seek(SeekFrom::Start(entry.data_offset))
+        let first = entry
+            .extents
+            .first()
+            .copied()
+            .ok_or_else(|| iso_error(ErrorKind::Protocol, "ISO entry has no file extent"))?;
+        indexed_input_mut(&mut self.input)?
+            .seek(SeekFrom::Start(first.data_offset))
             .map_err(StreamError::io)?;
-        let end_offset = entry
-            .data_offset
-            .checked_add(entry.size)
-            .ok_or_else(|| iso_error(ErrorKind::Malformed, "file extent offset overflow"))?;
+        let last = entry.extents.last().copied().ok_or_else(|| {
+            iso_error(ErrorKind::Protocol, "ISO entry lost its final file extent")
+        })?;
         self.body = ZipBody::Raw {
-            remaining: entry.size,
-            end_offset,
+            extents: Arc::clone(&entry.extents),
+            extent_index: 0,
+            remaining: first.size,
+            unit_remaining: iso_extent_first_unit(first),
+            end_offset: last.physical_end,
         };
         Ok(())
     }
@@ -2087,14 +4038,25 @@ struct IsoRoot {
     lba: u32,
     size: u32,
     joliet: bool,
+    extended_attribute_blocks: u8,
+    volume_length: u64,
+    volume_sequence: u16,
 }
 
 #[derive(Debug)]
 struct IsoDirectory {
     lba: u32,
     size: u32,
+    extended_attribute_blocks: u8,
     prefix: Vec<u8>,
     depth: usize,
+}
+
+#[derive(Debug, Default)]
+struct IsoExtendedMetadata {
+    mode: Option<u32>,
+    owner: Owner,
+    times: EntryTimes,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2106,7 +4068,7 @@ fn parse_iso_index<R: Read + Seek>(
     let mut primary = None;
     let mut joliet = None;
     let mut archive_metadata = ArchiveMetadata::new();
-    let mut saw_terminator = false;
+    let mut descriptor_set_end = None;
     for index in 0..ISO_MAX_DESCRIPTORS {
         let offset = (ISO_DESCRIPTOR_START + index)
             .checked_mul(ISO_SECTOR)
@@ -2133,16 +4095,16 @@ fn parse_iso_index<R: Read + Seek>(
         }
         match descriptor[0] {
             1 => {
-                if iso_u16(&descriptor, 128)? != ISO_SECTOR_U16 {
-                    return Err(iso_error(
-                        ErrorKind::Unsupported,
-                        "logical block size is not 2048",
-                    ));
-                }
+                validate_iso_logical_block_size(&descriptor)?;
+                let volume_length = iso_volume_length(&descriptor, image_length)?;
+                let volume_sequence = iso_volume_sequence(&descriptor)?;
                 primary = Some(IsoRoot {
                     lba: iso_u32(&descriptor, 158)?,
                     size: iso_u32(&descriptor, 166)?,
                     joliet: false,
+                    extended_attribute_blocks: descriptor[157],
+                    volume_length,
+                    volume_sequence,
                 });
                 let volume = trim_iso_text(&descriptor[40..72]);
                 if !volume.is_empty() {
@@ -2162,28 +4124,44 @@ fn parse_iso_index<R: Read + Seek>(
                 }
             },
             2 if is_joliet_descriptor(&descriptor) => {
+                validate_iso_logical_block_size(&descriptor)?;
+                let volume_length = iso_volume_length(&descriptor, image_length)?;
+                let volume_sequence = iso_volume_sequence(&descriptor)?;
                 joliet = Some(IsoRoot {
                     lba: iso_u32(&descriptor, 158)?,
                     size: iso_u32(&descriptor, 166)?,
                     joliet: true,
+                    extended_attribute_blocks: descriptor[157],
+                    volume_length,
+                    volume_sequence,
                 });
             },
             255 => {
-                saw_terminator = true;
+                descriptor_set_end = Some(offset.checked_add(ISO_SECTOR).ok_or_else(|| {
+                    iso_error(ErrorKind::Malformed, "descriptor set end overflow")
+                })?);
                 break;
             },
             _ => {},
         }
     }
-    if !saw_terminator {
-        return Err(iso_error(
-            ErrorKind::Malformed,
-            "volume descriptor terminator is missing",
-        ));
-    }
     let primary = primary
         .ok_or_else(|| iso_error(ErrorKind::Malformed, "primary volume descriptor is missing"))?;
-    let rock_ridge_skip = detect_rock_ridge(input, primary, image_length, limits)?;
+    let descriptor_set_end = descriptor_set_end.ok_or_else(|| {
+        iso_error(
+            ErrorKind::Malformed,
+            "volume descriptor terminator is missing",
+        )
+    })?;
+    if primary.volume_length < descriptor_set_end
+        || joliet.is_some_and(|root| root.volume_length < descriptor_set_end)
+    {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "volume descriptor set exceeds the declared volume",
+        ));
+    }
+    let rock_ridge_skip = detect_rock_ridge(input, primary, primary.volume_length, limits)?;
     let (root, susp_skip) = if let Some(skip) = rock_ridge_skip {
         (primary, skip)
     } else {
@@ -2192,6 +4170,7 @@ fn parse_iso_index<R: Read + Seek>(
     let mut stack = vec![IsoDirectory {
         lba: root.lba,
         size: root.size,
+        extended_attribute_blocks: root.extended_attribute_blocks,
         prefix: Vec::new(),
         depth: 0,
     }];
@@ -2208,7 +4187,11 @@ fn parse_iso_index<R: Read + Seek>(
                 "directory nesting exceeds configured limit",
             ));
         }
-        if !visited.insert((directory.lba, directory.size)) {
+        if !visited.insert((
+            directory.lba,
+            directory.size,
+            directory.extended_attribute_blocks,
+        )) {
             continue;
         }
         let extent_size = usize::try_from(directory.size).map_err(|_| {
@@ -2226,16 +4209,15 @@ fn parse_iso_index<R: Read + Seek>(
                 "directory extent exceeds the in-flight buffer limit",
             ));
         }
-        let extent_offset = u64::from(directory.lba)
-            .checked_mul(ISO_SECTOR)
-            .ok_or_else(|| iso_error(ErrorKind::Malformed, "directory extent offset overflow"))?;
+        let extent_offset =
+            iso_extent_data_offset(directory.lba, directory.extended_attribute_blocks)?;
         if extent_offset
             .checked_add(u64::from(directory.size))
-            .is_none_or(|end| end > image_length)
+            .is_none_or(|end| end > root.volume_length)
         {
             return Err(iso_error(
                 ErrorKind::Malformed,
-                "directory extent is outside the image",
+                "directory extent is outside the declared volume",
             ));
         }
         input
@@ -2249,7 +4231,8 @@ fn parse_iso_index<R: Read + Seek>(
             &directory,
             root.joliet,
             susp_skip,
-            image_length,
+            root.volume_length,
+            root.volume_sequence,
             limits,
             &mut metadata_used,
             &mut entries,
@@ -2259,15 +4242,76 @@ fn parse_iso_index<R: Read + Seek>(
     Ok((archive_metadata, entries))
 }
 
+fn validate_iso_logical_block_size(descriptor: &[u8]) -> Result<(), StreamError> {
+    if iso_u16(descriptor, 128)? != ISO_SECTOR_U16 {
+        return Err(iso_error(
+            ErrorKind::Unsupported,
+            "logical block size is not 2048",
+        ));
+    }
+    Ok(())
+}
+
+fn iso_volume_length(descriptor: &[u8], image_length: u64) -> Result<u64, StreamError> {
+    let blocks = iso_u32(descriptor, 80)?;
+    if blocks == 0 {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "declared volume space is empty",
+        ));
+    }
+    let length = u64::from(blocks)
+        .checked_mul(ISO_SECTOR)
+        .ok_or_else(|| iso_error(ErrorKind::Malformed, "declared volume size overflow"))?;
+    if length > image_length {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "declared volume space exceeds the image",
+        ));
+    }
+    Ok(length)
+}
+
+fn iso_volume_sequence(descriptor: &[u8]) -> Result<u16, StreamError> {
+    let volume_set_size = iso_u16(descriptor, 120)?;
+    let volume_sequence = iso_u16(descriptor, 124)?;
+    if volume_set_size == 0 || volume_sequence == 0 || volume_sequence > volume_set_size {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "invalid ISO volume-set size or volume sequence number",
+        ));
+    }
+    let root = descriptor
+        .get(156..190)
+        .ok_or_else(|| iso_error(ErrorKind::Malformed, "root directory record is truncated"))?;
+    if root[0] != 34
+        || root[25] != ISO_DIRECTORY_FLAG
+        || root[26] != 0
+        || root[27] != 0
+        || root[32] != 1
+        || root[33] != 0
+    {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "invalid root directory record in volume descriptor",
+        ));
+    }
+    if iso_u16(descriptor, 184)? != volume_sequence {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "root directory record has a different volume sequence number",
+        ));
+    }
+    Ok(volume_sequence)
+}
+
 fn detect_rock_ridge(
     input: &mut (impl Read + Seek),
     root: IsoRoot,
-    image_length: u64,
+    volume_length: u64,
     limits: Limits,
 ) -> Result<Option<usize>, StreamError> {
-    let offset = u64::from(root.lba)
-        .checked_mul(ISO_SECTOR)
-        .ok_or_else(|| iso_error(ErrorKind::Malformed, "root extent offset overflow"))?;
+    let offset = iso_extent_data_offset(root.lba, root.extended_attribute_blocks)?;
     let read_length = usize::try_from(root.size.min(u32::from(ISO_SECTOR_U16))).map_err(|_| {
         iso_error(
             ErrorKind::Limit,
@@ -2277,13 +4321,19 @@ fn detect_rock_ridge(
     if limits
         .in_flight_bytes()
         .is_some_and(|maximum| read_length > maximum)
-        || offset
-            .checked_add(read_length as u64)
-            .is_none_or(|end| end > image_length)
     {
         return Err(iso_error(
             ErrorKind::Limit,
             "root directory record exceeds configured limits",
+        ));
+    }
+    if offset
+        .checked_add(read_length as u64)
+        .is_none_or(|end| end > volume_length)
+    {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "root directory extent is outside the declared volume",
         ));
     }
     input
@@ -2336,78 +4386,202 @@ fn parse_iso_directory<R: Read + Seek>(
     directory: &IsoDirectory,
     joliet: bool,
     susp_skip: usize,
-    image_length: u64,
+    volume_length: u64,
+    volume_sequence: u16,
     limits: Limits,
     metadata_used: &mut usize,
     entries: &mut Vec<IsoIndex>,
     stack: &mut Vec<IsoDirectory>,
 ) -> Result<(), StreamError> {
     let mut position = 0;
-    while position < extent.len() {
-        let record_length = usize::from(extent[position]);
-        if record_length == 0 {
-            position = position
-                .checked_div(ISO_SECTOR_USIZE)
-                .and_then(|sector| sector.checked_add(1))
-                .and_then(|sector| sector.checked_mul(ISO_SECTOR_USIZE))
-                .ok_or_else(|| iso_error(ErrorKind::Malformed, "directory position overflow"))?;
+    while let Some(record) = next_iso_directory_record(extent, &mut position)? {
+        let (identifier, identifier_end) = iso_directory_identifier(record)?;
+        if identifier.len() == 1 && matches!(identifier[0], 0 | 1) {
+            validate_iso_volume_reference(record, volume_sequence)?;
+            if record[1] == 0 && record[25] & 0x18 != 0 {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "special directory flags require an extended attribute record",
+                ));
+            }
+            if record[25] & 0xe2 != ISO_DIRECTORY_FLAG || record[26] != 0 || record[27] != 0 {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "special directory record has invalid flags or interleaving",
+                ));
+            }
             continue;
         }
-        let end = position
-            .checked_add(record_length)
-            .ok_or_else(|| iso_error(ErrorKind::Malformed, "directory record length overflow"))?;
-        let record = extent.get(position..end).ok_or_else(|| {
-            iso_error(ErrorKind::Malformed, "directory record exceeds its extent")
-        })?;
-        position = end;
-        if record.len() < ISO_DIRECTORY_RECORD_BASE + 1 {
-            return Err(iso_error(
-                ErrorKind::Malformed,
-                "directory record is too short",
-            ));
-        }
-        let identifier_length = usize::from(record[32]);
-        let identifier_end = ISO_DIRECTORY_RECORD_BASE
-            .checked_add(identifier_length)
-            .ok_or_else(|| iso_error(ErrorKind::Malformed, "identifier length overflow"))?;
-        let identifier = record
-            .get(ISO_DIRECTORY_RECORD_BASE..identifier_end)
-            .ok_or_else(|| {
-                iso_error(ErrorKind::Malformed, "identifier exceeds directory record")
-            })?;
-        if identifier_length == 1 && matches!(identifier[0], 0 | 1) {
-            continue;
-        }
-        if record[25] & 0x80 != 0 {
-            return Err(iso_error(
-                ErrorKind::Unsupported,
-                "multi-extent files are not yet supported",
-            ));
-        }
-        let lba = iso_u32(record, 2)?;
-        let size = iso_u32(record, 10)?;
-        let data_offset = u64::from(lba)
-            .checked_mul(ISO_SECTOR)
-            .ok_or_else(|| iso_error(ErrorKind::Malformed, "file extent offset overflow"))?;
-        if data_offset
-            .checked_add(u64::from(size))
-            .is_none_or(|end| end > image_length)
-        {
-            return Err(iso_error(
-                ErrorKind::Malformed,
-                "entry extent is outside the image",
-            ));
-        }
-        if limits
-            .entry_bytes()
-            .is_some_and(|maximum| u64::from(size) > maximum)
-        {
-            return Err(iso_error(
-                ErrorKind::Limit,
-                "entry exceeds configured size limit",
-            ));
-        }
+        let identifier_length = identifier.len();
         let is_directory = record[25] & ISO_DIRECTORY_FLAG != 0;
+        if is_directory && record[25] & 0x80 != 0 {
+            return Err(iso_error(
+                ErrorKind::Malformed,
+                "directory record sets the multi-extent flag",
+            ));
+        }
+        let stable_flags = record[25] & 0x6f;
+        let lba = iso_u32(record, 2)?;
+        let first_size = iso_u32(record, 10)?;
+        let mut section = record;
+        let mut extents = Vec::new();
+        let mut extended_metadata: Option<IsoExtendedMetadata>;
+        let mut extended_records = Vec::new();
+        let mut extended_metadata_bytes = 0_usize;
+        let mut size = 0_u64;
+        loop {
+            validate_iso_volume_reference(section, volume_sequence)?;
+            let (section_identifier, _) = iso_directory_identifier(section)?;
+            if section_identifier != identifier || section[25] & 0x6f != stable_flags {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "multi-extent file sections have inconsistent directory records",
+                ));
+            }
+            if section[25] & 0x60 != 0 {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "directory record uses reserved file flags",
+                ));
+            }
+            let extended_attribute_blocks = section[1];
+            if extended_attribute_blocks == 0 && section[25] & 0x18 != 0 {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "record/protection flags require an extended attribute record",
+                ));
+            }
+            let file_unit_blocks = u64::from(section[26]);
+            let gap_blocks = u64::from(section[27]);
+            if file_unit_blocks == 0 && gap_blocks != 0 {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "interleave gap is present without a file unit",
+                ));
+            }
+            if is_directory && (file_unit_blocks != 0 || gap_blocks != 0) {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "directory extent is recorded in interleaved mode",
+                ));
+            }
+            let unit_bytes = file_unit_blocks
+                .checked_mul(ISO_SECTOR)
+                .ok_or_else(|| iso_error(ErrorKind::Malformed, "file unit size overflow"))?;
+            let gap_bytes = gap_blocks
+                .checked_mul(ISO_SECTOR)
+                .ok_or_else(|| iso_error(ErrorKind::Malformed, "interleave gap size overflow"))?;
+            let section_lba = iso_u32(section, 2)?;
+            let section_size = iso_u32(section, 10)?;
+            let extent_count = extents
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| iso_error(ErrorKind::Limit, "file extent count overflow"))?;
+            let extent_bytes = extent_count
+                .checked_mul(core::mem::size_of::<IsoExtent>())
+                .ok_or_else(|| iso_error(ErrorKind::Limit, "file extent metadata overflow"))?;
+            let provisional_metadata = (*metadata_used)
+                .checked_add(core::mem::size_of::<IsoIndex>())
+                .and_then(|value| value.checked_add(extent_bytes))
+                .and_then(|value| value.checked_add(extended_metadata_bytes))
+                .ok_or_else(|| iso_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+            if limits
+                .metadata_bytes()
+                .is_some_and(|maximum| provisional_metadata > maximum)
+            {
+                return Err(iso_error(
+                    ErrorKind::Limit,
+                    "ISO metadata exceeds configured limit",
+                ));
+            }
+            let record_budget = limits
+                .metadata_bytes()
+                .map(|maximum| maximum - provisional_metadata);
+            let section_extended = if extended_attribute_blocks == 0 {
+                None
+            } else {
+                let (metadata, raw) = parse_iso_extended_attribute_record(
+                    input,
+                    section_lba,
+                    extended_attribute_blocks,
+                    section[25],
+                    volume_length,
+                    limits,
+                    record_budget,
+                )?;
+                extended_metadata_bytes = extended_metadata_bytes
+                    .checked_add(raw.len())
+                    .ok_or_else(|| iso_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+                extended_records.try_reserve_exact(1).map_err(|_| {
+                    iso_error(
+                        ErrorKind::Limit,
+                        "extended attribute table allocation failed",
+                    )
+                })?;
+                extended_records.push(Extension::new(
+                    "iso-extended-attribute",
+                    b"record".to_vec(),
+                    raw,
+                ));
+                Some(metadata)
+            };
+            extended_metadata = section_extended;
+            let data_offset = iso_extent_data_offset(section_lba, extended_attribute_blocks)?;
+            let physical_end = iso_extent_physical_end(
+                data_offset,
+                u64::from(section_size),
+                unit_bytes,
+                gap_bytes,
+            )?;
+            if physical_end > volume_length {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "entry extent is outside the declared volume",
+                ));
+            }
+            size = size
+                .checked_add(u64::from(section_size))
+                .ok_or_else(|| iso_error(ErrorKind::Limit, "entry size overflow"))?;
+            if limits.entry_bytes().is_some_and(|maximum| size > maximum) {
+                return Err(iso_error(
+                    ErrorKind::Limit,
+                    "entry exceeds configured size limit",
+                ));
+            }
+            let provisional_metadata = (*metadata_used)
+                .checked_add(core::mem::size_of::<IsoIndex>())
+                .and_then(|value| value.checked_add(extent_bytes))
+                .and_then(|value| value.checked_add(extended_metadata_bytes))
+                .ok_or_else(|| iso_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+            if limits
+                .metadata_bytes()
+                .is_some_and(|maximum| provisional_metadata > maximum)
+            {
+                return Err(iso_error(
+                    ErrorKind::Limit,
+                    "ISO metadata exceeds configured limit",
+                ));
+            }
+            extents
+                .try_reserve_exact(1)
+                .map_err(|_| iso_error(ErrorKind::Limit, "file extent table allocation failed"))?;
+            extents.push(IsoExtent {
+                data_offset,
+                size: u64::from(section_size),
+                unit_bytes,
+                gap_bytes,
+                physical_end,
+            });
+            if section[25] & 0x80 == 0 {
+                break;
+            }
+            section = next_iso_directory_record(extent, &mut position)?.ok_or_else(|| {
+                iso_error(
+                    ErrorKind::Malformed,
+                    "multi-extent file is missing its final directory record",
+                )
+            })?;
+        }
         let mut name = decode_iso_identifier(identifier, joliet, is_directory)?;
         let system_use_start = identifier_end
             .checked_add(usize::from(identifier_length.is_multiple_of(2)))
@@ -2415,7 +4589,7 @@ fn parse_iso_directory<R: Read + Seek>(
             .ok_or_else(|| iso_error(ErrorKind::Malformed, "system-use offset overflow"))?;
         let system_use = record.get(system_use_start..).unwrap_or_default();
         let (rock_ridge, continuation_bytes) =
-            parse_rock_ridge_with_continuations(input, system_use, image_length, limits)?;
+            parse_rock_ridge_with_continuations(input, system_use, volume_length, limits)?;
         if rock_ridge.relocated {
             continue;
         }
@@ -2451,35 +4625,48 @@ fn parse_iso_directory<R: Read + Seek>(
             .link_target
             .map(|target| ArchivePath::try_from_encoded(target, PathEncoding::Bytes))
             .transpose()?;
+        let extended_metadata = extended_metadata.unwrap_or_default();
         let mut builder = EntryMetadata::builder(kind, path_value)
-            .size(Some(if is_directory { 0 } else { u64::from(size) }))
+            .size(Some(if is_directory { 0 } else { size }))
             .mode(
                 rock_ridge
                     .mode
+                    .or(extended_metadata.mode)
                     .or(Some(if is_directory { 0o755 } else { 0o644 })),
             )
             .owner(Owner {
-                uid: rock_ridge.uid,
-                gid: rock_ridge.gid,
+                uid: rock_ridge.uid.or(extended_metadata.owner.uid),
+                gid: rock_ridge.gid.or(extended_metadata.owner.gid),
                 ..Owner::default()
             })
             .times(EntryTimes {
-                modified: rock_ridge.modified.or_else(|| iso_record_time(record)),
-                accessed: rock_ridge.accessed,
-                changed: rock_ridge.changed,
-                created: rock_ridge.created,
+                modified: rock_ridge
+                    .modified
+                    .or(extended_metadata.times.modified)
+                    .or_else(|| iso_record_time(record)),
+                accessed: rock_ridge.accessed.or(extended_metadata.times.accessed),
+                changed: rock_ridge.changed.or(extended_metadata.times.changed),
+                created: rock_ridge.created.or(extended_metadata.times.created),
             })
             .link_target(link_target)
             .inode_and_links(rock_ridge.inode, rock_ridge.links)
             .devices(None, rock_ridge.referenced_device);
-        for extension in rock_ridge.extensions {
+        for extension in extended_records.into_iter().chain(rock_ridge.extensions) {
             builder = builder.extension(extension);
         }
         let accounted = path
             .len()
             .checked_add(system_use.len())
             .and_then(|value| value.checked_add(continuation_bytes))
+            .and_then(|value| value.checked_add(extended_metadata_bytes))
             .and_then(|value| value.checked_add(core::mem::size_of::<IsoIndex>()))
+            .and_then(|value| {
+                value.checked_add(
+                    extents
+                        .len()
+                        .checked_mul(core::mem::size_of::<IsoExtent>())?,
+                )
+            })
             .ok_or_else(|| iso_error(ErrorKind::Limit, "metadata accounting overflow"))?;
         *metadata_used = metadata_used
             .checked_add(accounted)
@@ -2509,18 +4696,329 @@ fn parse_iso_directory<R: Read + Seek>(
             }
             stack.push(IsoDirectory {
                 lba: rock_ridge.child_link.unwrap_or(lba),
-                size,
+                size: first_size,
+                extended_attribute_blocks: record[1],
                 prefix,
                 depth: directory.depth + 1,
             });
+            for extent in &mut extents {
+                extent.size = 0;
+                extent.physical_end = extent.data_offset;
+            }
         }
         entries.push(IsoIndex {
             metadata: builder.build(),
-            data_offset,
-            size: if is_directory { 0 } else { u64::from(size) },
+            extents: extents.into(),
         });
     }
     Ok(())
+}
+
+fn validate_iso_volume_reference(record: &[u8], volume_sequence: u16) -> Result<(), StreamError> {
+    let referenced_volume = iso_u16(record, 28)?;
+    if referenced_volume == 0 {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "directory record has a zero volume sequence number",
+        ));
+    }
+    if referenced_volume != volume_sequence {
+        return Err(iso_error(
+            ErrorKind::Unsupported,
+            "directory record references another ISO volume",
+        ));
+    }
+    Ok(())
+}
+
+fn iso_extent_first_unit(extent: IsoExtent) -> u64 {
+    if extent.unit_bytes == 0 {
+        extent.size
+    } else {
+        extent.size.min(extent.unit_bytes)
+    }
+}
+
+fn iso_extent_data_offset(
+    logical_block: u32,
+    extended_attribute_blocks: u8,
+) -> Result<u64, StreamError> {
+    u64::from(logical_block)
+        .checked_add(u64::from(extended_attribute_blocks))
+        .and_then(|block| block.checked_mul(ISO_SECTOR))
+        .ok_or_else(|| iso_error(ErrorKind::Malformed, "ISO extent offset overflow"))
+}
+
+fn iso_extent_physical_end(
+    data_offset: u64,
+    size: u64,
+    unit_bytes: u64,
+    gap_bytes: u64,
+) -> Result<u64, StreamError> {
+    let gaps = if size == 0 || unit_bytes == 0 {
+        0
+    } else {
+        (size - 1) / unit_bytes
+    };
+    gaps.checked_mul(gap_bytes)
+        .and_then(|gap_total| size.checked_add(gap_total))
+        .and_then(|span| data_offset.checked_add(span))
+        .ok_or_else(|| iso_error(ErrorKind::Malformed, "interleaved file extent overflow"))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn parse_iso_extended_attribute_record<R: Read + Seek>(
+    input: &mut R,
+    logical_block: u32,
+    allocated_blocks: u8,
+    file_flags: u8,
+    volume_length: u64,
+    limits: Limits,
+    metadata_budget: Option<usize>,
+) -> Result<(IsoExtendedMetadata, Vec<u8>), StreamError> {
+    const HEADER: usize = 250;
+    const REQUIRED_PERMISSION_BITS: u16 = 0xaaaa;
+    const ACCESS_PERMISSION_BITS: u16 = 0x5555;
+
+    let allocated_bytes = u64::from(allocated_blocks)
+        .checked_mul(ISO_SECTOR)
+        .ok_or_else(|| {
+            iso_error(
+                ErrorKind::Malformed,
+                "extended attribute allocation overflow",
+            )
+        })?;
+    let offset = u64::from(logical_block)
+        .checked_mul(ISO_SECTOR)
+        .ok_or_else(|| iso_error(ErrorKind::Malformed, "extended attribute offset overflow"))?;
+    if offset
+        .checked_add(allocated_bytes)
+        .is_none_or(|end| end > volume_length)
+    {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "extended attribute record is outside the declared volume",
+        ));
+    }
+    if limits
+        .in_flight_bytes()
+        .is_some_and(|maximum| HEADER > maximum)
+    {
+        return Err(iso_error(
+            ErrorKind::Limit,
+            "extended attribute header exceeds the in-flight buffer limit",
+        ));
+    }
+    input
+        .seek(SeekFrom::Start(offset))
+        .map_err(StreamError::io)?;
+    let mut raw = vec![0; HEADER];
+    input.read_exact(&mut raw).map_err(StreamError::io)?;
+
+    if raw[180] != 1 {
+        return Err(iso_error(
+            ErrorKind::Unsupported,
+            "unsupported ISO extended attribute record version",
+        ));
+    }
+    if raw[182..246].iter().any(|byte| *byte != 0) {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "extended attribute reserved bytes are nonzero",
+        ));
+    }
+    let application_length = usize::from(iso_u16(&raw, 246)?);
+    let escape_length = usize::from(raw[181]);
+    let used = HEADER
+        .checked_add(application_length)
+        .and_then(|value| value.checked_add(escape_length))
+        .ok_or_else(|| {
+            iso_error(
+                ErrorKind::Limit,
+                "extended attribute record length overflow",
+            )
+        })?;
+    if u64::try_from(used)
+        .ok()
+        .is_none_or(|used| used > allocated_bytes)
+    {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "extended attribute fields exceed their allocation",
+        ));
+    }
+    if limits
+        .in_flight_bytes()
+        .is_some_and(|maximum| used > maximum)
+        || metadata_budget.is_some_and(|maximum| used > maximum)
+    {
+        return Err(iso_error(
+            ErrorKind::Limit,
+            "extended attribute record exceeds configured limits",
+        ));
+    }
+    raw.try_reserve_exact(used - HEADER).map_err(|_| {
+        iso_error(
+            ErrorKind::Limit,
+            "extended attribute record allocation failed",
+        )
+    })?;
+    raw.resize(used, 0);
+    input
+        .read_exact(&mut raw[HEADER..])
+        .map_err(StreamError::io)?;
+
+    let owner = iso_u16(&raw, 0)?;
+    let group = iso_u16(&raw, 4)?;
+    let permissions = u16::from_be_bytes([raw[8], raw[9]]);
+    if permissions & REQUIRED_PERMISSION_BITS != REQUIRED_PERMISSION_BITS {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "extended attribute permissions omit required bits",
+        ));
+    }
+    let protected = file_flags & 0x10 != 0;
+    if protected {
+        if owner == 0 || group == 0 {
+            return Err(iso_error(
+                ErrorKind::Malformed,
+                "protected entry omits its owner or group",
+            ));
+        }
+    } else if owner != 0 || group != 0 || permissions & ACCESS_PERMISSION_BITS != 0 {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "unprotected entry has protected ownership or permissions",
+        ));
+    }
+
+    let record_format = raw[78];
+    if (file_flags & 0x08 != 0) != (record_format != 0) {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "record flag and extended attribute format disagree",
+        ));
+    }
+    let record_length = iso_u16(&raw, 80)?;
+    if record_format == 0 && record_length != 0 {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "unspecified record format has a nonzero record length",
+        ));
+    }
+
+    let mode = protected.then(|| {
+        [
+            (4, 0o400),
+            (6, 0o100),
+            (8, 0o040),
+            (10, 0o010),
+            (12, 0o004),
+            (14, 0o001),
+        ]
+        .into_iter()
+        .fold(0, |mode, (bit, value)| {
+            if permissions & (1 << bit) == 0 {
+                mode | value
+            } else {
+                mode
+            }
+        })
+    });
+    let created = iso_extended_time(&raw[10..27], "invalid ISO extended attribute creation time")?;
+    let modified = iso_extended_time(
+        &raw[27..44],
+        "invalid ISO extended attribute modification time",
+    )?;
+    iso_extended_time(
+        &raw[44..61],
+        "invalid ISO extended attribute expiration time",
+    )?;
+    iso_extended_time(
+        &raw[61..78],
+        "invalid ISO extended attribute effective time",
+    )?;
+    Ok((
+        IsoExtendedMetadata {
+            mode,
+            owner: Owner {
+                uid: protected.then_some(u64::from(owner)),
+                gid: protected.then_some(u64::from(group)),
+                ..Owner::default()
+            },
+            times: EntryTimes {
+                created,
+                modified,
+                ..EntryTimes::default()
+            },
+        },
+        raw,
+    ))
+}
+
+fn next_iso_directory_record<'a>(
+    extent: &'a [u8],
+    position: &mut usize,
+) -> Result<Option<&'a [u8]>, StreamError> {
+    loop {
+        if *position >= extent.len() {
+            return Ok(None);
+        }
+        let block_end = position
+            .checked_div(ISO_SECTOR_USIZE)
+            .and_then(|sector| sector.checked_add(1))
+            .and_then(|sector| sector.checked_mul(ISO_SECTOR_USIZE))
+            .ok_or_else(|| iso_error(ErrorKind::Malformed, "directory position overflow"))?
+            .min(extent.len());
+        let record_length = usize::from(extent[*position]);
+        if record_length == 0 {
+            if extent[*position..block_end].iter().any(|byte| *byte != 0) {
+                return Err(iso_error(
+                    ErrorKind::Malformed,
+                    "directory block padding contains nonzero bytes",
+                ));
+            }
+            *position = block_end;
+            continue;
+        }
+        let end = position
+            .checked_add(record_length)
+            .ok_or_else(|| iso_error(ErrorKind::Malformed, "directory record length overflow"))?;
+        if end > block_end {
+            return Err(iso_error(
+                ErrorKind::Malformed,
+                "directory record crosses a logical block",
+            ));
+        }
+        let record = extent.get(*position..end).ok_or_else(|| {
+            iso_error(ErrorKind::Malformed, "directory record exceeds its extent")
+        })?;
+        *position = end;
+        if record.len() < ISO_DIRECTORY_RECORD_BASE + 1 {
+            return Err(iso_error(
+                ErrorKind::Malformed,
+                "directory record is too short",
+            ));
+        }
+        return Ok(Some(record));
+    }
+}
+
+fn iso_directory_identifier(record: &[u8]) -> Result<(&[u8], usize), StreamError> {
+    let identifier_length = usize::from(record[32]);
+    let identifier_end = ISO_DIRECTORY_RECORD_BASE
+        .checked_add(identifier_length)
+        .ok_or_else(|| iso_error(ErrorKind::Malformed, "identifier length overflow"))?;
+    let identifier = record
+        .get(ISO_DIRECTORY_RECORD_BASE..identifier_end)
+        .ok_or_else(|| iso_error(ErrorKind::Malformed, "identifier exceeds directory record"))?;
+    if identifier_length.is_multiple_of(2) && record.get(identifier_end).copied() != Some(0) {
+        return Err(iso_error(
+            ErrorKind::Malformed,
+            "directory record has invalid identifier padding",
+        ));
+    }
+    Ok((identifier, identifier_end))
 }
 
 #[derive(Debug, Default)]
@@ -2555,7 +5053,7 @@ struct IsoContinuation {
 fn parse_rock_ridge_with_continuations<R: Read + Seek>(
     input: &mut R,
     system_use: &[u8],
-    image_length: u64,
+    volume_length: u64,
     limits: Limits,
 ) -> Result<(RockRidge, usize), StreamError> {
     let mut result = RockRidge::default();
@@ -2623,11 +5121,11 @@ fn parse_rock_ridge_with_continuations<R: Read + Seek>(
             .ok_or_else(|| iso_error(ErrorKind::Malformed, "SUSP continuation offset overflow"))?;
         if start
             .checked_add(u64::from(continuation.length))
-            .is_none_or(|end| end > image_length)
+            .is_none_or(|end| end > volume_length)
         {
             return Err(iso_error(
                 ErrorKind::Malformed,
-                "SUSP continuation is outside the image",
+                "SUSP continuation is outside the declared volume",
             ));
         }
         input
@@ -2867,6 +5365,23 @@ fn long_iso_time(raw: &[u8]) -> Option<Timestamp> {
     )
 }
 
+fn iso_extended_time(
+    raw: &[u8],
+    invalid_context: &'static str,
+) -> Result<Option<Timestamp>, StreamError> {
+    let unspecified = raw.iter().all(|byte| *byte == 0)
+        || raw
+            .get(..16)
+            .is_some_and(|digits| digits.iter().all(|byte| *byte == b'0'))
+            && raw.get(16) == Some(&0);
+    if unspecified {
+        return Ok(None);
+    }
+    long_iso_time(raw)
+        .map(Some)
+        .ok_or_else(|| iso_error(ErrorKind::Malformed, invalid_context))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn timestamp_from_parts(
     year: i32,
@@ -3016,6 +5531,28 @@ fn format_name(format: FormatId) -> &'static str {
         .map_or("archive", |record| record.name())
 }
 
+#[cfg(feature = "ppmd")]
+fn zip_ppmd_setup_error(error: &ppmd_rust::Error) -> StreamError {
+    let (kind, context) = match error {
+        ppmd_rust::Error::MemoryAllocation => {
+            (ErrorKind::Limit, "ZIP PPMd model allocation failed")
+        },
+        ppmd_rust::Error::RangeDecoderInitialization => (
+            ErrorKind::Malformed,
+            "ZIP PPMd range decoder initialization failed",
+        ),
+        ppmd_rust::Error::InvalidParameter => {
+            (ErrorKind::Malformed, "invalid ZIP PPMd coder parameters")
+        },
+        ppmd_rust::Error::IoError(_) => (ErrorKind::Malformed, "truncated ZIP PPMd range header"),
+    };
+    StreamError::archive(
+        ArchiveError::new(kind)
+            .with_format("zip")
+            .with_context(context),
+    )
+}
+
 fn iso_error(kind: ErrorKind, context: &'static str) -> StreamError {
     StreamError::archive(
         ArchiveError::new(kind)
@@ -3024,10 +5561,140 @@ fn iso_error(kind: ErrorKind, context: &'static str) -> StreamError {
     )
 }
 
+fn validate_zip_disk_count(disk_starts: Option<&[u64]>, declared: u32) -> Result<(), StreamError> {
+    let actual = disk_starts.map_or(1, <[u64]>::len);
+    if usize::try_from(declared).ok() != Some(actual) {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("ZIP64 locator disk count disagrees with supplied volumes"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_zip_disk_topology(
+    disk_starts: Option<&[u64]>,
+    this_disk: u32,
+    central_disk: u32,
+    count_on_disk: u64,
+    count: u64,
+) -> Result<(), StreamError> {
+    if count_on_disk > count {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("ZIP entry count on final disk exceeds the total count"),
+        ));
+    }
+    let Some(starts) = disk_starts else {
+        if this_disk != 0 || central_disk != 0 {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Unsupported)
+                    .with_format("zip")
+                    .with_context("multi-disk ZIP requires a VolumeSet reader"),
+            ));
+        }
+        if count_on_disk != count {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context("single-disk ZIP entry counts disagree"),
+            ));
+        }
+        return Ok(());
+    };
+    if starts.is_empty() || starts[0] != 0 || !starts.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("zip")
+                .with_context("split ZIP disk layout is empty or non-monotonic"),
+        ));
+    }
+    let final_disk = u32::try_from(starts.len() - 1).map_err(|_| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Limit)
+                .with_format("zip")
+                .with_context("split ZIP disk count exceeds u32"),
+        )
+    })?;
+    if this_disk != final_disk || central_disk > this_disk {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("ZIP end record disk topology disagrees with supplied volumes"),
+        ));
+    }
+    Ok(())
+}
+
+fn zip_disk_offset(
+    disk_starts: Option<&[u64]>,
+    archive_end: u64,
+    disk: u32,
+    offset: u64,
+    context: &'static str,
+) -> Result<u64, StreamError> {
+    let Some(starts) = disk_starts else {
+        if disk != 0 {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Unsupported)
+                    .with_format("zip")
+                    .with_context("multi-disk ZIP requires a VolumeSet reader"),
+            ));
+        }
+        if offset > archive_end {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context(context),
+            ));
+        }
+        return Ok(offset);
+    };
+    let index = usize::try_from(disk).map_err(|_| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("ZIP disk number exceeds address space"),
+        )
+    })?;
+    let start = *starts.get(index).ok_or_else(|| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("ZIP record references an unavailable disk"),
+        )
+    })?;
+    let finish = starts.get(index + 1).copied().unwrap_or(archive_end);
+    let disk_length = finish.checked_sub(start).ok_or_else(|| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("zip")
+                .with_context("split ZIP disk layout is non-monotonic"),
+        )
+    })?;
+    if offset > disk_length {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context(context),
+        ));
+    }
+    start.checked_add(offset).ok_or_else(|| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("ZIP disk-relative offset overflow"),
+        )
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_zip_index<R: Read + Seek>(
     input: &mut R,
     limits: Limits,
+    disk_starts: Option<&[u64]>,
 ) -> Result<(ArchiveMetadata, Vec<ZipIndex>), StreamError> {
     let end = input.seek(SeekFrom::End(0)).map_err(StreamError::io)?;
     let tail_length = end.min(EOCD_SEARCH);
@@ -3094,9 +5761,26 @@ fn parse_zip_index<R: Read + Seek>(
         ArchiveMetadata::new().with_comment(archive_comment.to_vec())
     };
     let eocd_absolute = end - tail_length + eocd as u64;
-    let mut count = u64::from(le16(&tail[eocd..], 10)?);
-    let mut central_offset = u64::from(le32(&tail[eocd..], 16)?);
-    if count == u64::from(u16::MAX) || central_offset == u64::from(u32::MAX) {
+    let classic_this_disk = le16(&tail[eocd..], 4)?;
+    let classic_central_disk = le16(&tail[eocd..], 6)?;
+    let classic_count_on_disk = le16(&tail[eocd..], 8)?;
+    let classic_count = le16(&tail[eocd..], 10)?;
+    let classic_central_size = le32(&tail[eocd..], 12)?;
+    let classic_central_offset = le32(&tail[eocd..], 16)?;
+    let mut this_disk = u32::from(classic_this_disk);
+    let mut central_disk = u32::from(classic_central_disk);
+    let mut count_on_disk = u64::from(classic_count_on_disk);
+    let mut count = u64::from(classic_count);
+    let mut central_size = u64::from(classic_central_size);
+    let mut central_relative = u64::from(classic_central_offset);
+    let zip64 = classic_this_disk == u16::MAX
+        || classic_central_disk == u16::MAX
+        || classic_count_on_disk == u16::MAX
+        || classic_count == u16::MAX
+        || classic_central_size == u32::MAX
+        || classic_central_offset == u32::MAX;
+    let mut zip64_record_absolute = None;
+    if zip64 {
         if eocd_absolute < ZIP64_LOCATOR as u64 {
             return Err(StreamError::archive(
                 ArchiveError::new(ErrorKind::Malformed)
@@ -3116,7 +5800,16 @@ fn parse_zip_index<R: Read + Seek>(
                     .with_context("bad ZIP64 locator"),
             ));
         }
-        let record_offset = le64(&locator, 8)?;
+        let locator_disk = le32(&locator, 4)?;
+        let record_offset = zip_disk_offset(
+            disk_starts,
+            end,
+            locator_disk,
+            le64(&locator, 8)?,
+            "ZIP64 end record offset is outside its declared disk",
+        )?;
+        let total_disks = le32(&locator, 16)?;
+        validate_zip_disk_count(disk_starts, total_disks)?;
         input
             .seek(SeekFrom::Start(record_offset))
             .map_err(StreamError::io)?;
@@ -3129,8 +5822,49 @@ fn parse_zip_index<R: Read + Seek>(
                     .with_context("bad ZIP64 end record"),
             ));
         }
+        if le64(&record, 4)? < 44 {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context("ZIP64 end record is shorter than its fixed fields"),
+            ));
+        }
+        this_disk = le32(&record, 16)?;
+        central_disk = le32(&record, 20)?;
+        count_on_disk = le64(&record, 24)?;
         count = le64(&record, 32)?;
-        central_offset = le64(&record, 48)?;
+        central_size = le64(&record, 40)?;
+        central_relative = le64(&record, 48)?;
+        if locator_disk != this_disk {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context("ZIP64 locator and end record disk numbers disagree"),
+            ));
+        }
+        zip64_record_absolute = Some(record_offset);
+    }
+    validate_zip_disk_topology(disk_starts, this_disk, central_disk, count_on_disk, count)?;
+    let central_offset = zip_disk_offset(
+        disk_starts,
+        end,
+        central_disk,
+        central_relative,
+        "central-directory offset is outside its declared disk",
+    )?;
+    let central_end = central_offset.checked_add(central_size).ok_or_else(|| {
+        StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("central-directory extent overflow"),
+        )
+    })?;
+    if central_end > zip64_record_absolute.unwrap_or(eocd_absolute) {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("central directory overlaps its end records"),
+        ));
     }
     if limits.entries().is_some_and(|limit| count > limit) {
         return Err(StreamError::archive(
@@ -3157,12 +5891,14 @@ fn parse_zip_index<R: Read + Seek>(
         }
         let flags = le16(&fixed, 8)?;
         let method = le16(&fixed, 10)?;
+        let dos_time = le16(&fixed, 12)?;
         let crc32 = le32(&fixed, 16)?;
         let compressed32 = le32(&fixed, 20)?;
         let uncompressed32 = le32(&fixed, 24)?;
         let name_length = usize::from(le16(&fixed, 28)?);
         let extra_length = usize::from(le16(&fixed, 30)?);
         let comment_length = usize::from(le16(&fixed, 32)?);
+        let disk16 = le16(&fixed, 34)?;
         let external_attributes = le32(&fixed, 38)?;
         let local32 = le32(&fixed, 42)?;
         let variable_length = name_length
@@ -3200,8 +5936,15 @@ fn parse_zip_index<R: Read + Seek>(
         let raw_name = &variable[..name_length];
         let extra = &variable[name_length..name_length + extra_length];
         let raw_comment = &variable[name_length + extra_length..];
-        let (uncompressed_size, compressed_size, local_offset) =
-            zip64_values(extra, uncompressed32, compressed32, local32)?;
+        let (uncompressed_size, compressed_size, local_relative, local_disk) =
+            zip64_values(extra, uncompressed32, compressed32, local32, disk16)?;
+        let local_offset = zip_disk_offset(
+            disk_starts,
+            end,
+            local_disk,
+            local_relative,
+            "local-header offset is outside its declared disk",
+        )?;
         let (aes_real_method, aes_strength) = zip_aes_parameters(extra, method)?;
         let name = unicode_zip_value(extra, 0x7075, raw_name)?.unwrap_or(raw_name);
         let comment = unicode_zip_value(extra, 0x6375, raw_comment)?.unwrap_or(raw_comment);
@@ -3245,6 +5988,7 @@ fn parse_zip_index<R: Read + Seek>(
         .mode((unix_mode != 0).then_some(unix_mode & 0o7777))
         .owner(owner)
         .encrypted(flags & 0x0001 != 0)
+        .file_flags(u64::from(dos_attributes & !0x10))
         .comment((!comment.is_empty()).then(|| comment.to_vec()))
         .times(times);
         let mut cursor = 0;
@@ -3278,6 +6022,7 @@ fn parse_zip_index<R: Read + Seek>(
             raw_name: raw_name.to_vec(),
             method,
             flags,
+            dos_time,
             crc32,
             compressed_size,
             uncompressed_size,
@@ -3285,6 +6030,14 @@ fn parse_zip_index<R: Read + Seek>(
             aes_real_method,
             aes_strength,
         });
+    }
+    let parsed_central_end = input.stream_position().map_err(StreamError::io)?;
+    if parsed_central_end > central_end {
+        return Err(StreamError::archive(
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("central-directory records exceed the declared extent"),
+        ));
     }
     hydrate_zip_symlink_targets(input, &mut entries, limits, &mut metadata_used)?;
     Ok((archive_metadata, entries))
@@ -3719,7 +6472,8 @@ fn zip64_values(
     uncompressed: u32,
     compressed: u32,
     local: u32,
-) -> Result<(u64, u64, u64), StreamError> {
+    disk: u16,
+) -> Result<(u64, u64, u64, u32), StreamError> {
     let mut values = None;
     let mut cursor = 0;
     while cursor + 4 <= extra.len() {
@@ -3774,7 +6528,19 @@ fn zip64_values(
     } else {
         u64::from(local)
     };
-    Ok((uncompressed, compressed, local))
+    let disk = if disk == u16::MAX {
+        if zip64.len() < 4 {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("zip")
+                    .with_context("truncated ZIP64 disk number"),
+            ));
+        }
+        le32(zip64, 0)?
+    } else {
+        u32::from(disk)
+    };
+    Ok((uncompressed, compressed, local, disk))
 }
 
 fn unicode_zip_value<'a>(

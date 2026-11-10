@@ -4,28 +4,30 @@
 
 //! Unix `compress(1)` LZW as a bounded, caller-driven decoder.
 //!
-//! The wire format is the three-byte `1f 9d` header followed by LSB-first
-//! variable-width LZW codes. The adapter uses `compcol`'s safe Rust state
-//! machine, but owns the archive-facing resource and protocol boundary:
-//! dictionary memory is rejected before allocation, decoded output is
-//! bounded, reserved header bits fail closed, and every progress count is
-//! validated before it reaches a caller.
+//! The wire format is the three-byte `1f 9d` header followed by LSB-first variable-width LZW codes.
+//! The adapter uses `compcol`'s safe Rust state machine, but owns the archive-facing resource and protocol boundary:
+//! dictionary memory is rejected before allocation, decoded output is bounded, reserved header bits fail closed, and every progress count is validated before it reaches a caller.
 
 use alloc::string::ToString;
 use core::fmt;
 
 use compcol::limit::LimitedDecoder;
 use compcol::lzw;
-use compcol::{Decoder as _, Error as CompcolError, Progress, Status};
-use libarchive_oxide_core::{
+use compcol::{Decoder as _, Encoder as _, Error as CompcolError, Progress, Status};
+use libarchive_oxide_protocol::{
     ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput, ErrorKind, Limits,
 };
 
 /// Two fixed 65,536-entry dictionary arrays plus the longest pending string.
 ///
-/// `compcol::lzw::Decoder` allocates a `u16` prefix table, a `u8` suffix
-/// table, and at most one 65,536-byte expansion pending caller output.
+/// `compcol::lzw::Decoder` allocates a `u16` prefix table, a `u8` suffix table, and at most one 65,536-byte expansion pending caller output.
 pub const DECODER_WORKSPACE_BYTES: usize = 256 * 1024;
+
+/// Two 131,072-entry `u32` hash tables plus bounded pending-code storage.
+///
+/// The caller-owned output slice is not included.
+/// `compcol` drains pending bytes on every encode step and bounds the internal queue independently of the total input length.
+pub const ENCODER_WORKSPACE_BYTES: usize = 2 * 128 * 1024 * 4 + 64 * 1024;
 
 const MAGIC: [u8; 2] = [0x1f, 0x9d];
 const RESERVED_HEADER_BITS: u8 = 0x60;
@@ -50,9 +52,7 @@ impl CompressDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Limit`] before allocating the dictionary when the
-    /// configured codec-memory budget is smaller than
-    /// [`DECODER_WORKSPACE_BYTES`].
+    /// Returns [`ErrorKind::Limit`] before allocating the dictionary when the configured codec-memory budget is smaller than [`DECODER_WORKSPACE_BYTES`].
     pub fn new() -> Result<Self, ArchiveError> {
         Self::with_limits(Limits::safe())
     }
@@ -61,8 +61,7 @@ impl CompressDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Limit`] before allocating the dictionary when the
-    /// configured codec-memory budget cannot hold the fixed LZW workspace.
+    /// Returns [`ErrorKind::Limit`] before allocating the dictionary when the configured codec-memory budget cannot hold the fixed LZW workspace.
     pub fn with_limits(limits: Limits) -> Result<Self, ArchiveError> {
         if limits
             .codec_memory()
@@ -279,12 +278,199 @@ impl Codec for CompressDecoder {
     }
 }
 
+/// Incremental encoder for the Unix `.Z` / `compress(1)` stream format.
+pub struct CompressEncoder {
+    encoder: lzw::Encoder,
+    terminal: TerminalState,
+    finishing: bool,
+    plain: u64,
+    plain_limit: Option<u64>,
+}
+
+impl CompressEncoder {
+    /// Creates an encoder with finite safe limits.
+    pub fn new() -> Result<Self, ArchiveError> {
+        Self::with_limits(Limits::safe())
+    }
+
+    /// Creates an encoder after checking its fixed dictionary workspace.
+    pub fn with_limits(limits: Limits) -> Result<Self, ArchiveError> {
+        if limits
+            .codec_memory()
+            .is_some_and(|limit| limit < ENCODER_WORKSPACE_BYTES)
+        {
+            return Err(ArchiveError::new(ErrorKind::Limit)
+                .with_format("compress")
+                .with_context("compress/LZW encoder exceeds the codec-memory budget"));
+        }
+        Ok(Self {
+            encoder: lzw::Encoder::new(),
+            terminal: TerminalState::Running,
+            finishing: false,
+            plain: 0,
+            plain_limit: limits.decoded_total(),
+        })
+    }
+
+    fn fail(&mut self, kind: ErrorKind, context: &'static str) -> ArchiveError {
+        self.terminal = TerminalState::Failed;
+        CompressDecoder::error(kind, context)
+    }
+
+    fn finish(
+        &mut self,
+        output: &mut [u8],
+        consumed: usize,
+        produced: usize,
+    ) -> Result<CodecStep, ArchiveError> {
+        let (progress, status) = self
+            .encoder
+            .finish(&mut output[produced..])
+            .map_err(CompressDecoder::codec_error)?;
+        let progress =
+            CompressDecoder::validate_progress(progress, 0, output.len().saturating_sub(produced))?;
+        let produced = produced.checked_add(progress.written).ok_or_else(|| {
+            self.fail(
+                ErrorKind::Limit,
+                "compress/LZW encoded-byte count overflowed",
+            )
+        })?;
+        let status = match status {
+            Status::StreamEnd => {
+                self.terminal = TerminalState::Done;
+                CodecStatus::Done
+            },
+            Status::OutputFull => CodecStatus::NeedOutput,
+            Status::InputEmpty => {
+                return Err(self.fail(
+                    ErrorKind::Protocol,
+                    "compress/LZW finish returned a non-terminal input request",
+                ));
+            },
+        };
+        Ok(CodecStep {
+            consumed,
+            produced,
+            status,
+        })
+    }
+}
+
+impl fmt::Debug for CompressEncoder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompressEncoder")
+            .field("terminal", &self.terminal)
+            .field("finishing", &self.finishing)
+            .field("plain_bytes", &self.plain)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Codec for CompressEncoder {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> Result<CodecStep, ArchiveError> {
+        match self.terminal {
+            TerminalState::Done if input.is_empty() => {
+                return Ok(CodecStep {
+                    consumed: 0,
+                    produced: 0,
+                    status: CodecStatus::Done,
+                });
+            },
+            TerminalState::Done => {
+                return Err(self.fail(
+                    ErrorKind::Protocol,
+                    "input supplied after compress/LZW completion",
+                ));
+            },
+            TerminalState::Failed => {
+                return Err(CompressDecoder::error(
+                    ErrorKind::Protocol,
+                    "compress/LZW encoder reused after failure",
+                ));
+            },
+            TerminalState::Running => {},
+        }
+
+        if self.finishing {
+            if !input.is_empty() {
+                return Err(self.fail(
+                    ErrorKind::Protocol,
+                    "input supplied after compress/LZW finalization started",
+                ));
+            }
+            return self
+                .finish(output, 0, 0)
+                .inspect_err(|_| self.terminal = TerminalState::Failed);
+        }
+
+        let input_length = u64::try_from(input.len())
+            .map_err(|_| self.fail(ErrorKind::Limit, "compress/LZW input length exceeds u64"))?;
+        let projected = self.plain.checked_add(input_length).ok_or_else(|| {
+            self.fail(ErrorKind::Limit, "compress/LZW input byte count overflowed")
+        })?;
+        if self.plain_limit.is_some_and(|maximum| projected > maximum) {
+            return Err(self.fail(
+                ErrorKind::Limit,
+                "compress/LZW input exceeds the configured decoded-byte budget",
+            ));
+        }
+
+        let (progress, status) = self
+            .encoder
+            .encode(input, output)
+            .map_err(CompressDecoder::codec_error)
+            .inspect_err(|_| self.terminal = TerminalState::Failed)?;
+        let progress = CompressDecoder::validate_progress(progress, input.len(), output.len())
+            .inspect_err(|_| self.terminal = TerminalState::Failed)?;
+        self.plain = self
+            .plain
+            .checked_add(u64::try_from(progress.consumed).map_err(|_| {
+                self.fail(
+                    ErrorKind::Limit,
+                    "compress/LZW consumed-byte count exceeds u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                self.fail(ErrorKind::Limit, "compress/LZW input byte count overflowed")
+            })?;
+
+        if matches!(end, EndOfInput::End) && progress.consumed == input.len() {
+            self.finishing = true;
+            return self
+                .finish(output, progress.consumed, progress.written)
+                .inspect_err(|_| self.terminal = TerminalState::Failed);
+        }
+
+        let status = match status {
+            Status::InputEmpty => CodecStatus::NeedInput,
+            Status::OutputFull => CodecStatus::NeedOutput,
+            Status::StreamEnd => {
+                return Err(self.fail(
+                    ErrorKind::Protocol,
+                    "compress/LZW encode ended before finalization",
+                ));
+            },
+        };
+        Ok(CodecStep {
+            consumed: progress.consumed,
+            produced: progress.written,
+            status,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use libarchive_oxide_core::ErrorKind;
+    use libarchive_oxide_protocol::ErrorKind;
 
     use super::*;
     use crate::test_support::{drive_codec, try_drive_codec};
@@ -399,6 +585,55 @@ mod tests {
         let error = decoder
             .process(b"x", &mut output, EndOfInput::End)
             .expect_err("terminal decoder rejects input");
+        assert_eq!(error.kind(), ErrorKind::Protocol);
+    }
+
+    #[test]
+    fn encoder_matches_independent_compress_fixture_across_chunks() {
+        for (input_chunk, output_chunk) in [(1, 1), (2, 3), (7, 5), (64, 64)] {
+            let encoded = drive_codec(
+                CompressEncoder::new().expect("safe LZW encoder workspace"),
+                b"hello world",
+                input_chunk,
+                output_chunk,
+            );
+            assert_eq!(encoded, COMPRESS_HELLO_WORLD);
+        }
+    }
+
+    #[test]
+    fn encoder_workspace_is_rejected_before_construction() {
+        let error = CompressEncoder::with_limits(
+            Limits::safe().with_codec_memory(Some(ENCODER_WORKSPACE_BYTES - 1)),
+        )
+        .expect_err("undersized encoder workspace budget");
+        assert_eq!(error.kind(), ErrorKind::Limit);
+    }
+
+    #[test]
+    fn encoder_plaintext_limit_fails_closed() {
+        let error = try_drive_codec(
+            CompressEncoder::with_limits(Limits::safe().with_decoded_total(Some(10)))
+                .expect("bounded encoder"),
+            b"hello world",
+            11,
+            64,
+        )
+        .expect_err("eleven bytes exceed the configured limit");
+        assert_eq!(error.kind(), ErrorKind::Limit);
+    }
+
+    #[test]
+    fn encoder_rejects_input_after_completion() {
+        let mut encoder = CompressEncoder::new().expect("safe LZW encoder workspace");
+        let mut output = [0; 64];
+        let step = encoder
+            .process(b"hello world", &mut output, EndOfInput::End)
+            .expect("valid input");
+        assert_eq!(step.status, CodecStatus::Done);
+        let error = encoder
+            .process(b"x", &mut output, EndOfInput::End)
+            .expect_err("terminal encoder rejects input");
         assert_eq!(error.kind(), ErrorKind::Protocol);
     }
 }

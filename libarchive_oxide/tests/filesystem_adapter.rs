@@ -504,6 +504,195 @@ fn windows_real_filesystem_refuses_aliases_without_leaking_temporary_files() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_reference_adapter_restores_creation_time_through_the_open_handle() {
+    use std::os::windows::fs::MetadataExt;
+
+    const WINDOWS_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
+    let timestamp = Timestamp::new(1_700_000_000, 123_456_700).expect("valid timestamp");
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("created-at.bin"))
+            .size(Some(7))
+            .times(EntryTimes {
+                created: Some(timestamp),
+                ..EntryTimes::default()
+            })
+            .build();
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(archive(&metadata, b"payload")))
+        .expect("session");
+    let plan = session.plan(Policy::safe()).expect("plan");
+    let destination = tempfile::tempdir().expect("destination");
+    let report = session
+        .apply(plan, capability(destination.path()))
+        .expect("apply");
+
+    let output =
+        std::fs::metadata(destination.path().join("created-at.bin")).expect("output metadata");
+    let expected = (u64::try_from(timestamp.seconds()).expect("positive fixture timestamp")
+        + WINDOWS_EPOCH_OFFSET_SECONDS)
+        * 10_000_000
+        + u64::from(timestamp.nanoseconds() / 100);
+    assert_eq!(output.creation_time(), expected);
+    assert!(report.filesystem_findings().iter().any(|finding| {
+        finding.operation() == &FilesystemOperation::CreationTime
+            && finding.kind() == FilesystemFindingKind::Applied
+    }));
+    assert!(FilesystemCapabilities::standard().creation_time());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_reference_adapter_restores_directory_creation_time_at_session_finish() {
+    use std::os::windows::fs::MetadataExt;
+
+    const WINDOWS_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
+    let timestamp = Timestamp::new(1_650_000_000, 765_432_100).expect("valid timestamp");
+    let metadata =
+        EntryMetadata::builder(EntryKind::Dir, ArchivePath::from_utf8("created-directory"))
+            .size(Some(0))
+            .times(EntryTimes {
+                created: Some(timestamp),
+                ..EntryTimes::default()
+            })
+            .build();
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(archive(&metadata, b"")))
+        .expect("session");
+    let plan = session.plan(Policy::safe()).expect("plan");
+    let destination = tempfile::tempdir().expect("destination");
+    let report = session
+        .apply(plan, capability(destination.path()))
+        .expect("apply");
+
+    let output =
+        std::fs::metadata(destination.path().join("created-directory")).expect("output metadata");
+    let expected = (u64::try_from(timestamp.seconds()).expect("positive fixture timestamp")
+        + WINDOWS_EPOCH_OFFSET_SECONDS)
+        * 10_000_000
+        + u64::from(timestamp.nanoseconds() / 100);
+    assert_eq!(output.creation_time(), expected);
+    assert!(report.filesystem_findings().iter().any(|finding| {
+        finding.operation() == &FilesystemOperation::CreationTime
+            && finding.kind() == FilesystemFindingKind::Applied
+    }));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_reference_adapter_reports_out_of_range_creation_time() {
+    // About 1590 CE: representable in the archive timestamp model and PAX,
+    // but before the Windows FILETIME epoch (1601-01-01).
+    let timestamp = Timestamp::new(-12_000_000_000, 0).expect("valid archive timestamp");
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("ancient.bin"))
+        .size(Some(7))
+        .times(EntryTimes {
+            created: Some(timestamp),
+            ..EntryTimes::default()
+        })
+        .build();
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(archive(&metadata, b"payload")))
+        .expect("session");
+    let plan = session.plan(Policy::safe()).expect("plan");
+    let destination = tempfile::tempdir().expect("destination");
+    let report = session
+        .apply(plan, capability(destination.path()))
+        .expect("metadata failure remains reportable");
+
+    assert_eq!(
+        std::fs::read(destination.path().join("ancient.bin")).expect("output payload"),
+        b"payload"
+    );
+    assert!(report.filesystem_findings().iter().any(|finding| {
+        finding.operation() == &FilesystemOperation::CreationTime
+            && finding.kind() == FilesystemFindingKind::OsError
+    }));
+}
+
+#[cfg(target_os = "macos")]
+fn macos_xattr(path: &std::path::Path, name: &[u8], length: usize) -> Vec<u8> {
+    let file = std::fs::File::open(path).expect("open xattr target");
+    let mut value = vec![0_u8; length];
+    let read = rustix::fs::fgetxattr(&file, name, &mut value).expect("read xattr");
+    value.truncate(read);
+    value
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_reference_adapter_restores_file_xattrs_and_resource_fork() {
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("resource-fork.bin"))
+            .size(Some(7))
+            .xattr(b"com.libarchive-oxide.rm104".to_vec(), b"evidence".to_vec())
+            .xattr(
+                b"com.apple.ResourceFork".to_vec(),
+                b"resource-fork-payload".to_vec(),
+            )
+            .build();
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(archive(&metadata, b"payload")))
+        .expect("session");
+    let plan = session.plan(Policy::safe()).expect("plan");
+    let destination = tempfile::tempdir().expect("destination");
+    let report = session
+        .apply(plan, capability(destination.path()))
+        .expect("apply");
+    let output = destination.path().join("resource-fork.bin");
+
+    assert_eq!(
+        macos_xattr(&output, b"com.libarchive-oxide.rm104", 8),
+        b"evidence"
+    );
+    assert_eq!(
+        macos_xattr(&output, b"com.apple.ResourceFork", 21),
+        b"resource-fork-payload"
+    );
+    for name in [
+        b"com.libarchive-oxide.rm104".as_slice(),
+        b"com.apple.ResourceFork".as_slice(),
+    ] {
+        let operation = FilesystemOperation::ExtendedAttribute(name.to_vec());
+        assert!(report.filesystem_findings().iter().any(|finding| {
+            finding.operation() == &operation && finding.kind() == FilesystemFindingKind::Applied
+        }));
+    }
+    assert!(FilesystemCapabilities::standard().xattrs());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_reference_adapter_restores_deferred_directory_xattr() {
+    let metadata =
+        EntryMetadata::builder(EntryKind::Dir, ArchivePath::from_utf8("xattr-directory"))
+            .size(Some(0))
+            .xattr(
+                b"com.libarchive-oxide.rm104".to_vec(),
+                b"directory".to_vec(),
+            )
+            .build();
+    let mut session = ArchiveEngine::new()
+        .prepare(Cursor::new(archive(&metadata, b"")))
+        .expect("session");
+    let plan = session.plan(Policy::safe()).expect("plan");
+    let destination = tempfile::tempdir().expect("destination");
+    let report = session
+        .apply(plan, capability(destination.path()))
+        .expect("apply");
+    let output = destination.path().join("xattr-directory");
+
+    assert_eq!(
+        macos_xattr(&output, b"com.libarchive-oxide.rm104", 9),
+        b"directory"
+    );
+    let operation = FilesystemOperation::ExtendedAttribute(b"com.libarchive-oxide.rm104".to_vec());
+    assert!(report.filesystem_findings().iter().any(|finding| {
+        finding.operation() == &operation && finding.kind() == FilesystemFindingKind::Applied
+    }));
+}
+
 #[test]
 fn destination_appearing_after_plan_is_not_replaced() {
     let metadata = regular_metadata("race.bin", 7);

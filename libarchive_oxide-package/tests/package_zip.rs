@@ -15,8 +15,8 @@
 
 use std::io::Cursor;
 
+use libarchive_oxide::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use libarchive_oxide::{ArchiveWriter, ZipMethod};
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use libarchive_oxide_package::{PackageFindingCode, ZipPackageProfile, ZipPackageValidator};
 
 /// A single raw ZIP member: name, compression method, general-purpose flags,

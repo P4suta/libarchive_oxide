@@ -10,8 +10,9 @@ use std::io::{self, Read};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use libarchive_oxide_codecs::gzip::GzipDecoder;
-use libarchive_oxide_core::{Codec, CodecStatus, EndOfInput, Limits};
+use libarchive_oxide::Limits;
+use libarchive_oxide::advanced::{Codec, CodecStatus, EndOfInput};
+use libarchive_oxide::filter::gzip::GzipDecoder;
 use ring::signature;
 use sha2::{Digest as _, Sha256};
 
@@ -123,7 +124,7 @@ pub struct PackageKeyError {
 }
 
 impl PackageKeyError {
-    fn new(detail: impl Into<String>) -> Self {
+    pub(crate) fn new(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
         }

@@ -5,14 +5,23 @@
 [workspace]
 resolver = "2"
 members = [
-    "libarchive_oxide-core",
-    "libarchive_oxide-codecs",
-    "libarchive_oxide",
-    "libarchive_oxide-package",
-    "libarchive_oxide-cli",
-    "xtask",
+  "libarchive_oxide-protocol",
+  "libarchive_oxide-core",
+  "libarchive_oxide-codecs",
+  "libarchive_oxide-ppmd",
+  "libarchive_oxide-rar-crypto",
+  "libarchive_oxide-rarvm",
+  "libarchive_oxide-rar",
+  "libarchive_oxide",
+  "libarchive_oxide-package",
+  "libarchive_oxide-cli",
+  "libarchive_oxide/vendor/delharc",
+  "libarchive_oxide/vendor/sevenz-rust2",
+  "xtask",
 ]
 # cargo-fuzz requires nightly and a sanitizer runtime.
+# The publishable LHA helper and dev-only 7z consumer are explicit members so formatting, locking,
+# and all-feature tests remain workspace-wide; release checks explicitly omit only the dev-only consumer.
 exclude = ["fuzz"]
 
 [workspace.package]

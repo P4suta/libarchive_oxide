@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 use sha2::{Digest, Sha256};
 use spki::EncodePublicKey;
 use subtle::ConstantTimeEq;

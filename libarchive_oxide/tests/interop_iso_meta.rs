@@ -305,11 +305,12 @@ fn continuation_iso() -> (Vec<u8>, Vec<u8>) {
     // Twelve independently framed SUSP fields make the continuation longer
     // than one logical block, exercising offset+length ranges across sectors.
     for index in 0..12_u8 {
-        builder = builder.extension(Extension::new(
-            "iso-system-use",
-            vec![b'X', b'A' + index],
-            vec![index; 240],
-        ));
+        let key = vec![b'X', b'A' + index];
+        let mut field = Vec::with_capacity(244);
+        field.extend_from_slice(&key);
+        field.extend_from_slice(&[244, 1]);
+        field.extend_from_slice(&vec![index; 240]);
+        builder = builder.extension(Extension::new("iso-system-use", key, field));
     }
     let metadata = builder.build();
     writer.start_entry(&metadata).unwrap();
@@ -393,6 +394,27 @@ fn iso_rock_ridge_continuation_outside_image_is_malformed() {
         },
         Err(error) => error,
     };
+    assert_eq!(
+        error
+            .archive_error()
+            .map(libarchive_oxide_core::ArchiveError::kind),
+        Some(ErrorKind::Malformed)
+    );
+}
+
+#[test]
+fn iso_rock_ridge_continuation_stays_within_the_declared_volume() {
+    const SECTOR: usize = 2048;
+    let (mut bytes, _) = continuation_iso();
+    let ce = ce_offset(&bytes);
+    let (block, _, _) = ce_target(&bytes, ce);
+    assert!(
+        block > 18,
+        "fixture continuation must follow the descriptor set"
+    );
+    put_both_u32(&mut bytes, 16 * SECTOR + 80, block);
+
+    let error = SeekArchiveReader::new(Cursor::new(bytes)).unwrap_err();
     assert_eq!(
         error
             .archive_error()

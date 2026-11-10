@@ -4,23 +4,662 @@
 
 //! Archive format and outer-codec provider contracts.
 //!
-//! Built-ins and legacy generic chains implement the same internal selection
-//! contract as the application-owned object-safe [`crate::Registry`].
-
-use std::fmt;
-use std::io::Write;
+//! Built-ins and downstream providers compose into generic chains. Runtime
+//! selection is represented by closed enums whose variants are fixed by the
+//! chain's type, so archive algorithm dispatch needs no trait objects.
 
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
     AccessMode, AccessProfile, ArDecoder, ArEncoder, ArchiveDecoder, ArchiveEncoder, ArchiveError,
     ArchiveMetadata, Codec, CpioDecoder, CpioEncoder, DecodeStep, Direction, DirectionSet,
-    EmptyDecoder, EncodeCommand, EncodeStep, ErrorKind, FormatId, Limits, ProbeResult, RawDecoder,
-    TarDecoder, TarEncoder, WarcDecoder,
+    EmptyDecoder, EncodeCommand, EncodeStep, ErrorKind, FormatId, Limits, MtreeDecoder,
+    MtreeEncoder, ProbeResult, Rar5Decoder, RarLegacyDecoder, RawDecoder, TarDecoder, TarEncoder,
+    WarcDecoder, WarcEncoder,
 };
+#[cfg(feature = "rar")]
+use libarchive_oxide_core::{
+    PayloadCodecAlgorithm, PayloadCodecProvider, PayloadCodecRequest, Rar5CompressionInfo,
+};
+#[cfg(feature = "aes")]
+use libarchive_oxide_core::{Rar3CryptoProvider, Rar5CryptoParameters, Rar5CryptoProvider};
+use std::fmt;
+use std::io::Write;
 
 use crate::BackendPreference;
 use crate::pipeline_codec::PipelineCodec;
+use crate::zip_read::ZipStreamDecoder;
 use crate::zip_stream::{StreamZipMethod, ZipStreamEncoder};
+
+#[cfg(feature = "aes")]
+pub(crate) struct BuiltinRar3CryptoProvider {
+    passwords: Vec<crate::SecretBytes>,
+    keys: Vec<std::sync::Mutex<Option<CachedRar3Key>>>,
+}
+
+#[cfg(feature = "aes")]
+struct CachedRar3Key {
+    salt: Option<[u8; 8]>,
+    key: libarchive_oxide_rar_crypto::Rar3Key,
+}
+
+#[cfg(feature = "aes")]
+impl BuiltinRar3CryptoProvider {
+    fn new(passwords: Vec<crate::SecretBytes>) -> Self {
+        let keys = passwords
+            .iter()
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        Self { passwords, keys }
+    }
+}
+
+#[cfg(feature = "aes")]
+impl fmt::Debug for BuiltinRar3CryptoProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BuiltinRar3CryptoProvider")
+            .field("password_candidates", &self.passwords.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "aes")]
+impl Rar3CryptoProvider for BuiltinRar3CryptoProvider {
+    fn candidate_count(&self) -> usize {
+        self.passwords.len()
+    }
+
+    fn decrypt(
+        &self,
+        candidate: usize,
+        salt: Option<[u8; 8]>,
+        ciphertext: &mut [u8],
+    ) -> Result<(), ArchiveError> {
+        let password = self.passwords.get(candidate).ok_or_else(|| {
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("rar-legacy")
+                .with_context("RAR3 crypto provider candidate index is out of range")
+        })?;
+        let key_slot = self.keys.get(candidate).ok_or_else(|| {
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("rar-legacy")
+                .with_context("RAR3 crypto key-cache index is out of range")
+        })?;
+        let mut cached = key_slot.lock().map_err(|_| {
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("rar-legacy")
+                .with_context("RAR3 crypto key cache was poisoned")
+        })?;
+        if cached.as_ref().is_none_or(|cached| cached.salt != salt) {
+            let key = libarchive_oxide_rar_crypto::derive_rar3_key(password.expose(), salt)
+                .map_err(|error| {
+                    let kind = match error {
+                        libarchive_oxide_rar_crypto::Error::InvalidBlockLength => {
+                            ErrorKind::Malformed
+                        },
+                        _ => ErrorKind::Integrity,
+                    };
+                    ArchiveError::new(kind)
+                        .with_format("rar-legacy")
+                        .with_context(error.to_string())
+                })?;
+            *cached = Some(CachedRar3Key { salt, key });
+        }
+        let key = cached.as_ref().ok_or_else(|| {
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("rar-legacy")
+                .with_context("RAR3 crypto key cache is unexpectedly empty")
+        })?;
+        key.key.decrypt_in_place(ciphertext).map_err(|error| {
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("rar-legacy")
+                .with_context(error.to_string())
+        })
+    }
+}
+
+#[cfg(feature = "aes")]
+pub(crate) struct BuiltinRar5CryptoProvider {
+    passwords: Vec<crate::SecretBytes>,
+    keys: Vec<std::sync::Mutex<Option<CachedRar5Key>>>,
+}
+
+#[cfg(feature = "aes")]
+struct CachedRar5Key {
+    salt: [u8; 16],
+    kdf_exponent: u8,
+    key: libarchive_oxide_rar_crypto::Rar5Key,
+}
+
+#[cfg(feature = "aes")]
+impl BuiltinRar5CryptoProvider {
+    fn new(passwords: Vec<crate::SecretBytes>) -> Self {
+        let keys = passwords
+            .iter()
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        Self { passwords, keys }
+    }
+
+    fn key_slot(
+        &self,
+        candidate: usize,
+    ) -> Result<std::sync::MutexGuard<'_, Option<CachedRar5Key>>, ArchiveError> {
+        self.keys
+            .get(candidate)
+            .ok_or_else(|| {
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("rar5")
+                    .with_context("RAR5 crypto key-cache index is out of range")
+            })?
+            .lock()
+            .map_err(|_| {
+                ArchiveError::new(ErrorKind::Protocol)
+                    .with_format("rar5")
+                    .with_context("RAR5 crypto key cache was poisoned")
+            })
+    }
+}
+
+#[cfg(feature = "aes")]
+impl fmt::Debug for BuiltinRar5CryptoProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BuiltinRar5CryptoProvider")
+            .field("password_candidates", &self.passwords.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "aes")]
+impl Rar5CryptoProvider for BuiltinRar5CryptoProvider {
+    type Key = usize;
+
+    fn candidate_count(&self) -> usize {
+        self.passwords.len()
+    }
+
+    fn derive_key(
+        &self,
+        candidate: usize,
+        parameters: Rar5CryptoParameters,
+        maximum_iterations: u64,
+    ) -> Result<Option<Self::Key>, ArchiveError> {
+        let password = self.passwords.get(candidate).ok_or_else(|| {
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("rar5")
+                .with_context("RAR5 crypto provider candidate index is out of range")
+        })?;
+        if let Some(check) = parameters.password_check()
+            && !libarchive_oxide_rar_crypto::rar5_password_check(
+                password.expose(),
+                parameters.salt(),
+                parameters.kdf_exponent(),
+                check,
+                maximum_iterations,
+            )
+            .map_err(rar5_crypto_error)?
+        {
+            return Ok(None);
+        }
+
+        let mut cached = self.key_slot(candidate)?;
+        let cache_matches = cached.as_ref().is_some_and(|cached| {
+            cached.salt == parameters.salt() && cached.kdf_exponent == parameters.kdf_exponent()
+        });
+        if cache_matches {
+            ensure_rar5_kdf_budget(parameters.kdf_exponent(), maximum_iterations)?;
+        } else {
+            let key = libarchive_oxide_rar_crypto::derive_rar5_key(
+                password.expose(),
+                parameters.salt(),
+                parameters.kdf_exponent(),
+                maximum_iterations,
+            )
+            .map_err(rar5_crypto_error)?;
+            *cached = Some(CachedRar5Key {
+                salt: parameters.salt(),
+                kdf_exponent: parameters.kdf_exponent(),
+                key,
+            });
+        }
+        Ok(Some(candidate))
+    }
+
+    fn decrypt(
+        &self,
+        key: &Self::Key,
+        iv: [u8; 16],
+        ciphertext: &mut [u8],
+    ) -> Result<(), ArchiveError> {
+        let cached = self.key_slot(*key)?;
+        let cached = cached.as_ref().ok_or_else(|| {
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("rar5")
+                .with_context("RAR5 crypto key cache is unexpectedly empty")
+        })?;
+        cached
+            .key
+            .decrypt_in_place(iv, ciphertext)
+            .map_err(rar5_crypto_error)
+    }
+
+    fn tweak_crc32(&self, key: &Self::Key, crc: u32) -> Result<u32, ArchiveError> {
+        let cached = self.key_slot(*key)?;
+        let cached = cached.as_ref().ok_or_else(|| {
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("rar5")
+                .with_context("RAR5 crypto key cache is unexpectedly empty")
+        })?;
+        Ok(libarchive_oxide_rar_crypto::tweak_rar5_crc32(
+            &cached.key,
+            crc,
+        ))
+    }
+
+    fn tweak_blake2sp(&self, key: &Self::Key, digest: [u8; 32]) -> Result<[u8; 32], ArchiveError> {
+        let cached = self.key_slot(*key)?;
+        let cached = cached.as_ref().ok_or_else(|| {
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_format("rar5")
+                .with_context("RAR5 crypto key cache is unexpectedly empty")
+        })?;
+        Ok(libarchive_oxide_rar_crypto::tweak_rar5_blake2sp(
+            &cached.key,
+            digest,
+        ))
+    }
+}
+
+#[cfg(feature = "aes")]
+fn rar5_crypto_error(error: libarchive_oxide_rar_crypto::Error) -> ArchiveError {
+    let kind = match error {
+        libarchive_oxide_rar_crypto::Error::KdfIterationsLimit { .. } => ErrorKind::Limit,
+        libarchive_oxide_rar_crypto::Error::InvalidKdfExponent
+        | libarchive_oxide_rar_crypto::Error::InvalidBlockLength => ErrorKind::Malformed,
+        _ => ErrorKind::Integrity,
+    };
+    ArchiveError::new(kind)
+        .with_format("rar5")
+        .with_context(error.to_string())
+}
+
+#[cfg(feature = "aes")]
+fn ensure_rar5_kdf_budget(kdf_exponent: u8, maximum_iterations: u64) -> Result<(), ArchiveError> {
+    let requested = 1_u64.checked_shl(u32::from(kdf_exponent)).ok_or_else(|| {
+        ArchiveError::new(ErrorKind::Malformed)
+            .with_format("rar5")
+            .with_context("RAR5 KDF exponent is not representable")
+    })?;
+    if requested > maximum_iterations {
+        return Err(ArchiveError::new(ErrorKind::Limit)
+            .with_format("rar5")
+            .with_context("RAR5 KDF exceeds the configured iteration budget"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rar")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BuiltinPayloadCodecProvider;
+
+#[cfg(feature = "rar")]
+const fn rar5_algorithm(version: u64) -> Option<libarchive_oxide_rar::Rar5Algorithm> {
+    match version {
+        0 => Some(libarchive_oxide_rar::Rar5Algorithm::Generation0),
+        1 => Some(libarchive_oxide_rar::Rar5Algorithm::Generation1),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "rar")]
+// RAR5 carries a fixed block guard alongside its bounded decoder state.
+// Keeping the 344-byte closed enum inline avoids allocation and preserves static dispatch; its size is independent of archive input.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub(crate) enum BuiltinPayloadDecoder {
+    Rar3(libarchive_oxide_rar::Rar3Decoder),
+    Rar5(libarchive_oxide_rar::Rar5Decoder),
+}
+
+#[cfg(feature = "rar")]
+impl Codec for BuiltinPayloadDecoder {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: libarchive_oxide_core::EndOfInput,
+    ) -> Result<libarchive_oxide_core::CodecStep, ArchiveError> {
+        match self {
+            Self::Rar3(decoder) => decoder.process(input, output, end),
+            Self::Rar5(decoder) => decoder.process(input, output, end),
+        }
+    }
+}
+
+#[cfg(feature = "rar")]
+impl PayloadCodecProvider for BuiltinPayloadCodecProvider {
+    type Decoder = BuiltinPayloadDecoder;
+
+    fn decoder(
+        &self,
+        request: PayloadCodecRequest,
+        limits: Limits,
+    ) -> Result<Option<Self::Decoder>, ArchiveError> {
+        let decoder = match request.algorithm() {
+            PayloadCodecAlgorithm::Rar3
+                if (29..=36).contains(&request.version())
+                    && (0x31..=0x35).contains(&request.method()) =>
+            {
+                BuiltinPayloadDecoder::Rar3(libarchive_oxide_rar::Rar3Decoder::new(
+                    request.packed_size(),
+                    request.unpacked_size(),
+                    limits,
+                )?)
+            },
+            PayloadCodecAlgorithm::Rar5 if (1..=5).contains(&request.method()) => {
+                let Some(algorithm) = rar5_algorithm(request.version()) else {
+                    return Ok(None);
+                };
+                let dictionary = usize::try_from(request.dictionary_size()).map_err(|_| {
+                    ArchiveError::new(ErrorKind::Limit)
+                        .with_format("rar5")
+                        .with_context("RAR5 dictionary exceeds the address space")
+                })?;
+                BuiltinPayloadDecoder::Rar5(libarchive_oxide_rar::Rar5Decoder::new_with_algorithm(
+                    request.packed_size(),
+                    request.unpacked_size(),
+                    dictionary,
+                    algorithm,
+                    limits,
+                )?)
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(decoder))
+    }
+
+    fn continue_decoder(
+        &self,
+        decoder: Self::Decoder,
+        request: PayloadCodecRequest,
+        limits: Limits,
+    ) -> Result<Option<Self::Decoder>, ArchiveError> {
+        match decoder {
+            BuiltinPayloadDecoder::Rar3(decoder)
+                if request.algorithm() == PayloadCodecAlgorithm::Rar3
+                    && (29..=36).contains(&request.version())
+                    && (0x31..=0x35).contains(&request.method()) =>
+            {
+                Ok(Some(BuiltinPayloadDecoder::Rar3(decoder.continue_solid(
+                    request.packed_size(),
+                    request.unpacked_size(),
+                    limits,
+                )?)))
+            },
+            BuiltinPayloadDecoder::Rar5(decoder)
+                if request.algorithm() == PayloadCodecAlgorithm::Rar5
+                    && (1..=5).contains(&request.method()) =>
+            {
+                let Some(algorithm) = rar5_algorithm(request.version()) else {
+                    return Ok(None);
+                };
+                let dictionary = usize::try_from(request.dictionary_size()).map_err(|_| {
+                    ArchiveError::new(ErrorKind::Limit)
+                        .with_format("rar5")
+                        .with_context("RAR5 dictionary exceeds the address space")
+                })?;
+                Ok(Some(BuiltinPayloadDecoder::Rar5(
+                    decoder.continue_solid_with_algorithm(
+                        request.packed_size(),
+                        request.unpacked_size(),
+                        dictionary,
+                        algorithm,
+                        limits,
+                    )?,
+                )))
+            },
+            _ => Ok(None),
+        }
+    }
+}
+
+#[cfg(feature = "rar")]
+pub(crate) fn builtin_split_rar5_decoder(
+    compression: Rar5CompressionInfo,
+    unpacked_size: u64,
+    limits: Limits,
+) -> Result<BuiltinPayloadDecoder, ArchiveError> {
+    let Some(algorithm) = rar5_algorithm(compression.version()) else {
+        return Err(ArchiveError::new(ErrorKind::Unsupported)
+            .with_format("rar5")
+            .with_context("split RAR5 payload uses an unsupported compression generation"));
+    };
+    if !(1..=5).contains(&compression.method()) || compression.solid() {
+        return Err(ArchiveError::new(ErrorKind::Unsupported)
+            .with_format("rar5")
+            .with_context("split RAR5 payload uses an unsupported compression method"));
+    }
+    let dictionary = usize::try_from(compression.dictionary()).map_err(|_| {
+        ArchiveError::new(ErrorKind::Limit)
+            .with_format("rar5")
+            .with_context("RAR5 dictionary exceeds the address space")
+    })?;
+    Ok(BuiltinPayloadDecoder::Rar5(
+        libarchive_oxide_rar::Rar5Decoder::new_streaming_with_algorithm(
+            unpacked_size,
+            dictionary,
+            algorithm,
+            limits,
+        )?,
+    ))
+}
+
+#[cfg(feature = "rar")]
+pub(crate) fn builtin_solid_split_rar5_decoder(
+    previous: BuiltinPayloadDecoder,
+    compression: Rar5CompressionInfo,
+    unpacked_size: u64,
+    limits: Limits,
+) -> Result<BuiltinPayloadDecoder, ArchiveError> {
+    let BuiltinPayloadDecoder::Rar5(previous) = previous else {
+        return Err(ArchiveError::new(ErrorKind::Malformed)
+            .with_format("rar5")
+            .with_context("RAR5 solid member follows an incompatible decoder generation"));
+    };
+    let Some(algorithm) = rar5_algorithm(compression.version()) else {
+        return Err(ArchiveError::new(ErrorKind::Unsupported)
+            .with_format("rar5")
+            .with_context("solid split RAR5 payload uses an unsupported compression generation"));
+    };
+    if !(1..=5).contains(&compression.method()) || !compression.solid() {
+        return Err(ArchiveError::new(ErrorKind::Unsupported)
+            .with_format("rar5")
+            .with_context("solid split RAR5 payload uses an unsupported compression method"));
+    }
+    let dictionary = usize::try_from(compression.dictionary()).map_err(|_| {
+        ArchiveError::new(ErrorKind::Limit)
+            .with_format("rar5")
+            .with_context("RAR5 dictionary exceeds the address space")
+    })?;
+    Ok(BuiltinPayloadDecoder::Rar5(
+        previous.continue_solid_streaming_with_algorithm(
+            unpacked_size,
+            dictionary,
+            algorithm,
+            limits,
+        )?,
+    ))
+}
+
+#[cfg(feature = "rar")]
+pub(crate) fn builtin_split_rar3_decoder(
+    method: u8,
+    version: u8,
+    packed_size: u64,
+    unpacked_size: u64,
+    retained_packed: usize,
+    limits: Limits,
+) -> Result<BuiltinPayloadDecoder, ArchiveError> {
+    if !(0x31..=0x35).contains(&method) || !(29..=36).contains(&version) {
+        return Err(ArchiveError::new(ErrorKind::Unsupported)
+            .with_format("rar-legacy")
+            .with_context("split RAR payload uses an unsupported compression method"));
+    }
+    let in_flight = limits
+        .in_flight_bytes()
+        .map(|maximum| {
+            maximum.checked_sub(retained_packed).ok_or_else(|| {
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("rar-legacy")
+                    .with_context("retained split RAR input exceeds the in-flight budget")
+            })
+        })
+        .transpose()?;
+    let codec_memory = limits
+        .codec_memory()
+        .map(|maximum| {
+            maximum.checked_sub(retained_packed).ok_or_else(|| {
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("rar-legacy")
+                    .with_context("retained split RAR input exceeds the codec-memory budget")
+            })
+        })
+        .transpose()?;
+    let adjusted = limits
+        .with_in_flight_bytes(in_flight)
+        .with_codec_memory(codec_memory);
+    Ok(BuiltinPayloadDecoder::Rar3(
+        libarchive_oxide_rar::Rar3Decoder::new(packed_size, unpacked_size, adjusted)?,
+    ))
+}
+
+#[cfg(feature = "rar")]
+fn builtin_payload_codec_provider() -> BuiltinPayloadCodecProvider {
+    BuiltinPayloadCodecProvider
+}
+
+#[cfg(all(feature = "rar", feature = "aes"))]
+pub(crate) type BuiltinRar5Decoder =
+    Rar5Decoder<BuiltinPayloadCodecProvider, BuiltinRar5CryptoProvider>;
+#[cfg(all(feature = "rar", not(feature = "aes")))]
+pub(crate) type BuiltinRar5Decoder = Rar5Decoder<BuiltinPayloadCodecProvider>;
+#[cfg(all(not(feature = "rar"), feature = "aes"))]
+pub(crate) type BuiltinRar5Decoder =
+    Rar5Decoder<libarchive_oxide_core::NoPayloadCodecProvider, BuiltinRar5CryptoProvider>;
+#[cfg(not(any(feature = "rar", feature = "aes")))]
+pub(crate) type BuiltinRar5Decoder = Rar5Decoder;
+
+#[cfg(all(feature = "rar", feature = "aes"))]
+pub(crate) type BuiltinRarLegacyDecoder =
+    RarLegacyDecoder<BuiltinPayloadCodecProvider, BuiltinRar3CryptoProvider>;
+#[cfg(all(feature = "rar", not(feature = "aes")))]
+pub(crate) type BuiltinRarLegacyDecoder = RarLegacyDecoder<BuiltinPayloadCodecProvider>;
+#[cfg(all(not(feature = "rar"), feature = "aes"))]
+pub(crate) type BuiltinRarLegacyDecoder =
+    RarLegacyDecoder<libarchive_oxide_core::NoPayloadCodecProvider, BuiltinRar3CryptoProvider>;
+#[cfg(not(any(feature = "rar", feature = "aes")))]
+pub(crate) type BuiltinRarLegacyDecoder = RarLegacyDecoder;
+
+pub(crate) fn builtin_rar5_decoder(
+    limits: Limits,
+    volume: bool,
+    passwords: Vec<crate::SecretBytes>,
+) -> BuiltinRar5Decoder {
+    #[cfg(all(feature = "rar", feature = "aes"))]
+    {
+        let crypto = BuiltinRar5CryptoProvider::new(passwords);
+        if volume {
+            Rar5Decoder::with_volume_providers(limits, builtin_payload_codec_provider(), crypto)
+        } else {
+            Rar5Decoder::with_payload_and_crypto(limits, builtin_payload_codec_provider(), crypto)
+        }
+    }
+    #[cfg(all(feature = "rar", not(feature = "aes")))]
+    {
+        drop(passwords);
+        if volume {
+            Rar5Decoder::with_volume_provider_and_payload_codecs(
+                limits,
+                builtin_payload_codec_provider(),
+            )
+        } else {
+            Rar5Decoder::with_payload_codecs(limits, builtin_payload_codec_provider())
+        }
+    }
+    #[cfg(all(not(feature = "rar"), feature = "aes"))]
+    {
+        let crypto = BuiltinRar5CryptoProvider::new(passwords);
+        if volume {
+            Rar5Decoder::with_volume_provider_and_crypto(limits, crypto)
+        } else {
+            Rar5Decoder::with_crypto(limits, crypto)
+        }
+    }
+    #[cfg(not(any(feature = "rar", feature = "aes")))]
+    {
+        drop(passwords);
+        if volume {
+            Rar5Decoder::with_volume_provider(limits)
+        } else {
+            Rar5Decoder::new(limits)
+        }
+    }
+}
+
+pub(crate) fn builtin_rar_legacy_decoder(
+    limits: Limits,
+    volume: bool,
+    passwords: Vec<crate::SecretBytes>,
+) -> BuiltinRarLegacyDecoder {
+    #[cfg(all(feature = "rar", feature = "aes"))]
+    {
+        let crypto = BuiltinRar3CryptoProvider::new(passwords);
+        if volume {
+            RarLegacyDecoder::with_volume_providers(
+                limits,
+                builtin_payload_codec_provider(),
+                crypto,
+            )
+        } else {
+            RarLegacyDecoder::with_payload_and_crypto(
+                limits,
+                builtin_payload_codec_provider(),
+                crypto,
+            )
+        }
+    }
+    #[cfg(all(feature = "rar", not(feature = "aes")))]
+    {
+        drop(passwords);
+        if volume {
+            RarLegacyDecoder::with_volume_provider_and_payload_codecs(
+                limits,
+                builtin_payload_codec_provider(),
+            )
+        } else {
+            RarLegacyDecoder::with_payload_codecs(limits, builtin_payload_codec_provider())
+        }
+    }
+    #[cfg(all(not(feature = "rar"), feature = "aes"))]
+    {
+        let crypto = BuiltinRar3CryptoProvider::new(passwords);
+        if volume {
+            RarLegacyDecoder::with_volume_provider_and_crypto(limits, crypto)
+        } else {
+            RarLegacyDecoder::with_crypto(limits, crypto)
+        }
+    }
+    #[cfg(not(any(feature = "rar", feature = "aes")))]
+    {
+        drop(passwords);
+        if volume {
+            RarLegacyDecoder::with_volume_provider(limits)
+        } else {
+            RarLegacyDecoder::new(limits)
+        }
+    }
+}
 
 /// Read/write capabilities advertised by one archive format provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,8 +1024,7 @@ impl<H: Codec, T: Codec> Codec for ChainedCodecDecoder<H, T> {
         }
     }
 }
-/// Internal static dispatch contract implemented by provider-chain nodes.
-#[doc(hidden)]
+/// Static dispatch contract implemented by archive format provider chains.
 pub trait StaticFormatProviders {
     /// Runtime selection encoded in the chain's type.
     type Selection: Clone;
@@ -409,6 +1047,7 @@ pub trait StaticFormatProviders {
         &self,
         selection: Self::Selection,
         limits: Limits,
+        passwords: Vec<crate::SecretBytes>,
     ) -> Result<Self::Decoder, ArchiveError>;
     /// Creates encoder state for a prior selection.
     fn format_encoder(
@@ -418,8 +1057,7 @@ pub trait StaticFormatProviders {
     ) -> Result<Self::Encoder, ArchiveError>;
 }
 
-/// Internal static dispatch contract implemented by codec-chain nodes.
-#[doc(hidden)]
+/// Static dispatch contract implemented by outer codec provider chains.
 pub trait StaticCodecProviders {
     /// Runtime selection encoded in the chain's type.
     type Selection: Clone;
@@ -474,6 +1112,7 @@ impl StaticFormatProviders for NoFormatProviders {
         &self,
         selection: Self::Selection,
         _limits: Limits,
+        _passwords: Vec<crate::SecretBytes>,
     ) -> Result<Self::Decoder, ArchiveError> {
         match selection {}
     }
@@ -575,6 +1214,7 @@ where
         &self,
         selection: Self::Selection,
         limits: Limits,
+        passwords: Vec<crate::SecretBytes>,
     ) -> Result<Self::Decoder, ArchiveError> {
         match selection {
             ProviderSelection::Head => {
@@ -585,11 +1225,12 @@ where
                         "decode",
                     ));
                 }
+                drop(passwords);
                 self.head.decoder(limits).map(ChainedFormatDecoder::Head)
             },
             ProviderSelection::Tail(selection) => self
                 .tail
-                .format_decoder(selection, limits)
+                .format_decoder(selection, limits, passwords)
                 .map(ChainedFormatDecoder::Tail),
         }
     }
@@ -856,10 +1497,18 @@ enum BuiltinFormatDecoderInner {
     Empty(EmptyDecoder),
     Raw(RawDecoder),
     Warc(Box<WarcDecoder>),
+    Mtree(Box<MtreeDecoder>),
+    RarLegacy(Box<BuiltinRarLegacyDecoder>),
+    Rar5(Box<BuiltinRar5Decoder>),
+    Zip(Box<ZipStreamDecoder>),
 }
 
 impl BuiltinFormatDecoder {
-    pub(crate) fn sequential(format: FormatId, limits: Limits) -> Result<Self, ArchiveError> {
+    pub(crate) fn sequential_with_passwords(
+        format: FormatId,
+        limits: Limits,
+        passwords: Vec<crate::SecretBytes>,
+    ) -> Result<Self, ArchiveError> {
         let inner = match format {
             FormatId::Tar => BuiltinFormatDecoderInner::Tar(Box::new(TarDecoder::new(limits))),
             FormatId::Cpio => BuiltinFormatDecoderInner::Cpio(Box::new(CpioDecoder::new(limits))),
@@ -867,7 +1516,19 @@ impl BuiltinFormatDecoder {
             FormatId::Empty => BuiltinFormatDecoderInner::Empty(EmptyDecoder::new()),
             FormatId::Raw => BuiltinFormatDecoderInner::Raw(RawDecoder::with_limits(limits)),
             FormatId::Warc => BuiltinFormatDecoderInner::Warc(Box::new(WarcDecoder::new(limits))),
-            FormatId::Zip | FormatId::SevenZip | FormatId::Iso9660 | FormatId::Udf => {
+            FormatId::Mtree => {
+                BuiltinFormatDecoderInner::Mtree(Box::new(MtreeDecoder::new(limits)))
+            },
+            FormatId::RarLegacy => BuiltinFormatDecoderInner::RarLegacy(Box::new(
+                builtin_rar_legacy_decoder(limits, false, passwords),
+            )),
+            FormatId::Rar5 => BuiltinFormatDecoderInner::Rar5(Box::new(builtin_rar5_decoder(
+                limits, false, passwords,
+            ))),
+            FormatId::Zip => BuiltinFormatDecoderInner::Zip(Box::new(
+                ZipStreamDecoder::with_passwords(limits, passwords),
+            )),
+            FormatId::SevenZip | FormatId::Iso9660 | FormatId::Udf => {
                 return Err(ArchiveError::new(ErrorKind::Capability)
                     .with_format(format_name(format))
                     .with_context("archive format requires Read + Seek"));
@@ -892,6 +1553,10 @@ impl ArchiveDecoder for BuiltinFormatDecoder {
             BuiltinFormatDecoderInner::Empty(decoder) => decoder.step(input, output, end),
             BuiltinFormatDecoderInner::Raw(decoder) => decoder.step(input, output, end),
             BuiltinFormatDecoderInner::Warc(decoder) => decoder.step(input, output, end),
+            BuiltinFormatDecoderInner::Mtree(decoder) => decoder.step(input, output, end),
+            BuiltinFormatDecoderInner::RarLegacy(decoder) => decoder.step(input, output, end),
+            BuiltinFormatDecoderInner::Rar5(decoder) => decoder.step(input, output, end),
+            BuiltinFormatDecoderInner::Zip(decoder) => decoder.step(input, output, end),
         }
     }
 }
@@ -909,6 +1574,8 @@ enum BuiltinFormatEncoderInner {
     Cpio(CpioEncoder),
     Ar(ArEncoder),
     Zip(Box<ZipStreamEncoder>),
+    Mtree(MtreeEncoder),
+    Warc(WarcEncoder),
 }
 
 impl BuiltinFormatEncoder {
@@ -931,6 +1598,8 @@ impl BuiltinFormatEncoder {
             FormatId::Tar => BuiltinFormatEncoderInner::Tar(TarEncoder::new(limits)),
             FormatId::Cpio => BuiltinFormatEncoderInner::Cpio(CpioEncoder::new(limits)),
             FormatId::Ar => BuiltinFormatEncoderInner::Ar(ArEncoder::new(limits)),
+            FormatId::Mtree => BuiltinFormatEncoderInner::Mtree(MtreeEncoder::new(limits)),
+            FormatId::Warc => BuiltinFormatEncoderInner::Warc(WarcEncoder::new(limits)),
             FormatId::Zip => {
                 BuiltinFormatEncoderInner::Zip(Box::new(ZipStreamEncoder::with_method_and_backend(
                     limits,
@@ -938,7 +1607,7 @@ impl BuiltinFormatEncoder {
                     backend,
                 )))
             },
-            FormatId::Udf | FormatId::Empty | FormatId::Raw | FormatId::Warc => {
+            FormatId::Udf | FormatId::Empty | FormatId::Raw => {
                 return Err(ArchiveError::new(ErrorKind::Unsupported)
                     .with_format(format_name(format))
                     .with_context("archive format is read-only"));
@@ -976,11 +1645,29 @@ impl BuiltinFormatEncoder {
         limits: Limits,
         method: crate::ZipMethod,
         password: crate::SecretBytes,
+        strength: crate::AesStrength,
         backend: BackendPreference,
     ) -> Self {
         let method = map_zip_method(method);
-        let encoder =
-            ZipStreamEncoder::with_password_and_backend(limits, method, password, backend);
+        let encoder = ZipStreamEncoder::with_password_and_backend(
+            limits, method, password, strength, backend,
+        );
+        Self {
+            inner: BuiltinFormatEncoderInner::Zip(Box::new(encoder)),
+        }
+    }
+
+    #[cfg(feature = "aes")]
+    pub(crate) fn zipcrypto_with_backend(
+        limits: Limits,
+        method: crate::ZipMethod,
+        password: crate::SecretBytes,
+        backend: BackendPreference,
+    ) -> Self {
+        let method = map_zip_method(method);
+        let encoder = ZipStreamEncoder::with_zipcrypto_password_and_backend(
+            limits, method, password, backend,
+        );
         Self {
             inner: BuiltinFormatEncoderInner::Zip(Box::new(encoder)),
         }
@@ -1001,6 +1688,10 @@ fn map_zip_method(method: crate::ZipMethod) -> StreamZipMethod {
         crate::ZipMethod::Zstd => StreamZipMethod::Zstd,
         #[cfg(feature = "xz")]
         crate::ZipMethod::Lzma => StreamZipMethod::Lzma,
+        #[cfg(feature = "xz")]
+        crate::ZipMethod::Xz => StreamZipMethod::Xz,
+        #[cfg(feature = "ppmd")]
+        crate::ZipMethod::Ppmd8 => StreamZipMethod::Ppmd8,
     }
 }
 
@@ -1020,6 +1711,8 @@ impl ArchiveEncoder for BuiltinFormatEncoder {
             BuiltinFormatEncoderInner::Cpio(encoder) => encoder.step(command, output),
             BuiltinFormatEncoderInner::Ar(encoder) => encoder.step(command, output),
             BuiltinFormatEncoderInner::Zip(encoder) => encoder.step(command, output),
+            BuiltinFormatEncoderInner::Mtree(encoder) => encoder.step(command, output),
+            BuiltinFormatEncoderInner::Warc(encoder) => encoder.step(command, output),
         }
         .and_then(|step| step.validate(data_len, output_len))
     }
@@ -1030,7 +1723,10 @@ impl ProviderArchiveEncoder for BuiltinFormatEncoder {
         match &mut self.inner {
             BuiltinFormatEncoderInner::Tar(encoder) => encoder.set_archive_metadata(metadata),
             BuiltinFormatEncoderInner::Zip(encoder) => encoder.set_archive_metadata(metadata),
-            BuiltinFormatEncoderInner::Cpio(_) | BuiltinFormatEncoderInner::Ar(_) => {
+            BuiltinFormatEncoderInner::Cpio(_)
+            | BuiltinFormatEncoderInner::Ar(_)
+            | BuiltinFormatEncoderInner::Mtree(_)
+            | BuiltinFormatEncoderInner::Warc(_) => {
                 ProviderArchiveEncoder::set_archive_metadata(&mut NoArchiveEncoder, metadata)
             },
         }
@@ -1093,6 +1789,7 @@ impl StaticFormatProviders for BuiltinFormatProviders {
         &self,
         selection: Self::Selection,
         limits: Limits,
+        passwords: Vec<crate::SecretBytes>,
     ) -> Result<Self::Decoder, ArchiveError> {
         if matches!(
             self.format_capability(selection),
@@ -1100,7 +1797,7 @@ impl StaticFormatProviders for BuiltinFormatProviders {
         ) {
             return Err(disabled_format(selection, format_name(selection), "decode"));
         }
-        BuiltinFormatDecoder::sequential(selection, limits)
+        BuiltinFormatDecoder::sequential_with_passwords(selection, limits, passwords)
     }
 
     fn format_encoder(
@@ -1186,6 +1883,34 @@ impl StaticCodecProviders for BuiltinCodecProviders {
             ProviderCapability::Unknown => return Err(unknown_codec(selection)),
         }
         let encoded = match selection {
+            FilterId::Base64 => {
+                let mut writer = crate::filtered_io::Base64FilterWrite::new(Vec::new(), limits);
+                writer
+                    .write_all(input)
+                    .and_then(|()| writer.finish())
+                    .map_err(|error| codec_io_error("base64", &error))?
+            },
+            FilterId::Uuencode => {
+                let mut writer = crate::filtered_io::UuencodeFilterWrite::new(Vec::new(), limits)?;
+                writer
+                    .write_all(input)
+                    .and_then(|()| writer.finish())
+                    .map_err(|error| codec_io_error("uuencode", &error))?
+            },
+            FilterId::Lzop => {
+                #[cfg(feature = "lzop")]
+                {
+                    let mut writer = crate::filtered_io::LzopFilterWrite::new(Vec::new(), limits)?;
+                    writer
+                        .write_all(input)
+                        .and_then(|()| writer.finish())
+                        .map_err(|error| codec_io_error("lzop", &error))?
+                }
+                #[cfg(not(feature = "lzop"))]
+                {
+                    return Err(disabled_codec(selection, "lzop", "encode"));
+                }
+            },
             FilterId::Gzip => {
                 let mut writer = crate::filtered_io::GzipFilterWrite::with_backend(
                     Vec::new(),
@@ -1275,7 +2000,6 @@ impl<F, C> ProviderSet<F, C> {
     }
 
     /// Prepends an archive format provider to the static chain.
-    #[doc(hidden)]
     #[must_use]
     pub fn with_format_provider<P>(self, provider: P) -> ProviderSet<FormatProviderNode<P, F>, C>
     where
@@ -1291,7 +2015,6 @@ impl<F, C> ProviderSet<F, C> {
     }
 
     /// Prepends an outer codec provider to the static chain.
-    #[doc(hidden)]
     #[must_use]
     pub fn with_codec_provider<P>(self, provider: P) -> ProviderSet<F, CodecProviderNode<P, C>>
     where
@@ -1307,7 +2030,6 @@ impl<F, C> ProviderSet<F, C> {
     }
 
     /// Splits the set into its statically typed chains.
-    #[doc(hidden)]
     #[must_use]
     pub fn into_chains(self) -> (F, C) {
         (self.formats, self.codecs)

@@ -37,6 +37,18 @@ impl FilterId {
     pub const Compress: Self = Self(7);
     /// lzip member stream.
     pub const Lzip: Self = Self(8);
+    /// LZMA-alone stream.
+    /// This is explicit-only because it has no reliable magic.
+    pub const Lzma: Self = Self(9);
+    /// lzop framed stream.
+    pub const Lzop: Self = Self(10);
+    /// POSIX uuencoded stream.
+    pub const Uuencode: Self = Self(11);
+    /// Base64-armored stream.
+    /// This is explicit-only to avoid text false positives.
+    pub const Base64: Self = Self(12);
+    /// RPM package wrapper.
+    pub const Rpm: Self = Self(13);
 
     /// Creates a downstream identifier from the collision-free custom range.
     ///
@@ -67,6 +79,9 @@ impl FilterId {
     pub fn probe(prefix: &[u8]) -> ProbeResult<Self> {
         const BZIP2_PREFIX: &[u8] = b"BZh";
         const SIGNATURES: &[(FilterId, &[u8])] = &[
+            (FilterId::Lzop, b"\x89LZO\0\r\n\x1a\n"),
+            (FilterId::Rpm, b"\xed\xab\xee\xdb"),
+            (FilterId::Uuencode, b"begin "),
             (FilterId::Gzip, &[0x1f, 0x8b]),
             (FilterId::Compress, &[0x1f, 0x9d]),
             (FilterId::Zstd, &[0x28, 0xb5, 0x2f, 0xfd]),
@@ -114,8 +129,63 @@ impl fmt::Debug for FilterId {
             Self::Deflate => "Deflate",
             Self::Compress => "Compress",
             Self::Lzip => "Lzip",
+            Self::Lzma => "Lzma",
+            Self::Lzop => "Lzop",
+            Self::Uuencode => "Uuencode",
+            Self::Base64 => "Base64",
+            Self::Rpm => "Rpm",
             _ => return write!(formatter, "FilterId({:#010x})", self.0),
         };
         formatter.write_str(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FilterId;
+    use crate::ProbeResult;
+    use alloc::format;
+
+    #[test]
+    fn planned_filter_ids_are_stable_and_named() {
+        assert_eq!(FilterId::Lzma.as_raw(), 9);
+        assert_eq!(FilterId::Lzop.as_raw(), 10);
+        assert_eq!(FilterId::Uuencode.as_raw(), 11);
+        assert_eq!(FilterId::Base64.as_raw(), 12);
+        assert_eq!(FilterId::Rpm.as_raw(), 13);
+        assert_eq!(format!("{:?}", FilterId::Lzma), "Lzma");
+        assert_eq!(format!("{:?}", FilterId::Lzop), "Lzop");
+        assert_eq!(format!("{:?}", FilterId::Uuencode), "Uuencode");
+        assert_eq!(format!("{:?}", FilterId::Base64), "Base64");
+        assert_eq!(format!("{:?}", FilterId::Rpm), "Rpm");
+    }
+
+    #[test]
+    fn framed_planned_filters_probe_incrementally() {
+        assert_eq!(
+            FilterId::probe(b"\x89LZO\0\r\n\x1a\n"),
+            ProbeResult::Match(FilterId::Lzop)
+        );
+        assert_eq!(
+            FilterId::probe(b"\xed\xab\xee\xdb"),
+            ProbeResult::Match(FilterId::Rpm)
+        );
+        assert_eq!(
+            FilterId::probe(b"begin 644 archive.tar\n"),
+            ProbeResult::Match(FilterId::Uuencode)
+        );
+        assert_eq!(
+            FilterId::probe(b"\x89LZO\0\r"),
+            ProbeResult::NeedMore { minimum: 9 }
+        );
+    }
+
+    #[test]
+    fn ambiguous_unframed_filters_are_explicit_only() {
+        assert_eq!(FilterId::probe(b"YWJjZA==\n"), ProbeResult::NoMatch);
+        assert_eq!(
+            FilterId::probe(&[0x5d, 0, 0, 0x80, 0]),
+            ProbeResult::NoMatch
+        );
     }
 }

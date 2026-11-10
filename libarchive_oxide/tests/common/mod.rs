@@ -29,8 +29,205 @@
 
 use std::io::Cursor;
 
-use libarchive_oxide::{ArchiveReader, ReaderEvent, SeekArchiveReader};
-use libarchive_oxide_core::{EntryKind, EntryMetadata};
+use libarchive_oxide::{ArchiveReader, ReaderEvent, SeekArchiveReader, SeekArchiveWriter};
+use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Limits};
+
+const ISO_SECTOR: usize = 2048;
+
+fn iso_both_u16(value: u16) -> [u8; 4] {
+    let little = value.to_le_bytes();
+    let big = value.to_be_bytes();
+    [little[0], little[1], big[0], big[1]]
+}
+
+fn iso_both_u32(value: u32) -> [u8; 8] {
+    let little = value.to_le_bytes();
+    let big = value.to_be_bytes();
+    [
+        little[0], little[1], little[2], little[3], big[0], big[1], big[2], big[3],
+    ]
+}
+
+fn iso_le_u32(bytes: &[u8], position: usize) -> u32 {
+    u32::from_le_bytes(bytes[position..position + 4].try_into().unwrap())
+}
+
+fn patch_iso_tree(image: &mut [u8], descriptor_sector: usize, identifier: &[u8], second_lba: u32) {
+    let record_start = iso_tree_record_start(image, descriptor_sector, identifier);
+    let length = usize::from(image[record_start]);
+    let root_record = descriptor_sector * ISO_SECTOR + 156;
+    let root_lba = usize::try_from(iso_le_u32(image, root_record + 2)).unwrap();
+    let root_size = usize::try_from(iso_le_u32(image, root_record + 10)).unwrap();
+    let base = root_lba * ISO_SECTOR;
+    let second_start = record_start + length;
+    assert!(second_start + length <= base + root_size);
+    assert_eq!(second_start / ISO_SECTOR, record_start / ISO_SECTOR);
+    let mut final_record = image[record_start..record_start + length].to_vec();
+    image[record_start + 10..record_start + 18].copy_from_slice(&iso_both_u32(5));
+    image[record_start + 25] |= 0x80;
+    final_record[2..10].copy_from_slice(&iso_both_u32(second_lba));
+    final_record[10..18].copy_from_slice(&iso_both_u32(6));
+    final_record[25] &= !0x80;
+    image[second_start..second_start + length].copy_from_slice(&final_record);
+}
+
+fn iso_tree_record_start(image: &[u8], descriptor_sector: usize, identifier: &[u8]) -> usize {
+    let root_record = descriptor_sector * ISO_SECTOR + 156;
+    let root_lba = usize::try_from(iso_le_u32(image, root_record + 2)).unwrap();
+    let root_size = usize::try_from(iso_le_u32(image, root_record + 10)).unwrap();
+    let base = root_lba * ISO_SECTOR;
+    let mut position = 0;
+    while position < root_size {
+        let record_start = base + position;
+        let length = usize::from(image[record_start]);
+        if length == 0 {
+            position = (position / ISO_SECTOR + 1) * ISO_SECTOR;
+            continue;
+        }
+        let identifier_length = usize::from(image[record_start + 32]);
+        let identifier_start = record_start + 33;
+        if image[identifier_start..identifier_start + identifier_length] == *identifier {
+            return record_start;
+        }
+        position += length;
+    }
+    panic!("ISO writer omitted the expected directory record");
+}
+
+fn update_iso_volume_sectors(image: &mut [u8], volume_sectors: u32) {
+    for descriptor_sector in [16, 17] {
+        let start = descriptor_sector * ISO_SECTOR + 80;
+        image[start..start + 8].copy_from_slice(&iso_both_u32(volume_sectors));
+    }
+}
+
+/// First-party ISO with one logical file split over two noncontiguous file sections.
+pub fn multi_extent_iso_fixture() -> Vec<u8> {
+    let output = Cursor::new(Vec::new());
+    let mut writer =
+        SeekArchiveWriter::with_format(output, FormatId::Iso9660, Limits::default()).unwrap();
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("SPLIT.BIN"))
+        .size(Some(11))
+        .build();
+    writer.start_entry(&metadata).unwrap();
+    writer.write_data(b"firstsecond").unwrap();
+    writer.end_entry().unwrap();
+    let mut image = writer.finish().unwrap().into_inner();
+
+    let original_sectors = image.len().div_ceil(ISO_SECTOR);
+    let second_lba = u32::try_from(original_sectors + 1).unwrap();
+    let volume_sectors = second_lba + 1;
+    image.resize(usize::try_from(volume_sectors).unwrap() * ISO_SECTOR, 0);
+    image[original_sectors * ISO_SECTOR..(original_sectors + 1) * ISO_SECTOR].fill(0xa5);
+    let second_start = usize::try_from(second_lba).unwrap() * ISO_SECTOR;
+    image[second_start..second_start + 6].copy_from_slice(b"second");
+    update_iso_volume_sectors(&mut image, volume_sectors);
+    patch_iso_tree(&mut image, 16, b"SPLIT.BIN;1", second_lba);
+    let joliet_identifier = "SPLIT.BIN"
+        .encode_utf16()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+    patch_iso_tree(&mut image, 17, &joliet_identifier, second_lba);
+    image
+}
+
+/// Fully mastered ISO with a 5,000-byte file recorded as 1-block units separated by 1-block gaps.
+pub fn interleaved_iso_fixture() -> (Vec<u8>, Vec<u8>) {
+    let payload = (0_u8..=250).cycle().take(5000).collect::<Vec<_>>();
+    let output = Cursor::new(Vec::new());
+    let mut writer =
+        SeekArchiveWriter::with_format(output, FormatId::Iso9660, Limits::default()).unwrap();
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("STRIPED.BIN"))
+        .size(Some(payload.len() as u64))
+        .build();
+    writer.start_entry(&metadata).unwrap();
+    writer.write_data(&payload).unwrap();
+    writer.end_entry().unwrap();
+    let mut image = writer.finish().unwrap().into_inner();
+
+    let original_sectors = image.len().div_ceil(ISO_SECTOR);
+    let first_lba = original_sectors + 1;
+    let volume_sectors = u32::try_from(first_lba + 5).unwrap();
+    image.resize(usize::try_from(volume_sectors).unwrap() * ISO_SECTOR, 0);
+    image[first_lba * ISO_SECTOR..(first_lba + 5) * ISO_SECTOR].fill(0);
+    image[first_lba * ISO_SECTOR..(first_lba + 1) * ISO_SECTOR]
+        .copy_from_slice(&payload[..ISO_SECTOR]);
+    image[(first_lba + 1) * ISO_SECTOR..(first_lba + 2) * ISO_SECTOR].fill(0xa5);
+    image[(first_lba + 2) * ISO_SECTOR..(first_lba + 3) * ISO_SECTOR]
+        .copy_from_slice(&payload[ISO_SECTOR..2 * ISO_SECTOR]);
+    image[(first_lba + 3) * ISO_SECTOR..(first_lba + 4) * ISO_SECTOR].fill(0x5a);
+    let final_start = (first_lba + 4) * ISO_SECTOR;
+    image[final_start..final_start + payload.len() - 2 * ISO_SECTOR]
+        .copy_from_slice(&payload[2 * ISO_SECTOR..]);
+    update_iso_volume_sectors(&mut image, volume_sectors);
+
+    let primary_record = iso_tree_record_start(&image, 16, b"STRIPED.BIN;1");
+    image[primary_record + 2..primary_record + 10]
+        .copy_from_slice(&iso_both_u32(u32::try_from(first_lba).unwrap()));
+    image[primary_record + 26] = 1;
+    image[primary_record + 27] = 1;
+    let joliet_identifier = "STRIPED.BIN"
+        .encode_utf16()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+    let joliet_record = iso_tree_record_start(&image, 17, &joliet_identifier);
+    image[joliet_record + 2..joliet_record + 10]
+        .copy_from_slice(&iso_both_u32(u32::try_from(first_lba).unwrap()));
+    image[joliet_record + 26] = 1;
+    image[joliet_record + 27] = 1;
+    (image, payload)
+}
+
+fn extended_attribute_iso_fixture_inner(select_joliet: bool) -> (Vec<u8>, Vec<u8>) {
+    let (mut image, payload) = interleaved_iso_fixture();
+    let primary_record = iso_tree_record_start(&image, 16, b"STRIPED.BIN;1");
+    let first_lba = usize::try_from(iso_le_u32(&image, primary_record + 2)).unwrap();
+    let joliet_identifier = "STRIPED.BIN"
+        .encode_utf16()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+    let joliet_record = iso_tree_record_start(&image, 17, &joliet_identifier);
+    for record in [primary_record, joliet_record] {
+        image[record + 1] = 1;
+        image[record + 25] |= 0x10;
+        image[record + 26] = 0;
+        image[record + 27] = 0;
+    }
+
+    let mut attributes = [0_u8; ISO_SECTOR];
+    attributes[0..4].copy_from_slice(&iso_both_u16(1000));
+    attributes[4..8].copy_from_slice(&iso_both_u16(1001));
+    attributes[8..10].copy_from_slice(&0xfeaa_u16.to_be_bytes());
+    attributes[10..27].copy_from_slice(b"2026081501020300\0");
+    attributes[27..44].copy_from_slice(b"2026081602030400\x04");
+    attributes[84..116].fill(b' ');
+    attributes[180] = 1;
+    attributes[246..250].copy_from_slice(&iso_both_u16(4));
+    attributes[250..254].copy_from_slice(b"meta");
+    image[first_lba * ISO_SECTOR..(first_lba + 1) * ISO_SECTOR].copy_from_slice(&attributes);
+    let data_start = (first_lba + 1) * ISO_SECTOR;
+    image[data_start..data_start + payload.len()].copy_from_slice(&payload);
+
+    if select_joliet {
+        // Select the Joliet tree so the writer-generated Rock Ridge PX field in the primary tree does not intentionally override EA.
+        let primary_root = 16 * ISO_SECTOR + 156;
+        let primary_root_lba = usize::try_from(iso_le_u32(&image, primary_root + 2)).unwrap();
+        let dot = primary_root_lba * ISO_SECTOR;
+        let dot_end = dot + usize::from(image[dot]);
+        image[dot + 35..dot_end].fill(0);
+    }
+    (image, payload)
+}
+
+/// Fully mastered primary/Joliet ISO with one ECMA-119 extended-attribute block.
+pub fn extended_attribute_iso_fixture() -> (Vec<u8>, Vec<u8>) {
+    extended_attribute_iso_fixture_inner(true)
+}
+
+/// The same fixture with Rock Ridge enabled to exercise metadata precedence.
+pub fn extended_attribute_iso_with_rock_ridge_fixture() -> (Vec<u8>, Vec<u8>) {
+    extended_attribute_iso_fixture_inner(false)
+}
 
 /// Compression method WHERE OBSERVABLE. arca's reader decodes transparently and exposes no
 /// per-entry codec, so [`read_with_arca`] always yields `None`. `Some(..)` is set only by

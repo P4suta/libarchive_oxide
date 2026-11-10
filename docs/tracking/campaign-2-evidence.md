@@ -475,21 +475,28 @@ stripping protection. Standard and fs-verity digest records may coexist; the
 4 KiB salted tree is streamed under the shared limits. Per-signer signature
 records follow AOSP's platform-introduction map and every selected
 signature-algorithm winner is verified. Only digest kinds requested by those
-winners are integrity inputs; unselected kinds are ignored. The official
-coexistence fixture also gates a standard-signature-only mutation while its
-fs-verity signature remains valid. The verifier deliberately does not claim
-complete SDK-range installability until binary manifest SDK parsing is present.
+winners are integrity inputs; unselected kinds are ignored. Binary
+`AndroidManifest.xml` chunk framing, UTF-8/UTF-16 string pools, resource IDs,
+nesting, numeric SDK declarations/defaults, truncation, and metadata limits are
+now parsed into an independent report; unmapped codenames are unsupported. The
+effective minimum/target SDK values also drive an independent signing-scheme
+compatibility verdict: v1 must cover pre-24, v1 or v2 must cover API 24-27, and
+target SDK 30+ requires v2 or newer. A compatibility failure neither rewrites a
+cryptographically verified signature nor grants/revokes issuer trust. The
+official coexistence fixture also gates a standard-signature-only mutation
+while its fs-verity signature remains valid. The verifier deliberately does not
+claim other platform policy or complete SDK-range installability.
 
 Evidence is `package_android_signature` (16 official-AOSP positive,
 tamper/malformed/strip, trust, algorithm-boundary, and resource cases),
 `package_android_rotation` (6 official v3/v3.1 positive, wrong-key, tamper,
 cycle/duplicate, stripping, SDK-boundary, fs-verity, trust-separation, and
-resource cases), `package_app` (22 structure cases), and `package_cli` (23
+resource cases), `package_app` (23 structure cases), and `package_cli` (23
 JSON/exit/trust cases). Direct official AOSP v2, v3, v3.1 positive, and v3.1
 wrong-lineage APKs are committed to `package_app` fuzz corpus; pristine and
 four-shard adversarial stable replay are gated. DSA,
 ECDSA-with-SHA-512/P-521, out-of-backend RSA sizes, unknown lineage algorithms,
-and binary-manifest installability remain explicit unsupported or unclaimed
+and complete cross-SDK installability remain explicit unsupported or unclaimed
 capabilities rather than successful detection.
 
 The next authenticity slice verifies MSIX/APPX package integrity independently
@@ -510,6 +517,25 @@ unsupported-algorithm/vocabulary, nesting, and metadata-limit cases. The
 Microsoft 2015/2017 encrypted or delta vocabularies remain typed
 `unsupported`.
 The official compact MSIX is also committed to the `package_app` fuzz corpus
-and the CLI contract fixture. `AppxSignature.p7x` is deliberately
-`not-evaluated`; this slice makes no cryptographic signature or issuer-trust
-claim.
+and the CLI contract fixture. A later continuation verifies its
+`AppxSignature.p7x` `PKCX` wrapper, direct-content Authenticode CMS signature,
+signer fingerprint, AXPC raw local-record view, canonical pre-signature AXCD
+classic/ZIP64 view, and AXCT/AXBM/optional AXCI uncompressed footprint digests.
+Central-metadata and CRC-valid payload tampering, CMS signature-octet tampering,
+truncation, duplicate digest records, and resource limits are negative evidence.
+The fixture certificate is intentionally untrusted: validity succeeds while
+trust remains invalid until the exact signer fingerprint is pinned.
+
+The IPA authenticity continuation uses two rcodesign 0.29.0 fixtures: one SHA-256 `CodeDirectory` and one SHA-1 primary plus SHA-256 alternative.
+The verifier sparsely re-reads Mach-O headers, architecture tables, load commands,
+and bounded embedded signatures, then streams every signed page outside the metadata budget.
+It checks special-slot hashes, exact ordinary-resource coverage from `CodeResources`, every CMS signer, v1 plist and v2 DER hash-agility bindings, and explicit signer pins.
+CRC-correct ZIP rewrites cover code-page, resource, CMS, and alternative-directory tampering; 16-KiB and 4-KiB budgets prove executable streaming and typed signature-resource refusal.
+The compact single-digest IPA is also committed to the existing `package_app` fuzz corpus, whose ZIP-content selector drives it through the IPA verifier.
+
+The RPM authenticity continuation uses upstream RPM test data at commit `ac5062c43e2337fb43a9179f02c0cc5d7d069802`: RSA header signatures made by a primary key and signing subkey, plus a legacy v3 header-and-payload signature.
+The validator retains the exact main-header range, parses v4 and RPM 6 signature tags under the metadata and 64-record limits, and maintains one incremental hash state per legacy record while the compressed payload is read.
+The verifier validates transferable certificate bindings and every applicable signature, reports SHA-256 of the native primary-key fingerprint, and leaves issuer trust to explicit pins.
+Synthetic RPM 6 arrays, header, payload, and packet tampering, unrelated/malformed/oversized keys, mixed good/bad signatures,
+signature-count limits, and an endless suffix provide negative and boundedness evidence.
+The official signed RPM is also a `package_rpm` fuzz seed, and CLI tests cover explicit key files plus untrusted and pinned outcomes.

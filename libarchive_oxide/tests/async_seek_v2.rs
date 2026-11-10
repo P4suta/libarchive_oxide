@@ -7,12 +7,19 @@
 #![cfg(feature = "async")]
 #![allow(clippy::unwrap_used, clippy::panic)]
 
+mod common;
+
 use futures_lite::future::block_on;
 use futures_lite::io::Cursor;
 use libarchive_oxide::{
     AsyncSeekArchiveReader, AsyncSeekArchiveWriter, ReaderEvent, SeekArchiveReader,
 };
 use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Limits};
+
+use common::{
+    extended_attribute_iso_fixture, extended_attribute_iso_with_rock_ridge_fixture,
+    interleaved_iso_fixture, multi_extent_iso_fixture,
+};
 
 #[test]
 fn futures_seek_iso_writer_and_reader_share_the_sync_state_machine() {
@@ -76,6 +83,92 @@ fn futures_seek_iso_writer_and_reader_share_the_sync_state_machine() {
 }
 
 #[test]
+fn futures_seek_iso_reader_streams_noncontiguous_multi_extent_sections() {
+    block_on(async {
+        let mut reader = AsyncSeekArchiveReader::new(Cursor::new(multi_extent_iso_fixture()))
+            .await
+            .unwrap();
+        assert_eq!(reader.format(), FormatId::Iso9660);
+        let mut decoded = Vec::new();
+        loop {
+            match reader.next_event().await.unwrap() {
+                ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+                ReaderEvent::Done => break,
+                _ => {},
+            }
+        }
+        assert_eq!(decoded, b"firstsecond");
+    });
+}
+
+#[test]
+fn futures_seek_iso_reader_skips_interleave_gaps() {
+    block_on(async {
+        let (image, expected) = interleaved_iso_fixture();
+        let mut reader = AsyncSeekArchiveReader::new(Cursor::new(image))
+            .await
+            .unwrap();
+        let mut decoded = Vec::new();
+        loop {
+            match reader.next_event().await.unwrap() {
+                ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+                ReaderEvent::Done => break,
+                _ => {},
+            }
+        }
+        assert_eq!(decoded, expected);
+    });
+}
+
+#[test]
+fn futures_seek_iso_reader_applies_extended_attributes() {
+    block_on(async {
+        let (image, expected) = extended_attribute_iso_fixture();
+        let mut reader = AsyncSeekArchiveReader::new(Cursor::new(image))
+            .await
+            .unwrap();
+        let mut decoded = Vec::new();
+        let mut saw_metadata = false;
+        loop {
+            match reader.next_event().await.unwrap() {
+                ReaderEvent::Entry(metadata) => {
+                    saw_metadata = true;
+                    assert_eq!(metadata.mode(), Some(0o540));
+                    assert_eq!(metadata.owner().uid, Some(1000));
+                    assert_eq!(metadata.owner().gid, Some(1001));
+                },
+                ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+                ReaderEvent::Done => break,
+                _ => {},
+            }
+        }
+        assert!(saw_metadata);
+        assert_eq!(decoded, expected);
+    });
+}
+
+#[test]
+fn iso_rock_ridge_metadata_takes_precedence_over_extended_attributes() {
+    block_on(async {
+        let (image, _) = extended_attribute_iso_with_rock_ridge_fixture();
+        let mut reader = AsyncSeekArchiveReader::new(Cursor::new(image))
+            .await
+            .unwrap();
+        loop {
+            match reader.next_event().await.unwrap() {
+                ReaderEvent::Entry(metadata) => {
+                    assert_eq!(metadata.mode(), Some(0o644));
+                    assert_ne!(metadata.mode(), Some(0o540));
+                    break;
+                },
+                ReaderEvent::Done => panic!("EA/Rock Ridge fixture omitted its file"),
+                _ => {},
+            }
+        }
+    });
+}
+
+#[test]
 fn futures_seek_zip_roundtrips_a_payload_larger_than_the_adapter_buffer() {
     block_on(async {
         let output = Cursor::new(Vec::new());
@@ -107,6 +200,42 @@ fn futures_seek_zip_roundtrips_a_payload_larger_than_the_adapter_buffer() {
                 ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
                 ReaderEvent::Done => break,
                 _ => panic!("unknown seek reader event"),
+            }
+        }
+        assert_eq!(decoded, body);
+    });
+}
+
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn futures_seek_xar_roundtrips_through_the_shared_state_machine() {
+    block_on(async {
+        let output = Cursor::new(Vec::new());
+        let mut writer =
+            AsyncSeekArchiveWriter::with_format(output, FormatId::Xar, Limits::default())
+                .await
+                .unwrap();
+        let body = b"async XAR payload".repeat(4096);
+        let file = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("xar/data.bin"))
+            .size(Some(body.len() as u64))
+            .build();
+        writer.start_entry(&file).await.unwrap();
+        for chunk in body.chunks(733) {
+            writer.write_data(chunk).await.unwrap();
+        }
+        writer.end_entry().await.unwrap();
+        let archive = writer.finish().await.unwrap().into_inner();
+
+        let mut reader = AsyncSeekArchiveReader::new(Cursor::new(archive))
+            .await
+            .unwrap();
+        assert_eq!(reader.format(), FormatId::Xar);
+        let mut decoded = Vec::new();
+        loop {
+            match reader.next_event().await.unwrap() {
+                ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+                ReaderEvent::Done => break,
+                _ => {},
             }
         }
         assert_eq!(decoded, body);
@@ -171,6 +300,105 @@ async fn tokio_seek_archive_adapters_match_the_futures_contract() {
             .await
             .unwrap();
     let body = b"tokio seek body";
+    let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("tokio.txt"))
+        .size(Some(body.len() as u64))
+        .build();
+    writer.start_entry(&metadata).await.unwrap();
+    writer.write_data(body).await.unwrap();
+    writer.end_entry().await.unwrap();
+    let archive = writer.finish().await.unwrap().into_inner();
+
+    let mut reader = TokioSeekArchiveReader::new(std::io::Cursor::new(archive))
+        .await
+        .unwrap();
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().await.unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(decoded, body);
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "current_thread")]
+async fn tokio_seek_iso_reader_streams_noncontiguous_multi_extent_sections() {
+    use libarchive_oxide::TokioSeekArchiveReader;
+
+    let mut reader = TokioSeekArchiveReader::new(std::io::Cursor::new(multi_extent_iso_fixture()))
+        .await
+        .unwrap();
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().await.unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(decoded, b"firstsecond");
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "current_thread")]
+async fn tokio_seek_iso_reader_skips_interleave_gaps() {
+    use libarchive_oxide::TokioSeekArchiveReader;
+
+    let (image, expected) = interleaved_iso_fixture();
+    let mut reader = TokioSeekArchiveReader::new(std::io::Cursor::new(image))
+        .await
+        .unwrap();
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().await.unwrap() {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(decoded, expected);
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "current_thread")]
+async fn tokio_seek_iso_reader_applies_extended_attributes() {
+    use libarchive_oxide::TokioSeekArchiveReader;
+
+    let (image, expected) = extended_attribute_iso_fixture();
+    let mut reader = TokioSeekArchiveReader::new(std::io::Cursor::new(image))
+        .await
+        .unwrap();
+    let mut decoded = Vec::new();
+    let mut saw_metadata = false;
+    loop {
+        match reader.next_event().await.unwrap() {
+            ReaderEvent::Entry(metadata) => {
+                saw_metadata = true;
+                assert_eq!(metadata.mode(), Some(0o540));
+                assert_eq!(metadata.owner().uid, Some(1000));
+                assert_eq!(metadata.owner().gid, Some(1001));
+            },
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert!(saw_metadata);
+    assert_eq!(decoded, expected);
+}
+
+#[cfg(all(feature = "tokio", not(target_os = "wasi")))]
+#[tokio::test(flavor = "current_thread")]
+async fn tokio_seek_xar_writer_matches_the_futures_contract() {
+    use libarchive_oxide::{TokioSeekArchiveReader, TokioSeekArchiveWriter};
+
+    let output = std::io::Cursor::new(Vec::new());
+    let mut writer = TokioSeekArchiveWriter::with_format(output, FormatId::Xar, Limits::default())
+        .await
+        .unwrap();
+    let body = b"tokio XAR body";
     let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("tokio.txt"))
         .size(Some(body.len() as u64))
         .build();

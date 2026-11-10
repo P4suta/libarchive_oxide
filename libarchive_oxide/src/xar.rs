@@ -12,6 +12,11 @@
 //! `application/x-bzip2`. Every other encoding surfaces a structured
 //! `Unsupported` error at read time.
 
+#[cfg(not(target_os = "wasi"))]
+mod write;
+#[cfg(not(target_os = "wasi"))]
+pub(crate) use write::XarSeekWriter;
+
 use std::io::{Read, Seek, SeekFrom};
 
 #[cfg(feature = "bzip2")]
@@ -595,7 +600,10 @@ fn read_payload<R: Read>(
                     *in_len = count;
                     *comp_remaining -= count as u64;
                 }
-                let flush = if *comp_remaining == 0 {
+                // Keep using the streaming mode while the final compressed input buffer still has bytes.
+                // `Finish` tells miniz that the caller has supplied all input *and* enough output space;
+                // setting it merely because the heap reader has buffered the final bytes fails when one input buffer expands into more than one output event.
+                let flush = if *comp_remaining == 0 && *in_pos == *in_len {
                     MZFlush::Finish
                 } else {
                     MZFlush::None
@@ -1309,10 +1317,16 @@ fn parse_octal(bytes: &[u8]) -> Option<u32> {
     Some(value)
 }
 
-/// Best-effort ISO-8601 (`YYYY-MM-DDThh:mm:ssZ`) → UNIX timestamp; `None` on any
-/// deviation so a malformed mtime never fails a read.
+/// Best-effort ISO-8601 (`YYYY-MM-DDThh:mm:ss[.nnnnnnnnn]Z`) → UNIX timestamp;
+/// `None` on any deviation so a malformed mtime never fails a read.
 fn parse_iso8601(bytes: &[u8]) -> Option<Timestamp> {
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
         return None;
     }
     let year = i64::try_from(parse_u64(&bytes[0..4])?).ok()?;
@@ -1321,9 +1335,28 @@ fn parse_iso8601(bytes: &[u8]) -> Option<Timestamp> {
     let hour = i64::try_from(parse_u64(&bytes[11..13])?).ok()?;
     let minute = i64::try_from(parse_u64(&bytes[14..16])?).ok()?;
     let second = i64::try_from(parse_u64(&bytes[17..19])?).ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day_of_month) {
+    let maximum_day = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return None,
+    };
+    if !(1..=maximum_day).contains(&day_of_month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
         return None;
     }
+    let nanos = match &bytes[19..] {
+        b"Z" => 0,
+        [b'.', fraction @ .., b'Z'] if (1..=9).contains(&fraction.len()) => {
+            let value = u32::try_from(parse_u64(fraction)?).ok()?;
+            value.checked_mul(10_u32.pow(u32::try_from(9 - fraction.len()).ok()?))?
+        },
+        _ => return None,
+    };
     // Howard Hinnant's days_from_civil.
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -1335,7 +1368,7 @@ fn parse_iso8601(bytes: &[u8]) -> Option<Timestamp> {
     let secs = days
         .checked_mul(86_400)?
         .checked_add(hour * 3600 + minute * 60 + second)?;
-    Some(Timestamp::from_seconds(secs))
+    Timestamp::new(secs, nanos).ok()
 }
 
 /// Decodes the five standard XML entities; leaves unknown `&…;` runs literal.
@@ -1373,4 +1406,23 @@ fn xml_unescape(input: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::parse_iso8601;
+    use libarchive_oxide_core::Timestamp;
+
+    #[test]
+    fn iso8601_parser_preserves_fractional_seconds_and_rejects_invalid_dates() {
+        assert_eq!(
+            parse_iso8601(b"2023-11-14T22:13:20.123456789Z"),
+            Timestamp::new(1_700_000_000, 123_456_789).ok()
+        );
+        assert!(parse_iso8601(b"2024-02-29T00:00:00Z").is_some());
+        assert!(parse_iso8601(b"2023-02-29T00:00:00Z").is_none());
+        assert!(parse_iso8601(b"2024-01-01T00:00:60Z").is_none());
+        assert!(parse_iso8601(b"2024-01-01T00:00:00.1234567890Z").is_none());
+        assert!(parse_iso8601(b"2024-01-01T00:00:00+00:00").is_none());
+    }
 }

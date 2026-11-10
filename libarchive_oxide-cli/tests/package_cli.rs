@@ -10,8 +10,10 @@
 
 mod common;
 
-use libarchive_oxide::{ArchiveEngine, ArchiveWriter, CreateOptions, ZipMethod};
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FilterId, FormatId, Limits};
+use libarchive_oxide::{
+    ArchiveEngine, ArchivePath, ArchiveWriter, CreateOptions, EntryKind, EntryMetadata, FilterId,
+    FormatId, Limits, ZipMethod,
+};
 use serde_json::Value;
 
 use common::{TempDir, code, run_in, run_stdin};
@@ -37,6 +39,11 @@ const ALPINE_KEY_ID: &str = "alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
 const ALPINE_SIGNER_SHA256_HEX: &str =
     "5e03bee6b12094ef8e01323d8efa0d5929487c781def110fb2e8d09fc446f899";
 const MICROSOFT_MSIX: &[u8] = include_bytes!("fixtures/package/msix-blockmap-microsoft.msix");
+const MICROSOFT_SIGNED_MSIX: &[u8] =
+    include_bytes!("fixtures/package/msix-authenticode-microsoft.appx");
+const RCODESIGN_SIGNED_IPA: &[u8] = include_bytes!("fixtures/package/ipa-rcodesign-signed.ipa");
+const RPM_SIGNED: &[u8] = include_bytes!("fixtures/package/rpm-signed.rpm");
+const RPM_OPENPGP_KEY: &[u8] = include_bytes!("fixtures/package/rpm.org-rsa-2048-test.pub");
 
 // --- Fixture builders (mirroring the library validator test suites) --------
 
@@ -249,10 +256,62 @@ fn build_epub() -> Vec<u8> {
 
 /// A structurally valid, unsigned Android APK.
 fn build_android_apk() -> Vec<u8> {
+    let manifest = minimal_android_manifest();
     build_zip_store(&[
-        (b"AndroidManifest.xml", b"manifest"),
+        (b"AndroidManifest.xml", &manifest),
         (b"classes.dex", b"dex\n035\0"),
     ])
+}
+
+fn push_axml_u16(output: &mut Vec<u8>, value: u16) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_axml_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn axml_chunk(kind: u16, header_size: u16, mut body: Vec<u8>) -> Vec<u8> {
+    let mut output = Vec::new();
+    push_axml_u16(&mut output, kind);
+    push_axml_u16(&mut output, header_size);
+    push_axml_u32(
+        &mut output,
+        u32::try_from(8 + body.len()).expect("AXML size"),
+    );
+    output.append(&mut body);
+    output
+}
+
+fn minimal_android_manifest() -> Vec<u8> {
+    let mut pool = Vec::new();
+    push_axml_u32(&mut pool, 1);
+    push_axml_u32(&mut pool, 0);
+    push_axml_u32(&mut pool, 0x100);
+    push_axml_u32(&mut pool, 32);
+    push_axml_u32(&mut pool, 0);
+    push_axml_u32(&mut pool, 0);
+    pool.extend_from_slice(b"\x08\x08manifest\0\0");
+
+    let mut start = Vec::new();
+    push_axml_u32(&mut start, 1);
+    push_axml_u32(&mut start, u32::MAX);
+    push_axml_u32(&mut start, u32::MAX);
+    push_axml_u32(&mut start, 0);
+    push_axml_u16(&mut start, 20);
+    push_axml_u16(&mut start, 20);
+    start.extend_from_slice(&[0; 8]);
+
+    let mut end = Vec::new();
+    push_axml_u32(&mut end, 1);
+    push_axml_u32(&mut end, u32::MAX);
+    push_axml_u32(&mut end, u32::MAX);
+    push_axml_u32(&mut end, 0);
+
+    let mut body = axml_chunk(0x0001, 28, pool);
+    body.extend_from_slice(&axml_chunk(0x0102, 16, start));
+    body.extend_from_slice(&axml_chunk(0x0103, 16, end));
+    axml_chunk(0x0003, 8, body)
 }
 
 /// A structurally valid, unsigned Alpine APK v2. The dedicated package-crate
@@ -395,6 +454,136 @@ fn microsoft_msix_reports_verified_block_map_without_claiming_signature_validity
 }
 
 #[test]
+fn microsoft_signed_msix_reports_valid_authenticode_and_requires_a_pin() {
+    let dir = TempDir::new("package_msix_signature");
+    let path = dir.write("signed-untrusted.appx", MICROSOFT_SIGNED_MSIX);
+    let package = path.to_str().expect("utf8 path");
+    let untrusted = run_in(
+        "oxarchive",
+        &["package", "validate", package, "--type", "msix"],
+        dir.path(),
+    );
+    assert_eq!(code(&untrusted), 1, "{untrusted:?}");
+    let value = object(&untrusted);
+    assert_eq!(value["integrity"], "verified");
+    assert_eq!(value["signature_validity"], "verified");
+    assert_eq!(value["trust"], "invalid");
+    let fingerprints = value["signer_fingerprints_sha256"]
+        .as_array()
+        .expect("fingerprint array");
+    assert_eq!(fingerprints.len(), 1);
+    let fingerprint = fingerprints[0]
+        .as_str()
+        .expect("hex fingerprint")
+        .to_string();
+
+    let trusted = run_in(
+        "oxarchive",
+        &[
+            "package",
+            "validate",
+            package,
+            "--type=msix",
+            "--trusted-signer-sha256",
+            &fingerprint,
+        ],
+        dir.path(),
+    );
+    assert_eq!(code(&trusted), 0, "{trusted:?}");
+    let value = object(&trusted);
+    assert_eq!(value["signature_validity"], "verified");
+    assert_eq!(value["trust"], "verified");
+}
+
+#[test]
+fn rcodesign_ipa_reports_valid_code_signature_and_requires_a_pin() {
+    let dir = TempDir::new("package_ipa_signature");
+    let path = dir.write("signed.ipa", RCODESIGN_SIGNED_IPA);
+    let package = path.to_str().expect("utf8 path");
+    let untrusted = run_in(
+        "oxarchive",
+        &["package", "validate", package, "--type", "ipa"],
+        dir.path(),
+    );
+    assert_eq!(code(&untrusted), 1, "{untrusted:?}");
+    let value = object(&untrusted);
+    assert_eq!(value["integrity"], "verified");
+    assert_eq!(value["signature_validity"], "verified");
+    assert_eq!(value["trust"], "invalid");
+    let fingerprints = value["signer_fingerprints_sha256"]
+        .as_array()
+        .expect("fingerprint array");
+    assert_eq!(fingerprints.len(), 1);
+    let fingerprint = fingerprints[0].as_str().expect("hex fingerprint");
+
+    let trusted = run_in(
+        "oxarchive",
+        &[
+            "package",
+            "validate",
+            package,
+            "--type=ipa",
+            "--trusted-signer-sha256",
+            fingerprint,
+        ],
+        dir.path(),
+    );
+    assert_eq!(code(&trusted), 0, "{trusted:?}");
+    let value = object(&trusted);
+    assert_eq!(value["signature_validity"], "verified");
+    assert_eq!(value["trust"], "verified");
+}
+
+#[test]
+fn rpm_openpgp_key_file_verifies_signature_and_pin_controls_trust() {
+    let dir = TempDir::new("package_rpm_signature");
+    let path = dir.write("signed.rpm", RPM_SIGNED);
+    let key = dir.write("signer.pub", RPM_OPENPGP_KEY);
+    let package = path.to_str().expect("utf8 package path");
+    let key = key.to_str().expect("utf8 key path");
+
+    let untrusted = run_in(
+        "oxarchive",
+        &[
+            "package",
+            "validate",
+            package,
+            "--type=rpm",
+            "--rpm-openpgp-key-file",
+            key,
+        ],
+        dir.path(),
+    );
+    assert_eq!(code(&untrusted), 1, "{untrusted:?}");
+    let value = object(&untrusted);
+    assert_eq!(value["integrity"], "verified");
+    assert_eq!(value["signature_validity"], "verified");
+    assert_eq!(value["trust"], "invalid");
+    let fingerprint = value["signer_fingerprints_sha256"][0]
+        .as_str()
+        .expect("RPM signer fingerprint");
+
+    let trusted = run_in(
+        "oxarchive",
+        &[
+            "package",
+            "validate",
+            package,
+            "--type",
+            "rpm",
+            &format!("--rpm-openpgp-key-file={key}"),
+            "--trusted-signer-sha256",
+            fingerprint,
+        ],
+        dir.path(),
+    );
+    assert_eq!(code(&trusted), 0, "{trusted:?}");
+    let value = object(&trusted);
+    assert_eq!(value["signature_validity"], "verified");
+    assert_eq!(value["trust"], "verified");
+}
+
+#[test]
 fn type_flag_accepts_equals_form() {
     let dir = TempDir::new("package_equals");
     let path = dir.write("demo.jar", &build_jar());
@@ -409,7 +598,10 @@ fn type_flag_accepts_equals_form() {
         dir.path(),
     );
     assert_eq!(code(&output), 0, "{output:?}");
-    assert_eq!(object(&output)["profile"], "jar");
+    let value = object(&output);
+    assert_eq!(value["profile"], "jar");
+    assert_eq!(value["android_apk_manifest"], Value::Null);
+    assert_eq!(value["android_apk_compatibility"], Value::Null);
 }
 
 #[test]
@@ -490,11 +682,19 @@ fn android_v2_verifies_content_and_requires_a_separate_trust_pin() {
         ],
         dir.path(),
     );
-    assert_eq!(code(&trusted), 0, "{trusted:?}");
+    assert_eq!(code(&trusted), 1, "{trusted:?}");
     let value = object(&trusted);
     assert_eq!(value["integrity"], "verified");
     assert_eq!(value["signature_validity"], "verified");
     assert_eq!(value["trust"], "verified");
+    assert_eq!(value["android_apk_compatibility"]["validity"], "invalid");
+    assert_eq!(value["android_apk_compatibility"]["minimum_sdk"], 23);
+    assert_eq!(value["android_apk_compatibility"]["target_sdk"], 23);
+    assert!(value["findings"].as_array().is_some_and(|findings| {
+        findings
+            .iter()
+            .any(|finding| finding["code"] == "android-signature-platform-gap")
+    }));
 }
 
 #[test]
@@ -526,6 +726,12 @@ fn android_v31_rotation_is_reported_without_collapsing_trust_or_v4() {
         "not-evaluated"
     );
     assert_eq!(value["android_apk_v4"]["trust"], "not-evaluated");
+    assert_eq!(value["android_apk_manifest"]["validity"], "verified");
+    assert!(value["android_apk_manifest"]["minimum_sdk"].is_u64());
+    assert!(value["android_apk_manifest"]["target_sdk"].is_u64());
+    assert_eq!(value["android_apk_compatibility"]["validity"], "verified");
+    assert_eq!(value["android_apk_compatibility"]["minimum_sdk"], 23);
+    assert_eq!(value["android_apk_compatibility"]["target_sdk"], 23);
 
     let rotation = &value["android_apk_rotation"];
     assert_eq!(rotation["v3_1_present"], true);
@@ -644,10 +850,16 @@ fn android_v4_sidecar_is_explicit_verified_and_reported_as_versioned_json() {
         ],
         dir.path(),
     );
-    assert_eq!(code(&trusted), 0, "{trusted:?}");
+    assert_eq!(code(&trusted), 1, "{trusted:?}");
     let value = object(&trusted);
     assert_eq!(value["android_apk_v4"]["trust"], "verified");
     assert_eq!(value["trust"], "verified");
+    assert_eq!(value["signature_validity"], "verified");
+    assert_eq!(value["android_apk_compatibility"]["validity"], "invalid");
+    assert_eq!(
+        value["android_apk_compatibility"]["findings"][0]["code"],
+        "android-signature-platform-gap"
+    );
 }
 
 #[test]

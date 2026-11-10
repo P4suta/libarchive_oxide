@@ -60,9 +60,9 @@ pub(super) mod testing {
         }
     }
 
-    pub(crate) struct DriverChannels {
-        pub(crate) sender: mpsc::SyncSender<InputMessage>,
-        pub(crate) events: mpsc::Receiver<WorkerEvent>,
+    pub(crate) struct DriverChannels<Message = InputMessage, Event = WorkerEvent> {
+        pub(crate) sender: mpsc::SyncSender<Message>,
+        pub(crate) events: mpsc::Receiver<Event>,
         pub(crate) schedule: Arc<DriveSchedule>,
         pub(crate) retained: Vec<u8>,
     }
@@ -71,10 +71,34 @@ pub(super) mod testing {
         magic: &'static [u8],
         drive: impl FnOnce(DriverChannels) -> Result<Option<CodecStep>, ArchiveError> + Send + 'static,
     ) {
+        assert_retained_input_progress_with(
+            magic,
+            InputMessage::Data,
+            WorkerEvent::NeedInput,
+            |message| match message {
+                InputMessage::Data(bytes) => Some(bytes),
+                InputMessage::End => None,
+            },
+            drive,
+        );
+    }
+
+    pub(crate) fn assert_retained_input_progress_with<
+        Message: Send + 'static,
+        Event: Send + 'static,
+    >(
+        magic: &'static [u8],
+        data: impl Fn(Vec<u8>) -> Message,
+        need_input: Event,
+        into_bytes: impl Fn(Message) -> Option<Vec<u8>>,
+        drive: impl FnOnce(DriverChannels<Message, Event>) -> Result<Option<CodecStep>, ArchiveError>
+        + Send
+        + 'static,
+    ) {
         let (sender, input) = mpsc::sync_channel(QUEUE_DEPTH);
         let prefix = &magic[..QUEUE_DEPTH];
         for &byte in prefix {
-            sender.send(InputMessage::Data(vec![byte])).unwrap();
+            sender.send(data(vec![byte])).unwrap();
         }
         let retained = magic[QUEUE_DEPTH..].to_vec();
         let (events, receiver) = mpsc::sync_channel(QUEUE_DEPTH);
@@ -102,7 +126,7 @@ pub(super) mod testing {
             for _ in prefix {
                 queued_prefix.push(input.try_recv());
             }
-            events.send(WorkerEvent::NeedInput).unwrap();
+            events.send(need_input).unwrap();
             release.wait();
             let next = checkpoints.recv().unwrap();
             completed = next == DriveCheckpoint::Finished;
@@ -123,9 +147,13 @@ pub(super) mod testing {
         assert_eq!(first, DriveCheckpoint::InputFull);
         assert!(completed, "owner waited after consuming an input request");
         for (message, &byte) in queued_prefix.into_iter().zip(prefix) {
-            assert!(matches!(message, Ok(InputMessage::Data(bytes)) if bytes == [byte]));
+            let message = message.expect("queued prefix");
+            assert_eq!(into_bytes(message).as_deref(), Some([byte].as_slice()));
         }
-        assert!(matches!(delivered, Some(Ok(InputMessage::Data(bytes))) if bytes == retained));
+        let delivered = delivered
+            .expect("retained input delivered")
+            .expect("retained input queued");
+        assert_eq!(into_bytes(delivered).as_deref(), Some(retained.as_slice()));
         let step = result.unwrap().unwrap();
         assert_eq!(step.status, CodecStatus::NeedInput);
         assert_eq!((step.consumed, step.produced), (0, 0));

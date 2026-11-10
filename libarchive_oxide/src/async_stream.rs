@@ -16,12 +16,14 @@ use libarchive_oxide_core::{
 };
 
 use crate::BackendPreference;
-#[cfg(feature = "aes")]
-use crate::SecretBytes;
 use crate::async_filter::{AsyncFilterReader, AsyncFilterWriter};
 use crate::provider::ProviderArchiveEncoder;
-use crate::stream::{Pipeline, PipelineEvent, ReaderEvent, RuntimeEncoder, StreamError};
+use crate::stream::{
+    Pipeline, PipelineEvent, ReaderEvent, RuntimeEncoder, StreamError, archive_error_from_io,
+};
 use crate::zip::ZipMethod;
+#[cfg(feature = "aes")]
+use crate::{AesStrength, SecretBytes};
 
 const BUFFER: usize = 64 * 1024;
 
@@ -68,6 +70,44 @@ impl<R: AsyncRead + Unpin> AsyncReaderInput<R> {
         )))
     }
 
+    fn with_filter(
+        input: R,
+        filter: FilterId,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Result<Self, ArchiveError> {
+        let depth = limits.filter_depth().unwrap_or(4).min(4);
+        if depth == 0 {
+            return Err(ArchiveError::new(ErrorKind::Limit)
+                .with_context("an explicit filter exceeds the zero filter-depth limit"));
+        }
+        let one =
+            AsyncFilterReader::with_filter(input, filter, limits, backend).map_err(|error| {
+                archive_error_from_io(&error).unwrap_or_else(|| {
+                    let kind = if error.kind() == std::io::ErrorKind::Unsupported {
+                        ErrorKind::Unsupported
+                    } else {
+                        ErrorKind::Io
+                    };
+                    ArchiveError::new(kind).with_context(error.to_string())
+                })
+            })?;
+        if depth == 1 {
+            return Ok(Self::One(Box::new(one)));
+        }
+        let two = AsyncFilterReader::with_backend(one, limits, backend);
+        if depth == 2 {
+            return Ok(Self::Two(Box::new(two)));
+        }
+        let three = AsyncFilterReader::with_backend(two, limits, backend);
+        if depth == 3 {
+            return Ok(Self::Three(Box::new(three)));
+        }
+        Ok(Self::Four(Box::new(AsyncFilterReader::with_backend(
+            three, limits, backend,
+        ))))
+    }
+
     fn poll_read(
         &mut self,
         context: &mut Context<'_>,
@@ -98,6 +138,41 @@ impl<R: AsyncRead + Unpin> AsyncReaderInput<R> {
 }
 
 impl<R: AsyncRead + Unpin> AsyncArchiveReader<R> {
+    /// Opens an asynchronous streaming reader with the common option model.
+    pub fn with_options(reader: R, options: &crate::OpenOptions) -> Result<Self, ArchiveError> {
+        if options.volumes().is_some() {
+            return Err(ArchiveError::new(ErrorKind::Capability)
+                .with_context("volume providers require an async seek or range reader"));
+        }
+        let passwords = options
+            .password_candidates(crate::PasswordRequest::new(
+                options.format().unwrap_or(FormatId::Zip),
+                None,
+                crate::PasswordPurpose::Header,
+            ))
+            .map_err(|error| {
+                ArchiveError::new(ErrorKind::Io)
+                    .with_context(format!("password provider failed: {error}"))
+            })?;
+        let limits = options.limits();
+        let backend = BackendPreference::Auto;
+        let reader = match options.filter() {
+            Some(filter) => AsyncReaderInput::with_filter(reader, filter, limits, backend)?,
+            None => AsyncReaderInput::new(reader, limits, backend),
+        };
+        let pipeline = match options.format() {
+            Some(format) => Pipeline::after_filter_adapters_with_format(limits, backend, format)?,
+            None => Pipeline::after_filter_adapters_with_backend(limits, backend),
+        }
+        .with_passwords(passwords);
+        Ok(Self {
+            reader,
+            pipeline,
+            read_buffer: vec![0; BUFFER],
+            event_data: Vec::with_capacity(BUFFER),
+        })
+    }
+
     /// Creates a reader using safe default resource limits.
     #[must_use]
     pub fn new(reader: R) -> Self {
@@ -206,7 +281,7 @@ impl<R: AsyncRead + Unpin> AsyncArchiveReader<R> {
                     let buffer = &mut self.read_buffer[..capacity];
                     let read = poll_fn(|cx| self.reader.poll_read(cx, buffer))
                         .await
-                        .map_err(StreamError::io)?;
+                        .map_err(StreamError::io_or_archive)?;
                     if read == 0 {
                         self.pipeline.finish_input().map_err(StreamError::archive)?;
                     } else {
@@ -357,9 +432,92 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveWriter<W> {
         limits: Limits,
         backend: BackendPreference,
     ) -> Self {
+        Self::with_zip_password_strength_and_backend(
+            output,
+            method,
+            password,
+            AesStrength::Bits256,
+            limits,
+            backend,
+        )
+    }
+
+    /// Creates an asynchronous `WinZip` AES AE-2 writer with an explicit key strength.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zip_password_and_strength(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        strength: AesStrength,
+        limits: Limits,
+    ) -> Self {
+        Self::with_zip_password_strength_and_backend(
+            output,
+            method,
+            password,
+            strength,
+            limits,
+            BackendPreference::Auto,
+        )
+    }
+
+    /// Creates a strength-selectable asynchronous ZIP writer with a codec backend.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zip_password_strength_and_backend(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        strength: AesStrength,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
         Self {
             output: AsyncFilterWriter::Plain(output),
-            encoder: RuntimeEncoder::encrypted_zip_with_backend(limits, method, password, backend),
+            encoder: RuntimeEncoder::encrypted_zip_with_backend(
+                limits, method, password, strength, backend,
+            ),
+            format: FormatId::Zip,
+            buffer: vec![0; BUFFER],
+            failed: false,
+        }
+    }
+
+    /// Creates an asynchronous traditional PKWARE `ZipCrypto` writer.
+    ///
+    /// `ZipCrypto` is cryptographically weak and is provided only for legacy interoperability.
+    /// Prefer `WinZip` AES for new archives.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zipcrypto_password(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        limits: Limits,
+    ) -> Self {
+        Self::with_zipcrypto_password_and_backend(
+            output,
+            method,
+            password,
+            limits,
+            BackendPreference::Auto,
+        )
+    }
+
+    /// Creates an asynchronous traditional `ZipCrypto` writer with a codec backend.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zipcrypto_password_and_backend(
+        output: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
+        Self {
+            output: AsyncFilterWriter::Plain(output),
+            encoder: RuntimeEncoder::zipcrypto_with_backend(limits, method, password, backend),
             format: FormatId::Zip,
             buffer: vec![0; BUFFER],
             failed: false,
@@ -385,7 +543,7 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveWriter<W> {
         backend: BackendPreference,
     ) -> Result<Self, ArchiveError> {
         Ok(Self {
-            output: AsyncFilterWriter::with_backend(output, filter, backend)?,
+            output: AsyncFilterWriter::with_backend(output, filter, limits, backend)?,
             encoder: RuntimeEncoder::sequential_with_backend(format, limits, backend)?,
             format,
             buffer: vec![0; BUFFER],

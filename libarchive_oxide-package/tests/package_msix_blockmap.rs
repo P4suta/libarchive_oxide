@@ -11,8 +11,8 @@ use std::io::Cursor;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use libarchive_oxide::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use libarchive_oxide::{ArchiveWriter, ZipMethod};
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use libarchive_oxide_package::{
     AppPackageProfile, PackageFindingCode, PackageVerifier, TrustPolicy, VerificationDimension,
 };
@@ -205,6 +205,54 @@ fn verify(bytes: &[u8]) -> libarchive_oxide_package::VerificationReport {
     PackageVerifier::default().app(AppPackageProfile::Msix, Cursor::new(bytes))
 }
 
+fn le_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("u32 field"))
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("u16 field"))
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("u64 field"))
+}
+
+fn eocd_offset(bytes: &[u8]) -> usize {
+    bytes
+        .windows(4)
+        .rposition(|window| window == b"PK\x05\x06")
+        .expect("committed fixture has an EOCD")
+}
+
+fn central_directory_offset(bytes: &[u8]) -> usize {
+    let eocd = eocd_offset(bytes);
+    let classic = le_u32(bytes, eocd + 16);
+    if classic != u32::MAX {
+        return classic as usize;
+    }
+    let locator = eocd.checked_sub(20).expect("ZIP64 locator precedes EOCD");
+    assert_eq!(&bytes[locator..locator + 4], b"PK\x06\x07");
+    let zip64 = usize::try_from(le_u64(bytes, locator + 8)).expect("ZIP64 offset fits");
+    assert_eq!(&bytes[zip64..zip64 + 4], b"PK\x06\x06");
+    usize::try_from(le_u64(bytes, zip64 + 48)).expect("central offset fits")
+}
+
+fn central_entry(bytes: &[u8], wanted: &[u8]) -> (usize, usize) {
+    let mut central = central_directory_offset(bytes);
+    loop {
+        assert_eq!(&bytes[central..central + 4], b"PK\x01\x02");
+        let name_len = usize::from(le_u16(bytes, central + 28));
+        let extra_len = usize::from(le_u16(bytes, central + 30));
+        let comment_len = usize::from(le_u16(bytes, central + 32));
+        let name = &bytes[central + 46..central + 46 + name_len];
+        if name == wanted {
+            let local = usize::try_from(le_u32(bytes, central + 42)).expect("local offset fits");
+            return (central, local);
+        }
+        central += 46 + name_len + extra_len + comment_len;
+    }
+}
+
 #[test]
 fn microsoft_msix_sdk_unsigned_fixture_verifies_block_map() {
     let report = verify(MICROSOFT_UNSIGNED);
@@ -231,8 +279,9 @@ fn microsoft_msix_sdk_unsigned_fixture_verifies_block_map() {
 }
 
 #[test]
-fn microsoft_multiblock_signed_fixture_verifies_only_integrity() {
-    let report = verify(MICROSOFT_SIGNED);
+fn microsoft_multiblock_signed_fixture_verifies_signature_offline() {
+    let report = PackageVerifier::new(TrustPolicy::offline())
+        .app(AppPackageProfile::Msix, Cursor::new(MICROSOFT_SIGNED));
     assert!(
         report.structure().profile_valid(),
         "{:?}",
@@ -246,11 +295,67 @@ fn microsoft_multiblock_signed_fixture_verifies_only_integrity() {
     );
     assert_eq!(
         report.signature_validity(),
-        VerificationDimension::NotEvaluated,
-        "AppxSignature.p7x presence is not CMS validity"
+        VerificationDimension::Verified,
+        "{:?}",
+        report.findings()
     );
-    assert_eq!(report.trust(), VerificationDimension::NotEvaluated);
-    assert_eq!(report.signer_fingerprints().len(), 0);
+    assert_eq!(report.trust(), VerificationDimension::Invalid);
+    assert_eq!(report.signer_fingerprints().len(), 1);
+
+    let trusted = PackageVerifier::new(
+        TrustPolicy::offline().with_trusted_signer_sha256(report.signer_fingerprints()[0]),
+    )
+    .app(AppPackageProfile::Msix, Cursor::new(MICROSOFT_SIGNED));
+    assert_eq!(
+        trusted.signature_validity(),
+        VerificationDimension::Verified
+    );
+    assert_eq!(trusted.trust(), VerificationDimension::Verified);
+}
+
+#[test]
+fn central_directory_metadata_tamper_invalidates_only_authenticode() {
+    let mut tampered = MICROSOFT_SIGNED.to_vec();
+    let central = central_directory_offset(&tampered);
+    assert_eq!(&tampered[central..central + 4], b"PK\x01\x02");
+    tampered[central + 12] ^= 0x01;
+
+    let report = verify(&tampered);
+    assert_eq!(
+        report.integrity(),
+        VerificationDimension::Verified,
+        "{:?}",
+        report.findings()
+    );
+    assert_eq!(report.signature_validity(), VerificationDimension::Invalid);
+    assert!(report.has_code(PackageFindingCode::SignatureMismatch));
+    assert_eq!(report.signer_fingerprints(), &[] as &[[u8; 32]]);
+}
+
+#[test]
+fn payload_tamper_with_valid_zip_crc_breaks_block_map_and_authenticode() {
+    let mut tampered = MICROSOFT_SIGNED.to_vec();
+    let (central, local) = central_entry(&tampered, b"Tile.png");
+    assert_eq!(
+        le_u16(&tampered, central + 10),
+        0,
+        "fixture payload is stored"
+    );
+    assert_eq!(&tampered[local..local + 4], b"PK\x03\x04");
+    let name_len = usize::from(le_u16(&tampered, local + 26));
+    let extra_len = usize::from(le_u16(&tampered, local + 28));
+    let body_offset = local + 30 + name_len + extra_len;
+    let body_len = usize::try_from(le_u32(&tampered, central + 24)).expect("body length fits");
+    tampered[body_offset + body_len / 2] ^= 0x80;
+    let crc = crc32fast::hash(&tampered[body_offset..body_offset + body_len]);
+    tampered[local + 14..local + 18].copy_from_slice(&crc.to_le_bytes());
+    tampered[central + 16..central + 20].copy_from_slice(&crc.to_le_bytes());
+
+    let report = verify(&tampered);
+    assert_eq!(report.integrity(), VerificationDimension::Invalid);
+    assert_eq!(report.signature_validity(), VerificationDimension::Invalid);
+    assert!(report.has_code(PackageFindingCode::IntegrityMismatch));
+    assert!(report.has_code(PackageFindingCode::SignatureMismatch));
 }
 
 #[test]

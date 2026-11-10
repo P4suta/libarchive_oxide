@@ -13,9 +13,9 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 use crate::async_seek::{AsyncSeekArchiveReader, AsyncSeekArchiveWriter};
 use crate::async_stream::{AsyncArchiveReader, AsyncArchiveWriter};
-use crate::{ReaderEvent, StreamError};
 #[cfg(feature = "aes")]
-use crate::{SecretBytes, ZipMethod};
+use crate::{AesStrength, SecretBytes};
+use crate::{BackendPreference, ReaderEvent, StreamError, ZipMethod};
 use libarchive_oxide_core::filter::FilterId;
 use libarchive_oxide_core::{
     ArchiveError, ArchiveMetadata, CpioDialect, EntryMetadata, FormatId, Limits,
@@ -105,6 +105,11 @@ impl<T: AsyncSeek + Unpin> FuturesSeek for TokioIo<T> {
 pub struct TokioArchiveReader<R>(AsyncArchiveReader<TokioIo<R>>);
 
 impl<R: AsyncRead + Unpin> TokioArchiveReader<R> {
+    /// Opens a Tokio streaming reader with the common option model.
+    pub fn with_options(reader: R, options: &crate::OpenOptions) -> Result<Self, ArchiveError> {
+        AsyncArchiveReader::with_options(TokioIo::new(reader), options).map(Self)
+    }
+
     /// Creates a Tokio reader with safe default limits.
     #[must_use]
     pub fn new(reader: R) -> Self {
@@ -163,6 +168,16 @@ impl<R: AsyncRead + Unpin> TokioArchiveReader<R> {
 pub struct TokioSeekArchiveReader<R>(AsyncSeekArchiveReader<TokioIo<R>>);
 
 impl<R: AsyncRead + AsyncSeek + Unpin> TokioSeekArchiveReader<R> {
+    /// Opens a Tokio seek archive with the common option model.
+    pub async fn with_options(
+        reader: R,
+        options: &crate::OpenOptions,
+    ) -> Result<Self, StreamError> {
+        AsyncSeekArchiveReader::with_options(TokioIo::new(reader), options)
+            .await
+            .map(Self)
+    }
+
     /// Opens a seek-required archive with safe default limits.
     pub async fn new(reader: R) -> Result<Self, StreamError> {
         AsyncSeekArchiveReader::new(TokioIo::new(reader))
@@ -238,6 +253,28 @@ impl<W: AsyncWrite + Unpin> TokioArchiveWriter<W> {
         AsyncArchiveWriter::with_filter(TokioIo::new(writer), format, filter, limits).map(Self)
     }
 
+    /// Creates a sequential Tokio ZIP writer with an explicit method.
+    #[must_use]
+    pub fn with_zip_method(writer: W, method: ZipMethod, limits: Limits) -> Self {
+        Self::with_zip_method_and_backend(writer, method, limits, BackendPreference::Auto)
+    }
+
+    /// Creates a Tokio ZIP writer with an explicit codec backend.
+    #[must_use]
+    pub fn with_zip_method_and_backend(
+        writer: W,
+        method: ZipMethod,
+        limits: Limits,
+        backend: BackendPreference,
+    ) -> Self {
+        Self(AsyncArchiveWriter::with_zip_method_and_backend(
+            TokioIo::new(writer),
+            method,
+            limits,
+            backend,
+        ))
+    }
+
     /// Creates a Tokio cpio writer for an explicit header dialect.
     #[must_use]
     pub fn with_cpio_dialect(writer: W, dialect: CpioDialect, limits: Limits) -> Self {
@@ -258,6 +295,42 @@ impl<W: AsyncWrite + Unpin> TokioArchiveWriter<W> {
         limits: Limits,
     ) -> Self {
         Self(AsyncArchiveWriter::with_zip_password(
+            TokioIo::new(writer),
+            method,
+            password,
+            limits,
+        ))
+    }
+
+    /// Creates a streaming Tokio `WinZip` AES AE-2 writer with an explicit key strength.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zip_password_and_strength(
+        writer: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        strength: AesStrength,
+        limits: Limits,
+    ) -> Self {
+        Self(AsyncArchiveWriter::with_zip_password_and_strength(
+            TokioIo::new(writer),
+            method,
+            password,
+            strength,
+            limits,
+        ))
+    }
+
+    /// Creates a streaming Tokio traditional PKWARE `ZipCrypto` writer.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn with_zipcrypto_password(
+        writer: W,
+        method: ZipMethod,
+        password: SecretBytes,
+        limits: Limits,
+    ) -> Self {
+        Self(AsyncArchiveWriter::with_zipcrypto_password(
             TokioIo::new(writer),
             method,
             password,

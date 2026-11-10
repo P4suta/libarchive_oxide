@@ -106,6 +106,14 @@ pub enum PackageFindingCode {
     InvalidPackageMetadata,
     /// Package metadata exceeded the configured allocation budget.
     MetadataTooLarge,
+    /// The binary AndroidManifest.xml was malformed or could not be decoded.
+    InvalidAndroidManifest,
+    /// An Android SDK declaration cannot be mapped to a stable API level.
+    UnsupportedAndroidManifestSdk,
+    /// AndroidManifest.xml inspection exceeded a configured resource budget.
+    AndroidManifestResourceLimit,
+    /// The verified APK signing schemes do not cover the manifest SDK range.
+    AndroidSignaturePlatformGap,
     /// A signature member name or position violated the package profile.
     InvalidSignatureMember,
     /// A declared package digest or size did not match the entry bytes.
@@ -173,6 +181,10 @@ impl PackageFindingCode {
             Self::SigningSchemeDetected => "signing-scheme-detected",
             Self::InvalidPackageMetadata => "invalid-package-metadata",
             Self::MetadataTooLarge => "metadata-too-large",
+            Self::InvalidAndroidManifest => "invalid-android-manifest",
+            Self::UnsupportedAndroidManifestSdk => "unsupported-android-manifest-sdk",
+            Self::AndroidManifestResourceLimit => "android-manifest-resource-limit",
+            Self::AndroidSignaturePlatformGap => "android-signature-platform-gap",
             Self::InvalidSignatureMember => "invalid-signature-member",
             Self::IntegrityMismatch => "integrity-mismatch",
             Self::InvalidIntegrityMetadata => "invalid-integrity-metadata",
@@ -198,6 +210,7 @@ impl PackageFindingCode {
         match self {
             Self::UnknownMember
             | Self::UnsupportedCompression
+            | Self::UnsupportedAndroidManifestSdk
             | Self::CompressorMismatch
             | Self::UnsupportedIntegrityAlgorithm
             | Self::UnsupportedIntegrityScope

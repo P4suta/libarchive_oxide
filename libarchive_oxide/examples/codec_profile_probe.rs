@@ -5,19 +5,102 @@
 //! Reproducible streaming throughput and resident-memory probe for codec profiles.
 
 use std::env;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 use std::io::{self, Cursor};
+use std::num::{ParseIntError, TryFromIntError};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::process::Command;
 use std::time::Instant;
 
 use libarchive_oxide::{ArchiveReader, ArchiveWriter, ReaderEvent};
 use libarchive_oxide_core::filter::FilterId;
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FormatId, Limits};
+use libarchive_oxide_core::{
+    ArchiveError, ArchivePath, EntryKind, EntryMetadata, FormatId, Limits,
+};
 
 const CHUNK: usize = 64 * 1024;
 const SAMPLE_INTERVAL: u64 = 8 * 1024 * 1024;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug)]
+enum ProbeError {
+    Message(String),
+    Archive(libarchive_oxide::Error),
+    Protocol(ArchiveError),
+    Io(io::Error),
+    ParseInt(ParseIntError),
+    Integer(TryFromIntError),
+}
+
+impl Display for ProbeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Archive(error) => Display::fmt(error, formatter),
+            Self::Protocol(error) => Display::fmt(error, formatter),
+            Self::Io(error) => Display::fmt(error, formatter),
+            Self::ParseInt(error) => Display::fmt(error, formatter),
+            Self::Integer(error) => Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl Error for ProbeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Message(_) => None,
+            Self::Archive(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::ParseInt(error) => Some(error),
+            Self::Integer(error) => Some(error),
+        }
+    }
+}
+
+impl From<&str> for ProbeError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_owned())
+    }
+}
+
+impl From<String> for ProbeError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<libarchive_oxide::Error> for ProbeError {
+    fn from(error: libarchive_oxide::Error) -> Self {
+        Self::Archive(error)
+    }
+}
+
+impl From<ArchiveError> for ProbeError {
+    fn from(error: ArchiveError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<io::Error> for ProbeError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<ParseIntError> for ProbeError {
+    fn from(error: ParseIntError) -> Self {
+        Self::ParseInt(error)
+    }
+}
+
+impl From<TryFromIntError> for ProbeError {
+    fn from(error: TryFromIntError) -> Self {
+        Self::Integer(error)
+    }
+}
+
+fn main() -> Result<(), ProbeError> {
     let mut arguments = env::args().skip(1);
     let filter_name = arguments
         .next()
@@ -104,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn parse_filter(name: &str) -> Result<FilterId, Box<dyn std::error::Error>> {
+fn parse_filter(name: &str) -> Result<FilterId, ProbeError> {
     match name {
         "gzip" => Ok(FilterId::Gzip),
         "bzip2" => Ok(FilterId::Bzip2),

@@ -26,12 +26,12 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::PathBuf;
 
-use libarchive_oxide_core::filter::FilterId;
-use libarchive_oxide_core::{ArchiveError, EntryMetadata, ErrorKind, Limits, ProbeResult};
+use libarchive_oxide::advanced::{ArchiveError, ProbeResult};
+use libarchive_oxide::{EntryMetadata, ErrorKind, FilterId, Limits};
 
 use super::finding::{PackageFinding, PackageFindingCode, SupportStatus};
 use libarchive_oxide::advanced::ProviderCapability;
-use libarchive_oxide::advanced::legacy::{
+use libarchive_oxide::advanced::{
     BuiltinCodecProviders, BuiltinFormatProviders, ProviderSet, StaticCodecProviders,
 };
 use libarchive_oxide::advanced::{Pipeline, PipelineEvent};

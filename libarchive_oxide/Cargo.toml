@@ -7,8 +7,7 @@ name = "libarchive_oxide"
 version.workspace = true
 description = "Safe-Rust archive detection, compression, extraction, and creation"
 edition.workspace = true
-# Workspace MSRV; `cab-quantum` uses compcol 0.6.8, whose audited
-# frame-overshoot fix establishes this floor.
+# Workspace MSRV; `cab-quantum` uses compcol 0.6.8, whose audited frame-overshoot fix establishes this floor.
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,7 +18,7 @@ documentation = "https://docs.rs/libarchive_oxide"
 keywords = ["archive", "tar", "zip", "7z", "iso9660"]
 categories = ["compression", "filesystem", "parsing"]
 # Repository-only integration tests.
-exclude = ["tests/"]
+exclude = ["tests/", "vendor/delharc/", "vendor/sevenz-rust2/"]
 
 [package.metadata.docs.rs]
 no-default-features = true
@@ -28,126 +27,172 @@ rustdoc-args = ["--generate-link-to-definition"]
 
 [features]
 default = ["portable-codecs"]
-# Additive codec backend profiles. Individual codec features remain compatible
-# and select their portable backend when neither profile is named. When both
-# profiles are enabled, native implementations remain the current default until
-# a caller selects a runtime backend preference.
+# Additive codec backend profiles.
+# Individual codec features remain compatible and select their portable backend when neither profile is named.
+# When both profiles are enabled, native implementations remain the current default until a caller selects a runtime backend preference.
 portable-codecs = [
-    "gzip",
-    "bzip2",
-    "zstd",
-    "xz",
-    "lz4",
-    "compress",
-    "lzip",
-    "cab-lzx",
-    "cab-quantum",
+  "gzip",
+  "bzip2",
+  "zstd",
+  "xz",
+  "lz4",
+  "lzop",
+  "compress",
+  "lzip",
+  "lzma",
+  "cab-lzx",
+  "cab-quantum",
+  "lha",
+  "ppmd",
+  "rar",
 ]
 native-codecs = [
-    "gzip",
-    "bzip2",
-    "zstd",
-    "xz",
-    "lz4",
-    "cab-lzx",
-    "cab-quantum",
-    "dep:compression-codecs",
-    "compression-codecs/gzip",
-    "compression-codecs/bzip2",
-    "compression-codecs/zstd",
-    "compression-codecs/lz4",
-    "dep:xz-codec",
-    "bzip2/bzip2-sys",
-    "dep:flate2",
+  "gzip",
+  "bzip2",
+  "zstd",
+  "xz",
+  "lz4",
+  "cab-lzx",
+  "cab-quantum",
+  "lha",
+  "ppmd",
+  "rar",
+  "dep:compression-codecs",
+  "compression-codecs/gzip",
+  "compression-codecs/bzip2",
+  "compression-codecs/zstd",
+  "compression-codecs/lz4",
+  "dep:xz-codec",
+  "bzip2/bzip2-sys",
+  "dep:flate2",
 ]
 # Compression codecs.
-gzip = ["dep:deflate64"]
+gzip = []
 bzip2 = [
-    "dep:bzip2",
-    "dep:compression-codecs",
-    "compression-codecs/bzip2",
-    "async-compression?/bzip2",
+  "dep:bzip2",
+  "dep:compression-codecs",
+  "compression-codecs/bzip2",
+  "async-compression?/bzip2",
 ]
 zstd = ["libarchive_oxide-codecs/zstd"]
+deflate64 = []
 xz = ["dep:lzma-rust2", "lzma-rust2/encoder", "lzma-rust2/xz"]
 lz4 = ["libarchive_oxide-codecs/lz4"]
-# Unix compress(1) / .Z LZW read support.
+# lzop framing with Safe Rust LZO1X read and deterministic stored-block write.
+lzop = ["libarchive_oxide-codecs/lzo"]
+# Unix compress(1) / .Z bounded LZW read/write support.
 compress = ["libarchive_oxide-codecs/lzw"]
-# lzip/LZMA read support. The public outer-filter writer intentionally has no
-# lzip branch.
-lzip = ["dep:lzma-rust2"]
-# Microsoft CAB LZX read support. The format remains listable when this
-# additive codec feature is disabled.
+# Bounded clean-room RAR3/RAR5 LZ payload decoding.
+# RAR writing remains permanently excluded by the format license policy.
+rar = ["dep:libarchive_oxide-rar"]
+# Strict lzip/LZMA read and canonical single-member write support.
+lzip = ["dep:lzma-rust2", "lzma-rust2/encoder", "lzma-rust2/lzip"]
+# LZMA-alone (.lzma) read/write support.
+# This format has no magic and is therefore available through explicit filter selection only.
+lzma = ["lzip", "lzma-rust2/encoder"]
+# Microsoft CAB LZX read support.
+# The format remains listable when this additive codec feature is disabled.
 cab-lzx = ["libarchive_oxide-codecs/lzx"]
-# Microsoft CAB Quantum read support. `compcol` is safe Rust, no_std + alloc,
-# and the format remains listable with a typed Unsupported payload error when
-# this additive codec feature is disabled.
+# Microsoft CAB Quantum read support.
+# `compcol` is safe Rust, no_std + alloc,
+# and the format remains listable with a typed Unsupported payload error when this additive codec feature is disabled.
 cab-quantum = ["dep:compcol"]
-# WinZip AES-256 AE-2 (ZIP) and AES-256/SHA-256 (7z, via `cbc`).
+# Bounded seek-native LHA/LZH read support.
+# The dependency is pure Rust and streams fixed-size dictionaries, including PMArc PM1/PM2; our adapter enforces archive-wide metadata, output, entry-count, path, and codec-memory budgets before decoding.
+# Unsafe assertion elision stays disabled in the dependency.
+lha = ["dep:delharc", "libarchive_oxide-codecs/lha"]
+# PPMd variant I revision 1 for ZIP method 98.
+# The model allocation is validated against Limits::codec_memory before constructing the codec.
+ppmd = ["dep:ppmd-rust"]
+# WinZip AES AE-2, traditional ZipCrypto, and AES-256/SHA-256 (7z, via `cbc`).
 aes = [
-    "dep:aes",
-    "dep:ctr",
-    "dep:hmac",
-    "dep:sha1",
-    "dep:pbkdf2",
-    "dep:subtle",
-    "dep:getrandom",
-    "libarchive_oxide-codecs/aes7z",
+  "dep:aes",
+  "dep:ctr",
+  "dep:hmac",
+  "dep:sha1",
+  "dep:pbkdf2",
+  "dep:subtle",
+  "dep:getrandom",
+  "dep:libarchive_oxide-rar-crypto",
+  "libarchive_oxide-codecs/aes7z",
 ]
-# 7z streaming decode/write support. PPMd7 is decode-only here; writers remain
-# deliberately pinned to the reproducible LZMA2 profile.
+# 7z streaming decode/write support.
+# PPMd7 remains decode-only; LZMA1/LZMA2 and raw Deflate writers use bounded, reproducible Safe-Rust encoders.
 sevenz = [
-    "dep:lzma-rust2",
-    "lzma-rust2/encoder",
-    "dep:ppmd-rust",
-    "gzip",
-    "libarchive_oxide-codecs/bcj",
-    "libarchive_oxide-codecs/deflate",
-    "libarchive_oxide-codecs/delta",
+  "dep:lzma-rust2",
+  "lzma-rust2/encoder",
+  "ppmd",
+  "gzip",
+  "libarchive_oxide-codecs/bcj",
+  "libarchive_oxide-codecs/deflate",
+  "libarchive_oxide-codecs/delta",
 ]
-# Runtime-neutral and Tokio I/O adapters. Both drive the same sans-I/O
-# pipeline; Tokio is a thin poll shim and does not enable a second parser.
+# Runtime-neutral and Tokio I/O adapters.
+# Both drive the same sans-I/O pipeline; Tokio is a thin poll shim and does not enable a second parser.
 async = [
-    "dep:futures-io",
-    "dep:async-compression",
-    "async-compression/futures-io",
-    "async-compression/gzip",
+  "dep:futures-io",
+  "dep:async-compression",
+  "async-compression/futures-io",
+  "async-compression/gzip",
 ]
 tokio = ["async", "dep:tokio"]
 
 [dependencies]
 libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
-libarchive_oxide-codecs = { path = "../libarchive_oxide-codecs", version = "0.2.0", default-features = false, features = ["gzip"] }
+libarchive_oxide-codecs = { path = "../libarchive_oxide-codecs", version = "0.2.0", default-features = false, features = [
+  "gzip",
+] }
+libarchive_oxide-rar = { path = "../libarchive_oxide-rar", version = "0.2.0", optional = true }
+libarchive_oxide-rar-crypto = { path = "../libarchive_oxide-rar-crypto", version = "0.2.0", optional = true }
 rustversion = "1.0.23"
 # Feature-gated codecs.
-miniz_oxide = { version = "0.9.0", default-features = false, features = ["with-alloc"] }
-deflate64 = { version = "0.1.12", default-features = false, optional = true }
+miniz_oxide = { version = "0.9.0", default-features = false, features = [
+  "with-alloc",
+] }
 compression-codecs = { version = "0.4.38", default-features = false, optional = true }
 bzip2 = { version = "0.6.1", optional = true }
-flate2 = { version = "1.1.9", default-features = false, features = ["zlib"], optional = true }
+flate2 = { version = "1.1.9", default-features = false, features = [
+  "zlib",
+], optional = true }
 xz-codec = { package = "xz2", version = "0.1.7", optional = true }
 # Shared by xz and 7z.
-lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std"], optional = true }
-# PPMd7 (variant H) with the 7z range coder. The adapter validates the archive
-# properties and codec-memory budget before this dependency allocates its model.
+lzma-rust2 = { version = "0.23.0", default-features = false, features = [
+  "std",
+], optional = true }
+# PPMd7 (variant H) with the 7z range coder.
+# The adapter validates the archive properties and codec-memory budget before this dependency allocates its model.
 ppmd-rust = { version = "1.4.0", optional = true }
-# Safe streaming CAB Quantum decoder. Keep the patch release exact: 0.6.8
-# contains the signed frame-accounting fix required at 32 KiB boundaries.
-compcol = { version = "=0.7.5", default-features = false, features = ["quantum"], optional = true }
-# WinZip AE-2 requires SHA-1. `zeroize` wipes the expanded AES key schedule on drop,
-# so a folder/member key never lingers in freed memory after the decoder is dropped
-# (defense in depth for both the 7z CBC and the ZIP AE-2 CTR paths).
+# Safe streaming CAB Quantum decoder.
+# Keep the patch release exact: 0.6.8 contains the signed frame-accounting fix required at 32 KiB boundaries.
+compcol = { version = "=0.7.5", default-features = false, features = [
+  "quantum",
+], optional = true }
+delharc = { package = "libarchive_oxide-delharc", version = "=0.8.0", path = "vendor/delharc", default-features = false, features = [
+  "std",
+  "lh1",
+  "lhx",
+  "lz",
+  "pm",
+  "no-unsafe-assertions",
+], optional = true }
+# WinZip AE-2 requires SHA-1.
+# `zeroize` wipes the expanded AES key schedule on drop,
+# so a folder/member key never lingers in freed memory after the decoder is dropped (defense in depth for both the 7z CBC and the ZIP AE-2 CTR paths).
 aes = { version = "0.9", features = ["zeroize"], optional = true }
 # 7z AES-256/SHA-256 uses CBC (ZIP AE-2 uses CTR via `ctr`).
 ctr = { version = "0.10", optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
-pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
+pbkdf2 = { version = "0.13", default-features = false, features = [
+  "hmac",
+], optional = true }
 subtle = { version = "2.6", default-features = false, optional = true }
 getrandom = { version = "0.4", optional = true }
 futures-io = { version = "0.3.31", optional = true }
 async-compression = { version = "0.4.42", default-features = false, optional = true }
-tokio = { version = "1.48", default-features = false, features = ["io-util"], optional = true }
+tokio = { version = "1.48", default-features = false, features = [
+  "io-util",
+], optional = true }
 zeroize = { version = "1.8.2", features = ["derive"] }
 sha2 = "0.11"
 
@@ -157,11 +202,10 @@ cap-fs-ext = "4.0.2"
 tempfile = "3.27.0"
 
 [target.'cfg(windows)'.dependencies]
-# Win32 destination identities are NFC-normalized before case folding so
-# canonically equivalent archive names cannot address the same object twice.
+# Win32 destination identities are NFC-normalized before case folding so canonically equivalent archive names cannot address the same object twice.
 unicode-normalization = "0.1.24"
 
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
@@ -169,7 +213,9 @@ rustix = { version = "1.1.4", features = ["fs"] }
 libarchive_oxide-fuzz-cases = { path = "../fuzz/fuzz_lib", default-features = false }
 # Test fixture generation.
 flate2 = "1"
-lz4_flex = { version = "0.14.0", default-features = false, features = ["frame"] }
+lz4_flex = { version = "0.14.0", default-features = false, features = [
+  "frame",
+] }
 # Independent liblz4 consumer used only to validate our Pure-Rust writer output.
 lz4-codec = { package = "lz4", version = "1.28.1" }
 lzma-rust2 = "0.23.0"
@@ -178,13 +224,26 @@ xz-codec = { package = "xz2", version = "0.1.7" }
 zstd-codec = { package = "zstd", version = "0.14.0" }
 # Independent SHA-256 reference for OCI layer digest/diffID tests.
 sha2 = "0.11"
-# `bzip2` is on by default; `deflate` and `zstd` are enabled so the 7z differential
-# tests can produce Deflate/Zstd folders for arca's reuse-codec decode path.
-sevenz-rust2 = { version = "0.24.0", features = ["deflate", "zstd"] }
-# Independent batch BCJ2 splitter/oracle used only to produce interoperability fixtures. The
-# production reader uses lzma-rust2's bounded streaming junction.
-compcol = { version = "0.7.0", default-features = false, features = ["bcj2"] }
-zip = { version = "9.0.5", default-features = false, features = ["deflate", "aes-crypto", "bzip2", "zstd", "lzma"] }
+# `bzip2` is on by default; `deflate` and `zstd` are enabled so the 7z differential tests can produce Deflate/Zstd folders for arca's reuse-codec decode path.
+sevenz-rust2 = { version = "=0.21.3", path = "vendor/sevenz-rust2", features = [
+  "deflate",
+  "zstd",
+] }
+# Independent batch BCJ2 splitter/oracle used only to produce interoperability fixtures.
+# The production reader uses lzma-rust2's bounded streaming junction.
+compcol = { version = "0.7.5", default-features = false, features = [
+  "bcj2",
+  "lha",
+] }
+zip = { version = "9.0.5", default-features = false, features = [
+  "deflate",
+  "aes-crypto",
+  "bzip2",
+  "zstd",
+  "lzma",
+  "xz",
+  "ppmd",
+] }
 # Independent tar/ar producers and consumers used only for RM-304 interop tests.
 tar = { version = "0.4", default-features = false }
 ar = "0.9"

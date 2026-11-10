@@ -9,7 +9,7 @@
 use std::io::{self, Cursor, Read};
 use std::ops::Range;
 
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 use libarchive_oxide_package::{
     AndroidApkV4Revision, AppPackageProfile, PackageFindingCode, PackageVerifier, TrustPolicy,
     VerificationDimension,

@@ -10,6 +10,9 @@ use core::fmt;
 pub(crate) mod ar;
 pub(crate) mod cpio;
 pub(crate) mod empty;
+pub(crate) mod mtree;
+pub(crate) mod rar5;
+pub(crate) mod rar_legacy;
 pub(crate) mod raw;
 pub(crate) mod tar;
 pub(crate) mod warc;
@@ -43,14 +46,22 @@ impl FormatId {
     pub const Udf: Self = Self(7);
     /// Microsoft Cabinet (read-only).
     pub const Cab: Self = Self(8);
-    /// XAR extensible archive (read-only).
+    /// XAR extensible archive.
     pub const Xar: Self = Self(9);
     /// Canonical zero-byte archive (read-only).
     pub const Empty: Self = Self(10);
     /// Explicit single-entry raw byte stream (read-only).
     pub const Raw: Self = Self(11);
-    /// WARC 1.0 and 1.1 (read-only).
+    /// WARC 1.0 and 1.1.
     pub const Warc: Self = Self(12);
+    /// RAR 3.x and 4.x archives (read-only).
+    pub const RarLegacy: Self = Self(13);
+    /// RAR 5.x and later archives (read-only).
+    pub const Rar5: Self = Self(14);
+    /// LHA/LZH archives (read-only).
+    pub const Lha: Self = Self(15);
+    /// mtree file hierarchies.
+    pub const Mtree: Self = Self(16);
 
     /// Creates a downstream identifier from the collision-free custom range.
     ///
@@ -84,8 +95,11 @@ impl FormatId {
         const UDF_SIGNATURE_END: usize = 17 * 2048 + 6;
 
         for (identifier, signature) in [
+            (Self::Rar5, b"Rar!\x1a\x07\x01\x00".as_slice()),
+            (Self::RarLegacy, b"Rar!\x1a\x07\x00".as_slice()),
             (Self::Warc, b"WARC/1.0\r\n".as_slice()),
             (Self::Warc, b"WARC/1.1\r\n".as_slice()),
+            (Self::Mtree, b"#mtree".as_slice()),
             (Self::Zip, b"PK\x03\x04".as_slice()),
             (Self::Zip, b"PK\x05\x06".as_slice()),
             (
@@ -105,6 +119,9 @@ impl FormatId {
         }
         if matches!(ar::ArDecoder::probe(prefix), ProbeResult::Match(())) {
             return ProbeResult::Match(Self::Ar);
+        }
+        if lha_signature(prefix) {
+            return ProbeResult::Match(Self::Lha);
         }
 
         if prefix.len() >= UDF_SIGNATURE_END
@@ -128,8 +145,11 @@ impl FormatId {
 
         let mut minimum = usize::MAX;
         for signature in [
+            b"Rar!\x1a\x07\x01\x00".as_slice(),
+            b"Rar!\x1a\x07\x00".as_slice(),
             b"WARC/1.0\r\n".as_slice(),
             b"WARC/1.1\r\n".as_slice(),
+            b"#mtree".as_slice(),
             b"PK\x03\x04".as_slice(),
             b"PK\x05\x06".as_slice(),
             [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c].as_slice(),
@@ -148,6 +168,9 @@ impl FormatId {
             if let ProbeResult::NeedMore { minimum: candidate } = result {
                 minimum = minimum.min(candidate);
             }
+        }
+        if prefix.len() < 7 && plausible_lha_prefix(prefix) {
+            minimum = minimum.min(7);
         }
         if prefix.len() < UDF_SIGNATURE_END {
             minimum = minimum.min(UDF_SIGNATURE_END);
@@ -175,8 +198,95 @@ impl fmt::Debug for FormatId {
             Self::Empty => "Empty",
             Self::Raw => "Raw",
             Self::Warc => "Warc",
+            Self::RarLegacy => "RarLegacy",
+            Self::Rar5 => "Rar5",
+            Self::Lha => "Lha",
+            Self::Mtree => "Mtree",
             _ => return write!(formatter, "FormatId({:#010x})", self.0),
         };
         formatter.write_str(name)
+    }
+}
+
+fn lha_signature(prefix: &[u8]) -> bool {
+    prefix.len() >= 7
+        && prefix[2] == b'-'
+        && prefix[6] == b'-'
+        && matches!(
+            &prefix[3..6],
+            b"lh0"
+                | b"lh1"
+                | b"lh2"
+                | b"lh3"
+                | b"lh4"
+                | b"lh5"
+                | b"lh6"
+                | b"lh7"
+                | b"lh8"
+                | b"lh9"
+                | b"lhx"
+                | b"lhd"
+                | b"lzs"
+                | b"lz4"
+                | b"lz5"
+                | b"pm0"
+                | b"pm1"
+                | b"pm2"
+        )
+}
+
+fn plausible_lha_prefix(prefix: &[u8]) -> bool {
+    prefix.len() <= 2
+        || (prefix.get(2) == Some(&b'-') && prefix.get(3).is_none_or(|b| *b == b'l' || *b == b'p'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FormatId;
+    use crate::ProbeResult;
+    use alloc::format;
+
+    #[test]
+    fn planned_format_ids_are_stable_and_named() {
+        assert_eq!(FormatId::RarLegacy.as_raw(), 13);
+        assert_eq!(FormatId::Rar5.as_raw(), 14);
+        assert_eq!(FormatId::Lha.as_raw(), 15);
+        assert_eq!(FormatId::Mtree.as_raw(), 16);
+        assert_eq!(format!("{:?}", FormatId::RarLegacy), "RarLegacy");
+        assert_eq!(format!("{:?}", FormatId::Rar5), "Rar5");
+        assert_eq!(format!("{:?}", FormatId::Lha), "Lha");
+        assert_eq!(format!("{:?}", FormatId::Mtree), "Mtree");
+    }
+
+    #[test]
+    fn rar_generations_probe_independently_and_incrementally() {
+        assert_eq!(
+            FormatId::probe(b"Rar!\x1a\x07\x00"),
+            ProbeResult::Match(FormatId::RarLegacy)
+        );
+        assert_eq!(
+            FormatId::probe(b"Rar!\x1a\x07\x01\x00"),
+            ProbeResult::Match(FormatId::Rar5)
+        );
+        assert_eq!(
+            FormatId::probe(b"Rar!\x1a\x07\x01"),
+            ProbeResult::NeedMore { minimum: 8 }
+        );
+    }
+
+    #[test]
+    fn lha_and_mtree_have_conservative_signatures() {
+        assert_eq!(
+            FormatId::probe(b"\x16\x00-lh5-"),
+            ProbeResult::Match(FormatId::Lha)
+        );
+        assert_eq!(
+            FormatId::probe(b"\x4a\x00-lhx-"),
+            ProbeResult::Match(FormatId::Lha)
+        );
+        assert_eq!(
+            FormatId::probe(b"#mtree\n/set type=file\n"),
+            ProbeResult::Match(FormatId::Mtree)
+        );
     }
 }

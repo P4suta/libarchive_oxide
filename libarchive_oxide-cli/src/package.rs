@@ -20,7 +20,7 @@ use std::path::Path;
 
 use libarchive_oxide_package::{
     AlpineRsaPublicKey, AndroidApkV4Revision, AppPackageProfile, PackageFinding, PackageVerifier,
-    TrustPolicy, VerificationReport, ZipPackageProfile,
+    RpmOpenPgpPublicKey, TrustPolicy, VerificationDimension, VerificationReport, ZipPackageProfile,
 };
 use serde_json::{Value, json};
 
@@ -46,19 +46,31 @@ Android APK v2/v3 Signing Block signatures, chunked/fs-verity content digests,
 v3 proof-of-rotation, and v3.1 targeted signer ranges are verified offline when
 present; no Android verification key file is required because each signer
 carries its certificate. Rotation evidence is reported separately from trust.
-This does not claim binary-manifest installability across every Android SDK.
+The bounded binary manifest supplies effective minimum/target SDK values to an
+independent signing-scheme compatibility verdict. It checks pre-24 v1 coverage,
+API 24-27 v1/v2 coverage, and the target-SDK-30 v2-or-newer rule; this is not a
+claim of complete installability across every Android SDK.
 For APK Signature Scheme v4/v4.1, --idsig-file explicitly supplies the detached
 sidecar. The command never guesses a sibling path. Missing sidecars are optional
 and reported as not-evaluated.
 MSIX AppxBlockMap.xml file coverage, sizes, and streamed 64-KiB SHA-256 blocks
-are verified. AppxSignature.p7x is detected but not yet cryptographically
-verified, so its signature-validity verdict remains not-evaluated.
+are verified. A present AppxSignature.p7x is verified offline through its PKCX
+wrapper, Authenticode CMS signer, APPX package-view digests, and footprint
+hashes. Trust still requires an explicit --trusted-signer-sha256 pin.
+IPA Mach-O CodeDirectory page and special-slot hashes, CodeResources file
+seals, CMS signer, and alternative-CodeDirectory hash-agility attributes are
+verified offline. Trust still requires an explicit signer fingerprint pin.
+RPM v3/v4 and RPM 6 OpenPGP signatures verify header-only or streamed
+header-plus-payload ranges when caller-supplied public certificates are present.
 
 Trust flags:
   --alpine-rsa-key-file PATH
       Supply one Alpine APK v2 RSA public key. The file basename is the exact
       .SIGN key-id. May be repeated. Supplying a key verifies validity but does
       not trust it.
+  --rpm-openpgp-key-file PATH
+      Supply one binary or ASCII-armored RPM OpenPGP public certificate. May be
+      repeated. Supplying a key verifies validity but does not trust it.
   --trusted-signer-sha256 HEX
       Trust one exact SHA-256 fingerprint of canonical signer material. May be
       repeated. HEX is exactly 64 hexadecimal digits.
@@ -72,6 +84,7 @@ Exit codes: 0 profile satisfied, 1 profile not satisfied or runtime failure,
 2 usage failure.";
 
 const MAX_ALPINE_KEY_FILE_BYTES: u64 = 64 * 1024;
+const MAX_RPM_KEY_FILE_BYTES: u64 = 256 * 1024;
 
 /// Dispatches an `oxarchive package` subcommand.
 ///
@@ -160,6 +173,7 @@ fn run_validate(args: &[String]) -> CliResult {
         package,
         trust_policy,
         alpine_rsa_key_files,
+        rpm_openpgp_key_files,
         idsig_file,
     } = parse_validate(args)?;
     let mut verifier = PackageVerifier::new(trust_policy);
@@ -173,6 +187,16 @@ fn run_validate(args: &[String]) -> CliResult {
             )));
         }
         verifier = verifier.with_alpine_rsa_public_key(key);
+    }
+    let mut rpm_fingerprints = BTreeSet::new();
+    for path in rpm_openpgp_key_files {
+        let key = read_rpm_openpgp_key(path)?;
+        if !rpm_fingerprints.insert(key.fingerprint_sha256()) {
+            return Err(CliError::usage(format!(
+                "duplicate RPM OpenPGP certificate fingerprint: {path}"
+            )));
+        }
+        verifier = verifier.with_rpm_openpgp_public_key(key);
     }
     let report = match profile {
         PackageProfile::Deb => {
@@ -212,17 +236,20 @@ struct ValidateSelection<'a> {
     package: &'a str,
     trust_policy: TrustPolicy,
     alpine_rsa_key_files: Vec<&'a str>,
+    rpm_openpgp_key_files: Vec<&'a str>,
     idsig_file: Option<&'a str>,
 }
 
 /// Parses the `validate` operands into a profile and the single package operand.
 ///
 /// A `--` separator forces the remaining arguments to be treated as operands.
+#[allow(clippy::too_many_lines)] // One pass preserves argv order and option termination semantics.
 fn parse_validate(args: &[String]) -> Result<ValidateSelection<'_>, CliError> {
     let mut type_value: Option<&str> = None;
     let mut operands: Vec<&str> = Vec::new();
     let mut trust_policy = TrustPolicy::offline();
     let mut alpine_rsa_key_files = Vec::new();
+    let mut rpm_openpgp_key_files = Vec::new();
     let mut idsig_file = None;
     let mut allow_unsigned = false;
     let mut positional_only = false;
@@ -259,6 +286,13 @@ fn parse_validate(args: &[String]) -> Result<ValidateSelection<'_>, CliError> {
                 alpine_rsa_key_files.push(value.as_str());
                 index += 1;
             },
+            "--rpm-openpgp-key-file" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| CliError::usage("--rpm-openpgp-key-file requires a value"))?;
+                rpm_openpgp_key_files.push(value.as_str());
+                index += 1;
+            },
             "--idsig-file" => {
                 let value = args
                     .get(index + 1)
@@ -290,6 +324,13 @@ fn parse_validate(args: &[String]) -> Result<ValidateSelection<'_>, CliError> {
                         ));
                     }
                     alpine_rsa_key_files.push(value);
+                } else if let Some(value) = argument.strip_prefix("--rpm-openpgp-key-file=") {
+                    if value.is_empty() {
+                        return Err(CliError::usage(
+                            "--rpm-openpgp-key-file requires a non-empty path",
+                        ));
+                    }
+                    rpm_openpgp_key_files.push(value);
                 } else if let Some(value) = argument.strip_prefix("--idsig-file=") {
                     set_idsig_file(&mut idsig_file, value)?;
                 } else if argument.starts_with('-') && argument != "-" {
@@ -306,6 +347,7 @@ fn parse_validate(args: &[String]) -> Result<ValidateSelection<'_>, CliError> {
         &operands,
         trust_policy,
         alpine_rsa_key_files,
+        rpm_openpgp_key_files,
         idsig_file,
     )
 }
@@ -315,6 +357,7 @@ fn finish_validate<'a>(
     operands: &[&'a str],
     trust_policy: TrustPolicy,
     alpine_rsa_key_files: Vec<&'a str>,
+    rpm_openpgp_key_files: Vec<&'a str>,
     idsig_file: Option<&'a str>,
 ) -> Result<ValidateSelection<'a>, CliError> {
     let type_value = type_value.ok_or_else(|| {
@@ -327,6 +370,11 @@ fn finish_validate<'a>(
     if !alpine_rsa_key_files.is_empty() && !matches!(profile, PackageProfile::AlpineApk) {
         return Err(CliError::usage(
             "--alpine-rsa-key-file is valid only with --type alpine-apk",
+        ));
+    }
+    if !rpm_openpgp_key_files.is_empty() && !matches!(profile, PackageProfile::Rpm) {
+        return Err(CliError::usage(
+            "--rpm-openpgp-key-file is valid only with --type rpm",
         ));
     }
     if idsig_file.is_some()
@@ -346,6 +394,7 @@ fn finish_validate<'a>(
         package,
         trust_policy,
         alpine_rsa_key_files,
+        rpm_openpgp_key_files,
         idsig_file,
     })
 }
@@ -388,6 +437,25 @@ fn read_alpine_rsa_key(path: &str) -> Result<AlpineRsaPublicKey, CliError> {
     }
     AlpineRsaPublicKey::from_bytes(key_id.as_bytes().to_vec(), bytes)
         .map_err(|error| CliError::usage(format!("invalid Alpine RSA key file {path}: {error}")))
+}
+
+fn read_rpm_openpgp_key(path: &str) -> Result<RpmOpenPgpPublicKey, CliError> {
+    let file = File::open(path).map_err(|error| {
+        CliError::runtime(format!("cannot open RPM OpenPGP key file {path}: {error}"))
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RPM_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            CliError::runtime(format!("cannot read RPM OpenPGP key file {path}: {error}"))
+        })?;
+    if u64::try_from(bytes.len()).is_ok_and(|length| length > MAX_RPM_KEY_FILE_BYTES) {
+        return Err(CliError::usage(format!(
+            "RPM OpenPGP key file exceeds the {MAX_RPM_KEY_FILE_BYTES}-byte limit: {path}"
+        )));
+    }
+    RpmOpenPgpPublicKey::from_bytes(bytes)
+        .map_err(|error| CliError::usage(format!("invalid RPM OpenPGP key file {path}: {error}")))
 }
 
 fn parse_sha256_pin(value: &str) -> Result<[u8; 32], CliError> {
@@ -475,7 +543,68 @@ fn emit(profile: &str, report: &VerificationReport) -> CliResult {
         .iter()
         .map(|fingerprint| hex(fingerprint))
         .collect();
-    let android_apk_rotation = report.android_apk_rotation().map(|rotation| {
+    let android_apk_rotation = android_apk_rotation_json(report);
+    let android_apk_manifest = android_apk_manifest_json(report);
+    let android_apk_compatibility = android_apk_compatibility_json(report);
+    let android_apk_v4 = report.android_apk_v4().map(|v4| {
+        let fingerprints: Vec<String> = v4
+            .signer_fingerprints()
+            .iter()
+            .map(|fingerprint| hex(fingerprint))
+            .collect();
+        let findings: Vec<Value> = v4.findings().iter().map(finding_json).collect();
+        json!({
+            "revision": v4.revision().map(AndroidApkV4Revision::label),
+            "integrity": v4.integrity().label(),
+            "signature_validity": v4.signature_validity().label(),
+            "trust": v4.trust().label(),
+            "signer_fingerprints_sha256": fingerprints,
+            "findings": findings,
+        })
+    });
+    print_json(&json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": "package_validation",
+        "profile": profile,
+        "container_readable": status.container_readable(),
+        "profile_valid": status.profile_valid(),
+        "integrity": report.integrity().label(),
+        "signature_validity": report.signature_validity().label(),
+        "trust": report.trust().label(),
+        "signer_fingerprints_sha256": signer_fingerprints,
+        "android_apk_manifest": android_apk_manifest,
+        "android_apk_compatibility": android_apk_compatibility,
+        "android_apk_rotation": android_apk_rotation,
+        "android_apk_v4": android_apk_v4,
+        "findings": findings,
+    }))?;
+    let cryptographic_failure = [
+        report.integrity(),
+        report.signature_validity(),
+        report.trust(),
+        report
+            .android_apk_compatibility()
+            .map_or(VerificationDimension::NotEvaluated, |report| {
+                report.validity()
+            }),
+    ]
+    .into_iter()
+    .any(|dimension| dimension == libarchive_oxide_package::VerificationDimension::Invalid);
+    if status.profile_valid() && !cryptographic_failure {
+        Ok(())
+    } else if cryptographic_failure {
+        Err(CliError::runtime(
+            "package integrity, signature, trust, or platform compatibility verification failed; see findings",
+        ))
+    } else {
+        Err(CliError::runtime(
+            "package did not satisfy its profile; see findings",
+        ))
+    }
+}
+
+fn android_apk_rotation_json(report: &VerificationReport) -> Option<Value> {
+    report.android_apk_rotation().map(|rotation| {
         let signers = rotation
             .signers()
             .iter()
@@ -516,55 +645,31 @@ fn emit(profile: &str, report: &VerificationReport) -> CliResult {
             "signers": signers,
             "lineage": lineage,
         })
-    });
-    let android_apk_v4 = report.android_apk_v4().map(|v4| {
-        let fingerprints: Vec<String> = v4
-            .signer_fingerprints()
-            .iter()
-            .map(|fingerprint| hex(fingerprint))
-            .collect();
-        let findings: Vec<Value> = v4.findings().iter().map(finding_json).collect();
+    })
+}
+
+fn android_apk_manifest_json(report: &VerificationReport) -> Option<Value> {
+    report.android_apk_manifest().map(|manifest| {
+        let findings: Vec<Value> = manifest.findings().iter().map(finding_json).collect();
         json!({
-            "revision": v4.revision().map(AndroidApkV4Revision::label),
-            "integrity": v4.integrity().label(),
-            "signature_validity": v4.signature_validity().label(),
-            "trust": v4.trust().label(),
-            "signer_fingerprints_sha256": fingerprints,
+            "validity": manifest.validity().label(),
+            "minimum_sdk": manifest.minimum_sdk(),
+            "target_sdk": manifest.target_sdk(),
             "findings": findings,
         })
-    });
-    print_json(&json!({
-        "schema_version": JSON_SCHEMA_VERSION,
-        "type": "package_validation",
-        "profile": profile,
-        "container_readable": status.container_readable(),
-        "profile_valid": status.profile_valid(),
-        "integrity": report.integrity().label(),
-        "signature_validity": report.signature_validity().label(),
-        "trust": report.trust().label(),
-        "signer_fingerprints_sha256": signer_fingerprints,
-        "android_apk_rotation": android_apk_rotation,
-        "android_apk_v4": android_apk_v4,
-        "findings": findings,
-    }))?;
-    let cryptographic_failure = [
-        report.integrity(),
-        report.signature_validity(),
-        report.trust(),
-    ]
-    .into_iter()
-    .any(|dimension| dimension == libarchive_oxide_package::VerificationDimension::Invalid);
-    if status.profile_valid() && !cryptographic_failure {
-        Ok(())
-    } else if cryptographic_failure {
-        Err(CliError::runtime(
-            "package integrity, signature, or trust verification failed; see findings",
-        ))
-    } else {
-        Err(CliError::runtime(
-            "package did not satisfy its profile; see findings",
-        ))
-    }
+    })
+}
+
+fn android_apk_compatibility_json(report: &VerificationReport) -> Option<Value> {
+    report.android_apk_compatibility().map(|compatibility| {
+        let findings: Vec<Value> = compatibility.findings().iter().map(finding_json).collect();
+        json!({
+            "validity": compatibility.validity().label(),
+            "minimum_sdk": compatibility.minimum_sdk(),
+            "target_sdk": compatibility.target_sdk(),
+            "findings": findings,
+        })
+    })
 }
 
 /// Renders one [`PackageFinding`] as a JSON object using only its stable

@@ -29,6 +29,14 @@
 //! constant-sized, and the configured decoded-total budget also bounds payload
 //! bytes read after the cpio parser completes solely to finish integrity.
 //!
+//! RPM v4 `DSAHEADER`/`RSAHEADER`, RPM 6 `OPENPGPHEADER`, and legacy v3/v4
+//! `PGP`/`GPG` signatures are retained under the same metadata budget. Header
+//! signatures cover the exact serialized main header. Legacy signatures cover
+//! that header plus the compressed payload and use one bounded incremental hash
+//! state per signature. Packet and certificate verification is performed later
+//! by [`crate::PackageVerifier`] with explicitly supplied offline keys, keeping
+//! structural inspection free of trust decisions.
+//!
 //! The result separates two questions: could the RPM container be parsed at all
 //! ([`SupportStatus::container_readable`]) and did the package satisfy the RPM
 //! profile ([`SupportStatus::profile_valid`]). [`RpmValidation::integrity`] is a
@@ -40,15 +48,18 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::PathBuf;
 
-use libarchive_oxide_core::filter::FilterId;
-use libarchive_oxide_core::{ArchiveError, EntryMetadata, ErrorKind, Limits, ProbeResult};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use libarchive_oxide::advanced::{ArchiveError, ProbeResult};
+use libarchive_oxide::{EntryMetadata, ErrorKind, FilterId, Limits};
 use sha2::{Digest, Sha256, Sha512};
 use sha3::Sha3_256;
 
 use super::finding::{PackageFinding, PackageFindingCode, Severity, SupportStatus};
+use super::rpm_signature::{RpmLegacyHash, RpmLegacyHashers, prepare_legacy_hashes};
 use super::verification::VerificationDimension;
 use libarchive_oxide::advanced::ProviderCapability;
-use libarchive_oxide::advanced::legacy::{
+use libarchive_oxide::advanced::{
     BuiltinCodecProviders, BuiltinFormatProviders, ProviderSet, StaticCodecProviders,
 };
 use libarchive_oxide::advanced::{Pipeline, PipelineEvent};
@@ -81,6 +92,9 @@ const TYPE_STRING: u32 = 6;
 
 /// RPM header data type code for one or more big-endian 32-bit integers.
 const TYPE_INT32: u32 = 4;
+
+/// RPM header data type code for an uninterpreted byte string.
+const TYPE_BIN: u32 = 7;
 
 /// RPM header data type code for an array of NUL-terminated strings.
 const TYPE_STRING_ARRAY: u32 = 8;
@@ -117,6 +131,30 @@ const TAG_PAYLOADSHA3_256ALT: u32 = 5124;
 
 /// `OpenPGP` hash-algorithm identifier for SHA-256.
 const HASH_ALGORITHM_SHA256: u32 = 8;
+
+/// V4 header-only `OpenPGP` DSA signature.
+const TAG_DSAHEADER: u32 = 267;
+
+/// V4 header-only `OpenPGP` RSA signature.
+const TAG_RSAHEADER: u32 = 268;
+
+/// RPM 6 header-only algorithm-independent `OpenPGP` signatures.
+const TAG_OPENPGPHEADER: u32 = 278;
+
+/// Legacy `OpenPGP` RSA signature over the main header and payload.
+const TAG_SIGPGP: u32 = 259;
+
+/// Legacy `OpenPGP` DSA signature over the main header and payload.
+const TAG_SIGGPG: u32 = 262;
+
+/// Original v3 on-disk `OpenPGP` RSA tag (before signature-tag uniquification).
+const TAG_V3_SIGPGP: u32 = 1002;
+
+/// Original v3 on-disk `OpenPGP` DSA tag (before signature-tag uniquification).
+const TAG_V3_SIGGPG: u32 = 1005;
+
+/// Fixed maximum number of independent RPM `OpenPGP` signatures.
+const MAX_SIGNATURE_RECORDS: usize = 64;
 
 /// Bytes buffered from the payload head before its outer filter is classified.
 ///
@@ -395,6 +433,21 @@ struct MainTags {
     format: Option<Vec<u8>>,
     compressor: Option<Vec<u8>>,
     digests: PayloadDigestDeclarations,
+}
+
+/// Bytes and signed range declared by one RPM signature-header tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RpmSignatureRecord {
+    pub(crate) packet: Vec<u8>,
+    pub(crate) header_only: bool,
+}
+
+/// Bounded signature metadata retained for the verification pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RpmSignatureMetadata {
+    pub(crate) records: Vec<RpmSignatureRecord>,
+    pub(crate) invalid: Option<String>,
+    pub(crate) resource_limit: Option<String>,
 }
 
 /// Incremental verifier for compressed-payload digests declared by the header.
@@ -720,7 +773,13 @@ where
         state.format_ok = format_ok;
         state.payload_compressor.clone_from(&tags.compressor);
 
-        self.validate_payload(&mut reader, &tags, &mut state);
+        let mut legacy_hashes = prepare_legacy_hashes(
+            &state.signatures,
+            &state.signed_header,
+            self.limits.decoded_total(),
+        );
+        self.validate_payload(&mut reader, &tags, &mut state, &mut legacy_hashes);
+        state.legacy_hashes = legacy_hashes.finish();
         state.finalize()
     }
 
@@ -733,10 +792,12 @@ where
         state: &mut RpmState,
     ) -> Result<MainTags, ()> {
         Self::read_lead(reader, state)?;
-        // Signature header: consumed only for structure; padded to 8 bytes.
-        self.read_header(reader, true, state)?;
+        let signature = self.read_header(reader, true, state)?;
+        state.signatures = extract_signature_metadata(&signature);
         let main = self.read_header(reader, false, state)?;
-        Ok(extract_main_tags(&main))
+        let tags = extract_main_tags(&main);
+        state.signed_header = main.into_raw();
+        Ok(tags)
     }
 
     /// Reads and validates the fixed 96-byte lead.
@@ -836,7 +897,11 @@ where
                 Self::read_header_bytes(reader, padding, state)?;
             }
         }
-        Ok(HeaderSection { index, store })
+        Ok(HeaderSection {
+            intro,
+            index,
+            store,
+        })
     }
 
     /// Reads exactly `len` header bytes, reporting truncation as a finding.
@@ -866,7 +931,13 @@ where
 
     /// Streams the remaining payload bytes through one bounded pipeline and,
     /// when declared, constant-memory SHA-2/SHA-3 digest state.
-    fn validate_payload<R: Read>(&self, reader: &mut R, tags: &MainTags, state: &mut RpmState) {
+    fn validate_payload<R: Read>(
+        &self,
+        reader: &mut R,
+        tags: &MainTags,
+        state: &mut RpmState,
+        legacy_hashes: &mut RpmLegacyHashers,
+    ) {
         let mut payload = Payload::new(self.limits, self.providers);
         let mut integrity = PayloadIntegrity::new(
             tags.digests.clone(),
@@ -875,13 +946,14 @@ where
         );
         let mut buffer = vec![0u8; PAYLOAD_CHUNK];
         loop {
-            if payload.is_terminal() && !integrity.needs_eof() {
+            if payload.is_terminal() && !integrity.needs_eof() && !legacy_hashes.needs_eof() {
                 break;
             }
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
                     integrity.feed(&buffer[..count]);
+                    legacy_hashes.feed(&buffer[..count]);
                     if !payload.is_terminal() {
                         payload.feed(&buffer[..count], &mut state.findings);
                     }
@@ -889,6 +961,7 @@ where
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
                 Err(error) => {
                     integrity.read_error(&error);
+                    legacy_hashes.read_error(&error);
                     if !payload.is_terminal() {
                         state.findings.push(PackageFinding::new(
                             PROFILE,
@@ -961,10 +1034,141 @@ fn extract_main_tags(section: &HeaderSection) -> MainTags {
     tags
 }
 
+/// Parses signature tags without interpreting the embedded `OpenPGP` packet.
+#[allow(clippy::too_many_lines)]
+fn extract_signature_metadata(section: &HeaderSection) -> RpmSignatureMetadata {
+    let mut metadata = RpmSignatureMetadata::default();
+    let mut seen = BTreeSet::new();
+    let count = section.index.len() / INDEX_ENTRY_LEN;
+    for entry in 0..count {
+        let base = entry * INDEX_ENTRY_LEN;
+        let record = &section.index[base..base + INDEX_ENTRY_LEN];
+        let tag = be_u32(&record[0..4]);
+        if !matches!(
+            tag,
+            TAG_DSAHEADER
+                | TAG_RSAHEADER
+                | TAG_OPENPGPHEADER
+                | TAG_SIGPGP
+                | TAG_SIGGPG
+                | TAG_V3_SIGPGP
+                | TAG_V3_SIGGPG
+        ) {
+            continue;
+        }
+        if !seen.insert(tag) {
+            metadata.invalid = Some(format!("RPM signature header repeats signature tag {tag}"));
+            continue;
+        }
+        let kind = be_u32(&record[4..8]);
+        let offset = be_u32(&record[8..12]);
+        let value_count = be_u32(&record[12..16]);
+        if tag == TAG_OPENPGPHEADER {
+            if kind != TYPE_STRING_ARRAY || value_count == 0 {
+                metadata.invalid =
+                    Some("RPM OPENPGPHEADER is not a non-empty string array".to_string());
+                continue;
+            }
+            let Some(signature_count) = usize::try_from(value_count).ok() else {
+                metadata.resource_limit =
+                    Some("RPM OPENPGPHEADER count does not fit usize".to_string());
+                continue;
+            };
+            if signature_count > MAX_SIGNATURE_RECORDS {
+                metadata.resource_limit = Some(format!(
+                    "RPM OPENPGPHEADER count {signature_count} exceeds fixed limit {MAX_SIGNATURE_RECORDS}"
+                ));
+                continue;
+            }
+            let Some(mut cursor) = usize::try_from(offset).ok() else {
+                metadata.invalid = Some("RPM OPENPGPHEADER offset does not fit usize".to_string());
+                continue;
+            };
+            for _ in 0..signature_count {
+                let Some(rest) = section.store.get(cursor..) else {
+                    metadata.invalid =
+                        Some("RPM OPENPGPHEADER points outside the store".to_string());
+                    break;
+                };
+                let Some(length) = rest.iter().position(|byte| *byte == 0) else {
+                    metadata.invalid =
+                        Some("RPM OPENPGPHEADER contains an unterminated value".to_string());
+                    break;
+                };
+                let packet = match STANDARD.decode(&rest[..length]) {
+                    Ok(packet) if !packet.is_empty() => packet,
+                    Ok(_) | Err(_) => {
+                        metadata.invalid =
+                            Some("RPM OPENPGPHEADER contains invalid or empty base64".to_string());
+                        break;
+                    },
+                };
+                metadata.records.push(RpmSignatureRecord {
+                    packet,
+                    header_only: true,
+                });
+                let Some(next_cursor) = cursor
+                    .checked_add(length)
+                    .and_then(|next| next.checked_add(1))
+                else {
+                    metadata.resource_limit =
+                        Some("RPM OPENPGPHEADER cursor overflowed".to_string());
+                    break;
+                };
+                cursor = next_cursor;
+            }
+            continue;
+        }
+        if kind != TYPE_BIN || value_count == 0 {
+            metadata.invalid = Some(format!(
+                "RPM signature tag {tag} is not a non-empty BIN value"
+            ));
+            continue;
+        }
+        let Some(start) = usize::try_from(offset).ok() else {
+            metadata.invalid = Some(format!("RPM signature tag {tag} offset does not fit usize"));
+            continue;
+        };
+        let Some(length) = usize::try_from(value_count).ok() else {
+            metadata.invalid = Some(format!("RPM signature tag {tag} length does not fit usize"));
+            continue;
+        };
+        let Some(end) = start.checked_add(length) else {
+            metadata.invalid = Some(format!("RPM signature tag {tag} range overflows"));
+            continue;
+        };
+        let Some(packet) = section.store.get(start..end) else {
+            metadata.invalid = Some(format!("RPM signature tag {tag} points outside the store"));
+            continue;
+        };
+        metadata.records.push(RpmSignatureRecord {
+            packet: packet.to_vec(),
+            header_only: matches!(tag, TAG_DSAHEADER | TAG_RSAHEADER),
+        });
+    }
+    metadata
+}
+
 /// One parsed RPM header structure's raw index and data store.
 struct HeaderSection {
+    intro: Vec<u8>,
     index: Vec<u8>,
     store: Vec<u8>,
+}
+
+impl HeaderSection {
+    fn into_raw(self) -> Vec<u8> {
+        let capacity = self
+            .intro
+            .len()
+            .saturating_add(self.index.len())
+            .saturating_add(self.store.len());
+        let mut raw = Vec::with_capacity(capacity);
+        raw.extend_from_slice(&self.intro);
+        raw.extend_from_slice(&self.index);
+        raw.extend_from_slice(&self.store);
+        raw
+    }
 }
 
 /// Mutable accumulator threaded through a single validation.
@@ -977,6 +1181,9 @@ struct RpmState {
     payload_filter: Option<FilterId>,
     payload_compressor: Option<Vec<u8>>,
     integrity: VerificationDimension,
+    signatures: RpmSignatureMetadata,
+    signed_header: Vec<u8>,
+    legacy_hashes: Vec<Option<RpmLegacyHash>>,
 }
 
 impl RpmState {
@@ -990,6 +1197,9 @@ impl RpmState {
             payload_filter: None,
             payload_compressor: None,
             integrity: VerificationDimension::NotEvaluated,
+            signatures: RpmSignatureMetadata::default(),
+            signed_header: Vec::new(),
+            legacy_hashes: Vec::new(),
         }
     }
 
@@ -1014,6 +1224,9 @@ impl RpmState {
             payload_filter: self.payload_filter,
             payload_compressor: self.payload_compressor,
             integrity: self.integrity,
+            signatures: self.signatures,
+            signed_header: self.signed_header,
+            legacy_hashes: self.legacy_hashes,
         }
     }
 }
@@ -1246,6 +1459,9 @@ pub struct RpmValidation {
     payload_filter: Option<FilterId>,
     payload_compressor: Option<Vec<u8>>,
     integrity: VerificationDimension,
+    signatures: RpmSignatureMetadata,
+    signed_header: Vec<u8>,
+    legacy_hashes: Vec<Option<RpmLegacyHash>>,
 }
 
 impl RpmValidation {
@@ -1302,5 +1518,17 @@ impl RpmValidation {
     #[must_use]
     pub fn has_code(&self, code: PackageFindingCode) -> bool {
         self.findings.iter().any(|finding| finding.code() == code)
+    }
+
+    pub(crate) const fn signature_metadata(&self) -> &RpmSignatureMetadata {
+        &self.signatures
+    }
+
+    pub(crate) fn signed_header(&self) -> &[u8] {
+        &self.signed_header
+    }
+
+    pub(crate) fn legacy_hashes(&self) -> &[Option<RpmLegacyHash>] {
+        &self.legacy_hashes
     }
 }

@@ -29,7 +29,7 @@
 
 use alloc::vec::Vec;
 
-use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput};
+use libarchive_oxide_protocol::{ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput};
 
 /// Which instruction family a BCJ filter targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -175,6 +175,39 @@ pub struct AsyncSeekArchiveReader<R> {
 }
 
 impl<R: AsyncRead + AsyncSeek + Unpin> AsyncSeekArchiveReader<R> {
+    /// Opens an async seek archive with the common option model.
+    pub async fn with_options(
+        mut input: R,
+        options: &crate::OpenOptions,
+    ) -> Result<Self, StreamError> {
+        if options.volumes().is_some() {
+            return Err(StreamError::archive(
+                ArchiveError::new(ErrorKind::Capability)
+                    .with_context("use a volume reader for OpenOptions containing VolumeSet"),
+            ));
+        }
+        let length = poll_fn(|context| Pin::new(&mut input).poll_seek(context, SeekFrom::End(0)))
+            .await
+            .map_err(StreamError::io)?;
+        let demand = DemandReader::new(length, options.limits());
+        let reader = loop {
+            match SeekArchiveReader::with_options(demand.clone(), options) {
+                Ok(reader) => break reader,
+                Err(error) if is_demand(&error) => {
+                    fulfill(&mut input, &demand).await?;
+                },
+                Err(error) => return Err(error),
+            }
+        };
+        demand.clear_cache()?;
+        Ok(Self {
+            input,
+            reader,
+            demand,
+            event_data: Vec::with_capacity(BUFFER),
+        })
+    }
+
     /// Opens a seek archive with safe default limits.
     pub async fn new(input: R) -> Result<Self, StreamError> {
         Self::with_limits(input, Limits::default()).await

@@ -29,6 +29,13 @@ const NEWC_HEADER: usize = 110;
 const ODC_HEADER: usize = 76;
 const TRAILER: &[u8] = b"TRAILER!!!";
 
+/// Reports whether a path is reserved as the cpio end-of-archive marker.
+#[doc(hidden)]
+#[must_use]
+pub fn cpio_name_is_trailer(name: &[u8]) -> bool {
+    name == TRAILER
+}
+
 /// Legacy binary format magic (both host byte orders).
 const BIN_MAGIC_LE: [u8; 2] = [0xc7, 0x71];
 const BIN_MAGIC_BE: [u8; 2] = [0x71, 0xc7];
@@ -1031,7 +1038,7 @@ impl CpioEncoder {
         let links = metadata.and_then(EntryMetadata::links).unwrap_or(1);
         let mtime = metadata
             .and_then(|meta| meta.times().modified)
-            .map_or(0, |time| u64::try_from(time.seconds().max(0)).unwrap_or(0));
+            .map_or(0, |time| u64::try_from(time.seconds()).unwrap_or(0));
         let device = metadata.and_then(EntryMetadata::device).unwrap_or_default();
         let referenced = metadata
             .and_then(EntryMetadata::referenced_device)
@@ -1226,6 +1233,55 @@ impl ArchiveEncoder for CpioEncoder {
                     return Err(ArchiveError::new(ErrorKind::Protocol)
                         .with_format("cpio")
                         .with_context("previous entry is still open"));
+                }
+                if cpio_name_is_trailer(metadata.path().as_bytes()) {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("cpio")
+                        .with_context("cpio trailer sentinel cannot be encoded as an entry path"));
+                }
+                if !metadata.extensions().is_empty() {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("cpio")
+                        .with_context("cpio cannot represent entry extensions"));
+                }
+                if !matches!(
+                    metadata.kind(),
+                    EntryKind::File
+                        | EntryKind::Dir
+                        | EntryKind::Symlink
+                        | EntryKind::Hardlink
+                        | EntryKind::Char
+                        | EntryKind::Block
+                        | EntryKind::Fifo
+                        | EntryKind::Socket
+                ) || metadata.owner().user.is_some()
+                    || metadata.owner().group.is_some()
+                    || metadata.mode().is_some_and(|mode| mode > 0o7777)
+                    || metadata.times().accessed.is_some()
+                    || metadata.times().changed.is_some()
+                    || metadata.times().created.is_some()
+                    || !metadata.sparse_extents().is_empty()
+                    || !metadata.xattrs().is_empty()
+                    || !metadata.acl().is_empty()
+                    || metadata.file_flags() != 0
+                    || metadata.is_encrypted()
+                    || metadata.comment().is_some()
+                    || (self.dialect != CpioDialect::Crc && metadata.checksum().is_some())
+                {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("cpio")
+                        .with_context("cpio cannot represent requested entry metadata"));
+                }
+                if metadata
+                    .times()
+                    .modified
+                    .is_some_and(|time| time.seconds() < 0 || time.nanoseconds() != 0)
+                {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("cpio")
+                        .with_context(
+                            "cpio modification time requires non-negative whole seconds",
+                        ));
                 }
                 if metadata.size().is_none() {
                     return Err(ArchiveError::new(ErrorKind::SizeRequired)

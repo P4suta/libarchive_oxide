@@ -13,7 +13,7 @@
 
 use std::io::Cursor;
 
-use libarchive_oxide::{ReaderEvent, SeekArchiveReader};
+use libarchive_oxide::{ArchiveReader, ReaderEvent, SeekArchiveReader};
 use libarchive_oxide_core::{EntryKind, ErrorKind, Limits};
 
 const REGULAR_ATTRIBUTES: u32 = 0o100_644_u32 << 16;
@@ -217,6 +217,34 @@ fn official_7zip_fixture_exercises_the_64k_window() {
     }
     let expected = base.repeat(3);
     assert_eq!(wide, expected);
+}
+
+#[cfg(feature = "gzip")]
+#[test]
+fn forward_only_reader_accepts_the_official_7zip_fixture() {
+    let archive = include_bytes!("fixtures/zip/7zip/deflate64.zip");
+    let mut reader = ArchiveReader::new(Cursor::new(archive.as_slice()));
+    let mut wide = Vec::new();
+    let mut current_is_wide = false;
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Entry(metadata) => {
+                current_is_wide = metadata.path().as_bytes() == b"wide-window.bin";
+            },
+            ReaderEvent::Data(bytes) if current_is_wide => wide.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    let mut base = vec![0_u8; 50_000];
+    let mut state = 0x1234_5678_u32;
+    for byte in &mut base {
+        state ^= state.wrapping_shl(13);
+        state ^= state.wrapping_shr(17);
+        state ^= state.wrapping_shl(5);
+        *byte = state as u8;
+    }
+    assert_eq!(wide, base.repeat(3));
 }
 
 #[cfg(feature = "gzip")]

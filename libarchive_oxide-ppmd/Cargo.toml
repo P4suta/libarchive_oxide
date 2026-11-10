@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "libarchive_oxide-ppmd"
+version.workspace = true
+description = "Safe no_std PPMd models and range decoders for archive formats"
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/libarchive_oxide-ppmd"
+keywords = ["compression", "ppmd", "no-std", "archive"]
+categories = ["compression", "no-std"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

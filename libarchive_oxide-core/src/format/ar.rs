@@ -55,6 +55,67 @@ fn radix_bytes(val: u64, radix: u64, buf: &mut [u8; 24]) -> &[u8] {
     &buf[i..]
 }
 
+fn ensure_radix_width(
+    value: u64,
+    radix: u64,
+    width: usize,
+    context: &'static str,
+) -> core::result::Result<(), ArchiveError> {
+    let mut remaining = value;
+    let mut digits = 1;
+    while remaining >= radix {
+        remaining /= radix;
+        digits += 1;
+    }
+    if digits > width {
+        return Err(ArchiveError::new(ErrorKind::Limit)
+            .with_format("ar")
+            .with_context(context));
+    }
+    Ok(())
+}
+
+fn validate_header_fields(
+    metadata: &EntryMetadata,
+    name_field_len: usize,
+    total: u64,
+) -> core::result::Result<u64, ArchiveError> {
+    if name_field_len > F_NAME.1 - F_NAME.0 {
+        return Err(ArchiveError::new(ErrorKind::Limit)
+            .with_format("ar")
+            .with_context("member name reference exceeds fixed-width field"));
+    }
+    let mtime = metadata
+        .times()
+        .modified
+        .map_or(0, |time| u64::try_from(time.seconds()).unwrap_or(0));
+    for (value, width, context) in [
+        (
+            mtime,
+            F_MTIME.1 - F_MTIME.0,
+            "modification time exceeds fixed-width field",
+        ),
+        (
+            metadata.owner().uid.unwrap_or(0),
+            F_UID.1 - F_UID.0,
+            "uid exceeds fixed-width field",
+        ),
+        (
+            metadata.owner().gid.unwrap_or(0),
+            F_GID.1 - F_GID.0,
+            "gid exceeds fixed-width field",
+        ),
+        (
+            total,
+            F_SIZE.1 - F_SIZE.0,
+            "member size exceeds fixed-width field",
+        ),
+    ] {
+        ensure_radix_width(value, 10, width, context)?;
+    }
+    Ok(mtime)
+}
+
 /// Extracts a fixed header field.
 fn field(hdr: &[u8], (start, end): (usize, usize)) -> &[u8] {
     &hdr[start..end]
@@ -460,7 +521,15 @@ impl ArchiveDecoder for ArDecoder {
                         .with_format("ar")
                         .with_context("BSD name state changed unexpectedly"));
                 };
-                let name = core::mem::take(&mut self.pending);
+                let mut name = core::mem::take(&mut self.pending);
+                while name.last() == Some(&0) {
+                    name.pop();
+                }
+                if name.is_empty() {
+                    return Err(ArchiveError::new(ErrorKind::Malformed)
+                        .with_format("ar")
+                        .with_context("BSD inline member name is empty after padding"));
+                }
                 let metadata = self.metadata(name, body_size, fields)?;
                 self.count_entry()?;
                 self.state = if self.thin {
@@ -662,35 +731,49 @@ impl ArEncoder {
                 .with_format("ar")
                 .with_context("ar requires a declared entry size")
         })?;
-        if !self.started {
-            self.pending.extend_from_slice(MAGIC);
-            self.started = true;
-        }
         let name = metadata.path().as_bytes();
         let mut name_field = Vec::new();
-        let inline_name = name.len() > 15;
+        let inline_name_size = ar_bsd_inline_name_size(name).ok_or_else(|| {
+            ArchiveError::new(ErrorKind::Limit)
+                .with_format("ar")
+                .with_context("BSD inline member name size overflow")
+        })?;
+        let inline_name = inline_name_size != 0;
         if inline_name {
             name_field.extend_from_slice(b"#1/");
             let mut buffer = [0_u8; 24];
-            name_field.extend_from_slice(radix_bytes(name.len() as u64, 10, &mut buffer));
+            name_field.extend_from_slice(radix_bytes(
+                u64::try_from(inline_name_size).map_err(|_| {
+                    ArchiveError::new(ErrorKind::Limit)
+                        .with_format("ar")
+                        .with_context("BSD inline member name exceeds u64")
+                })?,
+                10,
+                &mut buffer,
+            ));
         } else {
             name_field.extend_from_slice(name);
             name_field.push(b'/');
         }
         let total = size
-            .checked_add(if inline_name { name.len() as u64 } else { 0 })
+            .checked_add(u64::try_from(inline_name_size).map_err(|_| {
+                ArchiveError::new(ErrorKind::Limit)
+                    .with_format("ar")
+                    .with_context("BSD inline member name exceeds u64")
+            })?)
             .ok_or_else(|| {
                 ArchiveError::new(ErrorKind::Limit)
                     .with_format("ar")
                     .with_context("member size overflow")
             })?;
+        let mtime = validate_header_fields(metadata, name_field.len(), total)?;
+        if !self.started {
+            self.pending.extend_from_slice(MAGIC);
+            self.started = true;
+        }
         let mut header = [b' '; HEADER];
         let mut buffer = [0_u8; 24];
         put_field(&mut header[F_NAME.0..F_NAME.1], &name_field);
-        let mtime = metadata
-            .times()
-            .modified
-            .map_or(0, |time| u64::try_from(time.seconds().max(0)).unwrap_or(0));
         put_field(
             &mut header[F_MTIME.0..F_MTIME.1],
             radix_bytes(mtime, 10, &mut buffer),
@@ -726,11 +809,39 @@ impl ArEncoder {
         self.pending.extend_from_slice(&header);
         if inline_name {
             self.pending.extend_from_slice(name);
+            self.pending.resize(
+                self.pending
+                    .len()
+                    .checked_add(inline_name_size - name.len())
+                    .ok_or_else(|| {
+                        ArchiveError::new(ErrorKind::Limit)
+                            .with_format("ar")
+                            .with_context("BSD inline name padding overflow")
+                    })?,
+                0,
+            );
         }
         self.remaining = size;
         self.padding = usize::from(total & 1 != 0);
         self.open = true;
         Ok(())
+    }
+}
+
+/// Returns the padded BSD inline-name size, or zero for an unambiguous SysV short name.
+///
+/// `None` reports an address-space overflow while rounding a required inline name to four bytes.
+#[doc(hidden)]
+pub fn ar_bsd_inline_name_size(name: &[u8]) -> Option<usize> {
+    let required = name.len() > 15
+        || name == b"/"
+        || name == b"/SYM64"
+        || (name.first() == Some(&b'/') && name.get(1).is_some_and(u8::is_ascii_digit))
+        || name.starts_with(b"#1/");
+    if required {
+        name.len().checked_add(3).map(|length| length / 4 * 4)
+    } else {
+        Some(0)
     }
 }
 
@@ -771,6 +882,44 @@ impl ArchiveEncoder for ArEncoder {
                     return Err(ArchiveError::new(ErrorKind::Protocol)
                         .with_format("ar")
                         .with_context("previous entry is still open"));
+                }
+                if !metadata.extensions().is_empty() {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("ar")
+                        .with_context("ar cannot represent entry extensions"));
+                }
+                if metadata.kind() != EntryKind::File
+                    || metadata.owner().user.is_some()
+                    || metadata.owner().group.is_some()
+                    || metadata.mode().is_some_and(|mode| mode > 0o7777)
+                    || metadata.times().accessed.is_some()
+                    || metadata.times().changed.is_some()
+                    || metadata.times().created.is_some()
+                    || metadata.inode().is_some()
+                    || metadata.links().is_some()
+                    || metadata.device().is_some()
+                    || metadata.referenced_device().is_some()
+                    || metadata.link_target().is_some()
+                    || !metadata.sparse_extents().is_empty()
+                    || !metadata.xattrs().is_empty()
+                    || !metadata.acl().is_empty()
+                    || metadata.file_flags() != 0
+                    || metadata.checksum().is_some()
+                    || metadata.is_encrypted()
+                    || metadata.comment().is_some()
+                {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("ar")
+                        .with_context("ar cannot represent requested entry metadata"));
+                }
+                if metadata
+                    .times()
+                    .modified
+                    .is_some_and(|time| time.seconds() < 0 || time.nanoseconds() != 0)
+                {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("ar")
+                        .with_context("ar modification time requires non-negative whole seconds"));
                 }
                 let size = metadata.size().ok_or_else(|| {
                     ArchiveError::new(ErrorKind::SizeRequired)

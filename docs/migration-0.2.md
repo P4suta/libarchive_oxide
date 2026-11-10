@@ -49,6 +49,17 @@ v0.2 intentionally has no source-compatible v0.1 shim.
   `CpioEncoder::with_dialect`) with `CpioDialect` for newc, crc, odc, or binary
   LE/BE output. crc output requires the typed four-byte payload byte sum in
   entry metadata.
+- Use `ArchiveTranscoder::{transcode, transcode_to_seek,
+  transcode_from_seek, transcode_seek}` according to the source/destination
+  access requirements. Successful output includes a bounded `TranscodeReport`;
+  inspect every `MetadataLoss` or select `MetadataLossPolicy::Reject` before
+  rewriting. mtree conversion is refused because the format does not carry
+  file bodies.
+- Use `ArchiveEditor::{rewrite, rewrite_to_seek, rewrite_from_seek,
+  rewrite_seek}` for exact-path rename/remove plans. Rewrites validate all
+  retained output paths, update hardlink targets on rename, reject removals
+  that would leave hardlinks dangling, and fail when an operation matches no
+  entry. `EditReport` exposes operation counts and the nested fidelity report.
 
 ## Extraction
 
@@ -80,6 +91,17 @@ v0.2 intentionally has no source-compatible v0.1 shim.
 - `oxarchive create --format FORMAT [--filter FILTER] ARCHIVE INPUT...` uses the
   shared bounded filesystem builder. Existing file destinations are refused;
   successful file output is atomically published from a sibling.
+- `SeekArchiveBuilder` and `ArchiveEngine::create_seek` provide the same
+  filesystem contract for 7z, ISO 9660, and XAR. The CLI infers `.7z`, `.iso`,
+  and `.xar`; these seek-native outputs require a file and reject outer filters.
+- `oxarchive convert SOURCE DEST` is the thin CLI wrapper over
+  `ArchiveTranscoder`. It selects the required sequential/seek path, publishes
+  atomically without replacement, reports bounded typed metadata losses, and
+  supports fail-closed `--reject-metadata-loss`.
+- `oxarchive edit (--remove PATH | --rename FROM=TO)... SOURCE DEST` wraps
+  `ArchiveEditor` with the same access selection and atomic no-replace commit.
+  A missing operation, unmatched path, unsafe/conflicting result, or dangling
+  hardlink is an error and never publishes `DEST`.
 - `oxarchive --json inspect` is JSON Lines, not one collected JSON object.
   Consume `inspect_start`, `inspect_entry*`, and the required
   `inspect_complete` success sentinel.

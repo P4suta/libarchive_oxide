@@ -11,21 +11,15 @@ Rust and a sanitizer runtime.
 | `fuzz_targets` | `cargo-fuzz` entry points |
 | `corpus` | committed seeds |
 
-The 27 libFuzzer targets cover sequential and seek archive readers (including explicit
-raw and malformed/valid synthesized WARC decoding in the reused `read_tar`
-target and corpus, plus CAB, XAR, and UDF Metadata/Sparable/Virtual/VAT partitions), archive round trips,
-outer/internal codecs (including bounded Unix `compress(1)` LZW), safe-extraction policy
-planning, and bounded RPM, Alpine, ZIP-ecosystem, APK, IPA, and MSIX package
-verification. The Alpine target supplies a fixed official public key so
-mutations traverse exact compressed-member hashing and RSA verification rather
-than stopping at signature detection. The app target recognizes direct ZIP
-input by package metadata and includes official AOSP RSA v2/v3 plus Microsoft
-MSIX SDK seeds. A dedicated selector applies bounded offset/XOR mutations to
-the official CTS v4.0 APK/`.idsig` pair, while a length-prefixed envelope lets
-libFuzzer vary both inputs independently. APK Signing Block parsing,
-certificate and detached-sidecar signatures, v2/v3/v4 binding, chunked content
-digests, the APK-wide Merkle tree, and bounded `AppxBlockMap.xml` 64-KiB block
-hashing therefore remain mutation-reachable.
+The 31 libFuzzer targets cover sequential and seek archive readers (including explicit raw and malformed/valid synthesized WARC decoding in the reused `read_tar` target and corpus, forward-only ZIP local-header/data-descriptor parsing plus capped valid Deflate64, descriptor-framed Zstandard/XZ, and password-driven ZipCrypto plus WinZip AES Store/Deflate/BZip2/Zstandard/XZ envelopes on every mutation,
+standard split-ZIP disk maps and valid multi-disk envelopes,
+bounded RAR5 container/Store decoding, plus CAB, XAR, and UDF Metadata/Sparable/Virtual/VAT partitions), archive round trips,
+outer/internal codecs (including strict RFC 4648 Base64, bounded POSIX uuencode, explicit LZMA-alone, and bounded Unix `compress(1)` LZW), safe-extraction policy planning, and bounded RPM, Alpine, ZIP-ecosystem, APK, IPA, and MSIX package verification.
+The Alpine target supplies a fixed official public key so mutations traverse exact compressed-member hashing and RSA verification rather than stopping at signature detection.
+The app target recognizes direct ZIP input by package metadata and includes official AOSP RSA v2/v3 plus Microsoft MSIX SDK seeds.
+A dedicated selector applies bounded offset/XOR mutations to the official CTS v4.0 APK/`.idsig` pair, while a length-prefixed envelope lets libFuzzer vary both inputs independently.
+APK Signing Block parsing,
+certificate and detached-sidecar signatures, v2/v3/v4 binding, chunked content digests, the APK-wide Merkle tree, and bounded `AppxBlockMap.xml` 64-KiB block hashing therefore remain mutation-reachable.
 
 Stable corpus replay adds one portable LZIP decoder case (`codec_lzip`) without
 adding a `cargo-fuzz` target. This keeps LZIP regression coverage available on
@@ -74,7 +68,7 @@ OSS-Fuzz additionally caps generated inputs at 2 MiB, process RSS at 2 GiB
 ## OSS-Fuzz
 
 The proposed upstream OSS-Fuzz project bundle lives in
-[`../oss-fuzz`](../oss-fuzz/README.md). It builds all 27 targets with the
+[`../oss-fuzz`](../oss-fuzz/README.md). It builds all 30 targets with the
 portable, self-contained codec profile under libFuzzer + AddressSanitizer and
 packages every committed seed directory. It complements rather than replaces
 the stable replay and the short portable/native GitHub nightly campaign.

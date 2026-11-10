@@ -19,12 +19,12 @@ allow-print-in-tests = true
 allow-dbg-in-tests = true
 
 disallowed-macros = [
-    { path = "lazy_static::lazy_static", reason = "use std::sync::OnceLock or std::sync::LazyLock" },
+  { path = "lazy_static::lazy_static", reason = "use std::sync::OnceLock or std::sync::LazyLock" },
 ]
 disallowed-types = [
-    { path = "once_cell::sync::Lazy", reason = "use std::sync::LazyLock (stable since 1.80)" },
-    { path = "once_cell::sync::OnceCell", reason = "use std::sync::OnceLock (stable since 1.70)" },
-    # Archive output must be deterministic.
-    { path = "std::collections::HashMap", reason = "non-deterministic iteration; use BTreeMap or a sorted Vec" },
-    { path = "std::collections::HashSet", reason = "non-deterministic iteration; use BTreeSet or a sorted Vec" },
+  { path = "once_cell::sync::Lazy", reason = "use std::sync::LazyLock (stable since 1.80)" },
+  { path = "once_cell::sync::OnceCell", reason = "use std::sync::OnceLock (stable since 1.70)" },
+  # Archive output must be deterministic.
+  { path = "std::collections::HashMap", reason = "non-deterministic iteration; use BTreeMap or a sorted Vec" },
+  { path = "std::collections::HashSet", reason = "non-deterministic iteration; use BTreeSet or a sorted Vec" },
 ]

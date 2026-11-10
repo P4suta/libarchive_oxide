@@ -302,6 +302,17 @@ fn compress_lzw_has_an_explicit_portable_backend_only() {
             .kind(),
         io::ErrorKind::InvalidData
     );
+
+    let error = ArchiveWriter::with_filter_and_backend(
+        Vec::new(),
+        libarchive_oxide_core::FormatId::Tar,
+        Some(FilterId::Compress),
+        Limits::default(),
+        BackendPreference::Native,
+    )
+    .expect_err("compress writer has no native backend");
+    assert_eq!(error.kind(), libarchive_oxide_core::ErrorKind::Capability);
+    assert_eq!(error.format(), Some("compress"));
 }
 
 #[test]
@@ -330,18 +341,19 @@ fn malformed_zstd_block_does_not_panic() {
 #[test]
 fn decoded_output_limit_applies_to_plain_and_filtered_streams() {
     let limits = Limits::default().with_decoded_total(Some(4));
-    let mut inputs = vec![b"12345".to_vec()];
+    let mut inputs = vec![(None, b"12345".to_vec())];
     for filter in enabled_outer_filters() {
-        inputs.push(compress(b"12345", filter).unwrap());
+        inputs.push((Some(filter), compress(b"12345", filter).unwrap()));
     }
-    for bytes in inputs {
+    for (filter, bytes) in inputs {
         let mut reader = FilterReader::with_limits(OneByte::new(bytes), limits).unwrap();
         let mut output = Vec::new();
         assert_eq!(
             reader.read_to_end(&mut output).unwrap_err().kind(),
-            io::ErrorKind::Other
+            io::ErrorKind::OutOfMemory,
+            "{filter:?}"
         );
-        assert_eq!(output, b"1234");
+        assert_eq!(output, b"1234", "{filter:?}");
     }
 }
 

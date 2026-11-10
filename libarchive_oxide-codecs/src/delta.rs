@@ -10,7 +10,7 @@
 //! yields the same output. `distance` is `1..=256`; the history ring is a fixed
 //! 256-byte buffer indexed modulo 256.
 
-use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput};
+use libarchive_oxide_protocol::{ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput};
 
 /// The delta filter's fixed maximum distance (and history ring size).
 const MAX_DISTANCE: usize = 256;

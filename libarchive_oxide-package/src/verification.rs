@@ -7,26 +7,30 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 
 use crate::alpine_signature::{AlpineRsaPublicKey, verify_alpine};
+use crate::android_manifest::{AndroidApkManifestReport, inspect_android_manifest};
 use crate::android_signature::{AndroidRotationEvidence, verify_android_apk_v2_v3};
 use crate::android_v4_signature::{
     AndroidApkV4Revision, AndroidV4Verification, verify_android_apk_v4,
 };
 use crate::integrity::{verify_android_apk_v1, verify_zip};
+use crate::ipa_signature::verify_ipa_signature;
 use crate::msix_blockmap::verify_msix_block_map;
+use crate::msix_signature::{MsixSignatureVerification, verify_msix_signature};
+use crate::rpm_signature::{RpmOpenPgpPublicKey, verify_rpm_signatures};
 use crate::{
     AlpineApkValidation, AlpineApkValidator, AppPackageProfile, AppPackageValidation,
-    AppPackageValidator, DebValidation, DebValidator, PackageFinding, RpmValidation, RpmValidator,
-    SupportStatus, ZipPackageProfile, ZipPackageValidation, ZipPackageValidator,
+    AppPackageValidator, AppSignatureReport, DebValidation, DebValidator, PackageFinding,
+    PackageFindingCode, RpmValidation, RpmValidator, SupportStatus, ZipPackageProfile,
+    ZipPackageValidation, ZipPackageValidator,
 };
 
 /// State of one independent verification dimension.
 ///
-/// `NotEvaluated` is deliberately distinct from success. A detected signature
-/// container is not a cryptographically valid signature until a format-specific
-/// verifier has checked its signed bytes and algorithms.
+/// `NotEvaluated` is deliberately distinct from success.
+/// A detected signature container is not a cryptographically valid signature until a format-specific verifier has checked its signed bytes and algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum VerificationDimension {
@@ -42,11 +46,165 @@ pub enum VerificationDimension {
     Unsupported,
 }
 
+fn attach_android_apk_reports(
+    report: VerificationReport,
+    manifest: AndroidApkManifestReport,
+    signatures: AppSignatureReport,
+) -> VerificationReport {
+    let compatibility =
+        AndroidApkCompatibilityReport::evaluate(&manifest, report.signature_validity(), signatures);
+    report
+        .with_android_apk_manifest(manifest)
+        .with_android_apk_compatibility(compatibility)
+        .with_android_apk_v4(AndroidApkV4Report::not_provided())
+}
+
+/// Android platform coverage of the APK's verified signing schemes.
+///
+/// This verdict is deliberately separate from cryptographic signature validity:
+/// a valid v2-only signature, for example, cannot authenticate an APK to Android releases before API 24 when its manifest claims support for those releases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidApkCompatibilityReport {
+    validity: VerificationDimension,
+    minimum_sdk: Option<u32>,
+    target_sdk: Option<u32>,
+    findings: Vec<PackageFinding>,
+}
+
+impl AndroidApkCompatibilityReport {
+    fn evaluate(
+        manifest: &AndroidApkManifestReport,
+        signature_validity: VerificationDimension,
+        signatures: AppSignatureReport,
+    ) -> Self {
+        let minimum_sdk = manifest.minimum_sdk();
+        let target_sdk = manifest.target_sdk();
+        let prerequisite = match manifest.validity() {
+            VerificationDimension::Verified => signature_validity,
+            VerificationDimension::Unsupported => VerificationDimension::Unsupported,
+            VerificationDimension::Invalid
+            | VerificationDimension::NotPresent
+            | VerificationDimension::NotEvaluated => VerificationDimension::NotEvaluated,
+        };
+        if prerequisite != VerificationDimension::Verified {
+            return Self {
+                validity: prerequisite,
+                minimum_sdk,
+                target_sdk,
+                findings: Vec::new(),
+            };
+        }
+
+        let (Some(minimum_sdk), Some(target_sdk)) = (minimum_sdk, target_sdk) else {
+            return Self {
+                validity: VerificationDimension::NotEvaluated,
+                minimum_sdk,
+                target_sdk,
+                findings: Vec::new(),
+            };
+        };
+        let findings = android_signature_platform_findings(
+            minimum_sdk,
+            target_sdk,
+            AndroidSchemeCoverage::from(signatures),
+        );
+        Self {
+            validity: if findings.is_empty() {
+                VerificationDimension::Verified
+            } else {
+                VerificationDimension::Invalid
+            },
+            minimum_sdk: Some(minimum_sdk),
+            target_sdk: Some(target_sdk),
+            findings,
+        }
+    }
+
+    /// Whether the verified signing schemes cover the manifest SDK range.
+    #[must_use]
+    pub const fn validity(&self) -> VerificationDimension {
+        self.validity
+    }
+
+    /// Effective manifest minimum SDK used for this verdict.
+    #[must_use]
+    pub const fn minimum_sdk(&self) -> Option<u32> {
+        self.minimum_sdk
+    }
+
+    /// Effective manifest target SDK used for this verdict.
+    #[must_use]
+    pub const fn target_sdk(&self) -> Option<u32> {
+        self.target_sdk
+    }
+
+    /// Typed platform-coverage failures.
+    #[must_use]
+    pub fn findings(&self) -> &[PackageFinding] {
+        &self.findings
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct AndroidSchemeCoverage {
+    v1: bool,
+    v2: bool,
+    v3: bool,
+    v31: bool,
+}
+
+impl From<AppSignatureReport> for AndroidSchemeCoverage {
+    fn from(signatures: AppSignatureReport) -> Self {
+        Self {
+            v1: signatures.apk_v1(),
+            v2: signatures.apk_v2(),
+            v3: signatures.apk_v3(),
+            v31: signatures.apk_v3_1(),
+        }
+    }
+}
+
+fn android_signature_platform_findings(
+    minimum_sdk: u32,
+    target_sdk: u32,
+    coverage: AndroidSchemeCoverage,
+) -> Vec<PackageFinding> {
+    let mut findings = Vec::new();
+    if minimum_sdk < 24 && !coverage.v1 {
+        findings.push(PackageFinding::new(
+            "android-apk",
+            Some(b"AndroidManifest.xml".to_vec()),
+            PackageFindingCode::AndroidSignaturePlatformGap,
+            format!(
+                "manifest minimum SDK {minimum_sdk} includes pre-24 platforms, but no verified APK v1 signature covers them"
+            ),
+        ));
+    } else if minimum_sdk < 28 && !(coverage.v1 || coverage.v2) {
+        findings.push(PackageFinding::new(
+            "android-apk",
+            Some(b"AndroidManifest.xml".to_vec()),
+            PackageFindingCode::AndroidSignaturePlatformGap,
+            format!(
+                "manifest minimum SDK {minimum_sdk} includes API 24-27 platforms, but neither a verified APK v1 nor v2 signature covers them"
+            ),
+        ));
+    }
+    if target_sdk >= 30 && !(coverage.v2 || coverage.v3 || coverage.v31) {
+        findings.push(PackageFinding::new(
+            "android-apk",
+            Some(b"AndroidManifest.xml".to_vec()),
+            PackageFindingCode::AndroidSignaturePlatformGap,
+            format!("manifest target SDK {target_sdk} requires APK Signature Scheme v2 or newer"),
+        ));
+    }
+    findings
+}
+
 /// Result of the optional, explicitly supplied Android APK v4/v4.1 sidecar.
 ///
-/// This report is nested under [`VerificationReport`] only for the
-/// `android-apk` profile. Absence is represented by `NotEvaluated`, not by
-/// success or failure, because `.idsig` is an optional detached input.
+/// This report is nested under [`VerificationReport`] only for the `android-apk` profile.
+/// Absence is represented by `NotEvaluated`, not by success or failure, because `.idsig` is an optional detached input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AndroidApkV4Report {
     revision: Option<AndroidApkV4Revision>,
@@ -60,8 +218,7 @@ pub struct AndroidApkV4Report {
 /// Verified APK Signature Scheme v3 proof-of-rotation and targeted signer layout.
 ///
 /// This is cryptographic evidence carried by authenticated v3/v3.1 signed-data.
-/// It does not make an issuer-trust decision; [`VerificationReport::trust`]
-/// remains the sole trust-policy verdict.
+/// It does not make an issuer-trust decision; [`VerificationReport::trust`] remains the sole trust-policy verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AndroidApkRotationReport {
     v31_present: bool,
@@ -298,11 +455,10 @@ impl VerificationDimension {
 
 /// Explicit offline issuer-trust policy.
 ///
-/// Signers are identified by caller-supplied SHA-256 fingerprints of their
-/// canonical signer material: DER certificates for CMS or PKCS#1 DER public
-/// keys for Alpine APK v2. The policy never fetches certificates, revocation
-/// data, transparency records, or keys. When a package has multiple verified
-/// signers, every signer must have an explicit pin.
+/// Signers are identified by caller-supplied SHA-256 fingerprints of their canonical signer material: DER certificates for CMS, PKCS#1 DER public keys for Alpine APK v2, or the native `OpenPGP` primary-key fingerprint for RPM.
+/// The policy never fetches certificates, revocation data, transparency records,
+/// or keys.
+/// When a package has multiple verified signers, every signer must have an explicit pin.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustPolicy {
     trusted_signers: BTreeSet<Vec<u8>>,
@@ -353,7 +509,7 @@ impl TrustPolicy {
     }
 }
 
-/// Result whose four verdicts cannot be conflated.
+/// Result whose independent structure, cryptographic, trust, and platform compatibility verdicts cannot be conflated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
     structure: SupportStatus,
@@ -364,6 +520,8 @@ pub struct VerificationReport {
     findings: Vec<PackageFinding>,
     android_apk_rotation: Option<AndroidApkRotationReport>,
     android_apk_v4: Option<AndroidApkV4Report>,
+    android_apk_manifest: Option<AndroidApkManifestReport>,
+    android_apk_compatibility: Option<AndroidApkCompatibilityReport>,
 }
 
 impl VerificationReport {
@@ -383,6 +541,8 @@ impl VerificationReport {
             findings: findings.to_vec(),
             android_apk_rotation: None,
             android_apk_v4: None,
+            android_apk_manifest: None,
+            android_apk_compatibility: None,
         }
     }
 
@@ -402,6 +562,25 @@ impl VerificationReport {
 
     fn with_android_apk_rotation(mut self, report: Option<AndroidApkRotationReport>) -> Self {
         self.android_apk_rotation = report;
+        self
+    }
+
+    fn with_android_apk_manifest(mut self, report: AndroidApkManifestReport) -> Self {
+        if report
+            .findings()
+            .iter()
+            .any(|finding| finding.severity() >= crate::Severity::Warning)
+        {
+            self.structure = SupportStatus::new(self.structure.container_readable(), false);
+        }
+        self.findings.extend(report.findings().iter().cloned());
+        self.android_apk_manifest = Some(report);
+        self
+    }
+
+    fn with_android_apk_compatibility(mut self, report: AndroidApkCompatibilityReport) -> Self {
+        self.findings.extend(report.findings().iter().cloned());
+        self.android_apk_compatibility = Some(report);
         self
     }
 
@@ -429,8 +608,7 @@ impl VerificationReport {
         self.trust
     }
 
-    /// SHA-256 fingerprints of canonical signer material whose signature was
-    /// cryptographically verified.
+    /// SHA-256 fingerprints of canonical signer material whose signature was cryptographically verified.
     ///
     /// These bytes identify signers; they do not imply that a signer is trusted.
     /// [`TrustPolicy`] compares them only against caller-supplied offline roots.
@@ -439,7 +617,7 @@ impl VerificationReport {
         &self.signer_fingerprints
     }
 
-    /// Typed structural, integrity, signature, and resource findings.
+    /// Typed structural, integrity, signature, platform, and resource findings.
     #[must_use]
     pub fn findings(&self) -> &[PackageFinding] {
         &self.findings
@@ -447,8 +625,7 @@ impl VerificationReport {
 
     /// Verified Android APK v3 rotation evidence, when a lineage or v3.1 block is present.
     ///
-    /// This remains separate from [`Self::trust`]: a valid ancestor-to-descendant
-    /// rotation proof does not implicitly trust any certificate.
+    /// This remains separate from [`Self::trust`]: a valid ancestor-to-descendant rotation proof does not implicitly trust any certificate.
     #[must_use]
     pub const fn android_apk_rotation(&self) -> Option<&AndroidApkRotationReport> {
         self.android_apk_rotation.as_ref()
@@ -456,12 +633,27 @@ impl VerificationReport {
 
     /// Optional Android APK v4/v4.1 sidecar result.
     ///
-    /// Android reports always return `Some`; other package profiles return
-    /// `None`. A caller that did not supply a sidecar observes independent
-    /// `NotEvaluated` dimensions here.
+    /// Android reports always return `Some`; other package profiles return `None`.
+    /// A caller that did not supply a sidecar observes independent `NotEvaluated` dimensions here.
     #[must_use]
     pub const fn android_apk_v4(&self) -> Option<&AndroidApkV4Report> {
         self.android_apk_v4.as_ref()
+    }
+
+    /// Bounded binary Android manifest SDK inspection result.
+    ///
+    /// Android reports always return `Some`; other profiles return `None`.
+    #[must_use]
+    pub const fn android_apk_manifest(&self) -> Option<&AndroidApkManifestReport> {
+        self.android_apk_manifest.as_ref()
+    }
+
+    /// Android platform coverage of the APK's verified signing schemes.
+    ///
+    /// Android reports always return `Some`; other profiles return `None`.
+    #[must_use]
+    pub const fn android_apk_compatibility(&self) -> Option<&AndroidApkCompatibilityReport> {
+        self.android_apk_compatibility.as_ref()
     }
 
     /// Whether any finding carries `code`.
@@ -496,8 +688,7 @@ impl PackageInspector {
         ZipPackageValidator::new(profile).validate(reader)
     }
 
-    /// Inspects an OS/application ZIP profile and reports signature containers
-    /// only as detected metadata.
+    /// Inspects an OS/application ZIP profile and reports signature containers only as detected metadata.
     pub fn app<R: Read + Seek>(profile: AppPackageProfile, reader: R) -> AppPackageValidation {
         AppPackageValidator::new(profile).validate(reader)
     }
@@ -505,17 +696,19 @@ impl PackageInspector {
 
 /// Offline package verifier with an explicit issuer-trust policy.
 ///
-/// JAR and Android APK v1 adapters verify bounded CMS signatures. Android APK
-/// v2/v3 verifies the signing block and streamed whole-file content digests.
+/// JAR and Android APK v1 adapters verify bounded CMS signatures.
+/// Android APK v2/v3 verifies the signing block and streamed whole-file content digests.
 /// APK v4/v4.1 additionally verifies an explicitly supplied detached sidecar;
 /// no API locates one implicitly.
-/// Alpine APK v2 verifies exact compressed-control-member RSA signatures with
-/// explicitly supplied public keys. No verifier performs network access.
+/// Alpine APK v2 verifies exact compressed-control-member RSA signatures with explicitly supplied public keys.
+/// RPM verifies header-only and legacy header-plus-payload `OpenPGP` signatures with explicitly supplied transferable public-key certificates.
+/// No verifier performs network access.
 #[derive(Debug, Clone)]
 pub struct PackageVerifier {
     trust_policy: TrustPolicy,
     limits: Limits,
     alpine_rsa_keys: BTreeMap<Vec<u8>, AlpineRsaPublicKey>,
+    rpm_openpgp_keys: Vec<RpmOpenPgpPublicKey>,
 }
 
 impl PackageVerifier {
@@ -526,6 +719,7 @@ impl PackageVerifier {
             trust_policy,
             limits: Limits::safe(),
             alpine_rsa_keys: BTreeMap::new(),
+            rpm_openpgp_keys: Vec::new(),
         }
     }
 
@@ -550,12 +744,30 @@ impl PackageVerifier {
 
     /// Adds or replaces one offline Alpine APK v2 RSA verification key.
     ///
-    /// Supplying a key enables signature-validity checks but does not trust the
-    /// signer. Pin [`AlpineRsaPublicKey::fingerprint_sha256`] separately in the
-    /// [`TrustPolicy`] when that issuer should satisfy trust.
+    /// Supplying a key enables signature-validity checks but does not trust the signer.
+    /// Pin [`AlpineRsaPublicKey::fingerprint_sha256`] separately in the [`TrustPolicy`] when that issuer should satisfy trust.
     #[must_use]
     pub fn with_alpine_rsa_public_key(mut self, key: AlpineRsaPublicKey) -> Self {
         self.alpine_rsa_keys.insert(key.key_id().to_vec(), key);
+        self
+    }
+
+    /// Adds one offline `OpenPGP` certificate for RPM header signatures.
+    ///
+    /// Supplying a certificate enables cryptographic verification but does not trust it.
+    /// Pin [`RpmOpenPgpPublicKey::fingerprint_sha256`] separately in the [`TrustPolicy`] when that signer should satisfy trust.
+    #[must_use]
+    pub fn with_rpm_openpgp_public_key(mut self, key: RpmOpenPgpPublicKey) -> Self {
+        let fingerprint = key.fingerprint_sha256();
+        if let Some(existing) = self
+            .rpm_openpgp_keys
+            .iter_mut()
+            .find(|existing| existing.fingerprint_sha256() == fingerprint)
+        {
+            *existing = key;
+        } else {
+            self.rpm_openpgp_keys.push(key);
+        }
         self
     }
 
@@ -586,8 +798,7 @@ impl PackageVerifier {
         }
     }
 
-    /// Inspects an Alpine APK v2 package and keeps signature presence distinct
-    /// from signature validity and issuer trust.
+    /// Inspects an Alpine APK v2 package and keeps signature presence distinct from signature validity and issuer trust.
     pub fn alpine_apk<R: Read>(&self, reader: R) -> VerificationReport {
         let validation = AlpineApkValidator::new()
             .with_limits(self.limits)
@@ -626,14 +837,18 @@ impl PackageVerifier {
         let validation = RpmValidator::new()
             .with_limits(self.limits)
             .validate(reader);
-        let signature_validity = VerificationDimension::NotEvaluated;
+        let verified = verify_rpm_signatures(&validation, &self.rpm_openpgp_keys);
+        let mut findings = validation.findings().to_vec();
+        findings.extend(verified.findings);
+        let trust = self.trust_verdict(verified.signature_validity, &verified.signer_fingerprints);
         VerificationReport::structural(
             validation.status(),
             validation.integrity(),
-            signature_validity,
-            self.trust_verdict(signature_validity, &[]),
-            validation.findings(),
+            verified.signature_validity,
+            trust,
+            &findings,
         )
+        .with_signer_fingerprints(verified.signer_fingerprints)
     }
 
     /// Inspects a ZIP-container package and returns separated verification dimensions.
@@ -669,13 +884,11 @@ impl PackageVerifier {
         .with_signer_fingerprints(verified.signer_fingerprints)
     }
 
-    /// Verifies an Android APK together with a caller-supplied v4/v4.1
-    /// `.idsig` byte source.
+    /// Verifies an Android APK together with a caller-supplied v4/v4.1 `.idsig` byte source.
     ///
     /// The sidecar is never located implicitly: callers may pass a file,
-    /// in-memory bytes (for example through [`std::io::Cursor`]), or any other
-    /// [`Read`] source. Verification is offline and binds every sidecar signer
-    /// to the APK's cryptographically verified v2/v3 and optional v3.1 blocks.
+    /// in-memory bytes (for example through [`std::io::Cursor`]), or any other [`Read`] source.
+    /// Verification is offline and binds every sidecar signer to the APK's cryptographically verified v2/v3 and optional v3.1 blocks.
     pub fn android_apk_with_v4_sidecar<R: Read + Seek, S: Read>(
         &self,
         mut apk: R,
@@ -699,15 +912,11 @@ impl PackageVerifier {
         report.with_android_apk_v4(v4_report)
     }
 
-    /// Inspects an application package. Every detected Android APK v1, v2, and
-    /// v3 scheme is evaluated independently, then combined without allowing one
-    /// valid scheme to hide another scheme's failure. APK v1 is verified as a
-    /// JAR manifest + `.SF` + CMS chain; v2/v3 verify their whole-file content
-    /// digests. MSIX package-file sizes and SHA-256 blocks are verified from
-    /// `AppxBlockMap.xml`;
-    /// `AppxSignature.p7x` remains detected but cryptographically unevaluated.
-    /// This method never searches for an APK v4 sidecar; use
-    /// [`Self::android_apk_with_v4_sidecar`] to supply one explicitly.
+    /// Inspects an application package.
+    /// Every detected Android APK v1, v2, and v3 scheme is evaluated independently, then combined without allowing one valid scheme to hide another scheme's failure.
+    /// APK v1 is verified as a JAR manifest + `.SF` + CMS chain; v2/v3 verify their whole-file content digests.
+    /// MSIX package-file sizes and SHA-256 blocks are verified from `AppxBlockMap.xml`; `AppxSignature.p7x` CMS and all APPX package-view digests are verified offline when present.
+    /// This method never searches for an APK v4 sidecar; use [`Self::android_apk_with_v4_sidecar`] to supply one explicitly.
     pub fn app<R: Read + Seek>(
         &self,
         profile: AppPackageProfile,
@@ -716,6 +925,15 @@ impl PackageVerifier {
         let validation = AppPackageValidator::new(profile)
             .with_limits(self.limits)
             .validate(&mut reader);
+        let android_manifest = if profile == AppPackageProfile::AndroidApk {
+            if validation.container_readable() && reader.seek(SeekFrom::Start(0)).is_ok() {
+                inspect_android_manifest(&mut reader, self.limits)
+            } else {
+                AndroidApkManifestReport::not_evaluated()
+            }
+        } else {
+            AndroidApkManifestReport::not_evaluated()
+        };
 
         if profile == AppPackageProfile::Msix
             && validation.container_readable()
@@ -724,14 +942,20 @@ impl PackageVerifier {
             return self.verify_msix_app(&validation, reader);
         }
 
+        if profile == AppPackageProfile::Ipa
+            && validation.container_readable()
+            && reader.seek(SeekFrom::Start(0)).is_ok()
+        {
+            return self.verify_ipa_app(&validation, reader);
+        }
+
         if profile == AppPackageProfile::AndroidApk
             && validation.container_readable()
             && validation.signatures().apk_signing_block()
             && reader.seek(SeekFrom::Start(0)).is_ok()
         {
-            return self
-                .verify_android_signing_block_app(&validation, reader)
-                .with_android_apk_v4(AndroidApkV4Report::not_provided());
+            let report = self.verify_android_signing_block_app(&validation, reader);
+            return attach_android_apk_reports(report, android_manifest, validation.signatures());
         }
 
         if profile == AppPackageProfile::AndroidApk
@@ -739,9 +963,8 @@ impl PackageVerifier {
             && validation.signatures().apk_v1_metadata()
             && reader.seek(SeekFrom::Start(0)).is_ok()
         {
-            return self
-                .verify_android_v1_app(&validation, reader)
-                .with_android_apk_v4(AndroidApkV4Report::not_provided());
+            let report = self.verify_android_v1_app(&validation, reader);
+            return attach_android_apk_reports(report, android_manifest, validation.signatures());
         }
 
         let signature_validity = if validation.signatures().any() {
@@ -762,7 +985,7 @@ impl PackageVerifier {
             validation.findings(),
         );
         if profile == AppPackageProfile::AndroidApk {
-            report.with_android_apk_v4(AndroidApkV4Report::not_provided())
+            attach_android_apk_reports(report, android_manifest, validation.signatures())
         } else {
             report
         }
@@ -771,23 +994,55 @@ impl PackageVerifier {
     fn verify_msix_app<R: Read + Seek>(
         &self,
         validation: &AppPackageValidation,
-        reader: R,
+        mut reader: R,
     ) -> VerificationReport {
-        let verified = verify_msix_block_map(reader, self.limits);
-        let signature_validity = if validation.signatures().embedded_signature() {
-            VerificationDimension::NotEvaluated
+        let verified = verify_msix_block_map(&mut reader, self.limits);
+        let signature = if validation.signatures().embedded_signature()
+            && reader.seek(SeekFrom::Start(0)).is_ok()
+        {
+            verify_msix_signature(&mut reader, self.limits)
         } else {
-            VerificationDimension::NotPresent
+            MsixSignatureVerification {
+                validity: if validation.signatures().embedded_signature() {
+                    VerificationDimension::NotEvaluated
+                } else {
+                    VerificationDimension::NotPresent
+                },
+                signer_fingerprints: Vec::new(),
+                findings: Vec::new(),
+            }
         };
         let mut findings = validation.findings().to_vec();
         findings.extend(verified.findings);
+        findings.extend(signature.findings);
+        let trust = self.trust_verdict(signature.validity, &signature.signer_fingerprints);
         VerificationReport::structural(
             validation.status(),
             verified.integrity,
-            signature_validity,
-            self.trust_verdict(signature_validity, &[]),
+            signature.validity,
+            trust,
             &findings,
         )
+        .with_signer_fingerprints(signature.signer_fingerprints)
+    }
+
+    fn verify_ipa_app<R: Read + Seek>(
+        &self,
+        validation: &AppPackageValidation,
+        reader: R,
+    ) -> VerificationReport {
+        let verified = verify_ipa_signature(reader, self.limits);
+        let mut findings = validation.findings().to_vec();
+        findings.extend(verified.findings);
+        let trust = self.trust_verdict(verified.validity, &verified.signer_fingerprints);
+        VerificationReport::structural(
+            validation.status(),
+            verified.integrity,
+            verified.validity,
+            trust,
+            &findings,
+        )
+        .with_signer_fingerprints(verified.signer_fingerprints)
     }
 
     fn verify_android_signing_block_app<R: Read + Seek>(
@@ -972,6 +1227,44 @@ mod tests {
                 VerificationDimension::NotPresent,
             ),
             VerificationDimension::Verified
+        );
+    }
+
+    #[test]
+    fn android_scheme_coverage_obeys_platform_boundaries() {
+        let v1 = AndroidSchemeCoverage {
+            v1: true,
+            v2: false,
+            v3: false,
+            v31: false,
+        };
+        let v2 = AndroidSchemeCoverage {
+            v1: false,
+            v2: true,
+            v3: false,
+            v31: false,
+        };
+        let v3 = AndroidSchemeCoverage {
+            v1: false,
+            v2: false,
+            v3: true,
+            v31: false,
+        };
+
+        assert_eq!(android_signature_platform_findings(23, 23, v2).len(), 1);
+        assert_eq!(
+            android_signature_platform_findings(24, 29, v2),
+            [] as [crate::finding::PackageFinding; 0]
+        );
+        assert_eq!(android_signature_platform_findings(27, 29, v3).len(), 1);
+        assert_eq!(
+            android_signature_platform_findings(28, 29, v3),
+            [] as [crate::finding::PackageFinding; 0]
+        );
+        assert_eq!(android_signature_platform_findings(28, 30, v1).len(), 1);
+        assert_eq!(
+            android_signature_platform_findings(28, 30, v2),
+            [] as [crate::finding::PackageFinding; 0]
         );
     }
 }

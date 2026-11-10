@@ -1,0 +1,13 @@
+libarchive_oxide-rarvm
+
+The descriptor grammar, standard-program fingerprints, and Delta, E8/E8E9,
+RGB, and Audio transforms were derived from and cross-checked against
+libarchive's archive_read_support_format_rar.c:
+
+Copyright (c) 2003-2007 Tim Kientzle
+Copyright (c) 2011 Andres Mejia
+All rights reserved.
+
+That source is distributed under the BSD-2-Clause license reproduced in
+LICENSES/BSD-2-Clause.txt. The Rust implementation is bounds-checked, uses no
+unsafe code, interprets no arbitrary VM instructions, and has no RAR writer.

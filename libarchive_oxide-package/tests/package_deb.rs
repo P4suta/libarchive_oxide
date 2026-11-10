@@ -9,12 +9,13 @@
 
 use std::io::Cursor;
 
-use libarchive_oxide::advanced::CodecCapabilities;
-use libarchive_oxide::advanced::legacy::{CodecProvider, ProviderSet};
-use libarchive_oxide::{ArchiveEngine, CreateOptions};
-use libarchive_oxide_core::{
-    ArchiveError, ArchivePath, Codec, CodecStep, DirectionSet, EndOfInput, EntryKind,
-    EntryMetadata, ErrorKind, FilterId, FormatId, Limits, ProbeResult,
+use libarchive_oxide::advanced::{
+    ArchiveError, Codec, CodecCapabilities, CodecStep, DirectionSet, EndOfInput, ProbeResult,
+};
+use libarchive_oxide::advanced::{CodecProvider, ProviderSet};
+use libarchive_oxide::{
+    ArchiveEngine, ArchivePath, CreateOptions, EntryKind, EntryMetadata, ErrorKind, FilterId,
+    FormatId, Limits,
 };
 use libarchive_oxide_package::{DebValidator, PackageFindingCode};
 

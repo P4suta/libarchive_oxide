@@ -69,7 +69,7 @@ compcol = { version = "0.6.8", default-features = false, features = ["bcj2"] }
 
 All 7z bytes are produced at test time by pinned dev-dependencies
 `sevenz-rust2`/`compcol` or by arca itself; no third-party binary artifact is
-redistributed. `sevenz-rust2` is dual-licensed under `MIT OR Apache-2.0`;
+redistributed. `sevenz-rust2` is licensed under `Apache-2.0`;
 `compcol` is MIT-licensed. arca output is covered by this repository's
 `MIT OR Apache-2.0` license.
 

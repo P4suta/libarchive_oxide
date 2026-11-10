@@ -2,22 +2,22 @@
 
 `libarchive_oxide` has two additive compile-time backend profiles.
 
-Portable gzip/Deflate, Zstandard, LZ4, Unix `compress(1)` LZW, CAB LZX, BCJ,
+Portable gzip/Deflate, Zstandard, LZ4, lzop/LZO1X, Unix `compress(1)` LZW, CAB LZX, BCJ,
 and Delta state machines live in the separate `libarchive_oxide-codecs` crate.
+They implement the dependency-free `libarchive_oxide-protocol` byte-codec contract and do not depend on archive format core.
+Core re-exports the same types for compatibility.
 CAB Quantum uses the safe-Rust,
-`no_std + alloc` `compcol` state machine from the std format adapter. The
-standalone codecs crate is `no_std + alloc`,
-has no default algorithm features, and is built with all of its features for a
-bare-metal target in CI. The std flagship retains runtime backend selection,
-I/O adapters, and the portable bzip2/XZ/lzip implementations until those
-pull-oriented dependencies have bounded push adapters suitable for the
-standalone crate.
+`no_std + alloc` `compcol` state machine from the std format adapter.
+The standalone codecs crate is `no_std + alloc`,
+has no default algorithm features, and is built with all of its features for a bare-metal target in CI.
+The std flagship retains runtime backend selection,
+I/O adapters, and the portable bzip2/XZ/lzip implementations until those pull-oriented dependencies have bounded push adapters suitable for the standalone crate.
 
-| Profile | Invocation | gzip | bzip2 | zstd | xz/LZMA2 | LZ4 frame | compress/LZW | lzip/LZMA | CAB LZX | CAB Quantum |
-|---|---|---|---|---|---|---|---|---|---|---|
-| portable (default) | `cargo build` | `miniz_oxide` | `libbz2-rs-sys` | `ruzstd` | `lzma-rust2` | `lz4_flex` | `compcol` read | `lzma-rust2` read | audited `no_std` regular-LZX fork derived from `lzxd` | `compcol` 0.6.8 |
-| native-only | `cargo build --no-default-features --features native-codecs` | `libz-sys` | `bzip2-sys` | `zstd-sys` | `xz2` / `lzma-sys` | `lz4` / `lz4-sys` | — | — | shared safe-Rust fork | shared `compcol` adapter |
-| combined | `cargo build --features native-codecs` | portable + native | portable + native | portable + native | portable + native | portable + native | portable read | portable read | shared safe-Rust fork | shared `compcol` adapter |
+| Profile | Invocation | gzip | bzip2 | zstd | xz/LZMA2 | LZ4 frame | lzop/LZO1X | compress/LZW | lzip/LZMA | CAB LZX | CAB Quantum |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| portable (default) | `cargo build` | `miniz_oxide` | `libbz2-rs-sys` | `ruzstd` | `lzma-rust2` | `lz4_flex` | Safe Rust read / stored write | `compcol` read/write | `lzma-rust2` read/write | audited `no_std` regular-LZX fork derived from `lzxd` | `compcol` 0.6.8 |
+| native-only | `cargo build --no-default-features --features native-codecs` | `libz-sys` | `bzip2-sys` | `zstd-sys` | `xz2` / `lzma-sys` | `lz4` / `lz4-sys` | — | — | — | shared safe-Rust fork | shared `compcol` adapter |
+| combined | `cargo build --features native-codecs` | portable + native | portable + native | portable + native | portable + native | portable + native | portable read/write | portable read/write | portable read/write | shared safe-Rust fork | shared `compcol` adapter |
 
 The individual codec features remain available. For example,
 `--no-default-features --features zstd` is a compatibility portable build.
@@ -28,15 +28,15 @@ dependency auditing and differential conformance.
 ## Shared conformance
 
 Both profiles run the same sync, Pipeline, futures-io, Tokio, create, CLI,
-malformed-input, and fuzz-replay tests. The committed corpus covers all five
-read/write outer filters plus read-only `compress(1)` LZW and lzip, including
+malformed-input, and fuzz-replay tests. The committed corpus covers all eleven
+read/write outer filters plus the read-only RPM wrapper, including `compress(1)` LZW and
 one-byte input boundaries, concatenated members where the format defines them,
 trailing data, truncation, checksum failure, no-progress handling, decoded
 output limits, XZ/lzip dictionary limits, and independent producer or consumer
-fixtures. Nightly CI builds and runs all 27 libFuzzer targets under both
+fixtures. Nightly CI builds and runs all 35 libFuzzer targets under both
 profiles with overflow checks and panic-abort semantics. Stable replay
 additionally drives the lzip fixture; the same invariant bodies replay CAB/XAR
-and package-verifier seeds and deterministic mutants on stable CI.
+and RPM/package-verifier seeds and deterministic mutants on stable CI.
 
 CAB LZX conformance additionally uses Microsoft `makecab.exe` output with
 three word-aligned CFDATA frames and the libmspack mixed-method corpus. The
