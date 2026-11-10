@@ -63,7 +63,8 @@ test-ci: fuzz-replay
 
 # Run portable regressions and doctests without a platform or codec matrix.
 test-portable:
-    cargo nextest run --locked --profile ci --workspace --no-default-features --features {{ portable_features }}
+    cargo test --release --locked -p libarchive_oxide --test fuzz_replay --no-default-features --features portable-codecs,aes,sevenz,async,tokio -- --test-threads={{ fuzz_test_threads }}
+    cargo nextest run --locked --profile ci --workspace --no-default-features --features {{ portable_features }} -E '{{ nextest_filter }}'
     cargo test --locked --workspace --doc --no-default-features --features {{ portable_features }}
 
 # Run every committed corpus mutation in one optimized process per codec
@@ -229,7 +230,7 @@ vendor-msrv:
     cargo +1.95.0 check --manifest-path libarchive_oxide/vendor/sevenz-rust2/Cargo.toml --all-features
 
 # Fast deterministic checks used during the edit/commit loop.
-check: fmt-check typos lint-portable shear reuse license-sync architecture codec-policy capability-docs release-policy actionlint zizmor
+check: fmt-check typos lint-portable shear reuse license-sync architecture ci-efficiency codec-policy capability-docs release-policy actionlint zizmor
     @echo "fast local checks passed"
 
 # Verify ordinary changes through the same gate as pull requests.

@@ -425,13 +425,14 @@ fn check_ci_efficiency(root: &Path) -> Result {
         .lines()
         .filter(|line| line.trim_start().starts_with("cargo nextest run"))
         .collect::<Vec<_>>();
-    if nextest_lines.len() != 4
+    if nextest_lines.len() != 5
         || nextest_lines
             .iter()
-            .any(|line| !line.contains("-E '{{nextest_filter}}'"))
+            .any(|line| !line.replace(' ', "").contains("-E'{{nextest_filter}}'"))
     {
         return Err("every nextest profile must use the shared fuzz-replay exclusion".into());
     }
+    check_portable_fuzz_replay(&justfile)?;
 
     let fuzz_recipe = justfile
         .split_once("\nfuzz-replay:\n")
@@ -448,9 +449,11 @@ fn check_ci_efficiency(root: &Path) -> Result {
         .filter(|line| line.trim_start().starts_with("cargo test"))
         .collect::<Vec<_>>();
     if fuzz_commands.len() != 2
-        || fuzz_commands
-            .iter()
-            .any(|line| !line.contains("-- --test-threads={{fuzz_test_threads}}"))
+        || fuzz_commands.iter().any(|line| {
+            !line
+                .replace(' ', "")
+                .ends_with("----test-threads={{fuzz_test_threads}}")
+        })
     {
         return Err("both fuzz replay profiles must use the bounded thread count".into());
     }
@@ -469,6 +472,22 @@ fn check_ci_efficiency(root: &Path) -> Result {
     println!(
         "ci-efficiency: source-derived feature seams, all-target maximal profiles, nextest tests, and optimized portable/native fuzz replay remain automatic"
     );
+    Ok(())
+}
+
+fn check_portable_fuzz_replay(justfile: &str) -> Result {
+    let recipe = justfile
+        .split_once("\ntest-portable:\n")
+        .and_then(|(_, tail)| tail.split_once("\n\n"))
+        .map(|(recipe, _)| recipe)
+        .ok_or("missing test-portable recipe")?;
+    let replay = "cargo test --release --locked -p libarchive_oxide --test fuzz_replay --no-default-features --features portable-codecs,aes,sevenz,async,tokio -- --test-threads={{ fuzz_test_threads }}";
+    if !recipe.lines().any(|line| line.trim() == replay) {
+        return Err(
+            "portable CI must replay the complete corpus with optimization and bounded threads"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -2636,11 +2655,28 @@ mod tests {
     use std::process::{Command, Stdio};
 
     use super::{
-        check_manual_only_workflow, check_release_policy_contents, feature_seam_cells_from_text,
-        fingerprint_bytes, finish_fingerprint, package_smoke_build_target, packaged_cargo,
-        require_toml_assignment, section_between,
+        check_manual_only_workflow, check_portable_fuzz_replay, check_release_policy_contents,
+        feature_seam_cells_from_text, fingerprint_bytes, finish_fingerprint,
+        package_smoke_build_target, packaged_cargo, require_toml_assignment, section_between,
     };
     use sha2::Sha256;
+
+    #[test]
+    fn portable_ci_requires_complete_optimized_corpus_replay() {
+        let justfile = include_str!("../../Justfile");
+        assert!(check_portable_fuzz_replay(justfile).is_ok());
+        for invalid in [
+            justfile.replace("--release --locked", "--locked"),
+            justfile.replace("--test fuzz_replay", "--test providers"),
+            justfile.replace("-- --test-threads={{ fuzz_test_threads }}", ""),
+            justfile.replace(
+                "--features portable-codecs,aes,sevenz,async,tokio",
+                "--features portable-codecs",
+            ),
+        ] {
+            assert!(check_portable_fuzz_replay(&invalid).is_err());
+        }
+    }
 
     const VALID_RELEASE: &str = r"name: release
 on:
