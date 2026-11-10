@@ -2,10 +2,10 @@
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# typos — strict spell check across the repo, run by the CI `typos` job
-# (crate-ci/typos) and the pre-commit hook. Fix typos rather than suppress them;
-# keep the allowlist below to the minimum the archive/codec vocabulary needs. Every
-# entry is a name a format or codec chose, not a word this project misspelled.
+# typos — strict spell check across the repo, run by the CI `typos` job (crate-ci/typos) and the pre-commit hook.
+# Fix typos rather than suppress them;
+# keep the allowlist below to the minimum the archive/codec vocabulary needs.
+# Every entry is a name a format or codec chose, not a word this project misspelled.
 
 [default]
 locale = "en-us"
@@ -18,8 +18,7 @@ ustar = "ustar" # POSIX tar "ustar" magic
 cpio = "cpio"   # the cpio archive format
 # Rock Ridge `PN` is the POSIX device-number system-use field.
 PN = "PN"
-# `bsd*` / `ox*` are the drop-in CLI tool names (bsdtar/bsdcpio/bsdcat/bsdunzip
-# and oxtar/oxcpio/oxcat/oxunzip); not misspellings.
+# `bsd*` / `ox*` are the drop-in CLI tool names (bsdtar/bsdcpio/bsdcat/bsdunzip and oxtar/oxcpio/oxcat/oxunzip); not misspellings.
 bsdtar = "bsdtar"
 bsdcpio = "bsdcpio"
 bsdcat = "bsdcat"
@@ -35,8 +34,7 @@ ded = "ded"
 pn = "pn"
 # `mis-` is a valid English prefix (mis-decode, mis-read), not a misspelling.
 mis = "mis"
-# Microsoft ships the CAB extraction utility as `extrac32.exe`; typos splits
-# its numeric suffix before checking the word.
+# Microsoft ships the CAB extraction utility as `extrac32.exe`; typos splits its numeric suffix before checking the word.
 extrac = "extrac"
 # `café` is intentionally written with a Unicode escape in path-policy tests.
 caf = "caf"
@@ -46,8 +44,7 @@ fo = "fo"
 [default.extend-identifiers]
 ba = "ba"
 ded = "ded"
-# The Rust DEFLATE/zlib crate name contains a numeric suffix and is tokenized as
-# an identifier rather than an English word.
+# The Rust DEFLATE/zlib crate name contains a numeric suffix and is tokenized as an identifier rather than an English word.
 flate2 = "flate2"
 extrac = "extrac"
 caf = "caf"
@@ -67,9 +64,8 @@ extend-exclude = [
   "libarchive_oxide/vendor/sevenz-rust2/**",
 ]
 
-# Binary archive/fixture payloads are bytes, not prose. `extend-exclude` filters
-# directory walks; a `check-file = false` type rule also turns off content checking
-# when the pre-commit hook names a staged file explicitly.
+# Binary archive/fixture payloads are bytes, not prose.
+# `extend-exclude` filters directory walks; a `check-file = false` type rule also turns off content checking when the pre-commit hook names a staged file explicitly.
 [type.binfixture]
 extend-glob = [
   "*.tar",
@@ -94,6 +90,7 @@ extend-glob = [
   "*.deb",
   "*.apk",
   "*.appx",
+  "*.ipa",
   "*.msix",
   "*.nupkg",
   "*.idsig",
