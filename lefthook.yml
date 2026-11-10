@@ -34,8 +34,8 @@ pre-commit:
         - "libarchive_oxide/vendor/sevenz-rust2/**/*"
         # `typos --write-changes` can rewrite coincidental word fragments in a binary even when its type has `check-file = false`.
         # Keep every byte-exact archive/key/signature fixture out of the mutating hook.
-        - "*.{tar,tgz,cpio,ar,a,zip,7z,iso,gz,zst,xz,lz4,lzip,bin,cab,rar,udf,xar,rpm,deb,apk,appx,ipa,msix,nupkg,idsig,b64,pub,asc,exe,pdb}"
-        - "**/*.{tar,tgz,cpio,ar,a,zip,7z,iso,gz,zst,xz,lz4,lzip,bin,cab,rar,udf,xar,rpm,deb,apk,appx,ipa,msix,nupkg,idsig,b64,pub,asc,exe,pdb}"
+        - "*.{tar,tgz,cpio,ar,a,zip,7z,iso,gz,zst,xz,lz4,lzip,bin,cab,rar,udf,xar,rpm,deb,apk,appx,ipa,lzh,msix,nupkg,idsig,b64,pub,asc,exe,pdb}"
+        - "**/*.{tar,tgz,cpio,ar,a,zip,7z,iso,gz,zst,xz,lz4,lzip,bin,cab,rar,udf,xar,rpm,deb,apk,appx,ipa,lzh,msix,nupkg,idsig,b64,pub,asc,exe,pdb}"
       run: mise exec -- typos --write-changes {staged_files}
       stage_fixed: true
 

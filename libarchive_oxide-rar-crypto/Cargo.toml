@@ -18,7 +18,7 @@ keywords = ["archive", "cryptography", "rar", "no-std", "embedded"]
 categories = ["cryptography", "no-std"]
 
 [dependencies]
-aes = { version = "0.9", default-features = false, features = ["zeroize"] }
+aes = { version = "0.9.4", default-features = false, features = ["zeroize"] }
 cbc = { version = "0.2", default-features = false, features = ["zeroize"] }
 hmac = { version = "0.13", default-features = false }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }

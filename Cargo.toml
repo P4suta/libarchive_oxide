@@ -28,7 +28,7 @@ exclude = ["fuzz"]
 version = "0.2.0"
 edition = "2024"
 # Workspace-wide floor required by the audited compcol Quantum decoder.
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 authors = ["Yasunobu Sakashita <crates.tank733@slmails.com>"]
 repository = "https://github.com/P4suta/libarchive_oxide"

@@ -35,7 +35,7 @@ env:
   RUST_BACKTRACE: short
   # NOTE: `-D warnings` is applied *per job*, only on the stable toolchain we can reproduce locally
   # (fmt/clippy/test/32-bit/no_std/doc). It is deliberately NOT global: the msrv (cargo-msrv installs
-  # 1.88), fuzz (nightly), and big-endian (cross/qemu) jobs run toolchains or emulators the dev box
+  # 1.95), fuzz (nightly), and big-endian (cross/qemu) jobs run toolchains or emulators the dev box
   # cannot reproduce, and a version-specific warning from the compiler or a dependency there would
   # turn CI red for a reason invisible to every local gate. Those jobs still fail on real errors.
 
@@ -50,6 +50,8 @@ jobs:
       RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
           version: 2026.10.17
@@ -67,10 +69,10 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          components: clippy
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update --component clippy
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
@@ -82,9 +84,8 @@ jobs:
     if: inputs.full
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Each maximal profile includes the bounded, target-sharded invariant replay, followed by
-    # doctests. Keep the job ceiling above two complete profiles while nextest's per-test timeout
-    # still catches individual hangs.
+    # Each maximal profile includes the bounded, target-sharded invariant replay, followed by doctests.
+    # Keep the job ceiling above two complete profiles while nextest's per-test timeout still catches individual hangs.
     timeout-minutes: 30
     env:
       RUSTFLAGS: -D warnings
@@ -98,15 +99,16 @@ jobs:
             test_threads: 4
           - os: windows-latest
             test_threads: 4
-          # Pure-Rust preset-6 XZ cases contend heavily on the macOS runner when libtest schedules
-          # them together. Serial execution is faster and makes the last printed test causal.
+          # Pure-Rust preset-6 XZ cases contend heavily on the macOS runner when libtest schedules them together.
+          # Serial execution is faster and makes the last printed test causal.
           - os: macos-latest
             test_threads: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0,nextest@0.9.149
@@ -115,8 +117,8 @@ jobs:
           version: 2026.10.17
           install_args: jq
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # Nextest runs the normal conformance and committed fuzz-replay corpus process-per-test
-      # through both maximal profiles. Cargo follows each profile with its doctests.
+      # Nextest runs the normal conformance and committed fuzz-replay corpus process-per-test through both maximal profiles.
+      # Cargo follows each profile with its doctests.
       - run: just test-ci
 
   streaming-soak:
@@ -129,16 +131,16 @@ jobs:
       RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # Each test synthesizes a raw tar or repeats one small compressed frame on demand, consumes
-      # all 10 GiB through ArchiveReader, and reads Linux VmHWM after completion. No archive-sized
-      # file, compressed fixture, or allocation is ever created.
+      # Each test synthesizes a raw tar or repeats one small compressed frame on demand, consumes all 10 GiB through ArchiveReader, and reads Linux VmHWM after completion.
+      # No archive-sized file, compressed fixture, or allocation is ever created.
       - run: just streaming-soak
 
   feature-matrix:
@@ -150,9 +152,10 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0,cargo-hack@0.6.45
@@ -167,10 +170,10 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          targets: i686-pc-windows-msvc
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update --target i686-pc-windows-msvc
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
@@ -185,16 +188,16 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          targets: thumbv7em-none-eabi
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update --target thumbv7em-none-eabi
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # Core and all portable codec features must stay no_std + alloc. Building both for a
-      # bare-metal target with no std available proves the physical crate boundary.
+      # Core and all portable codec features must stay no_std + alloc.
+      # Building both for a bare-metal target with no std available proves the physical crate boundary.
       - run: just no-std
 
   wasi:
@@ -205,16 +208,15 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          targets: wasm32-wasip1
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update --target wasm32-wasip1
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # This is compile-only: archive inspection and portable codecs must remain
-      # usable without enabling native libraries or filesystem extraction.
+      # This is compile-only: archive inspection and portable codecs must remain usable without enabling native libraries or filesystem extraction.
       - run: just wasi
 
   doc:
@@ -223,28 +225,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # Intra-doc links and doctests across the whole public surface. Keep in sync with docs.yml
-      # (which additionally deploys the result to Pages).
+      # Intra-doc links and doctests across the whole public surface.
+      # Keep in sync with docs.yml (which additionally deploys the result to Pages).
       - env:
           RUSTDOCFLAGS: -D warnings
         run: just doc
 
   msrv:
     if: inputs.full
-    name: msrv (workspace 1.88, including no_std)
+    name: msrv (workspace 1.95, including no_std)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
@@ -252,27 +256,26 @@ jobs:
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
-      # `cargo-msrv verify` reads each crate's declared `rust-version` and proves it actually builds
-      # on that floor (installing the toolchain via rustup). Every workspace member uses the
-      # same 1.88 floor; core and portable codecs are additionally built as no_std + alloc.
+      # `cargo-msrv verify` reads each crate's declared `rust-version` and proves it actually builds on that floor (installing the toolchain via rustup).
+      # Every workspace member uses the same 1.95 floor; core and portable codecs are additionally built as no_std + alloc.
       - name: verify declared MSRVs
         run: just msrv
 
   registry:
     if: inputs.full
-    name: object-safe registry conformance
+    name: static provider conformance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
-      # Boxed downstream providers retain the common bounded incremental protocol,
-      # duplicate-ID rejection, and capability semantics.
-      - run: just registry
+      # Static downstream providers retain the bounded protocol and capability semantics.
+      - run: just provider-conformance architecture
 
   license-sync:
     if: inputs.full
@@ -280,9 +283,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just@1.59.0
@@ -295,58 +299,55 @@ jobs:
     if: inputs.full
     name: fuzz (nightly, build + short run)
     runs-on: ubuntu-latest
-    # The 27-target inventory receives 30 seconds per portable target and 10
-    # seconds per native target (18 minutes total) after two complete builds.
+    # The 27-target inventory receives 30 seconds per portable target and 10 seconds per native target (18 minutes total) after two complete builds.
     timeout-minutes: 30
     env:
-      # cargo-binstall distributes cargo-fuzz as a musl-linked executable. Explicitly select the
-      # runner's GNU target so cargo-fuzz does not mistake its own build target for the fuzz target;
+      # cargo-binstall distributes cargo-fuzz as a musl-linked executable.
+      # Explicitly select the runner's GNU target so cargo-fuzz does not mistake its own build target for the fuzz target;
       # ASan is incompatible with a statically linked musl libc.
       FUZZ_TARGET: x86_64-unknown-linux-gnu
       # Keep malformed length arithmetic fail-closed in panic-abort tests and libFuzzer builds.
       RUSTFLAGS: -C overflow-checks=yes
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-fuzz@0.13.2
-      # libFuzzer needs nightly + the sanitizer runtime. Pin the dated official
-      # toolchain so an unrelated nightly update cannot change this required gate.
+      # libFuzzer needs nightly + the sanitizer runtime.
+      # Pin the dated official toolchain so an unrelated nightly update cannot change this required gate.
       # The fuzz crate is outside the workspace, so it carries its own lockfile.
       - name: install pinned nightly (libFuzzer)
         run: rustup toolchain install nightly-2026-07-29 --profile minimal --no-self-update
       # A panic in a dependency must fail as a process abort here as it does under libFuzzer.
       # Overflow checks keep malformed length arithmetic on the same fail-closed path.
-      # Both profiles run the same target list and committed corpus. The portable budget remains the
-      # deeper default campaign; native gets a shorter differential run on the identical seeds.
+      # Both profiles run the same target list and committed corpus.
+      # The portable budget remains the deeper default campaign; native gets a shorter differential run on the identical seeds.
       - name: panic-abort regressions and bounded fuzz campaign
         run: cargo run --quiet -p xtask -- fuzz-ci
 
   big-endian:
     if: inputs.full
     name: big-endian (s390x, qemu)
-    # The archive formats carry big fields (zip is little-endian, tar is ASCII-octal, cpio/7z/iso
-    # mix endian): a byte-order bug hides on the little-endian CI matrix. `cross` runs both library
-    # suites under qemu on a big-endian target to surface it. The CLI contract suite is excluded
-    # because it spawns target binaries as child processes, bypassing cross's top-level qemu runner.
-    # Promoted to a required gate after three consecutive green runs on main. Stable/native replay
-    # and nightly libFuzzer already cover the full corpus; skip those CPU-heavy invariant batches
-    # under QEMU so this debug-profile gate remains focused on byte-order behavior without paying
-    # release-profile codegen cost for platform-specific filesystem code. The one-byte XZ writer
-    # case remains in every native OS job; under QEMU it measures encoder throughput rather than
-    # byte-order behavior and takes over 20 minutes. The xtask owns both command lines and the skip
-    # list so CI and local reproduction cannot drift apart.
+    # The archive formats carry big fields (zip is little-endian, tar is ASCII-octal, cpio/7z/iso mix endian): a byte-order bug hides on the little-endian CI matrix.
+    # `cross` runs both library suites under qemu on a big-endian target to surface it.
+    # The CLI contract suite is excluded because it spawns target binaries as child processes, bypassing cross's top-level qemu runner.
+    # Promoted to a required gate after three consecutive green runs on main.
+    # Stable/native replay and nightly libFuzzer already cover the full corpus; skip those CPU-heavy invariant batches under QEMU so this debug-profile gate remains focused on byte-order behavior without paying release-profile codegen cost for platform-specific filesystem code.
+    # The one-byte XZ writer case remains in every native OS job; under QEMU it measures encoder throughput rather than byte-order behavior and takes over 20 minutes.
+    # The xtask owns both command lines and the skip list so CI and local reproduction cannot drift apart.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - name: Install the pinned Rust compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
@@ -358,11 +359,12 @@ jobs:
 
   codeql:
     if: inputs.full
-    uses: ./.github/workflows/codeql.yml
+    # Pin identical workflow bytes while Actionlint lacks self-repository call syntax.
+    uses: P4suta/libarchive_oxide/.github/workflows/codeql.yml@201a5167ee21047471bc5903eaf07aafb3730914
     permissions:
-      contents: read
-      actions: read
-      security-events: write
+      contents: read # Read the selected source.
+      actions: read # Read the workflow analysis inputs.
+      security-events: write # Upload analysis results.
 
   ci-required:
     name: ci-required
@@ -385,6 +387,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
           version: 2026.10.17
@@ -410,6 +414,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
           version: 2026.10.17

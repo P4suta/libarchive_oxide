@@ -1,14 +1,13 @@
 # libarchive_oxide-codecs
 
-`no_std + alloc` portable compression state machines for
-[`libarchive_oxide`](https://github.com/P4suta/libarchive_oxide).
+`no_std + alloc` portable compression state machines for [`libarchive_oxide`](https://github.com/P4suta/libarchive_oxide).
 
 The crate exposes caller-driven codecs over `libarchive_oxide-protocol::Codec`.
 It does not depend on archive format core;
 `libarchive_oxide-core` re-exports the same protocol types for compatibility.
 It intentionally contains no filesystem, blocking I/O, worker thread, async runtime, or native-library adapter.
 
-MSRV: Rust 1.88.
+MSRV: Rust 1.95.
 
 The always-available Base64 and uuencode modules provide bounded, caller-driven ASCII armor.
 Uuencode decodes one strictly framed POSIX member with compatible space/backtick zero symbols and LF/CRLF lines, and writes canonical libarchive-compatible 45-byte data lines.
@@ -28,12 +27,9 @@ The codecs preflight their complete packed input and decoded output, the caller'
 The flagship dispatches these two built-ins through a private enum, so this hot path has no trait-object allocation or vtable.
 There is no LHA writer; the checked-in LH2/LH3 vectors are explicitly not independent producer evidence.
 
-The optional `lzx` feature exposes a bounded, incremental regular-LZX decoder
-used by the CAB reader. It is an audited fork of `lzxd` 0.2.7: allocation
-failure, malformed bitstreams, invalid offsets, and arithmetic overflow are
-returned as typed errors, while the caller controls CAB's per-CFDATA bitstream
-boundaries. LZX DELTA reference data and extended match lengths are deliberately
-outside this API. The exact upstream revision, source hashes, and local-change
-record live in `src/lzx/UPSTREAM.md`.
+The optional `lzx` feature exposes a bounded, incremental regular-LZX decoder used by the CAB reader.
+It is an audited fork of `lzxd` 0.2.7: allocation failure, malformed bitstreams, invalid offsets, and arithmetic overflow are returned as typed errors, while the caller controls CAB's per-CFDATA bitstream boundaries.
+LZX DELTA reference data and extended match lengths are deliberately outside this API.
+The exact upstream revision, source hashes, and local-change record live in `src/lzx/UPSTREAM.md`.
 
 Licensed under either MIT or Apache-2.0, at your option.

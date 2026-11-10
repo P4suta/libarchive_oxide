@@ -209,21 +209,24 @@ msrv:
     cargo msrv verify --path libarchive_oxide-codecs --all-features
     cargo msrv verify --path libarchive_oxide-ppmd
     cargo msrv verify --path libarchive_oxide-rarvm
+    cargo msrv verify --path libarchive_oxide-rar-crypto
     cargo msrv verify --path libarchive_oxide-rar
     cargo msrv verify --path libarchive_oxide --no-default-features --features portable-codecs,aes,sevenz,async,tokio
     cargo msrv verify --path libarchive_oxide --no-default-features --features native-codecs,aes,sevenz,async,tokio
     cargo msrv verify --path libarchive_oxide-package --no-default-features --features portable-codecs
     cargo msrv verify --path libarchive_oxide-cli --no-default-features --features portable-codecs
     cargo msrv verify --path xtask
+    rustup target add --toolchain 1.95.0 thumbv7em-none-eabi
+    cargo msrv verify --path libarchive_oxide-core --target thumbv7em-none-eabi
+    cargo msrv verify --path libarchive_oxide-codecs --all-features --target thumbv7em-none-eabi
 
-# Exercise both locally maintained upstream forks on the workspace MSRV. The
-# full-feature checks make their manifests' Rust 1.88 declarations honest even
-# for optional surfaces not enabled by the flagship crate.
+# Exercise both locally maintained upstream forks on the workspace MSRV.
+# Include optional surfaces not enabled by the flagship crate.
 vendor-msrv:
     cargo fmt --manifest-path libarchive_oxide/vendor/delharc/Cargo.toml --all -- --check
     cargo fmt --manifest-path libarchive_oxide/vendor/sevenz-rust2/Cargo.toml --all -- --check
-    cargo +1.88.0 test --manifest-path libarchive_oxide/vendor/delharc/Cargo.toml --all-features
-    cargo +1.88.0 check --manifest-path libarchive_oxide/vendor/sevenz-rust2/Cargo.toml --all-features
+    cargo +1.95.0 test --manifest-path libarchive_oxide/vendor/delharc/Cargo.toml --all-features
+    cargo +1.95.0 check --manifest-path libarchive_oxide/vendor/sevenz-rust2/Cargo.toml --all-features
 
 # Fast deterministic checks used during the edit/commit loop.
 check: fmt-check typos lint-portable shear reuse license-sync architecture codec-policy capability-docs release-policy actionlint zizmor

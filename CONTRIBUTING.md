@@ -86,12 +86,12 @@ CI must still exercise the portable assertions.
 
 | Crate | MSRV |
 |---|---:|
-| `libarchive_oxide-protocol` | 1.88 |
-| `libarchive_oxide-core` | 1.88 |
-| `libarchive_oxide-codecs` | 1.88 |
-| `libarchive_oxide` | 1.88 |
-| `libarchive_oxide-package` | 1.88 |
-| `libarchive_oxide-cli` | 1.88 |
+| `libarchive_oxide-protocol` | 1.95 |
+| `libarchive_oxide-core` | 1.95 |
+| `libarchive_oxide-codecs` | 1.95 |
+| `libarchive_oxide` | 1.95 |
+| `libarchive_oxide-package` | 1.95 |
+| `libarchive_oxide-cli` | 1.95 |
 
 During the current pre-1.0 completion program, breaking API and CLI changes are allowed when they produce the cleaner design.
 Do not publish, bump versions,

@@ -9,7 +9,7 @@ finite `Limits`, and context-rich `ArchiveError`; it does not know any archive f
 `libarchive_oxide-core` re-exports this surface for source compatibility.
 Concrete portable codecs depend directly on this crate, keeping them siblings of the archive-format state machines rather than clients of those formats.
 
-MSRV: Rust 1.88.
+MSRV: Rust 1.95.
 
 ## License
 

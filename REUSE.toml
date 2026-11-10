@@ -55,6 +55,12 @@ SPDX-FileCopyrightText = "2026 libarchive_oxide contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
 
 [[annotations]]
+path = "libarchive_oxide/tests/fixtures/lha/compcol-lh2.lzh"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Karpeles Lab Inc."
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
 path = "libarchive_oxide-ppmd/NOTICE"
 precedence = "override"
 SPDX-FileCopyrightText = [

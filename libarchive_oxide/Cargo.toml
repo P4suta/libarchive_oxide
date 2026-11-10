@@ -7,7 +7,7 @@ name = "libarchive_oxide"
 version.workspace = true
 description = "Safe-Rust archive detection, compression, extraction, and creation"
 edition.workspace = true
-# Workspace MSRV; `cab-quantum` uses compcol 0.6.8, whose audited frame-overshoot fix establishes this floor.
+# The workspace compiler floor follows the selected compcol codec release.
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -151,7 +151,7 @@ miniz_oxide = { version = "0.9.0", default-features = false, features = [
 ] }
 compression-codecs = { version = "0.4.38", default-features = false, optional = true }
 bzip2 = { version = "0.6.1", optional = true }
-flate2 = { version = "1.1.9", default-features = false, features = [
+flate2 = { version = "1.1.11", default-features = false, features = [
   "zlib",
 ], optional = true }
 xz-codec = { package = "xz2", version = "0.1.7", optional = true }
@@ -163,8 +163,8 @@ lzma-rust2 = { version = "0.23.0", default-features = false, features = [
 # The adapter validates the archive properties and codec-memory budget before this dependency allocates its model.
 ppmd-rust = { version = "1.4.0", optional = true }
 # Safe streaming CAB Quantum decoder.
-# Keep the patch release exact: 0.6.8 contains the signed frame-accounting fix required at 32 KiB boundaries.
-compcol = { version = "=0.7.5", default-features = false, features = [
+# Keep the codec release exact so decoder changes receive explicit review.
+compcol = { version = "=0.7.9", default-features = false, features = [
   "quantum",
 ], optional = true }
 delharc = { package = "libarchive_oxide-delharc", version = "=0.8.0", path = "vendor/delharc", default-features = false, features = [
@@ -231,11 +231,11 @@ sevenz-rust2 = { version = "=0.21.3", path = "vendor/sevenz-rust2", features = [
 ] }
 # Independent batch BCJ2 splitter/oracle used only to produce interoperability fixtures.
 # The production reader uses lzma-rust2's bounded streaming junction.
-compcol = { version = "0.7.5", default-features = false, features = [
+compcol = { version = "0.7.9", default-features = false, features = [
   "bcj2",
   "lha",
 ] }
-zip = { version = "9.0.5", default-features = false, features = [
+zip = { version = "9.5.0", default-features = false, features = [
   "deflate",
   "aes-crypto",
   "bzip2",

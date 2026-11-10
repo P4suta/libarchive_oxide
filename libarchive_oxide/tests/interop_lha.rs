@@ -21,11 +21,26 @@ struct ObservedEntry {
     body: Vec<u8>,
 }
 
-const LH2_TEST_PACKED: &[u8] = &[
-    0x28, 0x13, 0x06, 0xc2, 0x43, 0x29, 0xa3, 0xfa, 0x74, 0x3c, 0x1b, 0x4f, 0x46, 0x9f, 0xf0, 0x01,
-    0xe4, 0xd5, 0xef, 0x38, 0xfb, 0x9c, 0xbd, 0xff, 0x7f, 0x27, 0xd3, 0x81, 0xcf, 0xcf, 0xf3, 0xe0,
-    0xa1, 0x39, 0xdb, 0x39, 0xdd, 0xf3, 0xd4, 0xcb, 0x65, 0x80,
-];
+const LH2_ARCHIVE: &[u8] = include_bytes!("fixtures/lha/compcol-lh2.lzh");
+
+fn lh2_test_packed() -> &'static [u8] {
+    let start = usize::from(LH2_ARCHIVE[0]) + 2;
+    let length = usize::try_from(u32::from_le_bytes(LH2_ARCHIVE[7..11].try_into().unwrap()))
+        .expect("fixture packed length fits usize");
+    &LH2_ARCHIVE[start..start + length]
+}
+
+fn lh2_test_body() -> Vec<u8> {
+    let mut text = Vec::new();
+    for index in 0..60_u32 {
+        text.extend_from_slice(format!("line {index}: the quick brown fox jumps. ").as_bytes());
+        if index % 20 == 0 {
+            text.extend(std::iter::repeat_n(b'=', 300));
+        }
+        text.push(b'\n');
+    }
+    text
+}
 
 fn decode_hex(input: &str) -> Vec<u8> {
     let digits: Vec<_> = input
@@ -502,13 +517,19 @@ fn independent_clean_room_encoder_covers_lh1_and_static_huffman_methods() {
 
 #[test]
 fn bounded_lh2_payload_is_decoded_through_the_codec_boundary() {
-    let body = b"LH2 adaptive Huffman payload ".repeat(40);
+    let (path, decoded) =
+        read_all(LH2_ARCHIVE.to_vec(), Limits::safe()).expect("decode bounded LH2 member");
+    assert_eq!(path, b"lh2.txt");
+    assert_eq!(decoded, lh2_test_body());
+}
+
+#[test]
+fn obsolete_compcol_lh2_encoding_is_rejected() {
     let archive = decode_hex(include_str!(
         "fixtures/lha/compcol-0.6.8-lh2-level0.lzh.hex"
     ));
-    let (path, decoded) = read_all(archive, Limits::safe()).expect("decode bounded LH2 member");
-    assert_eq!(path, b"adaptive.bin");
-    assert_eq!(decoded, body);
+    let error = read_all(archive, Limits::safe()).expect_err("reject nonconforming LH2 payload");
+    assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);
 }
 
 #[test]
@@ -574,9 +595,9 @@ fn lh3_truncation_and_skip_fail_closed() {
 
 #[test]
 fn lh2_buffers_are_preflighted_and_crc_is_mandatory() {
-    let body = b"LH2 adaptive Huffman payload ".repeat(40);
-    let archive = level_zero(*b"-lh2-", b"bounded.bin", &body, LH2_TEST_PACKED);
-    let buffered = LH2_TEST_PACKED.len() + body.len() + 8 * 1024;
+    let body = lh2_test_body();
+    let archive = level_zero(*b"-lh2-", b"bounded.bin", &body, lh2_test_packed());
+    let buffered = lh2_test_packed().len() + body.len() + 8 * 1024;
     let error = SeekArchiveReader::with_limits(
         Cursor::new(archive.clone()),
         Limits::safe().with_in_flight_bytes(Some(buffered - 1)),
@@ -596,8 +617,8 @@ fn lh2_buffers_are_preflighted_and_crc_is_mandatory() {
 
 #[test]
 fn lh2_truncation_and_skip_fail_closed() {
-    let body = b"LH2 adaptive Huffman payload ".repeat(40);
-    let archive = level_zero(*b"-lh2-", b"skip.bin", &body, LH2_TEST_PACKED);
+    let body = lh2_test_body();
+    let archive = level_zero(*b"-lh2-", b"skip.bin", &body, lh2_test_packed());
     let error = SeekArchiveReader::new(Cursor::new(archive[..archive.len() - 2].to_vec()))
         .expect_err("reject LH2 payload truncated before its declared extent");
     assert_eq!(error.archive_error().unwrap().kind(), ErrorKind::Malformed);

@@ -91,6 +91,7 @@ extend-glob = [
   "*.apk",
   "*.appx",
   "*.ipa",
+  "*.lzh",
   "*.msix",
   "*.nupkg",
   "*.idsig",
