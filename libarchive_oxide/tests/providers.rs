@@ -6,18 +6,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 
-use libarchive_oxide::advanced::legacy::{
+use libarchive_oxide::advanced::{
+    CodecCapabilities, FormatCapabilities, Pipeline, PipelineEvent, ProviderArchiveEncoder,
+    ProviderCapability,
+};
+use libarchive_oxide::advanced::{
     CodecProvider, CodecProviderNode, FormatProvider, FormatProviderNode, NoCodecProviders,
     NoFormatProviders, ProviderSet,
 };
-use libarchive_oxide::advanced::{
-    CodecCapabilities, FormatCapabilities, Pipeline, PipelineEvent, ProviderArchiveEncoder,
-    ProviderCapability, Registry,
-};
 use libarchive_oxide::{
-    ArchiveEngine, ArchiveReader, ArchiveWriter, CreateOptions, PlanDisposition,
+    ArchiveEngine, ArchiveReader, ArchiveWriter, CreateOptions, OpenOptions, PlanDisposition,
 };
 use libarchive_oxide_core::{
     AccessMode, ArchiveDecoder, ArchiveEncoder, ArchiveError, ArchivePath, CAPABILITY_LEDGER,
@@ -104,20 +104,7 @@ fn built_in_provider_queries_are_derived_from_the_capability_ledger() {
 
 #[test]
 #[cfg(feature = "compress")]
-fn built_in_compress_provider_is_decode_only() {
-    #[derive(Debug)]
-    struct RejectIo;
-
-    impl Write for RejectIo {
-        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-            panic!("read-only filter reached output I/O")
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            panic!("read-only filter reached output I/O")
-        }
-    }
-
+fn built_in_compress_provider_is_read_write() {
     let providers = ProviderSet::builtins();
     let ProviderCapability::Available(capabilities) =
         providers.codec_capability(FilterId::Compress)
@@ -125,16 +112,17 @@ fn built_in_compress_provider_is_decode_only() {
         panic!("compress provider must be enabled by the portable profile");
     };
     assert!(capabilities.can_decode());
-    assert!(!capabilities.can_encode());
+    assert!(capabilities.can_encode());
 
-    let error = ArchiveWriter::with_filter(
-        RejectIo,
+    let writer = ArchiveWriter::with_filter(
+        Vec::new(),
         FormatId::Tar,
         Some(FilterId::Compress),
         Limits::default(),
     )
-    .expect_err("read-only compress provider must reject encoding before I/O");
-    assert_eq!(error.kind(), ErrorKind::Capability);
+    .expect("compress provider must expose its bounded writer");
+    let encoded = writer.finish().expect("finish empty compressed tar");
+    assert!(encoded.starts_with(&[0x1f, 0x9d]));
 }
 
 fn probe_magic(prefix: &[u8], magic: &[u8]) -> ProbeResult<()> {
@@ -615,7 +603,26 @@ fn registered_create_event_inspect_plan_and_rewind_share_one_state_model() {
 }
 
 #[test]
-fn caller_driven_pipeline_uses_registered_codec_and_format_at_one_byte_boundaries() {
+fn prepared_open_options_use_registered_explicit_filter_and_format() {
+    let payload = b"registered explicit filter";
+    let encoded = create_example_archive(payload);
+    let options = OpenOptions::new()
+        .with_format(Some(FORMAT))
+        .with_filter(Some(FILTER));
+    let mut session = ArchiveEngine::new()
+        .with_format_provider(ExampleFormat)
+        .with_codec_provider(ExampleCodec)
+        .prepare_with_options(Cursor::new(encoded), &options)
+        .expect("prepare registered explicit filter");
+    let inspection = session
+        .inspect()
+        .expect("inspect registered explicit filter");
+    assert_eq!(inspection.format(), FORMAT);
+    assert_eq!(inspection.entries()[0].metadata().size(), Some(26));
+}
+
+#[test]
+fn static_provider_chains_use_codec_and_format_at_one_byte_boundaries() {
     let payload: Vec<u8> = (0_u8..=127).cycle().take(4097).collect();
     let encoded = create_example_archive(&payload);
     let mut pipeline = Pipeline::with_providers(Limits::safe(), example_providers());
@@ -643,82 +650,6 @@ fn caller_driven_pipeline_uses_registered_codec_and_format_at_one_byte_boundarie
     }
     assert_eq!(pipeline.format(), Some(FORMAT));
     assert_eq!(decoded, payload);
-}
-
-#[test]
-fn object_safe_registry_runs_boxed_incremental_providers() {
-    let payload: Vec<u8> = (0_u8..=127).cycle().take(4097).collect();
-    let encoded = create_example_archive(&payload);
-    let mut builder = Registry::builder();
-    builder.register_format(Box::new(ExampleFormat)).unwrap();
-    builder.register_codec(Box::new(ExampleCodec)).unwrap();
-    let registry = builder.build();
-    assert_eq!(registry.format_count(), 1);
-    assert_eq!(registry.codec_count(), 1);
-
-    assert!(matches!(
-        registry.format_capability(FORMAT),
-        ProviderCapability::Available(_)
-    ));
-    assert!(matches!(
-        registry.codec_capability(FILTER),
-        ProviderCapability::Available(_)
-    ));
-    let mut pipeline = registry.pipeline(Limits::safe());
-    let mut offset = 0;
-    let mut finished = false;
-    let mut decoded = Vec::new();
-    loop {
-        match pipeline.poll_event().unwrap() {
-            PipelineEvent::NeedInput if offset < encoded.len() => {
-                let end = (offset + 7).min(encoded.len());
-                assert_eq!(pipeline.feed(&encoded[offset..end]).unwrap(), end - offset);
-                offset = end;
-            },
-            PipelineEvent::NeedInput if !finished => {
-                pipeline.finish_input().unwrap();
-                finished = true;
-            },
-            PipelineEvent::NeedInput => panic!("finished registry pipeline requested more input"),
-            PipelineEvent::Data(bytes) => decoded.extend_from_slice(bytes),
-            PipelineEvent::Done => break,
-            PipelineEvent::ArchiveMetadata(_)
-            | PipelineEvent::Entry(_)
-            | PipelineEvent::EndEntry => {},
-            _ => panic!("unknown registry pipeline event"),
-        }
-    }
-    assert_eq!(pipeline.format(), Some(FORMAT));
-    assert_eq!(decoded, payload);
-
-    let mut session = ArchiveEngine::from_registry(&registry)
-        .prepare(Cursor::new(encoded))
-        .unwrap();
-    assert_eq!(session.inspect().unwrap().format(), FORMAT);
-    session.rewind().unwrap();
-    let mut replayed = Vec::new();
-    loop {
-        match session.next_event().unwrap() {
-            libarchive_oxide::ReaderEvent::Data(bytes) => replayed.extend_from_slice(bytes),
-            libarchive_oxide::ReaderEvent::Done => break,
-            _ => {},
-        }
-    }
-    assert_eq!(replayed, payload);
-}
-
-#[test]
-fn object_safe_registry_rejects_duplicate_ids_before_io() {
-    let mut builder = Registry::builder();
-    builder.register_format(Box::new(ExampleFormat)).unwrap();
-    let format_error = builder
-        .register_format(Box::new(ExampleFormat))
-        .unwrap_err();
-    assert_eq!(format_error.kind(), ErrorKind::Protocol);
-
-    builder.register_codec(Box::new(ExampleCodec)).unwrap();
-    let codec_error = builder.register_codec(Box::new(ExampleCodec)).unwrap_err();
-    assert_eq!(codec_error.kind(), ErrorKind::Protocol);
 }
 
 #[derive(Debug, Clone, Copy)]

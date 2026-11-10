@@ -13,8 +13,10 @@
 use std::collections::BTreeSet;
 use std::io::{Cursor, Read};
 
-use libarchive_oxide::{ArchiveReader, ReaderEvent, sanitize_archive_path};
-use libarchive_oxide_core::{ArchiveError, EntryKind, ErrorKind, Limits};
+use libarchive_oxide::advanced::ArchiveError;
+use libarchive_oxide::{
+    ArchiveReader, EntryKind, EntryMetadata, ErrorKind, Limits, ReaderEvent, sanitize_archive_path,
+};
 
 use crate::alpine_signature::{GzipEvidence, TrackingGzipReader};
 use crate::{PackageFinding, PackageFindingCode, Severity, SupportStatus};
@@ -276,7 +278,7 @@ impl AlpineState {
         ));
     }
 
-    fn begin_entry(&mut self, metadata: &libarchive_oxide_core::EntryMetadata) {
+    fn begin_entry(&mut self, metadata: &EntryMetadata) {
         if self.current.take().is_some() {
             self.fail_container("tar began an entry before ending the previous entry");
         }

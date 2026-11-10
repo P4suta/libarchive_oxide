@@ -5,11 +5,13 @@
 //! Tokio reading through the thin runtime adapter.
 
 #[cfg(feature = "tokio")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::io::Result<()> {
     use libarchive_oxide::{ArchiveWriter, ReaderEvent, TokioArchiveReader};
     use tokio::io::AsyncWriteExt;
 
-    let archive = ArchiveWriter::new(Vec::new()).finish()?;
+    let archive = ArchiveWriter::new(Vec::new())
+        .finish()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     runtime.block_on(async {
         let (mut sender, receiver) = tokio::io::duplex(archive.len().max(1));
@@ -18,7 +20,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut reader = TokioArchiveReader::new(receiver);
         loop {
-            match reader.next_event().await? {
+            match reader
+                .next_event()
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+            {
                 ReaderEvent::Entry(metadata) => {
                     println!("{}", metadata.path().display_lossy());
                 },
@@ -26,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {},
             }
         }
-        Ok::<_, Box<dyn std::error::Error>>(())
+        Ok::<_, std::io::Error>(())
     })
 }
 

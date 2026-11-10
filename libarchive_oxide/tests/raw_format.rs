@@ -86,8 +86,8 @@ fn raw_enforces_the_decoded_total_limit_before_consuming_excess() {
 
 #[test]
 fn explicit_streaming_reader_rejects_seek_formats_before_reading() {
-    let error = ArchiveReader::with_format(Cursor::new(Vec::<u8>::new()), FormatId::Zip)
-        .expect_err("ZIP requires seek");
+    let error = ArchiveReader::with_format(Cursor::new(Vec::<u8>::new()), FormatId::Iso9660)
+        .expect_err("ISO requires seek");
     assert_eq!(error.kind(), ErrorKind::Capability);
 }
 

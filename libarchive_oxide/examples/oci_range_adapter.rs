@@ -37,7 +37,7 @@
 
 use std::io;
 
-use libarchive_oxide::advanced::{RangeReader, ReadAt, SourceIdentity, SourceIdentityError};
+use libarchive_oxide::advanced::{RangeReader, ReadAt, SourceIdentity};
 use libarchive_oxide::{
     ArchiveEngine, CreateOptions, IdentityOwnership, LayerDigests, OciLayerApplier, OciLayerEngine,
     Policy,
@@ -96,9 +96,6 @@ where
     }
 }
 
-type RangeFetch = Box<dyn Fn(u64, usize) -> io::Result<Vec<u8>> + Send + Sync>;
-type RangeSource = FetchRange<RangeFetch>;
-
 /// Formats an inclusive HTTP byte-range value, e.g. `bytes=0-1023`.
 ///
 /// Every adapter here shares this value; the protocols differ only in which
@@ -114,16 +111,13 @@ fn byte_range_value(offset: u64, len: usize) -> io::Result<String> {
     Ok(format!("bytes={offset}-{last}"))
 }
 
-fn transport_range_source<T>(
-    length: u64,
-    identity: &[u8],
-    transport: T,
-) -> Result<RangeSource, SourceIdentityError>
+fn transport_range_source<T>(length: u64, identity: &[u8], transport: T) -> io::Result<impl ReadAt>
 where
     T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
-    let identity = SourceIdentity::try_new(identity.to_vec())?;
-    let fetch: RangeFetch = Box::new(move |offset, len| transport(&byte_range_value(offset, len)?));
+    let identity = SourceIdentity::try_new(identity.to_vec())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let fetch = move |offset, len| transport(&byte_range_value(offset, len)?);
     Ok(FetchRange::new(length, identity, fetch))
 }
 
@@ -133,11 +127,7 @@ where
 /// must set the `Range` request header, and return the `206 Partial Content`
 /// body. The strong `ETag` is used as the immutable identity. No request is
 /// made here — wire `transport` to any HTTP client.
-fn http_range_source<T>(
-    length: u64,
-    etag: &[u8],
-    transport: T,
-) -> Result<RangeSource, SourceIdentityError>
+fn http_range_source<T>(length: u64, etag: &[u8], transport: T) -> io::Result<impl ReadAt>
 where
     T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
@@ -150,11 +140,7 @@ where
 /// `bytes=<a>-<b>` value and returns the response body. The object `VersionId`
 /// (or `ETag`) is the immutable identity. No AWS SDK is linked — `transport`
 /// stands in for `aws_sdk_s3::Client::get_object(...).range(...)`.
-fn s3_range_source<T>(
-    length: u64,
-    version_id: &[u8],
-    transport: T,
-) -> Result<RangeSource, SourceIdentityError>
+fn s3_range_source<T>(length: u64, version_id: &[u8], transport: T) -> io::Result<impl ReadAt>
 where
     T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
@@ -167,11 +153,7 @@ where
 /// value carried in the `Range` header, returning the partial body. The object
 /// `generation` number is the immutable identity, so a rewritten object with a
 /// new generation is rejected. No GCS SDK is linked.
-fn gcs_range_source<T>(
-    length: u64,
-    generation: &[u8],
-    transport: T,
-) -> Result<RangeSource, SourceIdentityError>
+fn gcs_range_source<T>(length: u64, generation: &[u8], transport: T) -> io::Result<impl ReadAt>
 where
     T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
@@ -183,11 +165,7 @@ where
 /// `transport` issues one `Get Blob` request carrying the supplied
 /// `bytes=<a>-<b>` value in the `x-ms-range` header and returns the body. The
 /// blob `ETag` is the immutable identity. No Azure SDK is linked.
-fn azure_range_source<T>(
-    length: u64,
-    etag: &[u8],
-    transport: T,
-) -> Result<RangeSource, SourceIdentityError>
+fn azure_range_source<T>(length: u64, etag: &[u8], transport: T) -> io::Result<impl ReadAt>
 where
     T: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
 {
@@ -219,38 +197,44 @@ fn serve_range(blob: &[u8], range: &str) -> io::Result<Vec<u8>> {
 }
 
 /// Builds a small in-memory tar+gzip layer blob to exercise the adapters.
-fn build_demo_layer() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn build_demo_layer() -> io::Result<Vec<u8>> {
     let entries: [(&[u8], EntryKind, &[u8]); 3] = [
         (b"etc/", EntryKind::Dir, b""),
         (b"etc/hostname", EntryKind::File, b"oxide-node\n"),
         (b"usr/bin/tool", EntryKind::File, b"ELF binary payload"),
     ];
-    let mut writer = ArchiveEngine::new().create(
-        Vec::new(),
-        CreateOptions::new()
-            .with_format(FormatId::Tar)
-            .with_filter(Some(FilterId::Gzip)),
-    )?;
+    let mut writer = ArchiveEngine::new()
+        .create(
+            Vec::new(),
+            CreateOptions::new()
+                .with_format(FormatId::Tar)
+                .with_filter(Some(FilterId::Gzip)),
+        )
+        .map_err(|error| io_other(&error))?;
     for (path, kind, body) in entries {
         let metadata = EntryMetadata::builder(kind, ArchivePath::from_bytes(path.to_vec()))
             .size(Some(body.len() as u64))
             .build();
-        writer.start_entry(&metadata)?;
+        writer
+            .start_entry(&metadata)
+            .map_err(|error| io_other(&error))?;
         if !body.is_empty() {
-            writer.write_data(body)?;
+            writer.write_data(body).map_err(|error| io_other(&error))?;
         }
-        writer.end_entry()?;
+        writer.end_entry().map_err(|error| io_other(&error))?;
     }
-    Ok(writer.finish()?)
+    writer.finish().map_err(|error| io_other(&error))
 }
 
 /// Streams every entry from a range-backed layer and returns its digests.
-fn inspect<S: ReadAt>(source: S, label: &str) -> Result<LayerDigests, Box<dyn std::error::Error>> {
+fn inspect<S: ReadAt>(source: S, label: &str) -> io::Result<LayerDigests> {
     // `RangeReader` gives the engine a `Read` view over the ranged source.
-    let reader = RangeReader::new(source)?;
-    let mut session = OciLayerEngine::new().open(reader)?;
+    let reader = RangeReader::new(source).map_err(|error| io_other(&error))?;
+    let mut session = OciLayerEngine::new()
+        .open(reader)
+        .map_err(|error| io_other(&error))?;
     println!("--- {label} ---");
-    while let Some(entry) = session.next_entry()? {
+    while let Some(entry) = session.next_entry().map_err(|error| io_other(&error))? {
         println!(
             "  {} ({:?}, {} bytes)",
             String::from_utf8_lossy(entry.path()),
@@ -258,13 +242,13 @@ fn inspect<S: ReadAt>(source: S, label: &str) -> Result<LayerDigests, Box<dyn st
             entry.size().unwrap_or(0),
         );
     }
-    let digests = session.digests()?;
+    let digests = session.digests().map_err(|error| io_other(&error))?;
     println!("  compressed: {}", digests.compressed_descriptor());
     println!("  diffID:     {}", digests.diff_id_descriptor());
     Ok(digests)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> io::Result<()> {
     let blob = build_demo_layer()?;
     let length = blob.len() as u64;
     println!("in-memory layer blob: {length} bytes\n");
@@ -298,7 +282,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Every adapter reads the identical bytes, so every digest pair must match.
     if s3_digests != http_digests || gcs_digests != http_digests || azure_digests != http_digests {
-        return Err("range adapters disagreed on the layer digests".into());
+        return Err(io::Error::other(
+            "range adapters disagreed on the layer digests",
+        ));
     }
     println!("\nall four range adapters agree on the layer digests");
 
@@ -309,12 +295,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let blob = blob.clone();
         move |range| serve_range(&blob, range)
     })?;
-    let mut applier = OciLayerApplier::new(RangeReader::new(planning_source)?);
-    let plan = applier.plan(http_digests, Policy::safe(), &IdentityOwnership)?;
+    let mut applier =
+        OciLayerApplier::new(RangeReader::new(planning_source).map_err(|error| io_other(&error))?);
+    let plan = applier
+        .plan(http_digests, Policy::safe(), &IdentityOwnership)
+        .map_err(|error| io_other(&error))?;
     println!(
         "planned {} operation(s) from the range-backed blob (no filesystem touched)",
         plan.operations().len(),
     );
 
     Ok(())
+}
+
+fn io_other(error: &impl ToString) -> io::Error {
+    io::Error::other(error.to_string())
 }

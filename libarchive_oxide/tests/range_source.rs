@@ -6,6 +6,8 @@
 
 #![allow(clippy::expect_used)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{self, Cursor, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,13 +16,15 @@ use std::sync::{Arc, Barrier};
 use libarchive_oxide::advanced::{
     FileReadAt, FormatCapabilities, MemoryReadAt, RandomAccessArchiveDecoder,
     RandomAccessFormatProvider, RangeArchiveReader, RangeReadError, RangeReadErrorKind,
-    RangeReader, ReadAt, Registry, SeekReadAt, SourceIdentity, SourceIdentityError, SourceLimits,
-    VolumeId, VolumeResolver, VolumeSet,
+    RangeReader, ReadAt, SeekReadAt, SourceIdentity, SourceIdentityError, SourceLimits, VolumeId,
+    VolumeResolver, VolumeSet,
 };
-use libarchive_oxide::{Error, ReaderEvent, SeekArchiveWriter};
+use libarchive_oxide::{Error, OpenOptions, ReaderEvent, SeekArchiveWriter, VolumeArchiveReader};
 use libarchive_oxide_core::{
     AccessMode, ArchivePath, DirectionSet, EntryKind, EntryMetadata, FormatId, Limits,
 };
+
+use common::{extended_attribute_iso_fixture, interleaved_iso_fixture, multi_extent_iso_fixture};
 
 const PAYLOAD: &[u8] = b"immutable range source payload";
 type SourceConfiguration = fn(&mut MemoryRange);
@@ -207,6 +211,51 @@ fn zip_and_iso_use_the_existing_seek_parser_with_exact_metrics() {
             source.transferred.load(Ordering::Relaxed)
         );
     }
+}
+
+#[test]
+fn iso_range_reader_streams_noncontiguous_multi_extent_sections() {
+    let source = MemoryRange::new(multi_extent_iso_fixture(), 7);
+    let mut reader = RangeArchiveReader::new(source).expect("open multi-extent range ISO");
+    assert_eq!(reader.format(), FormatId::Iso9660);
+    assert_eq!(read_all(&mut reader), b"firstsecond");
+    assert!(reader.metrics().requests() > 1);
+}
+
+#[test]
+fn iso_range_reader_skips_interleave_gaps() {
+    let (image, expected) = interleaved_iso_fixture();
+    let source = MemoryRange::new(image, 7);
+    let mut reader = RangeArchiveReader::new(source).expect("open interleaved range ISO");
+    assert_eq!(reader.format(), FormatId::Iso9660);
+    assert_eq!(read_all(&mut reader), expected);
+    assert!(reader.metrics().requests() > 1);
+}
+
+#[test]
+fn iso_range_reader_applies_extended_attributes() {
+    let (image, expected) = extended_attribute_iso_fixture();
+    let source = MemoryRange::new(image, 7);
+    let mut reader = RangeArchiveReader::new(source).expect("open extended-attribute range ISO");
+    assert_eq!(reader.format(), FormatId::Iso9660);
+    let mut decoded = Vec::new();
+    let mut saw_metadata = false;
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Entry(metadata) => {
+                saw_metadata = true;
+                assert_eq!(metadata.mode(), Some(0o540));
+                assert_eq!(metadata.owner().uid, Some(1000));
+                assert_eq!(metadata.owner().gid, Some(1001));
+            },
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert!(saw_metadata);
+    assert_eq!(decoded, expected);
+    assert!(reader.metrics().requests() > 1);
 }
 
 #[test]
@@ -481,7 +530,10 @@ fn downstream_volume_resolver_is_cached_bounded_and_contextual() {
     let primary = volume_source(0, b"primary");
     let secondary = volume_source(1, b"secondary");
     let resolver = Arc::new(ExternalVolumeResolver {
-        volumes: BTreeMap::from([(VolumeId::new(1), Arc::clone(&secondary))]),
+        volumes: BTreeMap::from([
+            (VolumeId::new(1), Arc::clone(&secondary)),
+            (VolumeId::new(2), volume_source(2, b"third")),
+        ]),
         requests: AtomicU64::new(0),
     });
     let volumes = VolumeSet::new(
@@ -514,6 +566,14 @@ fn downstream_volume_resolver_is_cached_bounded_and_contextual() {
     assert_eq!(error.kind(), RangeReadErrorKind::VolumeCountExceeded);
     assert_eq!(error.volume(), Some(VolumeId::new(2)));
     assert_eq!(error.budget(), Some((3, 2)));
+
+    let error = volumes
+        .resolve_required(VolumeId::new(3))
+        .err()
+        .expect("an absent lookup is missing, not a third physical volume");
+    let error = typed_io_error(&error).expect("typed missing-volume failure");
+    assert_eq!(error.kind(), RangeReadErrorKind::MissingVolume);
+    assert_eq!(error.volume(), Some(VolumeId::new(3)));
 }
 
 #[test]
@@ -615,6 +675,8 @@ const MULTI_VOLUME_FORMAT: FormatId = match FormatId::custom(0x8000_0042) {
 struct ExternalMultiVolumeFormat;
 
 impl RandomAccessFormatProvider for ExternalMultiVolumeFormat {
+    type Decoder = ExternalMultiVolumeDecoder;
+
     fn format(&self) -> FormatId {
         MULTI_VOLUME_FORMAT
     }
@@ -633,16 +695,12 @@ impl RandomAccessFormatProvider for ExternalMultiVolumeFormat {
         Ok(&magic == b"MV01")
     }
 
-    fn open(
-        &self,
-        source: Arc<VolumeSet>,
-        _limits: Limits,
-    ) -> Result<Box<dyn RandomAccessArchiveDecoder>, Error> {
+    fn open(&self, source: Arc<VolumeSet>, _limits: Limits) -> Result<Self::Decoder, Error> {
         let mut payload = vec![0_u8; 9];
         source
             .resolve_required(VolumeId::new(1))?
             .read_exact_at(0, &mut payload)?;
-        Ok(Box::new(ExternalMultiVolumeDecoder { payload, state: 0 }))
+        Ok(ExternalMultiVolumeDecoder { payload, state: 0 })
     }
 }
 
@@ -677,7 +735,7 @@ impl RandomAccessArchiveDecoder for ExternalMultiVolumeDecoder {
 }
 
 #[test]
-fn registry_random_access_provider_consumes_the_bounded_volume_seam() {
+fn typed_random_access_provider_consumes_the_bounded_volume_seam() {
     let resolver = Arc::new(ExternalVolumeResolver {
         volumes: BTreeMap::from([(VolumeId::new(1), volume_source(1, b"secondary"))]),
         requests: AtomicU64::new(0),
@@ -690,22 +748,10 @@ fn registry_random_access_provider_consumes_the_bounded_volume_seam() {
         )
         .expect("external provider volumes"),
     );
-    let mut builder = Registry::builder();
-    builder
-        .register_random_access_format(Box::new(ExternalMultiVolumeFormat))
-        .expect("register external random-access provider");
-    let registry = builder.build();
-    assert_eq!(registry.random_access_format_count(), 1);
-    assert_eq!(
-        registry
-            .detect_random_access(&volumes, Limits::safe())
-            .expect("detect external format"),
-        Some(MULTI_VOLUME_FORMAT)
-    );
-
-    let mut decoder = registry
-        .open_random_access(MULTI_VOLUME_FORMAT, volumes, Limits::safe())
+    let options = OpenOptions::new().with_volumes(volumes);
+    let mut decoder = VolumeArchiveReader::with_provider(&options, &ExternalMultiVolumeFormat)
         .expect("open external multi-volume provider");
+    assert_eq!(decoder.format(), MULTI_VOLUME_FORMAT);
     let mut payload_bytes = Vec::new();
     loop {
         match decoder.next_event().expect("external provider event") {
@@ -719,7 +765,7 @@ fn registry_random_access_provider_consumes_the_bounded_volume_seam() {
 }
 
 #[test]
-fn registry_random_access_provider_preserves_missing_volume_error() {
+fn typed_random_access_provider_preserves_missing_volume_error() {
     let volumes = Arc::new(
         VolumeSet::new(
             volume_source(0, b"MV01"),
@@ -731,15 +777,9 @@ fn registry_random_access_provider_preserves_missing_volume_error() {
         )
         .expect("missing external volume set"),
     );
-    let mut builder = Registry::builder();
-    builder
-        .register_random_access_format(Box::new(ExternalMultiVolumeFormat))
-        .expect("register external random-access provider");
-    let error = builder
-        .build()
-        .open_random_access(MULTI_VOLUME_FORMAT, volumes, Limits::safe())
-        .err()
-        .expect("missing volume must prevent provider open");
+    let options = OpenOptions::new().with_volumes(volumes);
+    let error = VolumeArchiveReader::with_provider(&options, &ExternalMultiVolumeFormat)
+        .expect_err("missing volume must prevent provider open");
     assert_eq!(
         error
             .io_error()
@@ -753,6 +793,7 @@ fn registry_random_access_provider_preserves_missing_volume_error() {
 #[cfg(feature = "async")]
 mod asynchronous {
     use futures_lite::future::block_on;
+    use libarchive_oxide::OpenOptions;
     use libarchive_oxide::advanced::{AsyncRangeArchiveReader, AsyncRangeSource};
 
     use super::*;
@@ -833,6 +874,18 @@ mod asynchronous {
                 typed_range_error(&error),
                 Some(RangeReadErrorKind::SourceSizeExceeded)
             );
+        });
+    }
+
+    #[test]
+    fn async_range_reader_uses_open_options() {
+        block_on(async {
+            let source = MemoryRange::new(archive(FormatId::Zip), 7);
+            let options = OpenOptions::new().with_format(Some(FormatId::Zip));
+            let reader = AsyncRangeArchiveReader::with_options(source, &options)
+                .await
+                .expect("open async range ZIP with common options");
+            assert_eq!(reader.format(), FormatId::Zip);
         });
     }
 }

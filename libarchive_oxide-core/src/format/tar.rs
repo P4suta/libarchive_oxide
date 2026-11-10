@@ -49,6 +49,7 @@ const GNU_SPARSE_COUNT: usize = 4;
 const GNU_SPARSE_EXTENDED: usize = 482;
 const GNU_SPARSE_REALSIZE: (usize, usize) = (483, 495);
 const GNU_SPARSE_EXT_COUNT: usize = 21;
+const DEVICE_BASE256_MAX: u64 = (1_u64 << 56) - 1;
 
 /// Overrides that a preceding header (PAX / GNU longname) imposes on the next entry or on all entries.
 type RawPaxRecord<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
@@ -66,6 +67,7 @@ struct Overrides<'a> {
     gid: Option<u64>,
     uname: Option<Cow<'a, [u8]>>,
     gname: Option<Cow<'a, [u8]>>,
+    comment: Option<Cow<'a, [u8]>>,
     sparse_realsize: Option<u64>,
     pax: Vec<RawPaxRecord<'a>>,
 }
@@ -530,6 +532,9 @@ impl TarSource {
             return None;
         }
         let mut metadata = ArchiveMetadata::new();
+        if let Some(comment) = &self.global.comment {
+            metadata = metadata.with_comment(comment.as_ref().to_vec());
+        }
         for (key, value) in &self.global.pax {
             metadata = metadata.with_extension(Extension::new(
                 "pax",
@@ -560,7 +565,14 @@ impl TarSource {
             })
             .times(times)
             .devices(self.stage_device, self.stage_referenced_device)
-            .link_target(header.link_target.map(ArchivePath::from_bytes));
+            .link_target(header.link_target.map(ArchivePath::from_bytes))
+            .comment(
+                pending
+                    .comment
+                    .as_deref()
+                    .or(global.comment.as_deref())
+                    .map(<[u8]>::to_vec),
+            );
         for extent in &self.stage_sparse {
             builder = builder.sparse_extent(*extent);
         }
@@ -1106,6 +1118,282 @@ impl<'a> HeaderView<'a> {
     }
 }
 
+fn last_pax_value<'a>(metadata: &'a EntryMetadata, keys: &[&[u8]]) -> Option<&'a [u8]> {
+    metadata
+        .extensions()
+        .iter()
+        .filter(|extension| {
+            extension.namespace() == "pax" && keys.iter().any(|key| extension.key() == *key)
+        })
+        .map(Extension::value)
+        .next_back()
+}
+
+fn pax_record_count(metadata: &EntryMetadata, key: &[u8], value: &[u8]) -> usize {
+    metadata
+        .extensions()
+        .iter()
+        .filter(|extension| {
+            extension.namespace() == "pax" && extension.key() == key && extension.value() == value
+        })
+        .count()
+}
+
+fn acl_pax_record_count(metadata: &EntryMetadata, value: &[u8]) -> usize {
+    metadata
+        .extensions()
+        .iter()
+        .filter(|extension| {
+            extension.namespace() == "pax"
+                && matches!(
+                    extension.key(),
+                    b"SCHILY.acl.access"
+                        | b"SCHILY.acl.default"
+                        | b"LIBARCHIVE.acl.access"
+                        | b"LIBARCHIVE.acl.default"
+                )
+                && extension.value() == value
+        })
+        .count()
+}
+
+fn pax_conflict(context: &'static str) -> ArchiveError {
+    ArchiveError::new(ErrorKind::Unsupported)
+        .with_format("tar")
+        .with_context(context)
+}
+
+fn tar_global_pax_extension_supported(extension: &Extension) -> bool {
+    if extension.namespace() != "pax" {
+        return false;
+    }
+    let key = extension.key();
+    if key == b"LIBARCHIVE.comment" {
+        return true;
+    }
+    !key.starts_with(b"GNU.sparse.")
+        && !key.starts_with(b"SCHILY.xattr.")
+        && !matches!(
+            key,
+            b"path"
+                | b"linkpath"
+                | b"size"
+                | b"uid"
+                | b"gid"
+                | b"mtime"
+                | b"atime"
+                | b"ctime"
+                | b"LIBARCHIVE.creationtime"
+                | b"SCHILY.birthtime"
+                | b"uname"
+                | b"gname"
+                | b"SCHILY.acl.access"
+                | b"SCHILY.acl.default"
+                | b"LIBARCHIVE.acl.access"
+                | b"LIBARCHIVE.acl.default"
+        )
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_entry_pax(metadata: &EntryMetadata) -> core::result::Result<(), ArchiveError> {
+    for (keys, expected, context) in [
+        (
+            &[b"path".as_slice()][..],
+            Some(metadata.path().as_bytes()),
+            "raw PAX path conflicts with typed entry path",
+        ),
+        (
+            &[b"linkpath".as_slice()][..],
+            metadata.link_target().map(ArchivePath::as_bytes),
+            "raw PAX linkpath conflicts with typed link target",
+        ),
+        (
+            &[b"uname".as_slice()][..],
+            metadata.owner().user.as_deref(),
+            "raw PAX uname conflicts with typed owner name",
+        ),
+        (
+            &[b"gname".as_slice()][..],
+            metadata.owner().group.as_deref(),
+            "raw PAX gname conflicts with typed group name",
+        ),
+        (
+            &[b"LIBARCHIVE.comment".as_slice()][..],
+            metadata.comment(),
+            "raw PAX comment conflicts with typed entry comment",
+        ),
+    ] {
+        if let Some(raw) = last_pax_value(metadata, keys)
+            && expected != Some(raw)
+        {
+            return Err(pax_conflict(context));
+        }
+    }
+
+    for (key, expected, context) in [
+        (
+            b"size".as_slice(),
+            metadata.size(),
+            "raw PAX size conflicts with typed entry size",
+        ),
+        (
+            b"uid".as_slice(),
+            metadata.owner().uid,
+            "raw PAX uid conflicts with typed owner id",
+        ),
+        (
+            b"gid".as_slice(),
+            metadata.owner().gid,
+            "raw PAX gid conflicts with typed group id",
+        ),
+    ] {
+        if let Some(raw) = last_pax_value(metadata, &[key]) {
+            let parsed = ascii_decimal_u64(raw).map_err(|_| {
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("tar")
+                    .with_context("raw PAX numeric value is malformed")
+            })?;
+            if expected != Some(parsed) {
+                return Err(pax_conflict(context));
+            }
+        }
+    }
+
+    let times = metadata.times();
+    for (keys, expected, context) in [
+        (
+            &[b"mtime".as_slice()][..],
+            times.modified,
+            "raw PAX mtime conflicts with typed modification time",
+        ),
+        (
+            &[b"atime".as_slice()][..],
+            times.accessed,
+            "raw PAX atime conflicts with typed access time",
+        ),
+        (
+            &[b"ctime".as_slice()][..],
+            times.changed,
+            "raw PAX ctime conflicts with typed change time",
+        ),
+        (
+            &[
+                b"LIBARCHIVE.creationtime".as_slice(),
+                b"SCHILY.birthtime".as_slice(),
+            ][..],
+            times.created,
+            "raw PAX birth time conflicts with typed creation time",
+        ),
+    ] {
+        if let Some(raw) = last_pax_value(metadata, keys) {
+            let parsed = parse_pax_time(raw).map_err(|_| {
+                ArchiveError::new(ErrorKind::Malformed)
+                    .with_format("tar")
+                    .with_context("raw PAX timestamp is malformed")
+            })?;
+            if expected != Some(parsed) {
+                return Err(pax_conflict(context));
+            }
+        }
+    }
+
+    for extension in metadata.extensions().iter().filter(|extension| {
+        extension.namespace() == "pax" && extension.key().starts_with(b"SCHILY.xattr.")
+    }) {
+        let name = &extension.key()[b"SCHILY.xattr.".len()..];
+        let raw_count = pax_record_count(metadata, extension.key(), extension.value());
+        let typed_count = metadata
+            .xattrs()
+            .iter()
+            .filter(|(typed_name, typed_value)| {
+                typed_name.as_slice() == name && typed_value.as_slice() == extension.value()
+            })
+            .count();
+        if raw_count > typed_count {
+            return Err(pax_conflict(
+                "raw PAX xattr conflicts with typed extended attributes",
+            ));
+        }
+    }
+
+    for extension in metadata.extensions().iter().filter(|extension| {
+        extension.namespace() == "pax"
+            && matches!(
+                extension.key(),
+                b"SCHILY.acl.access"
+                    | b"SCHILY.acl.default"
+                    | b"LIBARCHIVE.acl.access"
+                    | b"LIBARCHIVE.acl.default"
+            )
+    }) {
+        let raw_count = acl_pax_record_count(metadata, extension.value());
+        let typed_count = metadata
+            .acl()
+            .iter()
+            .filter(|acl| acl.as_slice() == extension.value())
+            .count();
+        if raw_count > typed_count {
+            return Err(pax_conflict("raw PAX ACL conflicts with typed ACL records"));
+        }
+    }
+
+    let mut has_raw_sparse = false;
+    for extension in metadata.extensions().iter().filter(|extension| {
+        extension.namespace() == "pax" && extension.key().starts_with(b"GNU.sparse.")
+    }) {
+        has_raw_sparse = true;
+        if !matches!(
+            extension.key(),
+            b"GNU.sparse.map"
+                | b"GNU.sparse.offset"
+                | b"GNU.sparse.numbytes"
+                | b"GNU.sparse.size"
+                | b"GNU.sparse.realsize"
+        ) {
+            return Err(ArchiveError::new(ErrorKind::Unsupported)
+                .with_format("tar")
+                .with_context("unsupported raw GNU sparse PAX property"));
+        }
+    }
+    if has_raw_sparse && metadata.sparse_extents().is_empty() {
+        return Err(pax_conflict(
+            "raw GNU sparse PAX metadata has no typed sparse map",
+        ));
+    }
+    if let Some(raw) = last_pax_value(
+        metadata,
+        &[
+            b"GNU.sparse.size".as_slice(),
+            b"GNU.sparse.realsize".as_slice(),
+        ],
+    ) {
+        let parsed =
+            ascii_decimal_u64(raw).map_err(|error| ArchiveError::from(error).with_format("tar"))?;
+        if metadata.size() != Some(parsed) {
+            return Err(pax_conflict(
+                "raw GNU sparse size conflicts with typed entry size",
+            ));
+        }
+    }
+    let raw_sparse = parse_pax_sparse_records(
+        metadata
+            .extensions()
+            .iter()
+            .filter(|extension| extension.namespace() == "pax")
+            .map(|extension| (extension.key(), extension.value())),
+    )
+    .map_err(|error| ArchiveError::from(error).with_format("tar"))?;
+    if raw_sparse
+        .as_deref()
+        .is_some_and(|raw| raw != metadata.sparse_extents())
+    {
+        return Err(pax_conflict(
+            "raw GNU sparse map conflicts with typed sparse extents",
+        ));
+    }
+    Ok(())
+}
+
 impl TarEncoder {
     /// Creates a fresh encoder.
     #[must_use]
@@ -1137,6 +1425,29 @@ impl TarEncoder {
             return Err(ArchiveError::new(ErrorKind::Protocol)
                 .with_format("tar")
                 .with_context("archive metadata must be set before the first entry"));
+        }
+        if metadata.volume_name().is_some()
+            || metadata
+                .extensions()
+                .iter()
+                .any(|extension| !tar_global_pax_extension_supported(extension))
+        {
+            return Err(ArchiveError::new(ErrorKind::Unsupported)
+                .with_format("tar")
+                .with_context("tar archive metadata contains an unrepresentable property"));
+        }
+        let raw_comment = metadata
+            .extensions()
+            .iter()
+            .filter(|extension| {
+                extension.namespace() == "pax" && extension.key() == b"LIBARCHIVE.comment"
+            })
+            .map(Extension::value)
+            .next_back();
+        if raw_comment.is_some() && metadata.comment() != raw_comment {
+            return Err(ArchiveError::new(ErrorKind::Unsupported)
+                .with_format("tar")
+                .with_context("tar archive metadata contains conflicting comments"));
         }
         let mut records = Vec::new();
         for extension in metadata
@@ -1234,6 +1545,37 @@ impl ArchiveEncoder for TarEncoder {
                     return Err(ArchiveError::new(ErrorKind::Protocol)
                         .with_format("tar")
                         .with_context("previous entry is still open"));
+                }
+                if meta
+                    .extensions()
+                    .iter()
+                    .any(|extension| extension.namespace() != "pax")
+                {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("tar")
+                        .with_context("tar entry contains a non-PAX extension"));
+                }
+                validate_entry_pax(meta)?;
+                let referenced_device_supported = match meta.kind() {
+                    EntryKind::Char | EntryKind::Block => {
+                        meta.referenced_device().is_some_and(|device| {
+                            device.major <= DEVICE_BASE256_MAX && device.minor <= DEVICE_BASE256_MAX
+                        })
+                    },
+                    _ => meta.referenced_device().is_none(),
+                };
+                if meta.device().is_some()
+                    || meta.inode().is_some()
+                    || meta.links().is_some()
+                    || meta.mode().is_some_and(|mode| mode > 0o7777)
+                    || meta.file_flags() != 0
+                    || meta.checksum().is_some()
+                    || meta.is_encrypted()
+                    || !referenced_device_supported
+                {
+                    return Err(ArchiveError::new(ErrorKind::Unsupported)
+                        .with_format("tar")
+                        .with_context("tar cannot represent requested entry metadata"));
                 }
                 let logical_size = meta.size().ok_or_else(|| {
                     ArchiveError::new(ErrorKind::SizeRequired)
@@ -1543,6 +1885,9 @@ fn merge_owned(dst: &mut OwnedOverrides, src: Overrides<'_>) {
     if let Some(v) = src.gname {
         dst.gname = Some(Cow::Owned(v.into_owned()));
     }
+    if let Some(v) = src.comment {
+        dst.comment = Some(Cow::Owned(v.into_owned()));
+    }
     if let Some(v) = src.sparse_realsize {
         dst.sparse_realsize = Some(v);
     }
@@ -1717,6 +2062,7 @@ fn apply_pax<'a>(key: &[u8], value: &'a [u8], into: &mut Overrides<'a>) -> Resul
         },
         b"uname" => into.uname = Some(Cow::Borrowed(value)),
         b"gname" => into.gname = Some(Cow::Borrowed(value)),
+        b"LIBARCHIVE.comment" => into.comment = Some(Cow::Borrowed(value)),
         b"GNU.sparse.size" | b"GNU.sparse.realsize" => {
             into.sparse_realsize = Some(ascii_decimal_u64(value)?);
         },
@@ -1729,20 +2075,40 @@ fn pax_sparse_extents(
     global: &OwnedOverrides,
     pending: &OwnedOverrides,
 ) -> Result<Vec<SparseExtent>> {
-    let records = global.pax.iter().chain(&pending.pax);
+    Ok(parse_pax_sparse_records(
+        global
+            .pax
+            .iter()
+            .chain(&pending.pax)
+            .map(|(key, value)| (key.as_ref(), value.as_ref())),
+    )?
+    .unwrap_or_default())
+}
+
+fn parse_pax_sparse_records<'a>(
+    records: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+) -> Result<Option<Vec<SparseExtent>>> {
     let mut map = None;
     let mut pairs = Vec::new();
     let mut offset = None;
+    let mut present = false;
     for (key, value) in records {
-        match key.as_ref() {
-            b"GNU.sparse.map" => map = Some(value.as_ref()),
-            b"GNU.sparse.offset" => offset = Some(ascii_decimal_u64(value.as_ref())?),
+        match key {
+            b"GNU.sparse.map" => {
+                present = true;
+                map = Some(value);
+            },
+            b"GNU.sparse.offset" => {
+                present = true;
+                offset = Some(ascii_decimal_u64(value)?);
+            },
             b"GNU.sparse.numbytes" => {
+                present = true;
                 let Some(offset) = offset.take() else {
                     return Err(Error::Malformed("GNU sparse length without offset"));
                 };
                 pairs.push(
-                    SparseExtent::new(offset, ascii_decimal_u64(value.as_ref())?)
+                    SparseExtent::new(offset, ascii_decimal_u64(value)?)
                         .map_err(|_| Error::Malformed("invalid GNU sparse extent"))?,
                 );
             },
@@ -1768,7 +2134,7 @@ fn pax_sparse_extents(
             );
         }
     }
-    Ok(pairs)
+    Ok(present.then_some(pairs))
 }
 
 fn parse_gnu_sparse_descriptors(
@@ -1953,20 +2319,22 @@ fn write_v2_header(
         .iter()
         .filter(|extension| extension.namespace() == "pax")
     {
-        if sparse
-            && matches!(
-                extension.key(),
-                b"GNU.sparse.map" | b"GNU.sparse.size" | b"GNU.sparse.realsize"
-            )
-        {
-            continue;
-        }
         push_pax_record(&mut pax, extension.key(), extension.value())?;
     }
-    if let Some(user) = metadata.owner().user.as_deref() {
+    if let Some(user) = metadata
+        .owner()
+        .user
+        .as_deref()
+        .filter(|_| last_pax_value(metadata, &[b"uname"]).is_none())
+    {
         push_pax_record(&mut pax, b"uname", user)?;
     }
-    if let Some(group) = metadata.owner().group.as_deref() {
+    if let Some(group) = metadata
+        .owner()
+        .group
+        .as_deref()
+        .filter(|_| last_pax_value(metadata, &[b"gname"]).is_none())
+    {
         push_pax_record(&mut pax, b"gname", group)?;
     }
     let times = metadata.times();
@@ -1976,52 +2344,83 @@ fn write_v2_header(
         (b"ctime".as_slice(), times.changed),
         (b"LIBARCHIVE.creationtime".as_slice(), times.created),
     ] {
-        if let Some(timestamp) = timestamp {
+        let raw_keys = if key == b"LIBARCHIVE.creationtime" {
+            &[
+                b"LIBARCHIVE.creationtime".as_slice(),
+                b"SCHILY.birthtime".as_slice(),
+            ][..]
+        } else {
+            core::slice::from_ref(&key)
+        };
+        if let Some(timestamp) = timestamp.filter(|_| last_pax_value(metadata, raw_keys).is_none())
+        {
             let value = format_pax_timestamp(timestamp);
             push_pax_record(&mut pax, key, value.as_bytes())?;
         }
     }
-    for (name, value) in metadata.xattrs() {
+    for (index, (name, value)) in metadata.xattrs().iter().enumerate() {
         let mut key = b"SCHILY.xattr.".to_vec();
         key.extend_from_slice(name);
-        if !metadata
-            .extensions()
+        let occurrence = metadata.xattrs()[..index]
             .iter()
-            .any(|extension| extension.namespace() == "pax" && extension.key() == key)
-        {
+            .filter(|(prior_name, prior_value)| prior_name == name && prior_value == value)
+            .count()
+            + 1;
+        if pax_record_count(metadata, &key, value) < occurrence {
             push_pax_record(&mut pax, &key, value)?;
         }
     }
-    if !metadata.acl().is_empty()
-        && !metadata.extensions().iter().any(|extension| {
-            extension.namespace() == "pax"
-                && (extension.key().starts_with(b"SCHILY.acl.")
-                    || extension.key().starts_with(b"LIBARCHIVE.acl."))
-        })
-    {
-        for acl in metadata.acl() {
+    for (index, acl) in metadata.acl().iter().enumerate() {
+        let occurrence = metadata.acl()[..index]
+            .iter()
+            .filter(|prior| *prior == acl)
+            .count()
+            + 1;
+        if acl_pax_record_count(metadata, acl) < occurrence {
             push_pax_record(&mut pax, b"SCHILY.acl.access", acl)?;
         }
     }
-    if let Some(comment) = metadata.comment() {
+    if let Some(comment) = metadata
+        .comment()
+        .filter(|_| last_pax_value(metadata, &[b"LIBARCHIVE.comment"]).is_none())
+    {
         push_pax_record(&mut pax, b"LIBARCHIVE.comment", comment)?;
     }
     if sparse {
-        let mut map = String::new();
-        for (index, extent) in metadata.sparse_extents().iter().enumerate() {
-            if index != 0 {
+        let has_raw_map = metadata.extensions().iter().any(|extension| {
+            extension.namespace() == "pax"
+                && matches!(
+                    extension.key(),
+                    b"GNU.sparse.map" | b"GNU.sparse.offset" | b"GNU.sparse.numbytes"
+                )
+        });
+        if !has_raw_map {
+            let mut map = String::new();
+            for (index, extent) in metadata.sparse_extents().iter().enumerate() {
+                if index != 0 {
+                    map.push(',');
+                }
+                map.push_str(&extent.offset().to_string());
                 map.push(',');
+                map.push_str(&extent.length().to_string());
             }
-            map.push_str(&extent.offset().to_string());
-            map.push(',');
-            map.push_str(&extent.length().to_string());
+            push_pax_record(&mut pax, b"GNU.sparse.map", map.as_bytes())?;
         }
-        push_pax_record(&mut pax, b"GNU.sparse.map", map.as_bytes())?;
-        push_pax_record(
-            &mut pax,
-            b"GNU.sparse.realsize",
-            metadata.size().unwrap_or(0).to_string().as_bytes(),
-        )?;
+        if last_pax_value(
+            metadata,
+            &[
+                b"GNU.sparse.size".as_slice(),
+                b"GNU.sparse.realsize".as_slice(),
+            ],
+        )
+        .is_none()
+        {
+            push_pax_record(
+                &mut pax,
+                b"GNU.sparse.realsize",
+                metadata.size().unwrap_or(0).to_string().as_bytes(),
+            )?;
+        }
     }
     if !pax.is_empty() {
         write_pax_header(sink, &pax, b'x')?;

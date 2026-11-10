@@ -12,16 +12,18 @@ use compression_codecs::Encode;
 use compression_codecs::core::util::PartialBuffer;
 use libarchive_oxide_core::{
     ArchiveEncoder, ArchiveError, ArchiveMetadata, Codec, CodecStatus, EncodeCommand, EncodeStatus,
-    EncodeStep, EndOfInput, EntryKind, EntryMetadata, EntryTimes, ErrorKind, Limits, Owner,
-    PathEncoding, Timestamp,
+    EncodeStep, EndOfInput, EntryKind, EntryMetadata, EntryTimes, ErrorKind, Extension, Limits,
+    Owner, PathEncoding, Timestamp,
 };
 
 #[cfg(feature = "zstd")]
 use crate::Backend;
 use crate::BackendPreference;
-#[cfg(feature = "aes")]
-use crate::SecretBytes;
 use crate::filter::gzip::{Crc32, RawDeflateEncoder};
+#[cfg(feature = "aes")]
+use crate::zipcrypto::ZipCrypto;
+#[cfg(feature = "aes")]
+use crate::{AesStrength, SecretBytes};
 
 const LOCAL_SIGNATURE: u32 = 0x0403_4b50;
 const CENTRAL_SIGNATURE: u32 = 0x0201_4b50;
@@ -30,7 +32,10 @@ const EOCD_SIGNATURE: u32 = 0x0605_4b50;
 const ZIP64_EOCD_SIGNATURE: u32 = 0x0606_4b50;
 const ZIP64_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
 const ZIP64_EXTRA: u16 = 0x0001;
+const ZIP_DOS_FILE_FLAGS: u64 = 0x0000_00ef;
 const AES_EXTRA: u16 = 0x9901;
+const UNICODE_PATH_EXTRA: u16 = 0x7075;
+const UNICODE_COMMENT_EXTRA: u16 = 0x6375;
 /// Info-ZIP Extended Timestamp extra field (`UT`).
 const EXTENDED_TIMESTAMP_EXTRA: u16 = 0x5455;
 /// NTFS timestamps extra field (0x000a): also carries modification/access/change times.
@@ -52,6 +57,10 @@ pub(crate) enum StreamZipMethod {
     Zstd,
     #[cfg(feature = "xz")]
     Lzma,
+    #[cfg(feature = "xz")]
+    Xz,
+    #[cfg(feature = "ppmd")]
+    Ppmd8,
 }
 
 /// Deterministic LZMA preset for ZIP member production (method 14).
@@ -69,15 +78,21 @@ const ZIP_LZMA_PRESET: u32 = 6;
 #[cfg(feature = "xz")]
 const ZIP_LZMA_VERSION: [u8; 2] = [9, 20];
 
+/// Reproducible ZIP method-98 writer profile.
+#[cfg(feature = "ppmd")]
+const ZIP_PPMD_ORDER: u32 = 8;
+#[cfg(feature = "ppmd")]
+const ZIP_PPMD_MEMORY: u32 = 8 * 1024 * 1024;
+
 /// In-crate `std::io::Write` sink that appends into an owned `Vec<u8>`.
 ///
 /// `LzmaWriter` owns its output, but the ZIP writer must drain compressed
 /// bytes between `write` calls; this sink is reached via `inner_mut().0`.
 /// Keeps `#![forbid(unsafe_code)]` intact and adds no trait object.
-#[cfg(feature = "xz")]
+#[cfg(any(feature = "xz", feature = "ppmd"))]
 struct VecSink(Vec<u8>);
 
-#[cfg(feature = "xz")]
+#[cfg(any(feature = "xz", feature = "ppmd"))]
 impl std::io::Write for VecSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.extend_from_slice(buf);
@@ -190,8 +205,28 @@ struct CentralRecord {
 }
 
 #[cfg(feature = "aes")]
+enum ZipAesCipher {
+    Bits128(ctr::Ctr128LE<aes::Aes128>),
+    Bits192(ctr::Ctr128LE<aes::Aes192>),
+    Bits256(ctr::Ctr128LE<aes::Aes256>),
+}
+
+#[cfg(feature = "aes")]
+impl ZipAesCipher {
+    fn apply_keystream(&mut self, bytes: &mut [u8]) {
+        use ctr::cipher::StreamCipher;
+
+        match self {
+            Self::Bits128(cipher) => cipher.apply_keystream(bytes),
+            Self::Bits192(cipher) => cipher.apply_keystream(bytes),
+            Self::Bits256(cipher) => cipher.apply_keystream(bytes),
+        }
+    }
+}
+
+#[cfg(feature = "aes")]
 struct ZipAesEncoder {
-    cipher: ctr::Ctr128LE<aes::Aes256>,
+    cipher: ZipAesCipher,
     mac: hmac::Hmac<sha1::Sha1>,
 }
 
@@ -204,42 +239,67 @@ impl core::fmt::Debug for ZipAesEncoder {
 
 #[cfg(feature = "aes")]
 impl ZipAesEncoder {
-    fn new(password: &[u8]) -> Result<(Self, [u8; 18]), ArchiveError> {
+    fn new(password: &[u8], strength: AesStrength) -> Result<(Self, Vec<u8>), ArchiveError> {
         use ctr::cipher::KeyIvInit;
         use hmac::digest::KeyInit;
         use zeroize::Zeroize;
 
+        let (key_len, salt_len) = match strength {
+            AesStrength::Bits128 => (16, 8),
+            AesStrength::Bits192 => (24, 12),
+            AesStrength::Bits256 => (32, 16),
+        };
         let mut salt = [0_u8; 16];
-        getrandom::fill(&mut salt).map_err(|_| {
+        getrandom::fill(&mut salt[..salt_len]).map_err(|_| {
             ArchiveError::new(ErrorKind::Integrity)
                 .with_format("zip")
                 .with_context("OS random generator failed for WinZip AES salt")
         })?;
         let mut key_material = [0_u8; 66];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, &salt, 1_000, &mut key_material);
+        let material_len = key_len * 2 + 2;
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(
+            password,
+            &salt[..salt_len],
+            1_000,
+            &mut key_material[..material_len],
+        );
         let mut counter = [0_u8; 16];
         counter[0] = 1;
-        let cipher = ctr::Ctr128LE::<aes::Aes256>::new_from_slices(&key_material[..32], &counter)
-            .map_err(|_| {
+        let cipher = match strength {
+            AesStrength::Bits128 => {
+                ctr::Ctr128LE::<aes::Aes128>::new_from_slices(&key_material[..key_len], &counter)
+                    .map(ZipAesCipher::Bits128)
+            },
+            AesStrength::Bits192 => {
+                ctr::Ctr128LE::<aes::Aes192>::new_from_slices(&key_material[..key_len], &counter)
+                    .map(ZipAesCipher::Bits192)
+            },
+            AesStrength::Bits256 => {
+                ctr::Ctr128LE::<aes::Aes256>::new_from_slices(&key_material[..key_len], &counter)
+                    .map(ZipAesCipher::Bits256)
+            },
+        }
+        .map_err(|_| {
             ArchiveError::new(ErrorKind::Malformed)
                 .with_format("zip")
                 .with_context("WinZip AES cipher initialization failed")
         })?;
-        let mac = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(&key_material[32..64])
-            .map_err(|_| {
-                ArchiveError::new(ErrorKind::Malformed)
-                    .with_format("zip")
-                    .with_context("WinZip AES MAC initialization failed")
-            })?;
-        let mut framing = [0_u8; 18];
-        framing[..16].copy_from_slice(&salt);
-        framing[16..].copy_from_slice(&key_material[64..]);
+        let mac = <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(
+            &key_material[key_len..key_len * 2],
+        )
+        .map_err(|_| {
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("zip")
+                .with_context("WinZip AES MAC initialization failed")
+        })?;
+        let mut framing = Vec::with_capacity(salt_len + 2);
+        framing.extend_from_slice(&salt[..salt_len]);
+        framing.extend_from_slice(&key_material[key_len * 2..material_len]);
         key_material.zeroize();
         Ok((Self { cipher, mac }, framing))
     }
 
     fn encrypt(&mut self, bytes: &mut [u8]) {
-        use ctr::cipher::StreamCipher;
         use hmac::Mac;
 
         self.cipher.apply_keystream(bytes);
@@ -267,6 +327,8 @@ struct OpenEntry {
     compressed_size: u64,
     uncompressed_size: u64,
     expected_size: Option<u64>,
+    metadata_payload: Vec<u8>,
+    metadata_payload_position: usize,
     local_offset: u64,
     external_attributes: u32,
     dos_time: u16,
@@ -281,8 +343,18 @@ struct OpenEntry {
     lzma: Option<lzma_rust2::LzmaWriter<VecSink>>,
     #[cfg(feature = "xz")]
     lzma_tail: Vec<u8>,
+    #[cfg(feature = "xz")]
+    xz: Option<lzma_rust2::XzWriter<VecSink>>,
+    #[cfg(feature = "xz")]
+    xz_tail: Vec<u8>,
+    #[cfg(feature = "ppmd")]
+    ppmd: Option<ppmd_rust::Ppmd8Encoder<VecSink>>,
+    #[cfg(feature = "ppmd")]
+    ppmd_tail: Vec<u8>,
     #[cfg(feature = "aes")]
     aes: Option<ZipAesEncoder>,
+    #[cfg(feature = "aes")]
+    zipcrypto: Option<ZipCrypto>,
 }
 
 impl core::fmt::Debug for OpenEntry {
@@ -293,6 +365,13 @@ impl core::fmt::Debug for OpenEntry {
             .field("payload_method", &self.payload_method)
             .field("compressed_size", &self.compressed_size)
             .field("uncompressed_size", &self.uncompressed_size)
+            .field(
+                "metadata_payload_remaining",
+                &self
+                    .metadata_payload
+                    .len()
+                    .saturating_sub(self.metadata_payload_position),
+            )
             .field("zip64_size", &self.zip64_size)
             .finish_non_exhaustive()
     }
@@ -305,6 +384,270 @@ enum Phase {
     Central { next: usize, start: u64 },
     FinalBytes,
     Done,
+}
+
+#[cfg(feature = "aes")]
+#[derive(Debug, Clone, Copy)]
+enum ZipStreamEncryption {
+    Aes(AesStrength),
+    ZipCrypto,
+}
+
+#[derive(Debug, Default)]
+struct StructuredZipMetadata {
+    times: EntryTimes,
+    time_covered: [bool; 4],
+    owner: Owner,
+    owner_covered: bool,
+}
+
+fn structured_zip_error(kind: ErrorKind, context: &'static str) -> ArchiveError {
+    ArchiveError::new(kind)
+        .with_format("zip")
+        .with_context(context)
+}
+
+fn body_u16(body: &[u8], offset: usize) -> Result<u16, ArchiveError> {
+    let bytes: [u8; 2] = body
+        .get(offset..offset + 2)
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| {
+            structured_zip_error(ErrorKind::Malformed, "truncated structured ZIP extra field")
+        })?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn body_u64(body: &[u8], offset: usize) -> Result<u64, ArchiveError> {
+    let bytes: [u8; 8] = body
+        .get(offset..offset + 8)
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| {
+            structured_zip_error(ErrorKind::Malformed, "truncated structured ZIP extra field")
+        })?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn zip_filetime_timestamp(ticks: u64) -> Option<Timestamp> {
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const UNIX_EPOCH_SECONDS: i128 = 11_644_473_600;
+    if ticks == 0 {
+        return None;
+    }
+    let seconds = i128::from(ticks / TICKS_PER_SECOND) - UNIX_EPOCH_SECONDS;
+    Timestamp::new(
+        i64::try_from(seconds).ok()?,
+        u32::try_from(ticks % TICKS_PER_SECOND)
+            .ok()?
+            .checked_mul(100)?,
+    )
+    .ok()
+}
+
+fn parse_ntfs_extra(
+    value: &[u8],
+    structured: &mut StructuredZipMetadata,
+) -> Result<(), ArchiveError> {
+    if value.len() < 4 {
+        return Ok(());
+    }
+    let mut tags = &value[4..];
+    while tags.len() >= 4 {
+        let tag = body_u16(tags, 0)?;
+        let size = usize::from(body_u16(tags, 2)?);
+        let end = 4_usize.checked_add(size).ok_or_else(|| {
+            structured_zip_error(ErrorKind::Malformed, "NTFS ZIP tag length overflow")
+        })?;
+        let body = tags.get(4..end).ok_or_else(|| {
+            structured_zip_error(ErrorKind::Malformed, "truncated NTFS ZIP timestamp tag")
+        })?;
+        if tag == 1 && body.len() >= 24 {
+            structured.times.modified = zip_filetime_timestamp(body_u64(body, 0)?);
+            structured.times.accessed = zip_filetime_timestamp(body_u64(body, 8)?);
+            structured.times.created = zip_filetime_timestamp(body_u64(body, 16)?);
+            structured.time_covered[0] = true;
+            structured.time_covered[1] = true;
+            structured.time_covered[3] = true;
+        }
+        tags = &tags[end..];
+    }
+    if !tags.is_empty() {
+        return Err(structured_zip_error(
+            ErrorKind::Malformed,
+            "truncated NTFS ZIP tag header",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_structured_zip_metadata(
+    metadata: &EntryMetadata,
+) -> Result<StructuredZipMetadata, ArchiveError> {
+    let mut structured = StructuredZipMetadata::default();
+    for extension in metadata.extensions() {
+        if extension.namespace() != "zip-extra" {
+            continue;
+        }
+        let [low, high] = extension.key() else {
+            continue;
+        };
+        let id = u16::from_le_bytes([*low, *high]);
+        let value = extension.value();
+        match id {
+            EXTENDED_TIMESTAMP_EXTRA if !value.is_empty() => {
+                let mut position = 1;
+                for (index, bit) in [0x01_u8, 0x02, 0x04].into_iter().enumerate() {
+                    if value[0] & bit == 0 {
+                        continue;
+                    }
+                    let bytes: [u8; 4] = value
+                        .get(position..position + 4)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .ok_or_else(|| {
+                            structured_zip_error(
+                                ErrorKind::Malformed,
+                                "truncated extended ZIP timestamp",
+                            )
+                        })?;
+                    let timestamp = Some(Timestamp::from_seconds(i64::from(i32::from_le_bytes(
+                        bytes,
+                    ))));
+                    match index {
+                        0 => structured.times.modified = timestamp,
+                        1 => structured.times.accessed = timestamp,
+                        _ => structured.times.changed = timestamp,
+                    }
+                    structured.time_covered[index] = true;
+                    position += 4;
+                }
+            },
+            NTFS_TIMESTAMP_EXTRA => parse_ntfs_extra(value, &mut structured)?,
+            INFOZIP_UNIX_OLD_EXTRA if value.len() >= 8 => {
+                let accessed = i32::from_le_bytes(value[..4].try_into().unwrap_or([0; 4]));
+                let modified = i32::from_le_bytes(value[4..8].try_into().unwrap_or([0; 4]));
+                structured.times.accessed = Some(Timestamp::from_seconds(i64::from(accessed)));
+                structured.times.modified = Some(Timestamp::from_seconds(i64::from(modified)));
+                structured.time_covered[0] = true;
+                structured.time_covered[1] = true;
+            },
+            INFOZIP_UNIX_NEW_EXTRA if value.len() >= 4 => {
+                structured.owner.uid = Some(u64::from(body_u16(value, 0)?));
+                structured.owner.gid = Some(u64::from(body_u16(value, 2)?));
+                structured.owner_covered = true;
+            },
+            _ => {},
+        }
+    }
+    Ok(structured)
+}
+
+fn validate_zip_typed_metadata(
+    metadata: &EntryMetadata,
+    structured: &StructuredZipMetadata,
+) -> Result<(), ArchiveError> {
+    let owner = metadata.owner();
+    let owner_ids_supported = if structured.owner_covered {
+        owner.uid == structured.owner.uid && owner.gid == structured.owner.gid
+    } else {
+        match (owner.uid, owner.gid) {
+            (None, None) => true,
+            (Some(uid), Some(gid)) => u16::try_from(uid).is_ok() && u16::try_from(gid).is_ok(),
+            _ => false,
+        }
+    };
+    let times = metadata.times();
+    let requested = [times.modified, times.accessed, times.changed, times.created];
+    let raw = [
+        structured.times.modified,
+        structured.times.accessed,
+        structured.times.changed,
+        structured.times.created,
+    ];
+    let times_supported = requested.into_iter().enumerate().all(|(index, timestamp)| {
+        if structured.time_covered[index] {
+            timestamp == raw[index]
+        } else if index == 3 {
+            timestamp.is_none()
+        } else {
+            timestamp.is_none_or(|value| {
+                value.nanoseconds() == 0 && i32::try_from(value.seconds()).is_ok()
+            })
+        }
+    });
+    if !matches!(
+        metadata.kind(),
+        EntryKind::File | EntryKind::Dir | EntryKind::Symlink
+    ) || owner.user.is_some()
+        || owner.group.is_some()
+        || !owner_ids_supported
+        || !times_supported
+        || metadata.mode().is_some_and(|mode| mode > 0o7777)
+        || metadata.inode().is_some()
+        || metadata.links().is_some()
+        || metadata.device().is_some()
+        || metadata.referenced_device().is_some()
+        || !metadata.sparse_extents().is_empty()
+        || !metadata.xattrs().is_empty()
+        || !metadata.acl().is_empty()
+        || metadata.file_flags() & !ZIP_DOS_FILE_FLAGS != 0
+        || metadata.checksum().is_some()
+        || metadata.is_encrypted()
+        || metadata.comment().is_some_and(<[u8]>::is_empty)
+    {
+        return Err(structured_zip_error(
+            ErrorKind::Unsupported,
+            "ZIP cannot represent requested typed entry metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_applicable_unicode_extra(
+    metadata: &EntryMetadata,
+    wanted: u16,
+    serialized: &[u8],
+    require_utf8_path: bool,
+) -> Result<(), ArchiveError> {
+    for extension in metadata.extensions() {
+        if extension.namespace() != "zip-extra" {
+            continue;
+        }
+        let [low, high] = extension.key() else {
+            continue;
+        };
+        if u16::from_le_bytes([*low, *high]) != wanted {
+            continue;
+        }
+        let value = extension.value();
+        if value.len() < 5
+            || value[0] != 1
+            || u32::from_le_bytes(value[1..5].try_into().unwrap_or([0; 4]))
+                != crate::filter::crc32(serialized)
+        {
+            continue;
+        }
+        core::str::from_utf8(&value[5..]).map_err(|_| {
+            structured_zip_error(ErrorKind::Malformed, "Unicode ZIP extra is not UTF-8")
+        })?;
+        if value[5..] != *serialized
+            || (require_utf8_path && !matches!(metadata.path().encoding(), PathEncoding::Utf8))
+        {
+            return Err(structured_zip_error(
+                ErrorKind::Unsupported,
+                "Unicode ZIP extra conflicts with typed entry metadata",
+            ));
+        }
+        break;
+    }
+    Ok(())
+}
+
+fn validate_zip_unicode_metadata(
+    metadata: &EntryMetadata,
+    serialized_path: &[u8],
+) -> Result<(), ArchiveError> {
+    validate_applicable_unicode_extra(metadata, UNICODE_PATH_EXTRA, serialized_path, true)?;
+    let comment = metadata.comment().unwrap_or_default();
+    validate_applicable_unicode_extra(metadata, UNICODE_COMMENT_EXTRA, comment, false)
 }
 
 /// Data-descriptor ZIP encoder.
@@ -327,6 +670,8 @@ pub(crate) struct ZipStreamEncoder {
     archive_comment: Vec<u8>,
     #[cfg(feature = "aes")]
     password: Option<SecretBytes>,
+    #[cfg(feature = "aes")]
+    encryption: Option<ZipStreamEncryption>,
 }
 
 impl ZipStreamEncoder {
@@ -352,6 +697,8 @@ impl ZipStreamEncoder {
             archive_comment: Vec::new(),
             #[cfg(feature = "aes")]
             password: None,
+            #[cfg(feature = "aes")]
+            encryption: None,
         }
     }
 
@@ -367,6 +714,18 @@ impl ZipStreamEncoder {
             return Err(Self::error(
                 ErrorKind::Protocol,
                 "ZIP archive metadata must be set before the first entry",
+            ));
+        }
+        if metadata.volume_name().is_some() || !metadata.extensions().is_empty() {
+            return Err(Self::error(
+                ErrorKind::Unsupported,
+                "ZIP archive metadata contains an unrepresentable property",
+            ));
+        }
+        if metadata.comment().is_some_and(<[u8]>::is_empty) {
+            return Err(Self::error(
+                ErrorKind::Unsupported,
+                "ZIP cannot distinguish an empty archive comment from no comment",
             ));
         }
         let comment = metadata.comment().unwrap_or_default();
@@ -396,10 +755,25 @@ impl ZipStreamEncoder {
         limits: Limits,
         method: StreamZipMethod,
         password: SecretBytes,
+        strength: AesStrength,
         backend: BackendPreference,
     ) -> Self {
         let mut encoder = Self::with_method_and_backend(limits, method, backend);
         encoder.password = Some(password);
+        encoder.encryption = Some(ZipStreamEncryption::Aes(strength));
+        encoder
+    }
+
+    #[cfg(feature = "aes")]
+    pub(crate) fn with_zipcrypto_password_and_backend(
+        limits: Limits,
+        method: StreamZipMethod,
+        password: SecretBytes,
+        backend: BackendPreference,
+    ) -> Self {
+        let mut encoder = Self::with_method_and_backend(limits, method, backend);
+        encoder.password = Some(password);
+        encoder.encryption = Some(ZipStreamEncryption::ZipCrypto);
         encoder
     }
 
@@ -450,6 +824,25 @@ impl ZipStreamEncoder {
                 "begin-entry received while another ZIP command is active",
             ));
         }
+        #[cfg(feature = "aes")]
+        if metadata.kind() == EntryKind::Symlink && self.encryption.is_some() {
+            return Err(Self::error(
+                ErrorKind::Unsupported,
+                "encrypted ZIP symbolic-link targets cannot be recovered as metadata",
+            ));
+        }
+        if metadata
+            .extensions()
+            .iter()
+            .any(|extension| !zip_entry_extension_supported(extension))
+        {
+            return Err(Self::error(
+                ErrorKind::Unsupported,
+                "ZIP entry metadata contains an unrepresentable raw extension",
+            ));
+        }
+        let structured = parse_structured_zip_metadata(metadata)?;
+        validate_zip_typed_metadata(metadata, &structured)?;
         if self
             .limits
             .entries()
@@ -461,6 +854,9 @@ impl ZipStreamEncoder {
             ));
         }
         let mut name = metadata.path().as_bytes().to_vec();
+        if metadata.kind() == EntryKind::Dir && !name.ends_with(b"/") {
+            name.push(b'/');
+        }
         if self
             .limits
             .path_bytes()
@@ -477,9 +873,45 @@ impl ZipStreamEncoder {
                 "ZIP pathname exceeds format field",
             ));
         }
-        if metadata.kind() == EntryKind::Dir && !name.ends_with(b"/") {
-            name.push(b'/');
-        }
+        validate_zip_unicode_metadata(metadata, &name)?;
+        let metadata_payload = if metadata.kind() == EntryKind::Symlink {
+            let target = metadata.link_target().ok_or_else(|| {
+                Self::error(
+                    ErrorKind::Malformed,
+                    "ZIP symbolic link is missing its target",
+                )
+            })?;
+            if self
+                .limits
+                .path_bytes()
+                .is_some_and(|limit| target.as_bytes().len() > limit)
+            {
+                return Err(Self::error(
+                    ErrorKind::Limit,
+                    "ZIP symbolic-link target exceeds configured path limit",
+                ));
+            }
+            if self
+                .limits
+                .in_flight_bytes()
+                .is_some_and(|limit| target.as_bytes().len() > limit)
+            {
+                return Err(Self::error(
+                    ErrorKind::Limit,
+                    "ZIP symbolic-link target exceeds in-flight memory limit",
+                ));
+            }
+            let target_size = target.as_bytes().len() as u64;
+            if metadata.size() != Some(target_size) {
+                return Err(Self::error(
+                    ErrorKind::Unsupported,
+                    "ZIP symbolic-link size must equal its target length",
+                ));
+            }
+            target.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
         let comment = metadata.comment().unwrap_or_default().to_vec();
         if comment.len() > usize::from(U16_SENTINEL) {
             return Err(Self::error(
@@ -513,24 +945,26 @@ impl ZipStreamEncoder {
             push_u16(&mut preserved_extra, value_length);
             preserved_extra.extend_from_slice(extension.value());
         }
-        // RM-308: emit structured extras derived from typed metadata (timestamps,
-        // Unix uid/gid) when the entry does not already carry an equivalent raw
-        // form, so a preserved-extra round trip never duplicates one. Reading
-        // promotes these ids to `EntryTimes`/`Owner` while also preserving their
-        // raw bytes, so a re-read entry keeps its original extra and no derived
-        // copy is appended; an entry created from typed metadata alone gains the
-        // structured form. The timestamp guard covers every raw field the reader
-        // promotes into `EntryTimes` — the Extended Timestamp itself, NTFS times,
-        // and the Info-ZIP `UX` times — so none of them re-synthesizes a 0x5455.
-        if !zip_extra_contains_id(&preserved_extra, EXTENDED_TIMESTAMP_EXTRA)
-            && !zip_extra_contains_id(&preserved_extra, NTFS_TIMESTAMP_EXTRA)
-            && !zip_extra_contains_id(&preserved_extra, INFOZIP_UNIX_OLD_EXTRA)
-        {
-            push_extended_timestamp(&mut preserved_extra, metadata.times());
-        }
-        if !zip_extra_contains_id(&preserved_extra, INFOZIP_UNIX_NEW_EXTRA)
-            && !zip_extra_contains_id(&preserved_extra, INFOZIP_UNIX_OLD_EXTRA)
-        {
+        // Structured raw extras and typed metadata are validated as one logical value above.
+        // Preserve the original bytes, then synthesize only fields that no raw extra covers.
+        // This permits a raw mtime plus a typed atime without either losing the atime or duplicating the mtime.
+        let times = metadata.times();
+        push_extended_timestamp(
+            &mut preserved_extra,
+            EntryTimes {
+                modified: (!structured.time_covered[0])
+                    .then_some(times.modified)
+                    .flatten(),
+                accessed: (!structured.time_covered[1])
+                    .then_some(times.accessed)
+                    .flatten(),
+                changed: (!structured.time_covered[2])
+                    .then_some(times.changed)
+                    .flatten(),
+                created: None,
+            },
+        );
+        if !structured.owner_covered {
             push_infozip_unix(&mut preserved_extra, metadata.owner());
         }
         // Reserve room for the ZIP64 extended-information field in BOTH headers.
@@ -587,16 +1021,38 @@ impl ZipStreamEncoder {
                 StreamZipMethod::Zstd => 93,
                 #[cfg(feature = "xz")]
                 StreamZipMethod::Lzma => 14,
+                #[cfg(feature = "xz")]
+                StreamZipMethod::Xz => 95,
+                #[cfg(feature = "ppmd")]
+                StreamZipMethod::Ppmd8 => 98,
                 _ => 8,
             }
         };
         #[cfg(feature = "aes")]
-        let encrypted = self.password.is_some();
+        let encryption = self.encryption;
+        #[cfg(feature = "aes")]
+        let encrypted = encryption.is_some();
         #[cfg(not(feature = "aes"))]
         let encrypted = false;
-        let method = if encrypted { 99 } else { payload_method };
-        if encrypted {
-            push_aes_extra(&mut preserved_extra, payload_method);
+        #[cfg(feature = "aes")]
+        let aes_strength = match encryption {
+            Some(ZipStreamEncryption::Aes(strength)) => Some(strength),
+            Some(ZipStreamEncryption::ZipCrypto) | None => None,
+        };
+        #[cfg(feature = "aes")]
+        let aes_encrypted = aes_strength.is_some();
+        #[cfg(not(feature = "aes"))]
+        let aes_encrypted = false;
+        let method = if aes_encrypted { 99 } else { payload_method };
+        if aes_encrypted {
+            #[cfg(feature = "aes")]
+            push_aes_extra(
+                &mut preserved_extra,
+                payload_method,
+                aes_strength.ok_or_else(|| {
+                    Self::error(ErrorKind::Protocol, "ZIP AES strength disappeared")
+                })?,
+            );
             self.metadata_bytes = self
                 .metadata_bytes
                 .checked_add(11)
@@ -624,11 +1080,11 @@ impl ZipStreamEncoder {
         // local/central cross-check mask, so it never trips consistency checks.
         let lzma_flag = if payload_method == 14 { 0x0002 } else { 0 };
         let flags = 0x0008 | lzma_flag | if utf8 { 0x0800 } else { 0 } | u16::from(encrypted);
-        let version_needed = if encrypted {
+        let version_needed = if aes_encrypted {
             51
         } else if payload_method == 12 {
             46
-        } else if payload_method == 93 || payload_method == 14 {
+        } else if matches!(payload_method, 14 | 93 | 95 | 98) {
             63
         } else if zip64_size {
             45
@@ -661,16 +1117,34 @@ impl ZipStreamEncoder {
         }
         local.extend_from_slice(&preserved_extra);
         #[cfg(feature = "aes")]
-        let (aes, aes_framing) = if let Some(password) = &self.password {
-            let (aes, framing) = ZipAesEncoder::new(password.expose())?;
-            (Some(aes), Some(framing))
-        } else {
-            (None, None)
+        let (aes, zipcrypto, encryption_framing) = match (self.password.as_ref(), encryption) {
+            (Some(password), Some(ZipStreamEncryption::Aes(strength))) => {
+                let (aes, framing) = ZipAesEncoder::new(password.expose(), strength)?;
+                (Some(aes), None, framing)
+            },
+            (Some(password), Some(ZipStreamEncryption::ZipCrypto)) => {
+                let mut framing = vec![0_u8; 12];
+                getrandom::fill(&mut framing[..11]).map_err(|_| {
+                    Self::error(
+                        ErrorKind::Integrity,
+                        "OS random generator failed for ZipCrypto header",
+                    )
+                })?;
+                framing[11] = (dos_time >> 8) as u8;
+                let mut zipcrypto = ZipCrypto::new(password.expose());
+                zipcrypto.encrypt(&mut framing);
+                (None, Some(zipcrypto), framing)
+            },
+            (None, None) => (None, None, Vec::new()),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Self::error(
+                    ErrorKind::Protocol,
+                    "ZIP encryption password and mode disagree",
+                ));
+            },
         };
         #[cfg(feature = "aes")]
-        if let Some(framing) = aes_framing {
-            local.extend_from_slice(&framing);
-        }
+        local.extend_from_slice(&encryption_framing);
         self.queue(local)?;
         let compressor = if payload_method == 8 {
             Some(RawDeflateEncoder::with_limits(self.limits)?)
@@ -704,6 +1178,69 @@ impl ZipStreamEncoder {
         } else {
             None
         };
+        #[cfg(feature = "xz")]
+        let xz = if payload_method == 95 {
+            let options = lzma_rust2::XzOptions::with_preset(ZIP_LZMA_PRESET);
+            let required = u64::from(lzma_rust2::lzma2_get_memory_usage(
+                options.lzma_options.dict_size,
+            ))
+            .checked_mul(1024)
+            .ok_or_else(|| Self::error(ErrorKind::Limit, "ZIP XZ workspace size overflow"))?;
+            if self
+                .limits
+                .codec_memory()
+                .is_some_and(|maximum| required > maximum as u64)
+            {
+                return Err(Self::error(
+                    ErrorKind::Limit,
+                    "ZIP XZ workspace exceeds codec memory limit",
+                ));
+            }
+            Some(
+                lzma_rust2::XzWriter::new(VecSink(Vec::new()), options).map_err(|_| {
+                    Self::error(ErrorKind::Malformed, "ZIP XZ encoder setup failed")
+                })?,
+            )
+        } else {
+            None
+        };
+        #[cfg(feature = "ppmd")]
+        let ppmd = if payload_method == 98 {
+            if self
+                .limits
+                .codec_memory()
+                .is_some_and(|maximum| ZIP_PPMD_MEMORY as usize > maximum)
+            {
+                return Err(Self::error(
+                    ErrorKind::Limit,
+                    "ZIP PPMd model exceeds codec workspace limit",
+                ));
+            }
+            let memory_mb = u16::try_from(ZIP_PPMD_MEMORY / (1024 * 1024))
+                .map_err(|_| Self::error(ErrorKind::Limit, "ZIP PPMd model size exceeds header"))?;
+            let order = u16::try_from(ZIP_PPMD_ORDER)
+                .map_err(|_| Self::error(ErrorKind::Limit, "ZIP PPMd order exceeds header"))?;
+            let parameters = (order - 1)
+                | ((memory_mb - 1) << 4)
+                | ((ppmd_rust::RestoreMethod::Restart as u16) << 12);
+            let mut sink = VecSink(Vec::with_capacity(2));
+            sink.0.extend_from_slice(&parameters.to_le_bytes());
+            Some(
+                ppmd_rust::Ppmd8Encoder::new(
+                    sink,
+                    ZIP_PPMD_ORDER,
+                    ZIP_PPMD_MEMORY,
+                    ppmd_rust::RestoreMethod::Restart,
+                )
+                .map_err(|error| ppmd_error(&error, "ZIP PPMd encoder setup failed"))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(feature = "aes")]
+        let initial_compressed_size = encryption_framing.len() as u64;
+        #[cfg(not(feature = "aes"))]
+        let initial_compressed_size = 0;
         self.phase = Phase::Open(Box::new(OpenEntry {
             name,
             comment,
@@ -712,13 +1249,16 @@ impl ZipStreamEncoder {
             payload_method,
             flags,
             crc: Crc32::new(),
-            compressed_size: if encrypted { 18 } else { 0 },
+            compressed_size: initial_compressed_size,
             uncompressed_size: 0,
             expected_size: metadata.size(),
+            metadata_payload,
+            metadata_payload_position: 0,
             local_offset,
             external_attributes: external_attributes(
                 metadata.kind(),
                 metadata.mode().unwrap_or(0o644),
+                metadata.file_flags(),
             ),
             dos_time,
             dos_date,
@@ -732,8 +1272,18 @@ impl ZipStreamEncoder {
             lzma,
             #[cfg(feature = "xz")]
             lzma_tail: Vec::new(),
+            #[cfg(feature = "xz")]
+            xz,
+            #[cfg(feature = "xz")]
+            xz_tail: Vec::new(),
+            #[cfg(feature = "ppmd")]
+            ppmd,
+            #[cfg(feature = "ppmd")]
+            ppmd_tail: Vec::new(),
             #[cfg(feature = "aes")]
             aes,
+            #[cfg(feature = "aes")]
+            zipcrypto,
         }));
         Ok(())
     }
@@ -847,6 +1397,60 @@ impl ZipStreamEncoder {
         Ok((data.len(), n))
     }
 
+    #[cfg(feature = "xz")]
+    fn xz_step(
+        entry: &mut OpenEntry,
+        data: &[u8],
+        output: &mut [u8],
+    ) -> Result<(usize, usize), ArchiveError> {
+        use std::io::Write as _;
+
+        let writer = entry
+            .xz
+            .as_mut()
+            .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP XZ state is missing"))?;
+        if !writer.inner().0.is_empty() {
+            let n = writer.inner().0.len().min(output.len());
+            output[..n].copy_from_slice(&writer.inner().0[..n]);
+            writer.inner_mut().0.drain(..n);
+            return Ok((0, n));
+        }
+        writer
+            .write_all(data)
+            .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP XZ encoder failed"))?;
+        let n = writer.inner().0.len().min(output.len());
+        output[..n].copy_from_slice(&writer.inner().0[..n]);
+        writer.inner_mut().0.drain(..n);
+        Ok((data.len(), n))
+    }
+
+    #[cfg(feature = "ppmd")]
+    fn ppmd_step(
+        entry: &mut OpenEntry,
+        data: &[u8],
+        output: &mut [u8],
+    ) -> Result<(usize, usize), ArchiveError> {
+        use std::io::Write as _;
+
+        let writer = entry
+            .ppmd
+            .as_mut()
+            .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP PPMd state is missing"))?;
+        if !writer.get_ref().0.is_empty() {
+            let n = writer.get_ref().0.len().min(output.len());
+            output[..n].copy_from_slice(&writer.get_ref().0[..n]);
+            writer.get_mut().0.drain(..n);
+            return Ok((0, n));
+        }
+        writer
+            .write_all(data)
+            .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP PPMd encoder failed"))?;
+        let n = writer.get_ref().0.len().min(output.len());
+        output[..n].copy_from_slice(&writer.get_ref().0[..n]);
+        writer.get_mut().0.drain(..n);
+        Ok((data.len(), n))
+    }
+
     fn compress_step(
         entry: &mut OpenEntry,
         data: &[u8],
@@ -864,8 +1468,28 @@ impl ZipStreamEncoder {
         if entry.payload_method == 14 {
             return Self::lzma_step(entry, data, output);
         }
+        #[cfg(feature = "xz")]
+        if entry.payload_method == 95 {
+            return Self::xz_step(entry, data, output);
+        }
+        #[cfg(feature = "ppmd")]
+        if entry.payload_method == 98 {
+            return Self::ppmd_step(entry, data, output);
+        }
         Self::deflate_step(entry, data, output)
     }
+
+    #[cfg(feature = "aes")]
+    fn encrypt_entry_output(entry: &mut OpenEntry, output: &mut [u8]) {
+        if let Some(aes) = &mut entry.aes {
+            aes.encrypt(output);
+        } else if let Some(zipcrypto) = &mut entry.zipcrypto {
+            zipcrypto.encrypt(output);
+        }
+    }
+
+    #[cfg(not(feature = "aes"))]
+    fn encrypt_entry_output(_entry: &mut OpenEntry, _output: &mut [u8]) {}
 
     fn write_data(&mut self, data: &[u8], output: &mut [u8]) -> Result<EncodeStep, ArchiveError> {
         let Phase::Open(entry) = &mut self.phase else {
@@ -874,6 +1498,12 @@ impl ZipStreamEncoder {
                 "ZIP data received outside an entry",
             ));
         };
+        if !entry.metadata_payload.is_empty() && !data.is_empty() {
+            return Err(Self::error(
+                ErrorKind::Protocol,
+                "ZIP symbolic-link payload is owned by link-target metadata",
+            ));
+        }
         if data.is_empty() {
             return Ok(EncodeStep {
                 consumed: 0,
@@ -889,9 +1519,7 @@ impl ZipStreamEncoder {
             Self::compress_step(entry, data, output)?
         };
         #[cfg(feature = "aes")]
-        if let Some(aes) = &mut entry.aes {
-            aes.encrypt(&mut output[..produced]);
-        }
+        Self::encrypt_entry_output(entry, &mut output[..produced]);
         entry.crc.update(&data[..consumed]);
         entry.uncompressed_size = entry
             .uncompressed_size
@@ -994,6 +1622,44 @@ impl ZipStreamEncoder {
             let n = drain_into(&mut entry.lzma_tail, output);
             return Ok((n, entry.lzma_tail.is_empty()));
         }
+        #[cfg(feature = "xz")]
+        if entry.payload_method == 95 {
+            if let Some(writer) = entry.xz.as_mut() {
+                if !writer.inner().0.is_empty() {
+                    let n = drain_into(&mut writer.inner_mut().0, output);
+                    return Ok((n, false));
+                }
+                let writer = entry
+                    .xz
+                    .take()
+                    .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP XZ state is missing"))?;
+                entry.xz_tail = writer
+                    .finish()
+                    .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP XZ finalization failed"))?
+                    .0;
+            }
+            let n = drain_into(&mut entry.xz_tail, output);
+            return Ok((n, entry.xz_tail.is_empty()));
+        }
+        #[cfg(feature = "ppmd")]
+        if entry.payload_method == 98 {
+            if let Some(writer) = entry.ppmd.as_mut() {
+                if !writer.get_ref().0.is_empty() {
+                    let n = drain_into(&mut writer.get_mut().0, output);
+                    return Ok((n, false));
+                }
+                let writer = entry
+                    .ppmd
+                    .take()
+                    .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP PPMd state is missing"))?;
+                entry.ppmd_tail = writer
+                    .finish(true)
+                    .map_err(|_| Self::error(ErrorKind::Malformed, "ZIP PPMd finalization failed"))?
+                    .0;
+            }
+            let n = drain_into(&mut entry.ppmd_tail, output);
+            return Ok((n, entry.ppmd_tail.is_empty()));
+        }
         if entry.payload_method != 0 {
             return Err(Self::error(
                 ErrorKind::Protocol,
@@ -1011,16 +1677,68 @@ impl ZipStreamEncoder {
                 "ZIP end-entry received outside an entry",
             ));
         };
-        let produced = if entry.payload_method == 8 {
+        let mut prefix_produced = 0;
+        if entry.metadata_payload_position < entry.metadata_payload.len() {
+            let remaining = &entry.metadata_payload[entry.metadata_payload_position..];
+            let count = remaining.len().min(output.len());
+            output[..count].copy_from_slice(&remaining[..count]);
+            entry.crc.update(&output[..count]);
+            Self::encrypt_entry_output(entry, &mut output[..count]);
+            entry.metadata_payload_position += count;
+            entry.uncompressed_size = entry
+                .uncompressed_size
+                .checked_add(count as u64)
+                .ok_or_else(|| Self::error(ErrorKind::Limit, "ZIP entry size overflow"))?;
+            entry.compressed_size = entry
+                .compressed_size
+                .checked_add(count as u64)
+                .ok_or_else(|| Self::error(ErrorKind::Limit, "ZIP compressed size overflow"))?;
+            if self
+                .limits
+                .entry_bytes()
+                .is_some_and(|limit| entry.uncompressed_size > limit)
+            {
+                return Err(Self::error(
+                    ErrorKind::Limit,
+                    "ZIP entry exceeds configured size limit",
+                ));
+            }
+            self.total_input = self
+                .total_input
+                .checked_add(count as u64)
+                .ok_or_else(|| Self::error(ErrorKind::Limit, "ZIP decoded total overflow"))?;
+            if self
+                .limits
+                .decoded_total()
+                .is_some_and(|limit| self.total_input > limit)
+            {
+                return Err(Self::error(
+                    ErrorKind::Limit,
+                    "ZIP total input exceeds configured limit",
+                ));
+            }
+            self.offset = self
+                .offset
+                .checked_add(count as u64)
+                .ok_or_else(|| Self::error(ErrorKind::Limit, "ZIP archive offset overflow"))?;
+            if entry.metadata_payload_position < entry.metadata_payload.len() {
+                return Ok(EncodeStep {
+                    consumed: 0,
+                    produced: count,
+                    status: EncodeStatus::NeedOutput,
+                });
+            }
+            prefix_produced = count;
+        }
+        let output = &mut output[prefix_produced..];
+        let finalized = if entry.payload_method == 8 {
             let compressor = entry
                 .compressor
                 .as_mut()
                 .ok_or_else(|| Self::error(ErrorKind::Protocol, "ZIP deflate state is missing"))?;
             let step = compressor.process(&[], output, EndOfInput::End)?;
             #[cfg(feature = "aes")]
-            if let Some(aes) = &mut entry.aes {
-                aes.encrypt(&mut output[..step.produced]);
-            }
+            Self::encrypt_entry_output(entry, &mut output[..step.produced]);
             entry.compressed_size = entry
                 .compressed_size
                 .checked_add(step.produced as u64)
@@ -1034,7 +1752,7 @@ impl ZipStreamEncoder {
                 CodecStatus::NeedOutput => {
                     return Ok(EncodeStep {
                         consumed: 0,
-                        produced: step.produced,
+                        produced: prefix_produced + step.produced,
                         status: EncodeStatus::NeedOutput,
                     });
                 },
@@ -1053,6 +1771,7 @@ impl ZipStreamEncoder {
             }
         } else {
             let (written, done) = Self::finish_step(entry, output)?;
+            Self::encrypt_entry_output(entry, &mut output[..written]);
             entry.compressed_size = entry
                 .compressed_size
                 .checked_add(written as u64)
@@ -1066,11 +1785,12 @@ impl ZipStreamEncoder {
             } else {
                 return Ok(EncodeStep {
                     consumed: 0,
-                    produced: written,
+                    produced: prefix_produced + written,
                     status: EncodeStatus::NeedOutput,
                 });
             }
         };
+        let produced = prefix_produced + finalized;
 
         let Phase::Open(entry) = core::mem::replace(&mut self.phase, Phase::Ready) else {
             return Err(Self::error(
@@ -1188,7 +1908,7 @@ impl ZipStreamEncoder {
                 51
             } else if record.method == 12 {
                 46
-            } else if record.method == 93 || record.method == 14 {
+            } else if matches!(record.method, 14 | 93 | 95 | 98) {
                 63
             } else if size_zip64 || offset_zip64 {
                 45
@@ -1362,6 +2082,16 @@ impl ZipStreamEncoder {
     }
 }
 
+pub(crate) fn zip_entry_extension_supported(extension: &Extension) -> bool {
+    if extension.namespace() != "zip-extra" {
+        return false;
+    }
+    let [low, high] = extension.key() else {
+        return false;
+    };
+    !matches!(u16::from_le_bytes([*low, *high]), ZIP64_EXTRA | AES_EXTRA)
+}
+
 impl ArchiveEncoder for ZipStreamEncoder {
     #[allow(clippy::too_many_lines)]
     fn step(
@@ -1415,7 +2145,7 @@ impl ArchiveEncoder for ZipStreamEncoder {
     }
 }
 
-fn external_attributes(kind: EntryKind, mode: u32) -> u32 {
+fn external_attributes(kind: EntryKind, mode: u32, file_flags: u64) -> u32 {
     let type_bits = match kind {
         EntryKind::Dir => 0o040_000,
         EntryKind::Symlink => 0o120_000,
@@ -1424,7 +2154,8 @@ fn external_attributes(kind: EntryKind, mode: u32) -> u32 {
         EntryKind::Fifo => 0o010_000,
         _ => 0o100_000,
     };
-    let mut attributes = (type_bits | (mode & 0o7777)) << 16;
+    let dos_attributes = u32::try_from(file_flags & ZIP_DOS_FILE_FLAGS).unwrap_or_default();
+    let mut attributes = ((type_bits | (mode & 0o7777)) << 16) | dos_attributes;
     if kind == EntryKind::Dir {
         attributes |= 0x10;
     }
@@ -1475,12 +2206,25 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 /// Copies as much of `source`'s front into `output` as fits, removing the
 /// copied bytes from `source`, and returns the count written.
-#[cfg(feature = "xz")]
+#[cfg(any(feature = "xz", feature = "ppmd"))]
 fn drain_into(source: &mut Vec<u8>, output: &mut [u8]) -> usize {
     let n = source.len().min(output.len());
     output[..n].copy_from_slice(&source[..n]);
     source.drain(..n);
     n
+}
+
+#[cfg(feature = "ppmd")]
+fn ppmd_error(error: &ppmd_rust::Error, context: &'static str) -> ArchiveError {
+    let kind = match error {
+        ppmd_rust::Error::MemoryAllocation => ErrorKind::Limit,
+        ppmd_rust::Error::RangeDecoderInitialization
+        | ppmd_rust::Error::InvalidParameter
+        | ppmd_rust::Error::IoError(_) => ErrorKind::Malformed,
+    };
+    ArchiveError::new(kind)
+        .with_format("zip")
+        .with_context(context)
 }
 
 fn push_u16(output: &mut Vec<u8>, value: u16) {
@@ -1493,29 +2237,6 @@ fn push_u32(output: &mut Vec<u8>, value: u32) {
 
 fn push_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
-}
-
-/// Reports whether an already-serialized ZIP extra buffer carries `wanted`.
-///
-/// `extra` is built by this writer from valid `(id, len, value)` triples, so the
-/// walk stays in bounds; a would-be overflow simply stops the scan.
-fn zip_extra_contains_id(extra: &[u8], wanted: u16) -> bool {
-    let mut cursor = 0;
-    while cursor + 4 <= extra.len() {
-        let id = u16::from_le_bytes([extra[cursor], extra[cursor + 1]]);
-        if id == wanted {
-            return true;
-        }
-        let length = usize::from(u16::from_le_bytes([extra[cursor + 2], extra[cursor + 3]]));
-        let Some(next) = cursor
-            .checked_add(4)
-            .and_then(|base| base.checked_add(length))
-        else {
-            return false;
-        };
-        cursor = next;
-    }
-    false
 }
 
 /// Appends an Info-ZIP Extended Timestamp (`UT`, 0x5455) built from `times`.
@@ -1569,12 +2290,17 @@ fn push_infozip_unix(output: &mut Vec<u8>, owner: &Owner) {
     push_u16(output, gid);
 }
 
-fn push_aes_extra(output: &mut Vec<u8>, real_method: u16) {
+#[cfg(feature = "aes")]
+fn push_aes_extra(output: &mut Vec<u8>, real_method: u16, strength: AesStrength) {
     push_u16(output, AES_EXTRA);
     push_u16(output, 7);
     push_u16(output, 2);
     output.extend_from_slice(b"AE");
-    output.push(3);
+    output.push(match strength {
+        AesStrength::Bits128 => 1,
+        AesStrength::Bits192 => 2,
+        AesStrength::Bits256 => 3,
+    });
     push_u16(output, real_method);
 }
 

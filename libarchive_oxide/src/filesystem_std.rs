@@ -24,6 +24,66 @@ use crate::filesystem::{
     FilesystemRemoval,
 };
 
+#[cfg(windows)]
+const WINDOWS_CREATE_FILE_ATTRIBUTES: u64 = 0x0000_0002 | 0x0000_0004 | 0x0000_0020;
+#[cfg(windows)]
+const WINDOWS_SUPPORTED_FILE_ATTRIBUTES: u64 = WINDOWS_CREATE_FILE_ATTRIBUTES | 0x0000_0001;
+
+#[cfg(windows)]
+fn apply_windows_file_flags(
+    parent: &Dir,
+    destination: &Path,
+    metadata: &EntryMetadata,
+    findings: &mut Vec<FilesystemFinding>,
+) {
+    use std::os::windows::fs::MetadataExt;
+
+    let requested = metadata.file_flags();
+    if requested == 0 {
+        return;
+    }
+    let actual = match (|| {
+        if requested & 0x0000_0001 != 0 && requested & WINDOWS_CREATE_FILE_ATTRIBUTES == 0 {
+            let mut permissions = parent.metadata(destination)?.permissions();
+            permissions.set_readonly(true);
+            parent.set_permissions(destination, permissions)?;
+        }
+        parent
+            .open(destination)
+            .map(File::into_std)
+            .and_then(|file| file.metadata())
+    })() {
+        Ok(metadata) => u64::from(metadata.file_attributes()),
+        Err(error) => {
+            findings.push(FilesystemFinding::os_error(
+                metadata.path().clone(),
+                FilesystemOperation::FileFlags,
+                "failed to restore or inspect Windows file attributes",
+                &error,
+            ));
+            return;
+        },
+    };
+    let supported = requested & WINDOWS_SUPPORTED_FILE_ATTRIBUTES;
+    let missing = supported & !actual;
+    let unsupported = requested & !WINDOWS_SUPPORTED_FILE_ATTRIBUTES;
+    if missing == 0 && unsupported == 0 {
+        findings.push(FilesystemFinding::applied(
+            metadata.path().clone(),
+            FilesystemOperation::FileFlags,
+        ));
+    } else {
+        findings.push(FilesystemFinding::partial(
+            metadata.path().clone(),
+            FilesystemOperation::FileFlags,
+            format!(
+                "restored Windows file-attribute mask 0x{supported:08x}; \
+                 unsupported mask 0x{unsupported:016x}; missing mask 0x{missing:08x}"
+            ),
+        ));
+    }
+}
+
 #[derive(Debug)]
 struct PendingFile {
     file: File,
@@ -78,10 +138,8 @@ struct PendingEntry {
 /// Built-in adapter rooted at a `cap-std` directory capability.
 ///
 /// Regular files are written into a unique `create_new` sibling, synchronized,
-/// decorated through the open file descriptor where the platform permits, and
-/// then atomically published. Parent components are opened without following
-/// links, and the resulting directory capability is retained through commit so
-/// a concurrent ancestor replacement cannot redirect publication.
+/// decorated through the open file descriptor where the platform permits, and then atomically published.
+/// Parent components are opened without following links, and the resulting directory capability is retained through commit so a concurrent ancestor replacement cannot redirect publication.
 #[derive(Debug)]
 pub struct CapStdFilesystemAdapter {
     root: Dir,
@@ -136,10 +194,8 @@ impl CapStdFilesystemAdapter {
         }
     }
 
-    /// Resolves the destination parent one component at a time and returns a
-    /// stable directory capability. Every subsequent create/commit operation
-    /// is relative to this handle, so replacing an ancestor after preflight
-    /// cannot redirect an entry outside the extraction root.
+    /// Resolves the destination parent one component at a time and returns a stable directory capability.
+    /// Every subsequent create/commit operation is relative to this handle, so replacing an ancestor after preflight cannot redirect an entry outside the extraction root.
     fn resolve_destination(&mut self, path: &Path) -> io::Result<Option<SecureDestination>> {
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(
@@ -200,6 +256,7 @@ impl CapStdFilesystemAdapter {
     fn create_temporary_sibling(
         &mut self,
         destination: &SecureDestination,
+        file_flags: u64,
     ) -> io::Result<(File, OsString)> {
         for _ in 0..128 {
             self.temporary_counter = self.temporary_counter.wrapping_add(1);
@@ -209,6 +266,23 @@ impl CapStdFilesystemAdapter {
             ));
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
+            #[cfg(windows)]
+            {
+                use cap_std::fs::OpenOptionsExt;
+
+                let attributes = u32::try_from(file_flags & WINDOWS_CREATE_FILE_ATTRIBUTES)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Windows file attributes exceed the platform mask",
+                        )
+                    })?;
+                if attributes != 0 {
+                    options.attributes(attributes);
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = file_flags;
             match destination.parent.open_with(&temporary, &options) {
                 Ok(file) => return Ok((file, temporary)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
@@ -352,7 +426,7 @@ impl CapStdFilesystemAdapter {
     ) -> PendingEntry {
         let metadata = entry.metadata();
         let path = metadata.path().clone();
-        match self.create_temporary_sibling(&destination) {
+        match self.create_temporary_sibling(&destination, metadata.file_flags()) {
             Ok((file, temporary)) => PendingEntry {
                 path,
                 materialization: PendingMaterialization::File(Box::new(PendingFile {
@@ -409,9 +483,8 @@ impl CapStdFilesystemAdapter {
         }
     }
 
-    /// Opens the directory named by `path` by resolving each component with a
-    /// `nofollow` step, so no intermediate symbolic link is traversed. An empty
-    /// or `.` path yields a fresh handle to the extraction root.
+    /// Opens the directory named by `path` by resolving each component with a `nofollow` step, so no intermediate symbolic link is traversed.
+    /// An empty or `.` path yields a fresh handle to the extraction root.
     fn open_dir_chain(&self, path: &Path) -> io::Result<Dir> {
         let mut current = self.root.open_dir_nofollow(".")?;
         for component in path.components() {
@@ -430,8 +503,7 @@ impl CapStdFilesystemAdapter {
         Ok(current)
     }
 
-    /// Removes `destination` and any subtree it roots without following a
-    /// terminal or intermediate symbolic link.
+    /// Removes `destination` and any subtree it roots without following a terminal or intermediate symbolic link.
     fn remove_target(&self, destination: &Path) -> io::Result<()> {
         let parent = destination.parent().unwrap_or_else(|| Path::new(""));
         let Some(name) = destination.file_name() else {
@@ -449,8 +521,8 @@ impl CapStdFilesystemAdapter {
         }
     }
 
-    /// Removes every child of `destination` while leaving the directory itself
-    /// in place. Symbolic-link children are unlinked, never followed.
+    /// Removes every child of `destination` while leaving the directory itself in place.
+    /// Symbolic-link children are unlinked, never followed.
     fn clear_directory_contents(&self, destination: &Path) -> io::Result<()> {
         let directory = self.open_dir_chain(destination)?;
         let mut children: Vec<(std::ffi::OsString, bool)> = Vec::new();
@@ -578,15 +650,15 @@ fn apply_linux_metadata<Fd: std::os::fd::AsFd>(
     metadata: &EntryMetadata,
     findings: &mut Vec<FilesystemFinding>,
 ) {
-    apply_linux_xattrs(fd, metadata, findings);
+    apply_unix_xattrs(fd, metadata, findings);
     apply_linux_acls(fd, metadata, findings);
     apply_linux_ownership(fd, metadata, findings);
     apply_linux_times(fd, metadata, findings);
     apply_linux_mode(fd, metadata, findings);
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn apply_linux_xattrs<Fd: std::os::fd::AsFd>(
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn apply_unix_xattrs<Fd: std::os::fd::AsFd>(
     fd: &Fd,
     metadata: &EntryMetadata,
     findings: &mut Vec<FilesystemFinding>,
@@ -596,7 +668,7 @@ fn apply_linux_xattrs<Fd: std::os::fd::AsFd>(
     let path = metadata.path();
     for (name, value) in metadata.xattrs() {
         let operation = FilesystemOperation::ExtendedAttribute(name.clone());
-        if name.is_empty() || name.contains(&0) {
+        if !valid_xattr_name(name) {
             findings.push(FilesystemFinding::refused(
                 path.clone(),
                 operation,
@@ -934,7 +1006,15 @@ fn apply_file_metadata(
     metadata: &EntryMetadata,
     findings: &mut Vec<FilesystemFinding>,
 ) {
+    #[cfg(target_os = "macos")]
+    apply_unix_xattrs(file, metadata, findings);
     apply_portable_times(root, filesystem_path, metadata, findings);
+    #[cfg(windows)]
+    apply_windows_creation_time(
+        || file.try_clone().map(cap_std::fs::File::into_std),
+        metadata,
+        findings,
+    );
     #[cfg(not(unix))]
     let _ = file;
     #[cfg(unix)]
@@ -962,7 +1042,15 @@ fn apply_directory_metadata(
     metadata: &EntryMetadata,
     findings: &mut Vec<FilesystemFinding>,
 ) {
+    #[cfg(target_os = "macos")]
+    apply_unix_xattrs(root, metadata, findings);
     apply_portable_times(root, filesystem_path, metadata, findings);
+    #[cfg(windows)]
+    apply_windows_creation_time(
+        || open_windows_directory_metadata_handle(root),
+        metadata,
+        findings,
+    );
     #[cfg(unix)]
     if let Some(mode) = metadata.mode() {
         use cap_std::fs::{Permissions, PermissionsExt};
@@ -1052,6 +1140,13 @@ fn apply_portable_times(
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn timestamp_spec(timestamp: Timestamp) -> io::Result<SystemTimeSpec> {
+    Ok(SystemTimeSpec::Absolute(
+        cap_std::time::SystemTime::from_std(timestamp_system_time(timestamp)?),
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn timestamp_system_time(timestamp: Timestamp) -> io::Result<SystemTime> {
     if timestamp.nanoseconds() >= 1_000_000_000 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1077,9 +1172,52 @@ fn timestamp_spec(timestamp: Timestamp) -> io::Result<SystemTimeSpec> {
             "archive timestamp is out of range",
         )
     })?;
-    Ok(SystemTimeSpec::Absolute(
-        cap_std::time::SystemTime::from_std(absolute),
-    ))
+    Ok(absolute)
+}
+
+#[cfg(windows)]
+fn apply_windows_creation_time(
+    open_file: impl FnOnce() -> io::Result<std::fs::File>,
+    metadata: &EntryMetadata,
+    findings: &mut Vec<FilesystemFinding>,
+) {
+    use std::os::windows::fs::FileTimesExt;
+
+    let Some(created) = metadata.times().created else {
+        return;
+    };
+    let operation = FilesystemOperation::CreationTime;
+    let result = timestamp_system_time(created).and_then(|created| {
+        let file = open_file()?;
+        file.set_times(std::fs::FileTimes::new().set_created(created))
+    });
+    match result {
+        Ok(()) => findings.push(FilesystemFinding::applied(
+            metadata.path().clone(),
+            operation,
+        )),
+        Err(error) => findings.push(FilesystemFinding::os_error(
+            metadata.path().clone(),
+            operation,
+            "failed to restore creation time through the open handle",
+            &error,
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_directory_metadata_handle(root: &Dir) -> io::Result<std::fs::File> {
+    use cap_fs_ext::OpenOptionsMaybeDirExt;
+    use cap_std::fs::OpenOptionsExt;
+
+    // Win32 FILE_WRITE_ATTRIBUTES.
+    // Passing only this narrow access mask lets `File::set_times` update metadata without granting data-write access.
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+
+    let mut options = OpenOptions::new();
+    options.access_mode(FILE_WRITE_ATTRIBUTES).maybe_dir(true);
+    root.open_with(".", &options)
+        .map(cap_std::fs::File::into_std)
 }
 impl FilesystemAdapter for CapStdFilesystemAdapter {
     fn capabilities(&self) -> FilesystemCapabilities {
@@ -1374,15 +1512,27 @@ impl CapStdFilesystemAdapter {
                 format!("destination committed but temporary link cleanup failed: {error}"),
             ));
         }
-        pending.findings.push(FilesystemFinding::applied(
-            path.clone(),
-            FilesystemOperation::AtomicCommit,
-        ));
-        pending
-            .findings
-            .push(FilesystemFinding::applied(path, FilesystemOperation::Entry));
-        FilesystemEntryReport::new(FilesystemMaterialization::File, pending.findings)
+        #[cfg(windows)]
+        apply_windows_file_flags(
+            &pending.parent,
+            Path::new(&pending.destination),
+            &pending.metadata,
+            &mut pending.findings,
+        );
+        committed_file_report(path, pending.findings)
     }
+}
+
+fn committed_file_report(
+    path: ArchivePath,
+    mut findings: Vec<FilesystemFinding>,
+) -> FilesystemEntryReport {
+    findings.push(FilesystemFinding::applied(
+        path.clone(),
+        FilesystemOperation::AtomicCommit,
+    ));
+    findings.push(FilesystemFinding::applied(path, FilesystemOperation::Entry));
+    FilesystemEntryReport::new(FilesystemMaterialization::File, findings)
 }
 
 fn materialization_result(
@@ -1470,6 +1620,11 @@ fn metadata_error_findings(
     }
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+fn valid_xattr_name(name: &[u8]) -> bool {
+    !name.is_empty() && !name.contains(&0)
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn create_special(
     root: &Dir,
@@ -1523,4 +1678,203 @@ fn create_special(
         raw_device,
     )
     .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_xattr_name;
+
+    #[test]
+    fn xattr_names_must_be_nonempty_and_nul_free() {
+        assert!(valid_xattr_name(b"com.apple.ResourceFork"));
+        assert!(valid_xattr_name(b"user.libarchive-oxide"));
+        assert!(!valid_xattr_name(b""));
+        assert!(!valid_xattr_name(b"com.example\0invalid"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_adapter_refuses_invalid_xattr_names_without_losing_payload() {
+        use std::path::Path;
+
+        use cap_std::{ambient_authority, fs::Dir};
+        use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata};
+
+        use super::CapStdFilesystemAdapter;
+        use crate::filesystem::{
+            FilesystemAdapter, FilesystemEntry, FilesystemFindingKind, FilesystemOperation,
+        };
+
+        let destination = tempfile::tempdir().expect("destination");
+        let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).expect("root");
+        let mut adapter = CapStdFilesystemAdapter::new(root);
+        let metadata =
+            EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("invalid.bin"))
+                .size(Some(7))
+                .xattr(Vec::new(), b"empty".to_vec())
+                .xattr(b"com.example\0invalid".to_vec(), b"nul".to_vec())
+                .build();
+        adapter.begin_session().expect("begin session");
+        adapter
+            .begin_entry(FilesystemEntry::new(
+                &metadata,
+                Path::new("invalid.bin"),
+                None,
+                false,
+            ))
+            .expect("begin entry");
+        adapter.write_data(b"payload").expect("write payload");
+        let report = adapter.finish_entry().expect("finish entry");
+
+        assert_eq!(
+            std::fs::read(destination.path().join("invalid.bin")).expect("output payload"),
+            b"payload"
+        );
+        assert_eq!(
+            report
+                .findings()
+                .iter()
+                .filter(|finding| {
+                    matches!(
+                        finding.operation(),
+                        FilesystemOperation::ExtendedAttribute(_)
+                    ) && finding.kind() == FilesystemFindingKind::Refused
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(windows)]
+    fn materialize_windows_file_flags(
+        path: &'static str,
+        file_flags: u64,
+    ) -> (tempfile::TempDir, crate::FilesystemEntryReport) {
+        use std::path::Path;
+
+        use cap_std::{ambient_authority, fs::Dir};
+        use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata};
+
+        use super::CapStdFilesystemAdapter;
+        use crate::filesystem::{FilesystemAdapter, FilesystemEntry, FilesystemMaterialization};
+
+        let destination = tempfile::tempdir().expect("destination");
+        let root = Dir::open_ambient_dir(destination.path(), ambient_authority()).expect("root");
+        let mut adapter = CapStdFilesystemAdapter::new(root);
+        let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8(path))
+            .size(Some(7))
+            .file_flags(file_flags)
+            .build();
+        adapter.begin_session().expect("begin session");
+        adapter
+            .begin_entry(FilesystemEntry::new(
+                &metadata,
+                Path::new(path),
+                None,
+                false,
+            ))
+            .expect("begin entry");
+        adapter.write_data(b"payload").expect("write payload");
+        let report = adapter.finish_entry().expect("finish entry");
+
+        assert_eq!(report.materialization(), FilesystemMaterialization::File);
+        let output = destination.path().join(path);
+        assert_eq!(std::fs::read(&output).expect("payload"), b"payload");
+        (destination, report)
+    }
+
+    #[cfg(windows)]
+    fn windows_attributes(destination: &tempfile::TempDir, path: &str) -> u64 {
+        use std::os::windows::fs::MetadataExt;
+
+        u64::from(
+            std::fs::metadata(destination.path().join(path))
+                .expect("metadata")
+                .file_attributes(),
+        )
+    }
+
+    #[cfg(windows)]
+    fn assert_file_flags_finding(
+        report: &crate::FilesystemEntryReport,
+        expected: crate::FilesystemFindingKind,
+    ) {
+        use crate::filesystem::FilesystemOperation;
+
+        assert!(
+            report.findings().iter().any(|finding| {
+                finding.operation() == &FilesystemOperation::FileFlags && finding.kind() == expected
+            }),
+            "findings: {:?}",
+            report.findings()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_adapter_restores_create_time_file_attributes() {
+        use super::WINDOWS_CREATE_FILE_ATTRIBUTES;
+        use crate::filesystem::{FilesystemCapabilities, FilesystemFindingKind};
+
+        let (destination, report) =
+            materialize_windows_file_flags("attributes.bin", WINDOWS_CREATE_FILE_ATTRIBUTES);
+        assert_file_flags_finding(&report, FilesystemFindingKind::Applied);
+        assert_eq!(
+            windows_attributes(&destination, "attributes.bin") & WINDOWS_CREATE_FILE_ATTRIBUTES,
+            WINDOWS_CREATE_FILE_ATTRIBUTES
+        );
+        assert!(FilesystemCapabilities::standard().file_flags());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)] // Windows-only cleanup of this test fixture.
+    fn windows_adapter_restores_readonly_after_publication() {
+        use crate::filesystem::FilesystemFindingKind;
+
+        const FILE_ATTRIBUTE_READONLY: u64 = 0x0000_0001;
+        let (destination, report) =
+            materialize_windows_file_flags("readonly.bin", FILE_ATTRIBUTE_READONLY);
+        assert_file_flags_finding(&report, FilesystemFindingKind::Applied);
+        assert_eq!(
+            windows_attributes(&destination, "readonly.bin") & FILE_ATTRIBUTE_READONLY,
+            FILE_ATTRIBUTE_READONLY
+        );
+        let output = destination.path().join("readonly.bin");
+        let mut permissions = std::fs::metadata(&output).expect("metadata").permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(output, permissions).expect("clear readonly for test cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_adapter_preserves_create_attributes_when_readonly_is_incompatible() {
+        use crate::filesystem::FilesystemFindingKind;
+
+        const FILE_ATTRIBUTE_READONLY: u64 = 0x0000_0001;
+        const FILE_ATTRIBUTE_HIDDEN: u64 = 0x0000_0002;
+        let requested = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN;
+        let (destination, report) = materialize_windows_file_flags("combined.bin", requested);
+        assert_file_flags_finding(&report, FilesystemFindingKind::Partial);
+        assert_eq!(
+            windows_attributes(&destination, "combined.bin") & requested,
+            FILE_ATTRIBUTE_HIDDEN
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_adapter_reports_unsupported_file_attributes() {
+        use crate::filesystem::FilesystemFindingKind;
+
+        const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u64 = 0x0000_2000;
+        let (destination, report) =
+            materialize_windows_file_flags("unsupported.bin", FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+        assert_file_flags_finding(&report, FilesystemFindingKind::Partial);
+        assert_eq!(
+            windows_attributes(&destination, "unsupported.bin")
+                & FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+            0
+        );
+    }
 }

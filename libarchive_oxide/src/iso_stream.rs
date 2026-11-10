@@ -98,6 +98,7 @@ pub(crate) struct IsoSeekWriter<W: Write + Seek> {
     pending: Option<PendingEntry>,
     limits: Limits,
     metadata_used: usize,
+    archive_metadata_used: usize,
     decoded_total: u64,
     archive_metadata: ArchiveMetadata,
 }
@@ -115,6 +116,7 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
             pending: None,
             limits,
             metadata_used: core::mem::size_of::<IsoNode>(),
+            archive_metadata_used: 0,
             decoded_total: 0,
             archive_metadata: ArchiveMetadata::new(),
         })
@@ -130,11 +132,15 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
                 "ISO archive metadata must be set before the first entry",
             ));
         }
-        if metadata.comment().is_some()
+        if metadata
+            .volume_name()
+            .is_some_and(|name| !iso_volume_name_supported(name))
+            || metadata.comment().is_some()
             || metadata
                 .extensions()
                 .iter()
-                .any(|extension| extension.namespace() != "iso9660-volume")
+                .any(|extension| !iso_archive_extension_supported(extension))
+            || has_duplicate_iso_archive_extensions(metadata)
         {
             return Err(iso_error(
                 ErrorKind::Unsupported,
@@ -142,10 +148,17 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
             ));
         }
         let cost = archive_metadata_cost(metadata)?;
+        let retained = self
+            .metadata_used
+            .checked_sub(self.archive_metadata_used)
+            .ok_or_else(|| iso_error(ErrorKind::Protocol, "metadata accounting underflow"))?;
+        let projected = retained
+            .checked_add(cost)
+            .ok_or_else(|| iso_error(ErrorKind::Limit, "metadata accounting overflow"))?;
         if self
             .limits
             .metadata_bytes()
-            .is_some_and(|limit| self.metadata_used.saturating_add(cost) > limit)
+            .is_some_and(|limit| projected > limit)
         {
             return Err(iso_error(
                 ErrorKind::Limit,
@@ -153,10 +166,8 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
             ));
         }
         self.archive_metadata = metadata.clone();
-        self.metadata_used = self
-            .metadata_used
-            .checked_add(cost)
-            .ok_or_else(|| iso_error(ErrorKind::Limit, "metadata accounting overflow"))?;
+        self.metadata_used = projected;
+        self.archive_metadata_used = cost;
         Ok(())
     }
 
@@ -467,12 +478,10 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
                 }
             },
             EntryKind::Hardlink => {
-                if metadata.link_target().is_none() {
-                    return Err(iso_error(
-                        ErrorKind::Protocol,
-                        "ISO hard link requires a target",
-                    ));
-                }
+                return Err(iso_error(
+                    ErrorKind::Unsupported,
+                    "ISO writer cannot preserve typed hard-link metadata",
+                ));
             },
             EntryKind::Char | EntryKind::Block => {
                 if metadata.referenced_device().is_none() {
@@ -489,12 +498,22 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
                 ));
             },
         }
+        if metadata
+            .size()
+            .is_some_and(|size| size > u64::from(u32::MAX))
+        {
+            return Err(iso_error(
+                ErrorKind::Limit,
+                "ISO declared entry size exceeds its u32 directory record",
+            ));
+        }
         if metadata.kind() != EntryKind::File && metadata.size().is_some_and(|size| size != 0) {
             return Err(iso_error(
                 ErrorKind::Protocol,
                 "non-file ISO entry must have size zero or unknown",
             ));
         }
+        validate_iso_typed_fields(metadata)?;
         if !metadata.sparse_extents().is_empty()
             || !metadata.xattrs().is_empty()
             || !metadata.acl().is_empty()
@@ -503,6 +522,31 @@ impl<W: Write + Seek> IsoSeekWriter<W> {
             return Err(iso_error(
                 ErrorKind::Unsupported,
                 "ISO writer cannot represent sparse, xattr, ACL, or encrypted metadata",
+            ));
+        }
+        if [
+            metadata.times().modified,
+            metadata.times().accessed,
+            metadata.times().changed,
+            metadata.times().created,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|timestamp| !iso_timestamp_supported(timestamp))
+        {
+            return Err(iso_error(
+                ErrorKind::Unsupported,
+                "ISO writer cannot represent requested timestamp exactly",
+            ));
+        }
+        if metadata
+            .extensions()
+            .iter()
+            .any(|extension| !iso_entry_extension_supported(extension))
+        {
+            return Err(iso_error(
+                ErrorKind::Unsupported,
+                "ISO entry metadata contains an unrepresentable raw extension",
             ));
         }
         Ok(())
@@ -1021,10 +1065,11 @@ fn volume_descriptor(
         descriptor[40..40 + count].copy_from_slice(&encoded[..count]);
     } else {
         descriptor[8..72].fill(b' ');
+        descriptor[190..813].fill(b' ');
         if let Some(system_id) = metadata.extensions().iter().find(|extension| {
             extension.namespace() == "iso9660-volume" && extension.key() == b"system-id"
         }) {
-            let count = system_id.value().len().min(32);
+            let count = system_id.value().len();
             descriptor[8..8 + count].copy_from_slice(&system_id.value()[..count]);
         }
         let encoded = primary_name(volume_name);
@@ -1033,7 +1078,7 @@ fn volume_descriptor(
         if let Some(application_id) = metadata.extensions().iter().find(|extension| {
             extension.namespace() == "iso9660-volume" && extension.key() == b"application-id"
         }) {
-            let count = application_id.value().len().min(128);
+            let count = application_id.value().len();
             descriptor[574..574 + count].copy_from_slice(&application_id.value()[..count]);
         }
     }
@@ -1058,11 +1103,47 @@ fn volume_descriptor(
         &[],
     )?;
     descriptor[156..156 + root.len()].copy_from_slice(&root);
-    if !layout.joliet {
-        descriptor[190..813].fill(b' ');
-    }
     descriptor[881] = 1;
     Ok(descriptor)
+}
+
+pub(crate) fn iso_archive_extension_supported(extension: &Extension) -> bool {
+    if extension.namespace() != "iso9660-volume" {
+        return false;
+    }
+    let maximum = match extension.key() {
+        b"system-id" => 32,
+        b"application-id" => 128,
+        _ => return false,
+    };
+    !extension.value().is_empty()
+        && extension.value().len() <= maximum
+        && extension
+            .value()
+            .last()
+            .is_some_and(|byte| !matches!(byte, b' ' | 0))
+}
+
+pub(crate) fn iso_volume_name_supported(name: &ArchivePath) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() <= 32 && primary_name(bytes) == bytes
+}
+
+fn has_duplicate_iso_archive_extensions(metadata: &ArchiveMetadata) -> bool {
+    let mut system_id = false;
+    let mut application_id = false;
+    for extension in metadata.extensions() {
+        let seen = match extension.key() {
+            b"system-id" => &mut system_id,
+            b"application-id" => &mut application_id,
+            _ => continue,
+        };
+        if *seen {
+            return true;
+        }
+        *seen = true;
+    }
+    false
 }
 
 fn archive_metadata_cost(metadata: &ArchiveMetadata) -> Result<usize, StreamError> {
@@ -1431,26 +1512,58 @@ fn push_nm_fields(output: &mut Vec<u8>, name: &[u8]) -> Result<(), StreamError> 
 }
 
 fn append_raw_system_use(output: &mut Vec<u8>, extension: &Extension) -> Result<(), StreamError> {
+    if !iso_entry_extension_supported(extension) {
+        return Err(iso_error(
+            ErrorKind::Unsupported,
+            "ISO entry metadata contains an unrepresentable raw extension",
+        ));
+    }
+    output.extend_from_slice(extension.value());
+    Ok(())
+}
+
+fn validate_iso_typed_fields(metadata: &EntryMetadata) -> Result<(), StreamError> {
+    let owner = metadata.owner();
+    let numeric_metadata_supported = owner
+        .uid
+        .into_iter()
+        .chain(owner.gid)
+        .chain(metadata.inode())
+        .chain(metadata.links())
+        .all(|value| u32::try_from(value).is_ok());
+    let device_supported = metadata.referenced_device().is_none_or(|device| {
+        u32::try_from(device.major).is_ok() && u32::try_from(device.minor).is_ok()
+    });
+    if owner.user.is_some()
+        || owner.group.is_some()
+        || metadata.mode().is_some_and(|mode| mode > 0o7777)
+        || !numeric_metadata_supported
+        || metadata.device().is_some()
+        || !device_supported
+        || metadata.file_flags() != 0
+        || metadata.checksum().is_some()
+        || metadata.comment().is_some()
+    {
+        return Err(iso_error(
+            ErrorKind::Unsupported,
+            "ISO writer cannot represent requested typed entry metadata",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn iso_entry_extension_supported(extension: &Extension) -> bool {
     if extension.namespace() != "iso-system-use"
+        || extension.key().len() != 2
         || matches!(
             extension.key(),
             b"SP" | b"RR" | b"NM" | b"PX" | b"PN" | b"SL" | b"TF" | b"CE" | b"ST"
         )
     {
-        return Ok(());
-    }
-    if extension.key().len() != 2 {
-        return Err(iso_error(
-            ErrorKind::Malformed,
-            "raw ISO system-use signature must be two bytes",
-        ));
+        return false;
     }
     let value = extension.value();
-    if value.len() >= 4 && &value[..2] == extension.key() && usize::from(value[2]) == value.len() {
-        output.extend_from_slice(value);
-        return Ok(());
-    }
-    push_susp_field(output, [extension.key()[0], extension.key()[1]], value)
+    value.len() >= 4 && &value[..2] == extension.key() && usize::from(value[2]) == value.len()
 }
 
 fn push_symbolic_link_fields(output: &mut Vec<u8>, target: &[u8]) -> Result<(), StreamError> {
@@ -1543,6 +1656,10 @@ fn long_timestamp(timestamp: Timestamp) -> Option<[u8; 17]> {
     let mut encoded = [0_u8; 17];
     encoded[..16].copy_from_slice(text.as_bytes());
     Some(encoded)
+}
+
+pub(crate) fn iso_timestamp_supported(timestamp: Timestamp) -> bool {
+    timestamp.nanoseconds().is_multiple_of(10_000_000) && long_timestamp(timestamp).is_some()
 }
 
 fn short_timestamp(timestamp: Timestamp) -> Option<[u8; 7]> {

@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 libarchive_oxide contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "libarchive_oxide-protocol"
+version.workspace = true
+description = "dependency-free no_std codec protocols, limits, and errors for libarchive_oxide"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/libarchive_oxide-protocol"
+keywords = ["archive", "compression", "codec", "no-std", "embedded"]
+categories = ["compression", "no-std"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

@@ -240,12 +240,18 @@ impl FilesystemCapabilities {
             .with_ownership(cfg!(any(target_os = "linux", target_os = "android")))
             .with_access_time(true)
             .with_modification_time(true)
+            .with_creation_time(cfg!(windows))
             .with_symlinks(true)
             .with_hardlinks(true)
-            .with_xattrs(cfg!(any(target_os = "linux", target_os = "android")))
+            .with_xattrs(cfg!(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos"
+            )))
             .with_acls(cfg!(any(target_os = "linux", target_os = "android")))
             .with_sparse(cfg!(unix))
             .with_special_files(cfg!(any(target_os = "linux", target_os = "android")))
+            .with_file_flags(cfg!(windows))
             .with_removals(true)
     }
 

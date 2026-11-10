@@ -8,7 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
-use libarchive_oxide_core::{
+use libarchive_oxide_protocol::{
     ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput, ErrorKind, Limits,
 };
 

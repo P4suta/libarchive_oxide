@@ -10,8 +10,9 @@ use std::ops::Range;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
+use libarchive_oxide::Limits;
 use libarchive_oxide::{ErrorKind, ReaderEvent, SeekArchiveReader};
-use libarchive_oxide_core::Limits;
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::jar_signature::{
@@ -40,6 +41,7 @@ pub(crate) struct ZipVerification {
 pub(crate) struct EntryDigest {
     pub(crate) name: Vec<u8>,
     pub(crate) size: u64,
+    pub(crate) sha1: Vec<u8>,
     pub(crate) sha256: Vec<u8>,
     pub(crate) sha384: Vec<u8>,
     pub(crate) sha512: Vec<u8>,
@@ -79,6 +81,7 @@ impl CollectError {
 struct CurrentDigest {
     name: Vec<u8>,
     size: u64,
+    sha1: Sha1,
     sha256: Sha256,
     sha384: Sha384,
     sha512: Sha512,
@@ -90,6 +93,7 @@ impl CurrentDigest {
         Self {
             name,
             size: 0,
+            sha1: Sha1::new(),
             sha256: Sha256::new(),
             sha384: Sha384::new(),
             sha512: Sha512::new(),
@@ -107,6 +111,7 @@ impl CurrentDigest {
             .size
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| CollectError::read("entry size overflow while hashing"))?;
+        self.sha1.update(bytes);
         self.sha256.update(bytes);
         self.sha384.update(bytes);
         self.sha512.update(bytes);
@@ -128,6 +133,7 @@ impl CurrentDigest {
         EntryDigest {
             name: self.name,
             size: self.size,
+            sha1: self.sha1.finalize().to_vec(),
             sha256: self.sha256.finalize().to_vec(),
             sha384: self.sha384.finalize().to_vec(),
             sha512: self.sha512.finalize().to_vec(),
@@ -1017,6 +1023,7 @@ mod tests {
         let entry = EntryDigest {
             name: b"payload.bin".to_vec(),
             size: 0,
+            sha1: vec![0x11; 20],
             sha256: vec![0x25; 32],
             sha384: vec![0x38; 48],
             sha512: vec![0x51; 64],

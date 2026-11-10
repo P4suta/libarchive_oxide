@@ -8,7 +8,7 @@
 #![cfg(feature = "lz4")]
 
 use libarchive_oxide_codecs::lz4::{Lz4Decoder, encode_frame};
-use libarchive_oxide_core::{Codec, CodecStatus, EndOfInput, ErrorKind};
+use libarchive_oxide_protocol::{Codec, CodecStatus, EndOfInput, ErrorKind};
 
 #[test]
 fn whole_frame_crosses_header_and_block_states_in_one_call() {

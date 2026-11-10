@@ -7,15 +7,17 @@
 #![allow(clippy::expect_used)]
 
 use std::io::{Cursor, Read};
+#[cfg(feature = "aes")]
+use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-#[cfg(feature = "aes")]
-use libarchive_oxide::SecretBytes;
 use libarchive_oxide::{
-    ArchiveEngine, CreateOptions, EntryOutcomeKind, PlanDisposition, Policy, PreparedArchive,
-    ReaderEvent, RejectionReason,
+    ArchiveEngine, CreateOptions, EntryOutcomeKind, OpenOptions, PlanDisposition, Policy,
+    PreparedArchive, ReaderEvent, RejectionReason, SourceLimits,
 };
+#[cfg(feature = "aes")]
+use libarchive_oxide::{PasswordCandidates, SecretBytes};
 use libarchive_oxide_core::{
     ArchiveError, ArchivePath, EntryKind, EntryMetadata, ErrorKind, FilterId, FormatId, Limits,
 };
@@ -109,12 +111,73 @@ fn inspection_handles_bzip2_tar() {
 #[test]
 fn inspection_handles_seek_zip() {
     let zip = archive(FormatId::Zip, None, b"zip.txt", b"zip");
-    let mut zip_session = ArchiveEngine::new()
-        .prepare(Cursor::new(zip))
-        .expect("open zip session");
-    let zip_inspection = zip_session.inspect().expect("inspect zip");
-    assert_eq!(zip_inspection.format(), FormatId::Zip);
-    assert_eq!(zip_inspection.entries().len(), 1);
+    for session in [
+        ArchiveEngine::new().prepare(Cursor::new(zip.clone())),
+        ArchiveEngine::new().prepare_with_format(Cursor::new(zip.clone()), FormatId::Zip),
+    ] {
+        let mut zip_session = session.expect("open zip session");
+        let zip_inspection = zip_session.inspect().expect("inspect zip");
+        assert_eq!(zip_inspection.format(), FormatId::Zip);
+        assert_eq!(zip_inspection.entries().len(), 1);
+        assert_eq!(
+            zip_inspection.entries()[0].metadata().path().as_bytes(),
+            b"zip.txt"
+        );
+    }
+}
+
+#[test]
+fn prepared_open_options_apply_explicit_filters_and_encoded_source_limits() {
+    let encoded = archive(
+        FormatId::Tar,
+        Some(FilterId::Base64),
+        b"filtered.txt",
+        b"filtered",
+    );
+    let options = OpenOptions::new()
+        .with_format(Some(FormatId::Tar))
+        .with_filter(Some(FilterId::Base64));
+    let mut session = ArchiveEngine::new()
+        .prepare_with_options(Cursor::new(encoded.clone()), &options)
+        .expect("prepare explicitly filtered session");
+    let inspection = session.inspect().expect("inspect explicitly filtered tar");
+    assert_eq!(inspection.format(), FormatId::Tar);
+    assert_eq!(
+        inspection.entries()[0].metadata().path().as_bytes(),
+        b"filtered.txt"
+    );
+    session
+        .rewind()
+        .expect("rewind explicitly filtered session");
+
+    let maximum = u64::try_from(encoded.len() - 1).expect("fixture length");
+    let limited = OpenOptions::new()
+        .with_source_limits(SourceLimits::safe().with_source_bytes(Some(maximum)));
+    let error = ArchiveEngine::new()
+        .prepare_with_options(Cursor::new(encoded.clone()), &limited)
+        .expect_err("encoded source limit must be enforced while spooling");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Limit)
+    );
+
+    let prepared = PreparedArchive::spool(Cursor::new(encoded)).expect("prepare reusable input");
+    let error = ArchiveEngine::new()
+        .open_prepared_with_options(prepared, &limited)
+        .expect_err("source limit must also apply to caller-prepared input");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Limit)
+    );
+
+    let discovery = OpenOptions::new().with_adjacent_volume_discovery(true);
+    let error = ArchiveEngine::new()
+        .prepare_with_options(Cursor::new(Vec::<u8>::new()), &discovery)
+        .expect_err("stream preparation must not inspect adjacent paths");
+    assert_eq!(
+        error.archive_error().map(ArchiveError::kind),
+        Some(ErrorKind::Capability)
+    );
 }
 
 #[test]
@@ -348,6 +411,25 @@ fn password_session_survives_inspect_and_explicit_rewinds() {
     }
     assert_eq!(payload, b"protected payload");
     assert!(!format!("{session:?}").contains("engine-session-secret"));
+
+    let options = OpenOptions::new()
+        .with_format(Some(FormatId::Zip))
+        .with_password_provider(Arc::new(PasswordCandidates::new([
+            SecretBytes::from(&b"wrong"[..]),
+            SecretBytes::from(PASSWORD),
+        ])))
+        .with_maximum_password_candidates(2);
+    let mut options_session = ArchiveEngine::new()
+        .prepare_with_options(Cursor::new(bytes.clone()), &options)
+        .expect("explicit format and password candidates");
+    let inspection = options_session
+        .inspect()
+        .expect("fallback password candidate authenticates ZIP");
+    assert_eq!(inspection.format(), FormatId::Zip);
+    options_session
+        .rewind()
+        .expect("rewind OpenOptions password session");
+    assert!(!format!("{options_session:?}").contains("engine-session-secret"));
 
     let error = ArchiveEngine::new()
         .prepare_with_password(Cursor::new(bytes), SecretBytes::from(&b"wrong"[..]))

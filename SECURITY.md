@@ -33,7 +33,8 @@ compatibility.
 ## Controls
 
 - all project-owned published crates use `#![forbid(unsafe_code)]`;
-- `libarchive_oxide-core` is zero-dependency safe Rust; the default
+- `libarchive_oxide-protocol` is zero-dependency Safe Rust and format core
+  depends only on that contract; the default
   `portable-codecs` normal/build graph excludes codec C/FFI packages, while
   additive `native-codecs` explicitly enables system backends. Portable,
   native, and combined builds run the same bounded conformance, malformed, and

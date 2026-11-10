@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::hash::Hasher;
 
-use libarchive_oxide_core::{
+use libarchive_oxide_protocol::{
     ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput, ErrorKind, Limits,
 };
 use twox_hash::XxHash32;

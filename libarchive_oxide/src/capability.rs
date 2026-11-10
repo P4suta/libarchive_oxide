@@ -99,8 +99,14 @@ fn requirement_enabled(requirement: &str) -> bool {
     if requirement == "xz" {
         return cfg!(feature = "xz");
     }
+    if requirement == "ppmd" {
+        return cfg!(feature = "ppmd");
+    }
     if requirement == "lz4" {
         return cfg!(feature = "lz4");
+    }
+    if requirement == "lzop" {
+        return cfg!(feature = "lzop");
     }
     if requirement == "compress" {
         return cfg!(feature = "compress");
@@ -119,6 +125,9 @@ fn requirement_enabled(requirement: &str) -> bool {
     }
     if requirement == "cab-quantum" {
         return cfg!(feature = "cab-quantum");
+    }
+    if requirement == "lha" {
+        return cfg!(feature = "lha");
     }
     false
 }

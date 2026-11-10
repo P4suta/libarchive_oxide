@@ -36,6 +36,13 @@ version change, or versioned release candidate is part of this snapshot.
 - The Linux reference test restores mode, timestamps, xattrs, POSIX ACLs, and
   sparse layout; link behavior and unsafe paths have dedicated extraction and
   adapter tests.
+- The Windows continuation restores file and deferred-directory creation times
+  through capability-rooted handles, reports pre-1601 conversion failure, and
+  retains the existing alias/race protections without project-owned unsafe
+  code.
+- The macOS continuation restores regular-file and deferred-directory xattrs,
+  including `com.apple.ResourceFork`, through descriptors; invalid names and
+  per-attribute outcomes remain explicit in the filesystem findings.
 - Current readers, writers, and `Pipeline` remain documented low-level APIs.
 
 ## RM-110

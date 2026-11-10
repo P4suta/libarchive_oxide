@@ -31,7 +31,9 @@
     clippy::doc_markdown
 )]
 
-use libarchive_oxide::{ArchiveWriter, ZipMethod};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+
+use libarchive_oxide::{ArchiveWriter, ReaderEvent, SeekArchiveReader, ZipMethod};
 use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 
 mod common;
@@ -80,6 +82,129 @@ fn arca_zip(entries: &[LogicalEntry], method: ZipMethod) -> Vec<u8> {
 
 fn arca_zip_lzma(entries: &[LogicalEntry]) -> Vec<u8> {
     arca_zip(entries, ZipMethod::Lzma)
+}
+
+struct PayloadPreparationGate {
+    inner: Cursor<Vec<u8>>,
+    payload_start: u64,
+    central_start: u64,
+    payload_allowance: usize,
+    payload_read: usize,
+}
+
+impl Read for PayloadPreparationGate {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let position = self.inner.position();
+        if position >= self.payload_start && position < self.central_start {
+            let available = self.payload_allowance.saturating_sub(self.payload_read);
+            if available == 0 {
+                return Err(std::io::Error::other(
+                    "LZMA payload was read before the first data event",
+                ));
+            }
+            let count = output.len().min(available);
+            let read = self.inner.read(&mut output[..count])?;
+            self.payload_read += read;
+            return Ok(read);
+        }
+        self.inner.read(output)
+    }
+}
+
+impl Seek for PayloadPreparationGate {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+#[test]
+fn zip_lzma_entry_preparation_reads_only_the_bounded_decoder_prefix() {
+    let payload: Vec<u8> = (0_u32..2 * 1024 * 1024)
+        .map(|index| {
+            let mixed = index.wrapping_mul(0x9e37_79b9) ^ index.rotate_left(13);
+            mixed.to_le_bytes()[0]
+        })
+        .collect();
+    let archive = arca_zip_lzma(&[LogicalEntry::file(b"large.bin".to_vec(), payload)]);
+    let name_length = usize::from(u16::from_le_bytes([archive[26], archive[27]]));
+    let extra_length = usize::from(u16::from_le_bytes([archive[28], archive[29]]));
+    let payload_start = u64::try_from(30 + name_length + extra_length).unwrap();
+    let eocd = archive
+        .windows(4)
+        .rposition(|window| window == b"PK\x05\x06")
+        .unwrap();
+    let central_start = u64::from(u32::from_le_bytes([
+        archive[eocd + 16],
+        archive[eocd + 17],
+        archive[eocd + 18],
+        archive[eocd + 19],
+    ]));
+    let source = PayloadPreparationGate {
+        inner: Cursor::new(archive),
+        payload_start,
+        central_start,
+        // Nine ZIP-LZMA header bytes plus the five-byte range decoder initialization prefix consumed by LzmaReader::new_with_props.
+        payload_allowance: 14,
+        payload_read: 0,
+    };
+    let mut reader = SeekArchiveReader::with_limits(source, Limits::default()).unwrap();
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::ArchiveMetadata(_)
+    ));
+    assert!(matches!(
+        reader.next_event().unwrap(),
+        ReaderEvent::Entry(_)
+    ));
+}
+
+fn two_lzma_members() -> Vec<u8> {
+    arca_zip_lzma(&[
+        LogicalEntry::file(b"first.bin".to_vec(), vec![b'a'; 32 * 1024]),
+        LogicalEntry::file(b"second.bin".to_vec(), b"second payload".to_vec()),
+    ])
+}
+
+#[test]
+fn zip_lzma_skip_recovers_source_and_continues_with_next_entry() {
+    let mut reader =
+        SeekArchiveReader::with_limits(Cursor::new(two_lzma_members()), Limits::default()).unwrap();
+    loop {
+        if let ReaderEvent::Data(_) = reader.next_event().unwrap() {
+            reader.skip_entry().unwrap();
+            break;
+        }
+    }
+    let mut second = Vec::new();
+    let mut in_second = false;
+    loop {
+        match reader.next_event().unwrap() {
+            ReaderEvent::Entry(metadata) if metadata.path().as_bytes() == b"second.bin" => {
+                in_second = true;
+            },
+            ReaderEvent::Data(bytes) if in_second => second.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(second, b"second payload");
+}
+
+#[test]
+fn zip_lzma_into_inner_recovers_source_during_decode() {
+    let archive = two_lzma_members();
+    let expected_len = archive.len();
+    let mut reader =
+        SeekArchiveReader::with_limits(Cursor::new(archive), Limits::default()).unwrap();
+    loop {
+        if matches!(reader.next_event().unwrap(), ReaderEvent::Data(_)) {
+            break;
+        }
+    }
+    let source = reader
+        .into_inner()
+        .expect("active LZMA source is recoverable");
+    assert_eq!(source.get_ref().len(), expected_len);
 }
 
 // ---------------------------------------------------------------------------

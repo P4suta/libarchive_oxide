@@ -9,9 +9,9 @@ use alloc::vec::Vec;
 
 use libarchive_oxide_core::{
     ArDecoder, ArEncoder, ArchiveDecoder, ArchiveEncoder, ArchivePath, Checksum, CodecStatus,
-    CodecStep, CpioDecoder, CpioDialect, CpioEncoder, DecodeEvent, Device, EncodeCommand,
-    EncodeStatus, EndOfInput, EntryKind, EntryMetadata, ErrorKind, FilterId, FormatId, Limits,
-    ProbeResult, TarDecoder, TarEncoder, Timestamp,
+    CodecStep, CpioDecoder, CpioDialect, CpioEncoder, DecodeEvent, DecodeStep, Device,
+    EncodeCommand, EncodeStatus, EndOfInput, EntryKind, EntryMetadata, ErrorKind, FilterId,
+    FormatId, Limits, ProbeResult, TarDecoder, TarEncoder, Timestamp,
 };
 
 extern crate alloc;
@@ -355,6 +355,20 @@ fn codec_progress_validation_rejects_out_of_range_counts() {
         .kind(),
         ErrorKind::Protocol
     );
+}
+
+#[test]
+fn internal_progress_is_valid_without_public_output() {
+    let step = DecodeStep {
+        consumed: 0,
+        produced: 0,
+        event: DecodeEvent::Progress,
+    };
+
+    let validated = step
+        .validate(1, 0)
+        .expect("internal work is semantic decoder progress");
+    assert!(matches!(validated.event, DecodeEvent::Progress));
 }
 
 #[test]

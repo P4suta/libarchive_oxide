@@ -12,22 +12,27 @@
 
 pub mod alpine;
 mod alpine_signature;
+mod android_manifest;
 mod android_signature;
 mod android_v4_signature;
 pub mod app_profile;
 pub mod deb;
 pub mod finding;
 mod integrity;
+mod ipa_signature;
 mod jar_signature;
 mod msix_blockmap;
+mod msix_signature;
 mod nuget_signature;
 pub mod rpm;
+mod rpm_signature;
 mod verification;
 pub mod zip_profile;
 mod zip_reader;
 
 pub use alpine::{AlpineApkValidation, AlpineApkValidator};
 pub use alpine_signature::{AlpineRsaPublicKey, PackageKeyError};
+pub use android_manifest::AndroidApkManifestReport;
 pub use android_v4_signature::AndroidApkV4Revision;
 pub use app_profile::{
     AppPackageProfile, AppPackageValidation, AppPackageValidator, AppSignatureReport,
@@ -35,9 +40,10 @@ pub use app_profile::{
 pub use deb::{DebValidation, DebValidator};
 pub use finding::{PackageFinding, PackageFindingCode, Severity, SupportStatus};
 pub use rpm::{RpmValidation, RpmValidator};
+pub use rpm_signature::RpmOpenPgpPublicKey;
 pub use verification::{
-    AndroidApkLineageLevelReport, AndroidApkRotationReport, AndroidApkTargetedSignerReport,
-    AndroidApkV4Report, PackageInspector, PackageVerifier, TrustPolicy, VerificationDimension,
-    VerificationReport,
+    AndroidApkCompatibilityReport, AndroidApkLineageLevelReport, AndroidApkRotationReport,
+    AndroidApkTargetedSignerReport, AndroidApkV4Report, PackageInspector, PackageVerifier,
+    TrustPolicy, VerificationDimension, VerificationReport,
 };
 pub use zip_profile::{ZipPackageProfile, ZipPackageValidation, ZipPackageValidator};

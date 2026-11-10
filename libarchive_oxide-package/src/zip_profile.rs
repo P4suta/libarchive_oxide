@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 use unicode_normalization::UnicodeNormalization;
 
 use super::finding::{PackageFinding, PackageFindingCode, Severity, SupportStatus};

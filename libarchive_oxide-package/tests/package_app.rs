@@ -17,8 +17,8 @@
 
 use std::io::Cursor;
 
+use libarchive_oxide::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use libarchive_oxide::{ArchiveWriter, ZipMethod};
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use libarchive_oxide_package::{
     AppPackageProfile, AppPackageValidation, AppPackageValidator, PackageFindingCode,
     PackageVerifier, VerificationDimension,
@@ -275,6 +275,26 @@ fn apk_unsigned_reports_unsigned_but_stays_valid() {
         report.signature_validity(),
         VerificationDimension::NotPresent
     );
+}
+
+#[test]
+fn apk_manifest_body_is_bounded_and_reported_independently() {
+    let bytes = build_zip(
+        &[
+            RawEntry::stored(b"classes.dex", b"dex\n035\0"),
+            RawEntry::stored(b"AndroidManifest.xml", &[0_u8; 1024]),
+        ],
+        &[],
+    );
+    let report = PackageVerifier::default()
+        .with_limits(Limits::safe().with_metadata_bytes(Some(512)))
+        .app(AppPackageProfile::AndroidApk, Cursor::new(bytes));
+    let manifest = report.android_apk_manifest().expect("Android report");
+
+    assert_eq!(manifest.validity(), VerificationDimension::Invalid);
+    assert_eq!(manifest.minimum_sdk(), None);
+    assert!(report.has_code(PackageFindingCode::AndroidManifestResourceLimit));
+    assert!(!report.structure().profile_valid());
 }
 
 #[test]

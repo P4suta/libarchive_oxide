@@ -36,17 +36,22 @@ impl ReadAt for MemoryRange {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args_os()
-        .nth(1)
-        .ok_or("usage: range_source ARCHIVE")?;
+fn main() -> io::Result<()> {
+    let path = std::env::args_os().nth(1).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "usage: range_source ARCHIVE")
+    })?;
     let source = MemoryRange {
         bytes: std::fs::read(path)?,
-        identity: SourceIdentity::try_new(b"in-memory-example-v1".to_vec())?,
+        identity: SourceIdentity::try_new(b"in-memory-example-v1".to_vec())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?,
     };
-    let mut archive = RangeArchiveReader::new(source)?;
+    let mut archive =
+        RangeArchiveReader::new(source).map_err(|error| io::Error::other(error.to_string()))?;
     loop {
-        match archive.next_event()? {
+        match archive
+            .next_event()
+            .map_err(|error| io::Error::other(error.to_string()))?
+        {
             ReaderEvent::Entry(metadata) => {
                 println!("{}", metadata.path().display_lossy());
             },

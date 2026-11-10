@@ -46,14 +46,14 @@ if [[ "${#fuzz_targets[@]}" -ne "$source_target_count" ]]; then
     echo "cargo-fuzz target count does not match fuzz/fuzz_targets/*.rs" >&2
     exit 1
 fi
-if [[ "${#fuzz_targets[@]}" -ne 27 ]]; then
-    echo "expected the reviewed 27-target OSS-Fuzz surface, found ${#fuzz_targets[@]}" >&2
+if [[ "${#fuzz_targets[@]}" -ne 32 ]]; then
+    echo "expected the reviewed 32-target OSS-Fuzz surface, found ${#fuzz_targets[@]}" >&2
     exit 1
 fi
 
 # cargo-fuzz supplies OSS-Fuzz's sanitizer instrumentation and libFuzzer link.
 # The portable profile keeps every runtime dependency in the produced binary.
-# Release optimization makes all 27 targets practical while debug assertions
+# Release optimization makes all 32 targets practical while debug assertions
 # and overflow checks retain the fail-closed arithmetic paths used by local CI.
 cargo fuzz build \
     --release \

@@ -4,4 +4,4 @@
 
 //! Portable 7z AES codec compatibility exports.
 
-pub(crate) use libarchive_oxide_codecs::aes7z::{AesDecoder, AesParams};
+pub(crate) use libarchive_oxide_codecs::aes7z::{AesDecoder, AesEncoder, AesParams};

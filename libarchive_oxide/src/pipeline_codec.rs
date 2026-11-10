@@ -4,16 +4,7 @@
 
 //! Private static dispatch for caller-driven outer codecs.
 
-#[cfg(all(
-    feature = "async",
-    any(
-        feature = "zstd",
-        feature = "xz",
-        feature = "lz4",
-        feature = "compress",
-        feature = "lzip"
-    )
-))]
+#[cfg(feature = "async")]
 use std::task::Waker;
 
 use libarchive_oxide_core::filter::FilterId;
@@ -28,6 +19,11 @@ use crate::filter::gzip::GzipDecoder;
 
 #[derive(Debug)]
 pub(crate) enum PipelineCodec {
+    Base64(Box<libarchive_oxide_codecs::base64::Base64Decoder>),
+    Uuencode(Box<libarchive_oxide_codecs::uuencode::UuencodeDecoder>),
+    Rpm(Box<libarchive_oxide_codecs::rpm::RpmDecoder>),
+    #[cfg(feature = "lzop")]
+    Lzop(Box<libarchive_oxide_codecs::lzop::LzopDecoder>),
     GzipPortable(Box<GzipDecoder>),
     #[cfg(feature = "native-codecs")]
     GzipNative(ExternalDecoder<compression_codecs::GzipDecoder>),
@@ -53,10 +49,19 @@ pub(crate) enum PipelineCodec {
     Compress(Box<libarchive_oxide_codecs::lzw::CompressDecoder>),
     #[cfg(feature = "lzip")]
     Lzip(Box<crate::filter::lzip::LzipDecoder>),
+    #[cfg(feature = "lzma")]
+    Lzma(Box<crate::filter::lzip::LzipDecoder>),
 }
 
 impl PipelineCodec {
-    #[cfg(any(feature = "zstd", feature = "sevenz"))]
+    #[cfg(any(
+        feature = "bzip2",
+        feature = "zstd",
+        feature = "sevenz",
+        feature = "xz"
+    ))]
+    // Some isolated codec features intentionally have no archive-container consumer; maximal profiles and consumer features exercise this factory.
+    #[allow(dead_code)]
     pub(crate) fn new(filter: FilterId, limits: Limits) -> Result<Self, ArchiveError> {
         Self::with_backend(filter, limits, BackendPreference::Auto)
     }
@@ -142,12 +147,40 @@ impl PipelineCodec {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Central static dispatch keeps feature-off errors consistent.
     pub(crate) fn with_backend(
         filter: FilterId,
         limits: Limits,
         preference: BackendPreference,
     ) -> Result<Self, ArchiveError> {
         match filter {
+            FilterId::Base64 => Ok(Self::Base64(Box::new(
+                libarchive_oxide_codecs::base64::Base64Decoder::new(limits),
+            ))),
+            FilterId::Uuencode => libarchive_oxide_codecs::uuencode::UuencodeDecoder::new(limits)
+                .map(Box::new)
+                .map(Self::Uuencode),
+            FilterId::Rpm => Ok(Self::Rpm(Box::new(
+                libarchive_oxide_codecs::rpm::RpmDecoder::new(limits),
+            ))),
+            FilterId::Lzop => {
+                #[cfg(feature = "lzop")]
+                {
+                    if matches!(preference, BackendPreference::Native) {
+                        return Err(ArchiveError::new(ErrorKind::Capability)
+                            .with_format("lzop")
+                            .with_context("the lzop filter has no native backend"));
+                    }
+                    Ok(Self::Lzop(Box::new(
+                        libarchive_oxide_codecs::lzop::LzopDecoder::new(limits),
+                    )))
+                }
+                #[cfg(not(feature = "lzop"))]
+                {
+                    let _ = (limits, preference);
+                    Err(disabled(filter))
+                }
+            },
             FilterId::Gzip => match preference.resolve()? {
                 Backend::Portable => Ok(Self::GzipPortable(Box::new(GzipDecoder::new(limits)))),
                 Backend::Native => {
@@ -216,6 +249,24 @@ impl PipelineCodec {
                     Err(disabled(filter))
                 }
             },
+            FilterId::Lzma => {
+                #[cfg(feature = "lzma")]
+                {
+                    if matches!(preference, BackendPreference::Native) {
+                        return Err(ArchiveError::new(ErrorKind::Capability)
+                            .with_format("lzma")
+                            .with_context("the LZMA-alone filter has no native backend"));
+                    }
+                    crate::filter::lzip::LzipDecoder::new_lzma(limits)
+                        .map(Box::new)
+                        .map(Self::Lzma)
+                }
+                #[cfg(not(feature = "lzma"))]
+                {
+                    let _ = (limits, preference);
+                    Err(disabled(filter))
+                }
+            },
             _ => {
                 Err(ArchiveError::new(ErrorKind::Unsupported).with_context("unknown outer filter"))
             },
@@ -229,6 +280,11 @@ impl PipelineCodec {
         end: EndOfInput,
     ) -> Result<CodecStep, ArchiveError> {
         match self {
+            Self::Base64(codec) => codec.process(input, output, end),
+            Self::Uuencode(codec) => codec.process(input, output, end),
+            Self::Rpm(codec) => codec.process(input, output, end),
+            #[cfg(feature = "lzop")]
+            Self::Lzop(codec) => codec.process(input, output, end),
             Self::GzipPortable(codec) => codec.process(input, output, end),
             #[cfg(feature = "native-codecs")]
             Self::GzipNative(codec) => codec.process(input, output, end),
@@ -252,24 +308,17 @@ impl PipelineCodec {
             Self::Compress(codec) => codec.process(input, output, end),
             #[cfg(feature = "lzip")]
             Self::Lzip(codec) => codec.process(input, output, end),
+            #[cfg(feature = "lzma")]
+            Self::Lzma(codec) => codec.process(input, output, end),
         }
     }
 
     /// Non-blocking mirror of [`process`](Self::process) for async adapters.
     ///
     /// Every variant inherits the blocking-delegating default except the `Xz`
-    /// and lzip worker bridges, which override [`Codec::poll_process`] to avoid
+    /// and LZMA worker bridges, which override [`Codec::poll_process`] to avoid
     /// parking the executor thread on a worker channel.
-    #[cfg(all(
-        feature = "async",
-        any(
-            feature = "zstd",
-            feature = "xz",
-            feature = "lz4",
-            feature = "compress",
-            feature = "lzip"
-        )
-    ))]
+    #[cfg(feature = "async")]
     pub(crate) fn poll_process(
         &mut self,
         input: &[u8],
@@ -278,6 +327,11 @@ impl PipelineCodec {
         waker: &Waker,
     ) -> Result<Option<CodecStep>, ArchiveError> {
         match self {
+            Self::Base64(codec) => codec.poll_process(input, output, end, waker),
+            Self::Uuencode(codec) => codec.poll_process(input, output, end, waker),
+            Self::Rpm(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "lzop")]
+            Self::Lzop(codec) => codec.poll_process(input, output, end, waker),
             Self::GzipPortable(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "native-codecs")]
             Self::GzipNative(codec) => codec.poll_process(input, output, end, waker),
@@ -301,6 +355,8 @@ impl PipelineCodec {
             Self::Compress(codec) => codec.poll_process(input, output, end, waker),
             #[cfg(feature = "lzip")]
             Self::Lzip(codec) => codec.poll_process(input, output, end, waker),
+            #[cfg(feature = "lzma")]
+            Self::Lzma(codec) => codec.poll_process(input, output, end, waker),
         }
     }
 }

@@ -2,20 +2,22 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Bounded, incremental WARC 1.0 and WARC 1.1 reader.
+//! Bounded, incremental WARC 1.0 and WARC 1.1 reader and writer.
 //!
-//! Each WARC record is exposed as one regular-file entry whose data is the
-//! record's content block. Validated WARC named fields are retained as
-//! `warc` metadata extensions. Paths are deterministic and collision-free:
-//! `warc/<20-digit sequence>/<percent-encoded WARC-Record-ID>.record` when the
-//! identifier fits the path budget, otherwise
-//! `warc/<20-digit sequence>.record`.
+//! Each WARC record is exposed as one regular-file entry whose data is the record's content block.
+//! Validated WARC named fields are retained as `warc` metadata extensions.
+//! Paths are deterministic and collision-free:
+//! `warc/<20-digit sequence>/<percent-encoded WARC-Record-ID>.record` when the identifier fits the path budget, otherwise `warc/<20-digit sequence>.record`.
 
 use alloc::format;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::metadata::{ArchivePath, EntryMetadata, Extension};
-use crate::protocol::{ArchiveDecoder, Chunk, DecodeEvent, DecodeStep, EndOfInput, ProbeResult};
+use crate::protocol::{
+    ArchiveDecoder, ArchiveEncoder, Chunk, DecodeEvent, DecodeStep, EncodeCommand, EncodeStatus,
+    EncodeStep, EndOfInput, ProbeResult,
+};
 use crate::{ArchiveError, EntryKind, ErrorKind, Limits};
 
 const SIGNATURE_10: &[u8] = b"WARC/1.0\r\n";
@@ -46,6 +48,129 @@ pub struct WarcDecoder {
     header: Vec<u8>,
     entries: u64,
     decoded: u64,
+}
+
+/// Incremental WARC 1.0/1.1 writer with strict CRLF record framing.
+///
+/// Entry data becomes the WARC content block.
+/// Named fields are supplied as `warc` extensions; `WARC-Type`, `WARC-Record-ID`, and `WARC-Date` are mandatory.
+/// A `version` extension selects `1.0` or `1.1` and defaults to `1.1`.
+/// `Content-Length` is synthesized from the declared entry size when it is absent and validated when supplied.
+#[derive(Debug)]
+pub struct WarcEncoder {
+    limits: Limits,
+    pending: Vec<u8>,
+    pending_pos: usize,
+    open: bool,
+    remaining: u64,
+    entries: u64,
+    encoded_total: u64,
+    done: bool,
+}
+
+impl WarcEncoder {
+    /// Creates a WARC writer with explicit finite budgets.
+    #[must_use]
+    pub const fn new(limits: Limits) -> Self {
+        Self {
+            limits,
+            pending: Vec::new(),
+            pending_pos: 0,
+            open: false,
+            remaining: 0,
+            entries: 0,
+            encoded_total: 0,
+            done: false,
+        }
+    }
+
+    fn drain_pending(&mut self, output: &mut [u8]) -> usize {
+        let available = self.pending.len().saturating_sub(self.pending_pos);
+        let count = available.min(output.len());
+        if count != 0 {
+            output[..count]
+                .copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + count]);
+            self.pending_pos += count;
+        }
+        if self.pending_pos == self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+        }
+        count
+    }
+
+    fn queue_header(&mut self, metadata: &EntryMetadata) -> Result<u64, ArchiveError> {
+        let size = metadata.size().ok_or_else(|| {
+            warc_error(
+                ErrorKind::SizeRequired,
+                "WARC records require a declared content length",
+            )
+        })?;
+        validate_writable_metadata(metadata)?;
+        if self
+            .limits
+            .entry_bytes()
+            .is_some_and(|maximum| size > maximum)
+        {
+            return Err(warc_error(
+                ErrorKind::Limit,
+                "WARC content block exceeds the per-entry limit",
+            ));
+        }
+
+        let extensions = metadata.extensions();
+        let (version_index, version) = warc_version(extensions)?;
+        validate_warc_fields(extensions, version_index, size)?;
+        self.pending.clear();
+        self.pending_pos = 0;
+        self.push_header_bytes(b"WARC/")?;
+        self.push_header_bytes(version)?;
+        self.push_header_bytes(b"\r\n")?;
+        let mut has_length = false;
+        for (index, extension) in extensions.iter().enumerate() {
+            if Some(index) == version_index {
+                continue;
+            }
+            self.push_header_bytes(extension.key())?;
+            self.push_header_bytes(b": ")?;
+            self.push_header_bytes(extension.value())?;
+            self.push_header_bytes(b"\r\n")?;
+            has_length |= extension.key().eq_ignore_ascii_case(b"content-length");
+        }
+        if !has_length {
+            self.push_header_bytes(b"Content-Length: ")?;
+            self.push_header_bytes(size.to_string().as_bytes())?;
+            self.push_header_bytes(b"\r\n")?;
+        }
+        self.push_header_bytes(b"\r\n")?;
+        Ok(size)
+    }
+
+    fn push_header_bytes(&mut self, bytes: &[u8]) -> Result<(), ArchiveError> {
+        let next =
+            self.pending.len().checked_add(bytes.len()).ok_or_else(|| {
+                warc_error(ErrorKind::Limit, "WARC encoded header length overflow")
+            })?;
+        if self
+            .limits
+            .metadata_bytes()
+            .is_some_and(|maximum| next > maximum)
+            || self
+                .limits
+                .in_flight_bytes()
+                .is_some_and(|maximum| next > maximum)
+        {
+            return Err(warc_error(
+                ErrorKind::Limit,
+                "WARC encoded header exceeds the metadata or in-flight budget",
+            ));
+        }
+        self.pending
+            .try_reserve(bytes.len())
+            .map_err(|_| warc_error(ErrorKind::Limit, "WARC header allocation failed"))?;
+        self.pending.extend_from_slice(bytes);
+        Ok(())
+    }
 }
 
 impl WarcDecoder {
@@ -440,11 +565,181 @@ impl ArchiveDecoder for WarcDecoder {
     }
 }
 
+impl ArchiveEncoder for WarcEncoder {
+    #[allow(clippy::too_many_lines)]
+    fn step(
+        &mut self,
+        command: EncodeCommand<'_>,
+        output: &mut [u8],
+    ) -> Result<EncodeStep, ArchiveError> {
+        if self.done {
+            return match command {
+                EncodeCommand::Finish => Ok(encode_step(0, 0, EncodeStatus::Done)),
+                _ => Err(warc_error(
+                    ErrorKind::Protocol,
+                    "command supplied after WARC finish",
+                )),
+            };
+        }
+        if !self.pending.is_empty() {
+            let produced = self.drain_pending(output);
+            return Ok(encode_step(
+                0,
+                produced,
+                if self.pending.is_empty() {
+                    EncodeStatus::NeedCommand
+                } else {
+                    EncodeStatus::NeedOutput
+                },
+            ));
+        }
+
+        match command {
+            EncodeCommand::BeginEntry(metadata) => {
+                if self.open {
+                    return Err(warc_error(
+                        ErrorKind::Protocol,
+                        "previous WARC record is still open",
+                    ));
+                }
+                let next_entries = self
+                    .entries
+                    .checked_add(1)
+                    .ok_or_else(|| warc_error(ErrorKind::Limit, "WARC record count overflow"))?;
+                if self
+                    .limits
+                    .entries()
+                    .is_some_and(|maximum| next_entries > maximum)
+                {
+                    return Err(warc_error(
+                        ErrorKind::Limit,
+                        "WARC record count exceeds the configured limit",
+                    ));
+                }
+                let size = self.queue_header(metadata)?;
+                self.entries = next_entries;
+                self.remaining = size;
+                self.open = true;
+                let produced = self.drain_pending(output);
+                Ok(encode_step(
+                    1,
+                    produced,
+                    if self.pending.is_empty() {
+                        EncodeStatus::NeedCommand
+                    } else {
+                        EncodeStatus::NeedOutput
+                    },
+                ))
+            },
+            EncodeCommand::Data(input) => {
+                if !self.open {
+                    return Err(warc_error(
+                        ErrorKind::Protocol,
+                        "WARC content supplied without an open record",
+                    ));
+                }
+                let input_length = u64::try_from(input.len())
+                    .map_err(|_| warc_error(ErrorKind::Limit, "WARC content length exceeds u64"))?;
+                if input_length > self.remaining {
+                    return Err(warc_error(
+                        ErrorKind::Protocol,
+                        "WARC content exceeds its declared Content-Length",
+                    ));
+                }
+                let command_total =
+                    self.encoded_total
+                        .checked_add(input_length)
+                        .ok_or_else(|| {
+                            warc_error(ErrorKind::Limit, "WARC encoded byte count overflow")
+                        })?;
+                if self
+                    .limits
+                    .decoded_total()
+                    .is_some_and(|maximum| command_total > maximum)
+                {
+                    return Err(warc_error(
+                        ErrorKind::Limit,
+                        "WARC content exceeds the configured total-byte limit",
+                    ));
+                }
+                let count = input.len().min(output.len());
+                output[..count].copy_from_slice(&input[..count]);
+                let count_u64 = u64::try_from(count)
+                    .map_err(|_| warc_error(ErrorKind::Limit, "WARC content length exceeds u64"))?;
+                self.remaining -= count_u64;
+                self.encoded_total =
+                    self.encoded_total.checked_add(count_u64).ok_or_else(|| {
+                        warc_error(ErrorKind::Limit, "WARC encoded byte count overflow")
+                    })?;
+                Ok(encode_step(
+                    count,
+                    count,
+                    if count == input.len() {
+                        EncodeStatus::NeedCommand
+                    } else {
+                        EncodeStatus::NeedOutput
+                    },
+                ))
+            },
+            EncodeCommand::EndEntry => {
+                if !self.open {
+                    return Err(warc_error(
+                        ErrorKind::Protocol,
+                        "WARC end-entry supplied without an open record",
+                    ));
+                }
+                if self.remaining != 0 {
+                    return Err(warc_error(
+                        ErrorKind::Protocol,
+                        "WARC content is shorter than its declared Content-Length",
+                    ));
+                }
+                self.push_header_bytes(RECORD_END)?;
+                self.open = false;
+                let produced = self.drain_pending(output);
+                Ok(encode_step(
+                    1,
+                    produced,
+                    if self.pending.is_empty() {
+                        EncodeStatus::NeedCommand
+                    } else {
+                        EncodeStatus::NeedOutput
+                    },
+                ))
+            },
+            EncodeCommand::Finish => {
+                if self.open {
+                    return Err(warc_error(
+                        ErrorKind::Protocol,
+                        "cannot finish WARC with an open record",
+                    ));
+                }
+                if self.entries == 0 {
+                    return Err(warc_error(
+                        ErrorKind::Protocol,
+                        "cannot finish a WARC file without any records",
+                    ));
+                }
+                self.done = true;
+                Ok(encode_step(0, 0, EncodeStatus::Done))
+            },
+        }
+    }
+}
+
 fn step(consumed: usize, event: DecodeEvent<'_>) -> DecodeStep<'_> {
     DecodeStep {
         consumed,
         produced: 0,
         event,
+    }
+}
+
+const fn encode_step(consumed: usize, produced: usize, status: EncodeStatus) -> EncodeStep {
+    EncodeStep {
+        consumed,
+        produced,
+        status,
     }
 }
 
@@ -602,6 +897,147 @@ fn parse_content_length(value: &[u8]) -> Result<u64, ArchiveError> {
 
 const fn is_path_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+fn validate_writable_metadata(metadata: &EntryMetadata) -> Result<(), ArchiveError> {
+    if metadata.kind() != EntryKind::File {
+        return Err(warc_error(
+            ErrorKind::Unsupported,
+            "WARC content blocks must be regular-file entries",
+        ));
+    }
+    if metadata.mode().is_some_and(|mode| mode != 0o644)
+        || metadata.owner() != &crate::metadata::Owner::default()
+        || metadata.times() != crate::metadata::EntryTimes::default()
+        || metadata.inode().is_some()
+        || metadata.links().is_some()
+        || metadata.device().is_some()
+        || metadata.referenced_device().is_some()
+        || metadata.link_target().is_some()
+        || !metadata.sparse_extents().is_empty()
+        || !metadata.xattrs().is_empty()
+        || !metadata.acl().is_empty()
+        || metadata.file_flags() != 0
+        || metadata.checksum().is_some()
+        || metadata.is_encrypted()
+        || metadata.comment().is_some()
+    {
+        return Err(warc_error(
+            ErrorKind::Unsupported,
+            "WARC cannot represent requested filesystem entry metadata",
+        ));
+    }
+    if metadata
+        .extensions()
+        .iter()
+        .any(|extension| extension.namespace() != "warc")
+    {
+        return Err(warc_error(
+            ErrorKind::Unsupported,
+            "non-WARC extension cannot be represented in a WARC record",
+        ));
+    }
+    Ok(())
+}
+
+fn warc_version(extensions: &[Extension]) -> Result<(Option<usize>, &'static [u8]), ArchiveError> {
+    let value = extensions
+        .iter()
+        .enumerate()
+        .find(|(_, extension)| extension.namespace() == "warc" && extension.key() == b"version");
+    let Some((index, extension)) = value else {
+        return Ok((None, b"1.1"));
+    };
+    match extension.value() {
+        b"1.0" => Ok((Some(index), b"1.0")),
+        b"1.1" => Ok((Some(index), b"1.1")),
+        _ => Err(warc_error(
+            ErrorKind::Unsupported,
+            "WARC writer supports only versions 1.0 and 1.1",
+        )),
+    }
+}
+
+fn validate_warc_fields(
+    extensions: &[Extension],
+    version_index: Option<usize>,
+    size: u64,
+) -> Result<(), ArchiveError> {
+    for (index, extension) in extensions.iter().enumerate() {
+        if Some(index) == version_index {
+            continue;
+        }
+        validate_field_name(extension.key())?;
+        validate_field_value(extension.value())?;
+        core::str::from_utf8(extension.value()).map_err(|_| {
+            warc_error(
+                ErrorKind::Malformed,
+                "WARC named field value is not valid UTF-8",
+            )
+        })?;
+        if trim_ows(extension.value()) != extension.value() {
+            return Err(warc_error(
+                ErrorKind::Malformed,
+                "WARC writer refuses lossy leading or trailing field whitespace",
+            ));
+        }
+    }
+
+    for required in [
+        b"warc-type".as_slice(),
+        b"warc-record-id".as_slice(),
+        b"warc-date".as_slice(),
+    ] {
+        let mut values = named_values(extensions, required);
+        let Some(value) = values.next() else {
+            return Err(warc_error(
+                ErrorKind::Malformed,
+                "WARC record is missing a mandatory named field",
+            ));
+        };
+        if value.is_empty() {
+            return Err(warc_error(
+                ErrorKind::Malformed,
+                "mandatory WARC named field must not be empty",
+            ));
+        }
+        if values.next().is_some() {
+            return Err(warc_error(
+                ErrorKind::Malformed,
+                "WARC record contains a duplicate singleton field",
+            ));
+        }
+    }
+
+    let mut lengths = named_values(extensions, b"content-length");
+    if let Some(value) = lengths.next() {
+        if parse_content_length(value)? != size {
+            return Err(warc_error(
+                ErrorKind::Malformed,
+                "WARC Content-Length does not match the declared entry size",
+            ));
+        }
+        if lengths.next().is_some() {
+            return Err(warc_error(
+                ErrorKind::Malformed,
+                "WARC record contains duplicate Content-Length fields",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn named_values<'a>(extensions: &'a [Extension], name: &'a [u8]) -> impl Iterator<Item = &'a [u8]> {
+    extensions
+        .iter()
+        .filter(move |extension| extension.key().eq_ignore_ascii_case(name))
+        .map(Extension::value)
+}
+
+fn warc_error(kind: ErrorKind, context: &'static str) -> ArchiveError {
+    ArchiveError::new(kind)
+        .with_format("warc")
+        .with_context(context)
 }
 
 #[cfg(test)]

@@ -28,4 +28,12 @@ pub enum ZipMethod {
     /// `xz` feature is enabled (both codec profiles).
     #[cfg(feature = "xz")]
     Lzma,
+    /// Encode bytes as a complete XZ stream (method 95).
+    #[cfg(feature = "xz")]
+    Xz,
+    /// Encode bytes with prediction by partial matching variant I revision 1 (method 98).
+    ///
+    /// The encoder uses an 8 MiB model at order 8 and validates that allocation against the configured codec-memory limit before starting an entry.
+    #[cfg(feature = "ppmd")]
+    Ppmd8,
 }

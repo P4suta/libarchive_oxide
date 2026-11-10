@@ -80,10 +80,16 @@ ADR, or roadmap unit) is named for every verdict.
   sequence selection and corruption fallback, the 65,535-byte descriptor-CRC
   cap, packet-boundary remapping, table/map/range corruption, exact
   capacity-based cumulative metadata limits, and an independent `mkudffs` 2.3
-  image. RAR5 remains
-  deliberately deferred. The matrices are still
-  evolving and are not
-  declared final. Verdict:
+  image. Bounded legacy RAR and RAR5/RAR7 LZ payload decoding is now available
+  for the method cells recorded in the support matrix; legacy PPMd, every
+  standard RAR3 filter, RAR5/RAR7 generation 0/1, and bounded non-solid
+  decryption are implemented. Arbitrary RAR3 VM programs, rare RAR5 filter
+  types, encrypted solid/split payloads, and legacy solid split-volume
+  continuation remain open. Non-solid RAR5/RAR7 split compression retains one
+  bounded codec across volumes;
+  legacy RAR3 LZ split compression uses an explicitly bounded whole-payload
+  join and charges its retained packed copy. The matrices are still evolving
+  and are not declared final. Verdict:
   **partial** — implemented cells pass, but external-producer coverage and
   matrix freeze remain incomplete.
 
@@ -108,10 +114,20 @@ ADR, or roadmap unit) is named for every verdict.
   root/tree, explicit trust pins, and versioned CLI JSON. Official CTS and
   `apksig` v4.0/v4.1 positive pairs, AOSP's v3.1 digest-mismatch negative pair,
   tampering, wrong-APK, unknown-algorithm, resource-limit, and no-sidecar
-  scenarios run in `package_android_v4_signature` and `package_cli`. RPM
-  package signatures, Wheel `RECORD.jws`/`RECORD.p7s`, IPA signing, MSIX
-  `AppxSignature.p7x`, and Android binary-manifest/per-platform installability
-  semantics remain unverified or explicitly unsupported. APK v3/v3.1
+  scenarios run in `package_android_v4_signature` and `package_cli`. Bounded
+  binary-manifest SDK parsing now drives an independent signing-scheme coverage
+  verdict for pre-24, API 24-27, and target-SDK-30 policy. RPM v4, RPM 6, and
+  legacy v3/v4 OpenPGP signatures now have bounded offline primary/signing-
+  subkey verification, streamed legacy payload hashes, explicit signer pins,
+  official RPM fixtures, CLI key input, and fuzz coverage. Network key discovery
+  and experimental PQC algorithms remain unsupported. Wheel
+  `RECORD.jws`/`RECORD.p7s` and remaining Android per-platform installability
+  semantics remain unverified or explicitly unsupported. IPA signing now has
+  bounded sparse thin/universal Mach-O parsing,
+  streamed code/resource digests, CMS and hash-agility verification, signer
+  pins, and tamper/resource-limit coverage. MSIX `AppxSignature.p7x` has bounded offline
+  Authenticode CMS, AXPC/AXCD, AXCT/AXBM/AXCI, signer-pin, and tamper coverage.
+  APK v3/v3.1
   proof-of-rotation, targeted signer ranges, stripping protection, and
   standard/fs-verity content-digest combinations are now verified separately
   from trust with official AOSP positive and negative fixtures.
@@ -192,11 +208,20 @@ not completion criteria.
 ### 8. Native and portable performance gates pass without unapproved sustained regressions — **partial**
 
 - Baseline performance / RSS data is collected in the Campaign 1 completion
-  evidence (referenced from `docs/tracking/README.md`). However, **no automated
-  performance-regression gate is wired into `ci.yml`** — there is no benchmark
-  job comparing native vs portable throughput against a baseline with an
-  approval mechanism for sustained regressions. Verdict: **partial** — baseline
-  data exists; the enforcing gate does not.
+  evidence (referenced from `docs/tracking/README.md`). The ordinary `just ci`
+  loop now includes deterministic CI-shape and duplicate-work guards. Individual
+  features and selected pairs compile their library surfaces; maximal profiles
+  compile every test and binary target once, cutting the measured Windows matrix
+  to 457 seconds without removing an automatic validation class. Packaged-crate
+  smoke now reuses the workspace Cargo target instead of rebuilding third-party
+  dependencies in a disposable nested target, disables incremental growth, and
+  removes the unpacked consumer after success; its measured warm Windows path
+  falls from 213.8 seconds to 31.9 seconds. The full
+  pre-push path keeps every validation class automatic. There is still no
+  stable cross-run throughput comparison with an approval mechanism because
+  hosted-runner variance would make a raw wall-time threshold noisy. Verdict:
+  **partial** — baseline and loop-efficiency enforcement exist; a sustained
+  native-vs-portable throughput gate does not.
 
 ### 9. Portable/native, no_std, WASI inspection, big-endian, 32-bit, MSRV, and all-features CI pass — **implemented**
 
@@ -228,22 +253,13 @@ are not completion gates for this continuation.
 
 ## Still-open checkboxes (remaining tasks for the gate's true state)
 
-- **Checkbox 2** — implemented format cells now include Deflate64 read and UDF
-  through the 2.50/2.60 Metadata Partition and 1.50/2.00+ Virtual/VAT
-  follow-ons plus 1.50+ Sparable Partition remapping; RAR5 remains deferred by
-  ADR-0013, and the overall matrix is not frozen.
-- **Authenticity continuation beyond checkbox 3** — structural package
-  conformance is present, but the ecosystem signature gaps enumerated in
-  section 3 remain implementation work.
-- **Checkbox 4** — only the CLI exit-code and generated support-matrix portions
-  belong to this continuation; Rust SemVer freeze and C ABI work are explicitly
-  excluded.
-- **Checkbox 5** — three-producer/two-consumer completeness is not yet universal
-  per format/method (ISO/cpio/7z plus Deflate64/UDF gaps noted).
-- **Checkbox 8** — no CI performance-regression gate exists (only Campaign 1
-  baseline data).
-- **Checkbox 9** — every listed build axis now has a required CI job. Sustained
-  remote-run history remains to be accumulated after merge.
+- **Checkbox 2** — implemented format cells now include Deflate64 read, bounded legacy RAR/RAR5 LZ method cells, and UDF through the 2.50/2.60 Metadata Partition and 1.50/2.00+ Virtual/VAT follow-ons plus 1.50+ Sparable Partition remapping; the remaining RAR algorithms and overall matrix freeze stay open.
+- **Authenticity continuation beyond checkbox 3** — structural package conformance is present, but the ecosystem signature gaps enumerated in section 3 remain implementation work.
+- **Checkbox 4** — only the CLI exit-code and generated support-matrix portions belong to this continuation; Rust SemVer freeze and C ABI work are explicitly excluded.
+- **Checkbox 5** — three-producer/two-consumer completeness is not yet universal per format/method (ISO/cpio/7z plus Deflate64/UDF gaps noted).
+- **Checkbox 8** — deterministic CI-shape and duplicate-work guards now run in the ordinary `just ci` loop; historical wall-time baselines remain descriptive rather than a noisy machine-dependent pass/fail threshold.
+- **Checkbox 9** — every listed build axis now has a required CI job.
+  Sustained remote-run history remains to be accumulated after merge.
 
 ## Status tally
 

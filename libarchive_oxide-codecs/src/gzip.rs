@@ -10,7 +10,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use libarchive_oxide_core::{
+use libarchive_oxide_protocol::{
     ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput, ErrorKind, Limits,
 };
 
@@ -417,6 +417,19 @@ impl RawInflateDecoder {
         Ok(Self::new(limits))
     }
 
+    /// Decodes one raw-DEFLATE stream at the start of `input` and leaves any bytes after its end unconsumed.
+    ///
+    /// Container readers use this when a trailer follows a self-terminating DEFLATE payload in the same input chunk.
+    /// The [`Codec`] implementation remains strict and rejects such trailing bytes.
+    pub fn process_prefix(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> core::result::Result<CodecStep, ArchiveError> {
+        self.process_inner(input, output, end, true)
+    }
+
     fn account_output(&mut self, produced: usize) -> Result<()> {
         if produced == 0 {
             return Ok(());
@@ -438,18 +451,16 @@ impl RawInflateDecoder {
         self.decoded_total = next;
         Ok(())
     }
-}
 
-#[cfg(feature = "deflate")]
-impl Codec for RawInflateDecoder {
-    fn process(
+    fn process_inner(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         end: EndOfInput,
+        allow_trailing: bool,
     ) -> core::result::Result<CodecStep, ArchiveError> {
         if self.done {
-            if input.is_empty() {
+            if input.is_empty() || allow_trailing {
                 return Ok(CodecStep {
                     consumed: 0,
                     produced: 0,
@@ -503,7 +514,7 @@ impl Codec for RawInflateDecoder {
         self.account_output(produced)?;
         match res.status {
             Ok(MZStatus::StreamEnd) => {
-                if consumed != input.len() {
+                if !allow_trailing && consumed != input.len() {
                     return Err(deflate_error(
                         ErrorKind::Malformed,
                         "data follows the completed raw DEFLATE stream",
@@ -540,6 +551,18 @@ impl Codec for RawInflateDecoder {
             status,
         }
         .validate(input.len(), output.len())
+    }
+}
+
+#[cfg(feature = "deflate")]
+impl Codec for RawInflateDecoder {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> core::result::Result<CodecStep, ArchiveError> {
+        self.process_inner(input, output, end, false)
     }
 }
 
@@ -1058,6 +1081,7 @@ fn nul_terminated(b: &[u8], start: usize) -> Option<usize> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
+    use alloc::vec;
     use alloc::vec::Vec;
     use std::io::{Read, Write};
 
@@ -1122,6 +1146,22 @@ mod tests {
                 "raw decoder mismatch at input={input_chunk}, output={output_chunk}"
             );
         }
+    }
+
+    #[test]
+    fn raw_prefix_decoder_leaves_container_trailer_unconsumed() {
+        let plain = payload(4097);
+        let encoded = independent_encode(&plain);
+        let mut framed = encoded.clone();
+        framed.extend_from_slice(b"container trailer");
+        let mut output = vec![0_u8; plain.len() + 64];
+        let step = RawInflateDecoder::new(Limits::safe())
+            .process_prefix(&framed, &mut output, EndOfInput::More)
+            .unwrap();
+
+        assert_eq!(step.status, CodecStatus::Done);
+        assert_eq!(step.consumed, encoded.len());
+        assert_eq!(&output[..step.produced], plain);
     }
 
     #[test]

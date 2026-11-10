@@ -21,7 +21,7 @@ use crate::filesystem::{
 };
 use crate::path::DestinationKey;
 use crate::provider::{StaticCodecProviders, StaticFormatProviders};
-use crate::{ArchiveReader, ReaderEvent, SeekArchiveReader, StreamError};
+use crate::{ArchiveReader, ReaderEvent, SeekArchiveReader, StreamError, VolumeArchiveReader};
 
 pub(crate) struct AdapterExtraction {
     pub(crate) extraction: ExtractionReport,
@@ -454,6 +454,35 @@ pub(crate) fn apply_seek_plan<R, A>(
 ) -> Result<AdapterExtraction, StreamError>
 where
     R: Read + Seek,
+    A: FilesystemAdapter,
+{
+    let mut driver = AdapterDriver::new(adapter, policy, limits, planned)?;
+    loop {
+        let event = match reader.next_event() {
+            Ok(event) => event,
+            Err(error) => {
+                driver.abort();
+                return Err(error);
+            },
+        };
+        match event {
+            ReaderEvent::ArchiveMetadata(_) => {},
+            ReaderEvent::Entry(metadata) => driver.start_entry(&metadata)?,
+            ReaderEvent::Data(data) => driver.write_data(data)?,
+            ReaderEvent::EndEntry => driver.end_entry()?,
+            ReaderEvent::Done => return driver.finish(),
+        }
+    }
+}
+
+pub(crate) fn apply_volume_plan<A>(
+    reader: &mut VolumeArchiveReader,
+    adapter: &mut A,
+    policy: Policy,
+    limits: Limits,
+    planned: &[PlannedEntry],
+) -> Result<AdapterExtraction, StreamError>
+where
     A: FilesystemAdapter,
 {
     let mut driver = AdapterDriver::new(adapter, policy, limits, planned)?;

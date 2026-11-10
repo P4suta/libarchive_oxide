@@ -27,8 +27,10 @@
 
 use alloc::vec::Vec;
 
-use aes::cipher::{BlockModeDecrypt, KeyIvInit, array::Array};
-use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput, ErrorKind};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, array::Array};
+use libarchive_oxide_protocol::{
+    ArchiveError, Codec, CodecStatus, CodecStep, EndOfInput, ErrorKind,
+};
 use sha2::Digest;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -43,11 +45,12 @@ const BLOCK: usize = 16;
 const MAX_CYCLES_POWER: u8 = 24;
 
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
 /// Parsed AES256SHA256 coder properties. Salt and IV are archive-public (they are
 /// stored in the clear in the header), so this carries no secret material and is safe
 /// to `Debug`. The derived key never lives here.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AesParams {
     ncp: u8,
     salt: [u8; BLOCK],
@@ -56,6 +59,32 @@ pub struct AesParams {
 }
 
 impl AesParams {
+    /// Builds the standard writer profile with full-size random salt and IV.
+    pub fn standard(ncp: u8, salt: [u8; BLOCK], iv: [u8; BLOCK]) -> Result<Self, ArchiveError> {
+        if ncp > MAX_CYCLES_POWER {
+            return Err(ArchiveError::new(ErrorKind::Limit)
+                .with_format("7z")
+                .with_context("7z AES KDF work factor exceeds the safe limit"));
+        }
+        Ok(Self {
+            ncp,
+            salt,
+            salt_len: BLOCK,
+            iv,
+        })
+    }
+
+    /// Serializes the full-size salt/IV writer profile as 7z coder properties.
+    #[must_use]
+    pub fn properties(self) -> [u8; 2 + BLOCK * 2] {
+        let mut properties = [0_u8; 2 + BLOCK * 2];
+        properties[0] = (self.ncp & 0x3F) | 0xC0;
+        properties[1] = 0xFF;
+        properties[2..2 + BLOCK].copy_from_slice(&self.salt);
+        properties[2 + BLOCK..].copy_from_slice(&self.iv);
+        properties
+    }
+
     /// Parses the coder property bytes for method `06 F1 07 01`.
     ///
     /// Returns `None` (→ the folder lists but is not decodable) for an external-key
@@ -96,6 +125,150 @@ impl AesParams {
             salt,
             salt_len: salt_size,
             iv,
+        })
+    }
+}
+
+/// Streaming AES-256-CBC encryption coder for a 7z folder.
+///
+/// Complete blocks are emitted immediately and the final partial block is zero-padded.
+/// At most one plaintext and one ciphertext block are retained regardless of caller chunking.
+pub struct AesEncoder {
+    enc: Aes256CbcEnc,
+    in_block: [u8; BLOCK],
+    in_len: usize,
+    out_block: [u8; BLOCK],
+    out_pos: usize,
+    out_len: usize,
+    finished: bool,
+}
+
+impl AesEncoder {
+    /// Builds an encoder from archive-public parameters and a raw UTF-8 password.
+    pub fn new(params: AesParams, password: &[u8]) -> Result<Self, ArchiveError> {
+        let password_utf16le = Zeroizing::new(password_utf16le(password)?);
+        let derived_key = Zeroizing::new(derive_key(
+            params.ncp,
+            &params.salt[..params.salt_len],
+            password_utf16le.as_slice(),
+        ));
+        let key: &Array<u8, _> = derived_key.as_slice().try_into().map_err(|_| {
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("7z")
+                .with_context("derived AES-256 key has an invalid length")
+        })?;
+        let iv: &Array<u8, _> = params.iv.as_slice().try_into().map_err(|_| {
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("7z")
+                .with_context("AES-CBC IV has an invalid length")
+        })?;
+        Ok(Self {
+            enc: Aes256CbcEnc::new(key, iv),
+            in_block: [0; BLOCK],
+            in_len: 0,
+            out_block: [0; BLOCK],
+            out_pos: 0,
+            out_len: 0,
+            finished: false,
+        })
+    }
+
+    fn encrypt_block(&mut self) -> Result<(), ArchiveError> {
+        let block: &mut Array<u8, _> = self.in_block.as_mut_slice().try_into().map_err(|_| {
+            ArchiveError::new(ErrorKind::Malformed)
+                .with_format("7z")
+                .with_context("AES block framing is invalid")
+        })?;
+        self.enc.encrypt_block(block);
+        self.out_block.copy_from_slice(block);
+        self.in_block.zeroize();
+        self.in_len = 0;
+        self.out_pos = 0;
+        self.out_len = BLOCK;
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for AesEncoder {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("AesEncoder")
+            .field("buffered_plaintext", &self.in_len)
+            .field("pending_ciphertext", &(self.out_len - self.out_pos))
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AesEncoder {
+    fn drop(&mut self) {
+        self.in_block.zeroize();
+        self.out_block.zeroize();
+    }
+}
+
+impl Codec for AesEncoder {
+    fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: EndOfInput,
+    ) -> Result<CodecStep, ArchiveError> {
+        if self.finished {
+            return Ok(CodecStep {
+                consumed: 0,
+                produced: 0,
+                status: CodecStatus::Done,
+            });
+        }
+
+        let mut consumed = 0;
+        let mut produced = 0;
+        loop {
+            if self.out_pos < self.out_len {
+                let take = (self.out_len - self.out_pos).min(output.len() - produced);
+                if take == 0 {
+                    break;
+                }
+                output[produced..produced + take]
+                    .copy_from_slice(&self.out_block[self.out_pos..self.out_pos + take]);
+                self.out_pos += take;
+                produced += take;
+                continue;
+            }
+
+            while self.in_len < BLOCK && consumed < input.len() {
+                self.in_block[self.in_len] = input[consumed];
+                self.in_len += 1;
+                consumed += 1;
+            }
+            if self.in_len == BLOCK {
+                self.encrypt_block()?;
+                continue;
+            }
+            if consumed == input.len() && matches!(end, EndOfInput::End) {
+                if self.in_len != 0 {
+                    self.encrypt_block()?;
+                    continue;
+                }
+                self.finished = true;
+                return Ok(CodecStep {
+                    consumed,
+                    produced,
+                    status: CodecStatus::Done,
+                });
+            }
+            break;
+        }
+
+        Ok(CodecStep {
+            consumed,
+            produced,
+            status: if self.out_pos < self.out_len {
+                CodecStatus::NeedOutput
+            } else {
+                CodecStatus::NeedInput
+            },
         })
     }
 }
@@ -514,6 +687,36 @@ mod tests {
     }
 
     #[test]
+    fn encoder_round_trips_at_every_chunking() {
+        let salt = runtime_crypto_bytes();
+        let iv = runtime_crypto_bytes();
+        let password = runtime_password();
+        let plaintext: Vec<u8> = (0..1003u32).map(|i| (i * 17 + 11) as u8).collect();
+        let params = AesParams::standard(4, salt, iv).unwrap();
+
+        for (input_chunk, output_chunk) in [
+            (1usize, 1usize),
+            (3, 7),
+            (16, 16),
+            (17, 3),
+            (512, 31),
+            (4096, 4096),
+        ] {
+            let encoder = AesEncoder::new(params, &password).unwrap();
+            let ciphertext = drive_codec(encoder, &plaintext, input_chunk, output_chunk);
+            assert_eq!(ciphertext.len(), plaintext.len().next_multiple_of(BLOCK));
+
+            let decoder = AesDecoder::new(params, plaintext.len() as u64, &password).unwrap();
+            let roundtrip = drive_codec(decoder, &ciphertext, output_chunk, input_chunk);
+            assert_eq!(
+                roundtrip, plaintext,
+                "mismatch at input={input_chunk}, output={output_chunk}"
+            );
+        }
+        assert_eq!(AesParams::parse(&params.properties()), Some(params));
+    }
+
+    #[test]
     fn wrong_password_never_silently_returns_the_expected_plaintext() {
         // A block-aligned message has no zero padding to authenticate here; the
         // 7z folder CRC is responsible for classifying the wrong password.
@@ -584,6 +787,7 @@ mod tests {
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
 
         assert_zeroize_on_drop::<Aes256CbcDec>();
+        assert_zeroize_on_drop::<Aes256CbcEnc>();
         assert_zeroize_on_drop::<sha2::Sha256>();
     }
 }

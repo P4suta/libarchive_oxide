@@ -20,6 +20,10 @@ name = "libarchive_oxide-core"
 version_group = "libarchive_oxide-workspace"
 
 [[package]]
+name = "libarchive_oxide-rar"
+version_group = "libarchive_oxide-workspace"
+
+[[package]]
 name = "libarchive_oxide"
 version_group = "libarchive_oxide-workspace"
 changelog_update = true

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Strict lzip interoperability through the public sync and async readers.
+//! Strict lzip interoperability through the public sync and async adapters.
 
 #![cfg(feature = "lzip")]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use libarchive_oxide::BackendPreference;
 use libarchive_oxide::advanced::{CapabilityState, Pipeline, PipelineEvent, capability_state};
 use libarchive_oxide::{
-    ArchiveReader, ArchiveWriter, Backend, ErrorKind, FilterId, FilterReader, FormatId, Limits,
-    filter_for_name,
+    ArchivePath, ArchiveReader, ArchiveWriter, Backend, EntryKind, EntryMetadata, ErrorKind,
+    FilterId, FilterReader, FormatId, Limits, ReaderEvent, filter_for_name,
 };
 use libarchive_oxide_core::{AccessMode, CAPABILITY_LEDGER, Direction, DirectionSet, ProbeResult};
 
@@ -396,13 +396,13 @@ fn probe_filename_and_capability_ledger_are_consistent() {
         .find(|record| record.key() == "filter.lzip")
         .expect("canonical lzip capability record");
     assert_eq!(record.access().read(), Some(AccessMode::Filter));
-    assert_eq!(record.access().write(), None);
-    assert_eq!(record.portable(), DirectionSet::READ);
+    assert_eq!(record.access().write(), Some(AccessMode::Filter));
+    assert_eq!(record.portable(), DirectionSet::READ_WRITE);
     assert_eq!(record.native(), DirectionSet::NONE);
     assert!(record.portable().contains(Direction::Read));
     assert_eq!(
         capability_state(*record, Backend::Portable),
-        CapabilityState::Available(DirectionSet::READ)
+        CapabilityState::Available(DirectionSet::READ_WRITE)
     );
 }
 
@@ -421,20 +421,97 @@ impl Write for CountingSink {
 }
 
 #[test]
-fn writer_rejects_lzip_with_capability_before_io() {
+fn writer_preflights_lzip_memory_before_io() {
     let written = Arc::new(AtomicUsize::new(0));
     let result = ArchiveWriter::with_filter(
         CountingSink(Arc::clone(&written)),
         FormatId::Tar,
         Some(FilterId::Lzip),
-        Limits::default(),
+        Limits::default().with_codec_memory(Some(1)),
     );
     let Err(error) = result else {
-        panic!("lzip writer must not be constructible");
+        panic!("lzip writer must enforce its encoder memory limit");
     };
-    assert_eq!(error.kind(), ErrorKind::Capability);
+    assert_eq!(error.kind(), ErrorKind::Limit);
     assert_eq!(error.format(), Some("lzip"));
     assert_eq!(written.load(Ordering::SeqCst), 0);
+}
+
+fn write_lzip_tar() -> Vec<u8> {
+    let mut writer = ArchiveWriter::with_filter(
+        Vec::new(),
+        FormatId::Tar,
+        Some(FilterId::Lzip),
+        Limits::safe(),
+    )
+    .expect("lzip tar writer");
+    let metadata = EntryMetadata::builder(
+        EntryKind::File,
+        ArchivePath::from_bytes(b"lzip.txt".to_vec()),
+    )
+    .size(Some(7))
+    .build();
+    writer.start_entry(&metadata).expect("start lzip entry");
+    writer.write_data(b"payload").expect("write lzip entry");
+    writer.end_entry().expect("end lzip entry");
+    writer.finish().expect("finish lzip tar")
+}
+
+#[test]
+fn writer_output_round_trips_through_independent_and_public_readers() {
+    let encoded = write_lzip_tar();
+    let mut independent = lzma_rust2::LzipReader::new(encoded.as_slice());
+    let mut tar = Vec::new();
+    independent
+        .read_to_end(&mut tar)
+        .expect("independent lzip consumer");
+
+    let mut tar_reader = ArchiveReader::new(tar.as_slice());
+    let mut independent_payload = Vec::new();
+    loop {
+        match tar_reader.next_event().expect("independent tar event") {
+            ReaderEvent::Data(bytes) => independent_payload.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(independent_payload, b"payload");
+
+    let mut public_reader = ArchiveReader::new(encoded.as_slice());
+    let mut public_payload = Vec::new();
+    loop {
+        match public_reader.next_event().expect("public lzip event") {
+            ReaderEvent::Data(bytes) => public_payload.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(public_payload, b"payload");
+}
+
+#[test]
+fn writer_abort_never_synthesizes_a_lzip_trailer() {
+    let mut writer = ArchiveWriter::with_filter(
+        Vec::new(),
+        FormatId::Tar,
+        Some(FilterId::Lzip),
+        Limits::safe(),
+    )
+    .expect("lzip tar writer");
+    let metadata = EntryMetadata::builder(
+        EntryKind::File,
+        ArchivePath::from_bytes(b"aborted.txt".to_vec()),
+    )
+    .size(Some(7))
+    .build();
+    writer.start_entry(&metadata).expect("start entry");
+    writer.write_data(b"payload").expect("write body");
+    let incomplete = writer.abort().expect("recover incomplete lzip output");
+    assert_ne!(incomplete, [] as [u8; 0]);
+    assert!(
+        decode_filter(incomplete, 1, 7).is_err(),
+        "abort must not finish the lzip member"
+    );
 }
 
 #[test]
@@ -525,20 +602,91 @@ mod asynchronous {
     }
 
     #[test]
-    fn async_writer_rejects_lzip_with_capability_before_io() {
+    fn async_writer_preflights_lzip_memory_before_io() {
         let written = Arc::new(AtomicUsize::new(0));
         let result = AsyncArchiveWriter::with_filter(
             AsyncCountingSink(Arc::clone(&written)),
             FormatId::Tar,
             Some(FilterId::Lzip),
-            Limits::default(),
+            Limits::default().with_codec_memory(Some(1)),
         );
         let Err(error) = result else {
-            panic!("async lzip writer must not be constructible");
+            panic!("async lzip writer must enforce its encoder memory limit");
         };
-        assert_eq!(error.kind(), ErrorKind::Capability);
+        assert_eq!(error.kind(), ErrorKind::Limit);
         assert_eq!(error.format(), Some("lzip"));
         assert_eq!(written.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn async_writer_streams_lzip_for_the_public_reader() {
+        block_on(async {
+            let output = futures_lite::io::Cursor::new(Vec::new());
+            let mut writer = AsyncArchiveWriter::with_filter(
+                output,
+                FormatId::Tar,
+                Some(FilterId::Lzip),
+                Limits::safe(),
+            )
+            .expect("async lzip writer");
+            let metadata = EntryMetadata::builder(
+                EntryKind::File,
+                ArchivePath::from_bytes(b"async-lzip.txt".to_vec()),
+            )
+            .size(Some(7))
+            .build();
+            writer.start_entry(&metadata).await.expect("start entry");
+            writer.write_data(b"pay").await.expect("first chunk");
+            writer.write_data(b"load").await.expect("second chunk");
+            writer.end_entry().await.expect("end entry");
+            let encoded = writer.finish().await.expect("finish lzip").into_inner();
+
+            let mut reader = ArchiveReader::new(encoded.as_slice());
+            let mut payload = Vec::new();
+            loop {
+                match reader.next_event().expect("read async lzip output") {
+                    ReaderEvent::Data(bytes) => payload.extend_from_slice(bytes),
+                    ReaderEvent::Done => break,
+                    _ => {},
+                }
+            }
+            assert_eq!(payload, b"payload");
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn tokio_writer_streams_lzip_for_the_public_reader() {
+        use libarchive_oxide::TokioArchiveWriter;
+
+        let mut writer = TokioArchiveWriter::with_filter(
+            Vec::new(),
+            FormatId::Tar,
+            Some(FilterId::Lzip),
+            Limits::safe(),
+        )
+        .expect("Tokio lzip writer");
+        let metadata = EntryMetadata::builder(
+            EntryKind::File,
+            ArchivePath::from_bytes(b"tokio-lzip.txt".to_vec()),
+        )
+        .size(Some(7))
+        .build();
+        writer.start_entry(&metadata).await.expect("start entry");
+        writer.write_data(b"payload").await.expect("body");
+        writer.end_entry().await.expect("end entry");
+        let encoded = writer.finish().await.expect("finish lzip");
+
+        let mut reader = ArchiveReader::new(encoded.as_slice());
+        let mut payload = Vec::new();
+        loop {
+            match reader.next_event().expect("read Tokio lzip output") {
+                ReaderEvent::Data(bytes) => payload.extend_from_slice(bytes),
+                ReaderEvent::Done => break,
+                _ => {},
+            }
+        }
+        assert_eq!(payload, b"payload");
     }
 
     #[test]

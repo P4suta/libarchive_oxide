@@ -106,6 +106,27 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "read_rar_legacy"
+path = "fuzz_targets/read_rar_legacy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_rar5"
+path = "fuzz_targets/read_rar5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_lha"
+path = "fuzz_targets/read_lha.rs"
+test = false
+doc = false
+bench = false
+
 # ── Round-trip targets: synthesized entry set → write → read back → id. ──
 
 [[bin]]
@@ -143,6 +164,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "roundtrip_xar"
+path = "fuzz_targets/roundtrip_xar.rs"
+test = false
+doc = false
+bench = false
+
 # ── Codec targets: decode-no-panic + decode∘encode = id. ──
 
 [[bin]]
@@ -154,6 +182,27 @@ bench = false
 [[bin]]
 name = "codec_gzip"
 path = "fuzz_targets/codec_gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_base64"
+path = "fuzz_targets/codec_base64.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_uuencode"
+path = "fuzz_targets/codec_uuencode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_lzop"
+path = "fuzz_targets/codec_lzop.rs"
 test = false
 doc = false
 bench = false
@@ -189,6 +238,13 @@ bench = false
 [[bin]]
 name = "codec_lzma2"
 path = "fuzz_targets/codec_lzma2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_lzma"
+path = "fuzz_targets/codec_lzma.rs"
 test = false
 doc = false
 bench = false

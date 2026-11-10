@@ -11,8 +11,9 @@
 mod common;
 
 use libarchive_oxide::oci::OciLayerEngine;
-use libarchive_oxide::{ArchiveEngine, CreateOptions};
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, FilterId, FormatId};
+use libarchive_oxide::{
+    ArchiveEngine, ArchivePath, CreateOptions, EntryKind, EntryMetadata, FilterId, FormatId,
+};
 use serde_json::Value;
 
 use common::{TempDir, code, run_in, run_stdin};

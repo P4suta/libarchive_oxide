@@ -29,21 +29,45 @@ delta = []
 deflate = ["dep:miniz_oxide"]
 gzip = ["deflate"]
 lz4 = ["dep:lz4_flex", "dep:twox-hash"]
-lzw = ["dep:compcol"]
+lzo = ["dep:lzo"]
+lha = ["dep:compcol", "compcol/lha"]
+lzw = ["dep:compcol", "compcol/lzw"]
 lzx = []
 zstd = ["dep:ruzstd"]
 
 [dependencies]
-libarchive_oxide-core = { path = "../libarchive_oxide-core", version = "0.2.0" }
-aes = { version = "0.9", default-features = false, features = ["zeroize"], optional = true }
-cbc = { version = "0.2", default-features = false, features = ["zeroize"], optional = true }
-compcol = { version = "=0.7.5", default-features = false, features = ["lzw"], optional = true }
-miniz_oxide = { version = "0.9.0", default-features = false, features = ["with-alloc"], optional = true }
-lz4_flex = { version = "0.14.0", default-features = false, features = ["alloc", "checked-decode", "safe-decode", "safe-encode"], optional = true }
-ruzstd = { version = "0.9.1", default-features = false, features = ["hash"], optional = true }
-sha2 = { version = "0.11", default-features = false, features = ["zeroize"], optional = true }
-twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash32"], optional = true }
-zeroize = { version = "1.8.2", default-features = false, features = ["alloc"], optional = true }
+libarchive_oxide-protocol = { path = "../libarchive_oxide-protocol", version = "0.2.0" }
+aes = { version = "0.9.4", default-features = false, features = [
+  "zeroize",
+], optional = true }
+cbc = { version = "0.2", default-features = false, features = [
+  "zeroize",
+], optional = true }
+compcol = { version = "=0.7.9", default-features = false, features = [
+  "lzw",
+], optional = true }
+miniz_oxide = { version = "0.9.0", default-features = false, features = [
+  "with-alloc",
+], optional = true }
+lz4_flex = { version = "0.14.0", default-features = false, features = [
+  "alloc",
+  "checked-decode",
+  "safe-decode",
+  "safe-encode",
+], optional = true }
+ruzstd = { version = "0.9.1", default-features = false, features = [
+  "hash",
+], optional = true }
+lzo = { version = "0.1.3", default-features = false, optional = true }
+sha2 = { version = "0.11", default-features = false, features = [
+  "zeroize",
+], optional = true }
+twox-hash = { version = "2.1.3", default-features = false, features = [
+  "xxhash32",
+], optional = true }
+zeroize = { version = "1.8.2", default-features = false, features = [
+  "alloc",
+], optional = true }
 
 [dev-dependencies]
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib"] }

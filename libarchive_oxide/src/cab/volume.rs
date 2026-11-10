@@ -28,13 +28,11 @@ const CAB_FILE_SIZE: usize = 16;
 const CAB_DATA_HEADER_SIZE: u64 = 8;
 const CAB_DATA_RESERVE_MAX: usize = 255;
 
-/// Built-in object-safe provider for a complete Microsoft Cabinet set.
+/// Built-in statically dispatched provider for a complete Microsoft Cabinet set.
 ///
-/// `VolumeId(0)` must contain cabinet index zero. Further `VolumeId` values map
-/// directly to `CFHEADER::iCabinet`; the application-owned [`VolumeSet`]
-/// decides how those logical requests reach local or remote immutable objects.
-/// Header names are validated as set links but are never interpreted as paths
-/// and never trigger filesystem or network access.
+/// `VolumeId(0)` must contain cabinet index zero.
+/// Further `VolumeId` values map directly to `CFHEADER::iCabinet`; the application-owned [`VolumeSet`] decides how those logical requests reach local or remote immutable objects.
+/// Header names are validated as set links but are never interpreted as paths and never trigger filesystem or network access.
 #[derive(Debug, Default)]
 pub struct CabVolumeProvider;
 
@@ -47,6 +45,8 @@ impl CabVolumeProvider {
 }
 
 impl RandomAccessFormatProvider for CabVolumeProvider {
+    type Decoder = CabVolumeReader;
+
     fn format(&self) -> FormatId {
         FormatId::Cab
     }
@@ -69,15 +69,8 @@ impl RandomAccessFormatProvider for CabVolumeProvider {
         Ok(&magic == b"MSCF")
     }
 
-    fn open(
-        &self,
-        source: Arc<VolumeSet>,
-        limits: Limits,
-    ) -> Result<Box<dyn RandomAccessArchiveDecoder>, StreamError> {
-        Ok(Box::new(CabVolumeReader::with_limits(
-            source.as_ref(),
-            limits,
-        )?))
+    fn open(&self, source: Arc<VolumeSet>, limits: Limits) -> Result<Self::Decoder, StreamError> {
+        CabVolumeReader::with_limits(source.as_ref(), limits)
     }
 }
 

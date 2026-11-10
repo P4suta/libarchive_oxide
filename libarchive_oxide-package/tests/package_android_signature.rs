@@ -8,7 +8,7 @@
 
 use std::io::Cursor;
 
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 use libarchive_oxide_package::{
     AppPackageProfile, AppPackageValidator, PackageFindingCode, PackageVerifier, TrustPolicy,
     VerificationDimension, ZipPackageProfile,
@@ -74,6 +74,19 @@ fn aosp_rsa_v2_signature_and_content_digest_verify() {
     );
     assert_eq!(report.trust(), VerificationDimension::Invalid);
     assert_eq!(report.signer_fingerprints().len(), 1);
+    let manifest = report
+        .android_apk_manifest()
+        .expect("Android reports include binary manifest inspection");
+    assert_eq!(manifest.validity(), VerificationDimension::Verified);
+    assert!(manifest.minimum_sdk().is_some_and(|sdk| sdk >= 1));
+    assert!(manifest.target_sdk().is_some_and(|sdk| sdk >= 1));
+    let compatibility = report
+        .android_apk_compatibility()
+        .expect("Android reports include platform signature compatibility");
+    assert_eq!(compatibility.minimum_sdk(), Some(23));
+    assert_eq!(compatibility.target_sdk(), Some(23));
+    assert_eq!(compatibility.validity(), VerificationDimension::Invalid);
+    assert!(report.has_code(PackageFindingCode::AndroidSignaturePlatformGap));
 }
 
 #[test]
@@ -299,6 +312,13 @@ fn v3_1_targeted_dev_release_rotation_verifies_both_blocks() {
     assert!(rotation.targets_dev_release());
     assert_eq!(rotation.signers().len(), 2);
     assert_eq!(rotation.lineage().len(), 2);
+    let compatibility = report
+        .android_apk_compatibility()
+        .expect("Android reports include platform signature compatibility");
+    assert_eq!(compatibility.minimum_sdk(), Some(23));
+    assert_eq!(compatibility.target_sdk(), Some(23));
+    assert_eq!(compatibility.validity(), VerificationDimension::Verified);
+    assert_eq!(compatibility.findings(), []);
 }
 
 #[test]

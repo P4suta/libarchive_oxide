@@ -49,9 +49,9 @@ fn corpus_root() -> PathBuf {
 /// Two strategies, each bounded regardless of seed size (the iso seed is ~58 KiB):
 /// * **Truncations** — a header that promises more bytes than remain is the classic panic trigger;
 ///   every prefix (strided on large seeds) is tried.
-/// * **`u32`-field smashes** — force a sliding 4-byte little-endian window to all-`0xFF` (max value,
+/// * **`u32`-field smashes** — force 4-byte little-endian windows to all-`0xFF` (max value,
 ///   most likely to overflow an index) and to all-`0x00`, at a stride fine enough that every
-///   4-byte length/offset/size field gets at least one byte forced out of range. For back-loaded
+///   possible 4-byte length/offset/size field overlaps a smashed window. For back-loaded
 ///   formats (zip's EOCD + central directory live at the tail) this reaches the offset fields while
 ///   leaving the signature elsewhere intact — exactly the shape that trips an unchecked slice index.
 ///
@@ -83,11 +83,11 @@ fn for_each_adversarial_mutant(
     let mut visited = 0usize;
 
     // (1) Truncations: dense for small seeds, strided to at most TRUNC_MAX cuts for large ones.
-    // Optical images are necessarily much larger than the compact archive
-    // seeds. Keep their stable-CI replay bounded while still sampling the
-    // complete image (nightly libFuzzer remains the dense mutation gate).
-    let trunc_max = if len > 256 * 1024 { 128 } else { TRUNC_MAX };
-    let smash_max = if len > 256 * 1024 { 256 } else { SMASH_MAX };
+    // Optical images and real executable-bearing archives are necessarily
+    // much larger than compact synthetic seeds. Keep stable-CI replay bounded
+    // while sampling the complete input (nightly libFuzzer remains dense).
+    let trunc_max = if len > 64 * 1024 { 128 } else { TRUNC_MAX };
+    let smash_max = if len > 64 * 1024 { 256 } else { SMASH_MAX };
     let tstride = len.div_ceil(trunc_max);
     let mut cut = 0;
     while cut < len {
@@ -100,7 +100,11 @@ fn for_each_adversarial_mutant(
     }
 
     // (2) 4-byte field smashes (all-0xFF → giant index; all-0x00 → zero count/size edge cases).
-    let sstride = len.div_ceil(smash_max);
+    // Adjacent u32-width windows cover every possible (including unaligned)
+    // four-byte field: any such field intersects at least one window. Sliding
+    // the window one byte at a time repeats the same boundary coverage four
+    // times and makes the stable development gate needlessly expensive.
+    let sstride = len.div_ceil(smash_max).max(size_of::<u32>());
     let mut scratch = seed.to_vec();
     let mut pos = 0;
     while pos < len {
@@ -191,8 +195,8 @@ fn arbitrary_seeds_uphold_invariants() {
 
     assert_eq!(
         TARGETS.len(),
-        28,
-        "all stable replay targets are wired (27 libFuzzer targets plus lzip)"
+        36,
+        "all stable replay targets are wired (35 libFuzzer targets plus lzip)"
     );
     assert_eq!(runs, TARGETS.len() * LENGTHS.len() * STREAMS);
 }
@@ -258,6 +262,26 @@ fn mutant_shards_cover_the_unsharded_stream_exactly_once() {
     assert_eq!(sharded, unsharded);
 }
 
+#[test]
+fn small_seed_smashes_advance_by_one_u32_width() {
+    let seed = b"thirteen-byte";
+    let runs = for_each_adversarial_mutant(seed, 0, 1, |_| {});
+
+    let truncations = seed.len();
+    let aligned_u32_windows = seed.len().div_ceil(size_of::<u32>());
+    assert_eq!(runs, truncations + 2 * aligned_u32_windows);
+}
+
+#[test]
+fn large_seed_mutation_count_is_bounded() {
+    let seed = vec![0_u8; 94_301];
+    let runs = for_each_adversarial_mutant(&seed, 0, 1, |_| {});
+    assert!(
+        runs <= 640,
+        "large stable-replay seed produced {runs} mutants"
+    );
+}
+
 macro_rules! mutant_replay_tests {
     (
         $(
@@ -290,17 +314,40 @@ mutant_replay_tests! {
     "read_udf" => { seed_mutants_read_udf: 0 / 1 },
     "read_cab" => { seed_mutants_read_cab: 0 / 1 },
     "read_xar" => { seed_mutants_read_xar: 0 / 1 },
+    "read_rar_legacy" => {
+        seed_mutants_read_rar_legacy_1_of_4: 0 / 4,
+        seed_mutants_read_rar_legacy_2_of_4: 1 / 4,
+        seed_mutants_read_rar_legacy_3_of_4: 2 / 4,
+        seed_mutants_read_rar_legacy_4_of_4: 3 / 4,
+    },
+    "read_rar5" => {
+        seed_mutants_read_rar5_1_of_4: 0 / 4,
+        seed_mutants_read_rar5_2_of_4: 1 / 4,
+        seed_mutants_read_rar5_3_of_4: 2 / 4,
+        seed_mutants_read_rar5_4_of_4: 3 / 4,
+    },
+    "read_lha" => {
+        seed_mutants_read_lha_1_of_4: 0 / 4,
+        seed_mutants_read_lha_2_of_4: 1 / 4,
+        seed_mutants_read_lha_3_of_4: 2 / 4,
+        seed_mutants_read_lha_4_of_4: 3 / 4,
+    },
     "roundtrip_tar" => { seed_mutants_roundtrip_tar: 0 / 1 },
     "roundtrip_cpio" => { seed_mutants_roundtrip_cpio: 0 / 1 },
     "roundtrip_ar" => { seed_mutants_roundtrip_ar: 0 / 1 },
     "roundtrip_7z" => { seed_mutants_roundtrip_7z: 0 / 1 },
     "roundtrip_iso" => { seed_mutants_roundtrip_iso: 0 / 1 },
+    "roundtrip_xar" => { seed_mutants_roundtrip_xar: 0 / 1 },
     "codec_gzip" => { seed_mutants_codec_gzip: 0 / 1 },
+    "codec_base64" => { seed_mutants_codec_base64: 0 / 1 },
+    "codec_uuencode" => { seed_mutants_codec_uuencode: 0 / 1 },
+    "codec_lzop" => { seed_mutants_codec_lzop: 0 / 1 },
     "codec_lzw" => { seed_mutants_codec_lzw: 0 / 1 },
     "codec_bzip2" => { seed_mutants_codec_bzip2: 0 / 1 },
     "codec_zstd" => { seed_mutants_codec_zstd: 0 / 1 },
     "codec_xz" => { seed_mutants_codec_xz: 0 / 1 },
     "codec_lzip" => { seed_mutants_codec_lzip: 0 / 1 },
+    "codec_lzma" => { seed_mutants_codec_lzma: 0 / 1 },
     "codec_lz4" => { seed_mutants_codec_lz4: 0 / 1 },
     "codec_lzma2" => { seed_mutants_codec_lzma2: 0 / 1 },
     "package_rpm" => { seed_mutants_package_rpm: 0 / 1 },

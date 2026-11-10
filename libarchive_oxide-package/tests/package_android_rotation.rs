@@ -6,7 +6,7 @@
 
 use std::io::Cursor;
 
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 use libarchive_oxide_package::{
     AppPackageProfile, PackageFindingCode, PackageVerifier, TrustPolicy, VerificationDimension,
 };

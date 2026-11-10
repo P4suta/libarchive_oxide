@@ -28,5 +28,8 @@ std = []
 [package.metadata.docs.rs]
 all-features = true
 
+[dependencies]
+libarchive_oxide-protocol = { path = "../libarchive_oxide-protocol", version = "0.2.0" }
+
 [lints]
 workspace = true

@@ -82,7 +82,7 @@ struct PostProcessState {
 ///     let decompressed = lzx.decompress_next(&chunk, output_size)?;
 ///     write_data(decompressed);
 /// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// # Ok::<(), libarchive_oxide_codecs::lzx::DecompressError>(())
 /// ```
 #[derive(Debug)]
 pub struct LzxDecoder {

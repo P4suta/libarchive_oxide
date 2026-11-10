@@ -56,7 +56,6 @@ impl<Inner: Read, C: Codec> CodecReader<Inner, C> {
     }
 
     /// Borrows the inner reader (used to reach the raw source below a chain).
-    #[cfg(feature = "sevenz")]
     pub(crate) fn get_ref(&self) -> &Inner {
         &self.input
     }

@@ -7,9 +7,38 @@
 version = 1
 
 [[annotations]]
+path = ["libarchive_oxide/vendor/deflate64/**"]
+precedence = "override"
+SPDX-FileCopyrightText = [
+  ".NET Foundation and Contributors",
+  "2023 anatawa12",
+  "2026 libarchive_oxide contributors",
+]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["libarchive_oxide/vendor/delharc/**"]
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "Rafal Michalski and rust-delharc contributors",
+  "2026 libarchive_oxide contributors",
+]
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = ["libarchive_oxide/vendor/sevenz-rust2/**"]
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "sevenz-rust and sevenz-rust2 contributors",
+  "2026 libarchive_oxide contributors",
+]
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
 path = [
   "**/*.md",
   "Cargo.lock",
+  "fuzz/Cargo.lock",
   ".gitignore",
   "fuzz/.gitignore",
   ".github/CODEOWNERS",
@@ -24,6 +53,116 @@ path = ["fuzz/corpus/**", "**/tests/fixtures/**"]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 libarchive_oxide contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "libarchive_oxide/tests/fixtures/lha/compcol-lh2.lzh"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Karpeles Lab Inc."
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "libarchive_oxide-ppmd/NOTICE"
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "2026 libarchive_oxide contributors",
+  "2026 k1717 aka Delphinium",
+]
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "libarchive_oxide-rarvm/NOTICE"
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "2003-2007 Tim Kientzle",
+  "2011 Andres Mejia",
+  "2026 libarchive_oxide contributors",
+]
+SPDX-License-Identifier = "BSD-2-Clause"
+
+[[annotations]]
+path = "libarchive_oxide-rar-crypto/NOTICE"
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "2005-2026 Marko Kreen",
+  "2026 libarchive_oxide contributors",
+]
+SPDX-License-Identifier = "ISC"
+
+[[annotations]]
+path = [
+  "fuzz/corpus/read_rar_legacy/ssokolow-rar3-solid.hex",
+  "libarchive_oxide/tests/fixtures/rar-legacy/ssokolow-rar3-solid.cbr.hex",
+  "libarchive_oxide/tests/fixtures/rar-legacy/ssokolow-rar3-solid-payloads.hex",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "Stephan Sokolow"
+SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = [
+  "fuzz/corpus/read_rar_legacy/junrar-rar4-solid.hex",
+  "libarchive_oxide/tests/fixtures/rar-legacy/junrar-rar4-solid.rar.hex",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "junrar contributors"
+SPDX-License-Identifier = "LicenseRef-UnRAR"
+
+[[annotations]]
+path = [
+  "fuzz/corpus/read_rar5/libarchive-v3.8.8-solid.hex",
+  "libarchive_oxide/tests/fixtures/rar5/libarchive-v3.8.8-multiple-files-solid.rar.hex",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2018 Grzegorz Antoniak and libarchive contributors"
+SPDX-License-Identifier = "BSD-2-Clause"
+
+[[annotations]]
+path = [
+  "fuzz/corpus/read_rar_legacy/libarchive-rar3-filter.rar",
+  "libarchive_oxide/tests/fixtures/rar-legacy/libarchive-rar3-filter.rar",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2003-2021 Wei-Cheng Pan and libarchive contributors"
+SPDX-License-Identifier = "BSD-2-Clause"
+
+[[annotations]]
+path = [
+  "libarchive_oxide/tests/fixtures/rar-legacy/rarfile-rar3-data-password.rar",
+  "libarchive_oxide/tests/fixtures/rar-legacy/rarfile-rar3-header-password.rar",
+  "fuzz/corpus/read_rar5/rarfile-rar5-data-password.rar",
+  "libarchive_oxide/tests/fixtures/rar5/rarfile-rar5-data-password-blake.rar",
+  "libarchive_oxide/tests/fixtures/rar5/rarfile-rar5-data-password.rar",
+  "libarchive_oxide/tests/fixtures/rar5/rarfile-rar5-header-password.rar",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2005-2026 Marko Kreen"
+SPDX-License-Identifier = "ISC"
+
+[[annotations]]
+path = [
+  "fuzz/corpus/read_lha/unlha32-lhx.hex",
+  "libarchive_oxide/tests/fixtures/lha/unlha32-2.67a-h2-lhx.lzh.hex",
+]
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "1989, 1991 Free Software Foundation, Inc.",
+  "Rafal Michalski and rust-delharc contributors",
+]
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
+path = [
+  "fuzz/corpus/read_lha/pmarc-pm1.hex",
+  "fuzz/corpus/read_lha/pmarc-pm2.hex",
+  "libarchive_oxide/tests/fixtures/lha/pmarc-1.24-pm1.pma.hex",
+  "libarchive_oxide/tests/fixtures/lha/pmarc2-pm2.pma.hex",
+]
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "1989, 1991 Free Software Foundation, Inc.",
+  "Simon Howard and Lhasa contributors",
+]
+SPDX-License-Identifier = "GPL-2.0-or-later"
 
 [[annotations]]
 path = [
@@ -111,7 +250,37 @@ path = [
   "libarchive_oxide-package/tests/fixtures/msix_blockmap/SignedUntrustedCert.appx",
   "fuzz/corpus/package_app/microsoft-test-windows.msix",
   "libarchive_oxide-cli/tests/fixtures/package/msix-blockmap-microsoft.msix",
+  "libarchive_oxide-cli/tests/fixtures/package/msix-authenticode-microsoft.appx",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "Microsoft Corporation"
 SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = [
+  "libarchive_oxide-package/tests/fixtures/ipa_codesign/rcodesign-signed.ipa",
+  "libarchive_oxide-package/tests/fixtures/ipa_codesign/rcodesign-dual-digest.ipa",
+  "fuzz/corpus/package_app/rcodesign-signed.ipa",
+  "libarchive_oxide-cli/tests/fixtures/package/ipa-rcodesign-signed.ipa",
+]
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "2026 libarchive_oxide contributors",
+  "Gregory Szorc and apple-platform-rs contributors",
+]
+SPDX-License-Identifier = "MPL-2.0 AND (MIT OR Apache-2.0)"
+
+[[annotations]]
+path = [
+  "libarchive_oxide-package/tests/fixtures/rpm_signature/alice.asc",
+  "libarchive_oxide-package/tests/fixtures/rpm_signature/hello-2.0-1.x86_64-signed-with-subkey.rpm",
+  "libarchive_oxide-package/tests/fixtures/rpm_signature/hello-2.0-1.x86_64-signed.rpm",
+  "libarchive_oxide-package/tests/fixtures/rpm_signature/hello-2.0-1.x86_64-v3-signed.rpm",
+  "libarchive_oxide-package/tests/fixtures/rpm_signature/rpm.org-rsa-2048-test.pub",
+  "fuzz/corpus/package_rpm/rpm-official-signed.rpm",
+  "libarchive_oxide-cli/tests/fixtures/package/rpm-signed.rpm",
+  "libarchive_oxide-cli/tests/fixtures/package/rpm.org-rsa-2048-test.pub",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "RPM contributors"
+SPDX-License-Identifier = "GPL-2.0-or-later"

@@ -1,0 +1,21 @@
+libarchive_oxide-rar-crypto contains a clean Rust implementation of the RAR3
+string-to-key compatibility behavior described by the ISC-licensed rarfile
+project.
+
+Copyright (c) 2005-2026 Marko Kreen <markokr@gmail.com>
+Copyright (c) 2026 libarchive_oxide contributors
+
+Source reviewed for interoperability:
+https://github.com/markokr/rarfile
+Revision: c4bb54b3aa6d8316b77e8d15947bd59e27b6f9b5
+Files: src/rarfile/crypto.py, test/test_hashing.py, test/test_crypto.py
+
+The RAR5 implementation follows RARLAB's public format note:
+https://www.rarlab.com/technote.htm
+
+RAR5 interoperability behavior was independently compared with the
+Apache-2.0-licensed unrar5j implementation without copying source code:
+https://github.com/RealBurst/unrar5j
+Revision: fa0cca53227e2e562d84af95ae6fae07bc1b4ece
+
+The complete ISC license is distributed as ../LICENSES/ISC.txt.

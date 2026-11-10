@@ -18,9 +18,11 @@ Upstream paths:
 
 `TestWindows.msix` is a compact unsigned package produced for the Microsoft
 SDK’s platform-manifest tests. `SignedUntrustedCert.appx` contains a multi-block
-deflated payload and an intentionally untrusted certificate; it is used here
-only to prove block-map interoperability. This project does not treat the
-presence of its `AppxSignature.p7x` as cryptographic signature validity.
+deflated payload and an intentionally untrusted certificate. It proves both
+block-map and `AppxSignature.p7x` interoperability: the committed bytes verify
+the CMS signature, signer fingerprint, AXPC/AXCD package views, and footprint
+digests, while trust remains invalid until that fingerprint is explicitly
+pinned. No network or platform certificate store is consulted.
 
 SHA-256:
 

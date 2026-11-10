@@ -156,7 +156,7 @@ impl Vli {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ValidationState {
     StreamHeader,
     BlockHeaderSize,
@@ -203,11 +203,12 @@ enum ValidationState {
     OpaqueMalformed,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct XzValidator {
     state: ValidationState,
     held: Vec<u8>,
     codec_memory: Option<usize>,
+    stream_flags: [u8; 2],
     check_size: usize,
     block_data_bytes: u64,
     index_bytes: u64,
@@ -220,6 +221,7 @@ impl XzValidator {
             state: ValidationState::StreamHeader,
             held: Vec::with_capacity(MAX_HEADER),
             codec_memory: limits.codec_memory(),
+            stream_flags: [0; 2],
             check_size: 0,
             block_data_bytes: 0,
             index_bytes: 0,
@@ -259,6 +261,7 @@ impl XzValidator {
                     if self.held[6] != 0 {
                         return Err(malformed("invalid XZ stream flags"));
                     }
+                    self.stream_flags = [self.held[6], self.held[7]];
                     self.check_size = match self.held[7] {
                         0x00 => 0,
                         0x01 => 4,
@@ -442,9 +445,16 @@ impl XzValidator {
                 }
             },
             ValidationState::Footer { remaining } => {
-                pending.push(byte);
+                self.held.push(byte);
                 *remaining -= 1;
                 if *remaining == 0 {
+                    if self.held.len() != 12
+                        || self.held[8..10] != self.stream_flags
+                        || &self.held[10..12] != b"YZ"
+                    {
+                        return Err(malformed("invalid XZ stream footer"));
+                    }
+                    self.release_held(pending);
                     self.stream_padding = 0;
                     self.state = ValidationState::StreamPadding;
                 }
@@ -486,6 +496,91 @@ impl XzValidator {
             ValidationState::IndexPadding { remaining }
         };
         Ok(())
+    }
+
+    const fn at_stream_boundary(&self) -> bool {
+        matches!(self.state, ValidationState::StreamPadding)
+            && self.stream_padding.is_multiple_of(4)
+    }
+}
+
+/// Bounded structural scanner used by ZIP method 95 to keep a signed data descriptor outside the XZ decoder.
+/// It shares the filter validator's allocation checks and retains at most one XZ header while looking ahead.
+#[derive(Clone, Debug)]
+pub(crate) struct XzStreamBoundary {
+    validator: XzValidator,
+}
+
+impl XzStreamBoundary {
+    const ZIP_DESCRIPTOR_SIGNATURE: &'static [u8; 4] = b"PK\x07\x08";
+    const PREVIEW_BYTES: usize = 4 * 1024;
+
+    pub(crate) fn new(limits: Limits) -> Self {
+        Self {
+            validator: XzValidator::new(limits),
+        }
+    }
+
+    pub(crate) const fn done(&self) -> bool {
+        self.validator.at_stream_boundary()
+    }
+
+    pub(crate) fn preview(&self, input: &[u8]) -> Result<(usize, bool), ArchiveError> {
+        let mut next = self.clone();
+        let preview = &input[..input.len().min(Self::PREVIEW_BYTES)];
+        let consumed = next.consume(preview)?;
+        let descriptor = next.done()
+            && input
+                .get(consumed..consumed + Self::ZIP_DESCRIPTOR_SIGNATURE.len())
+                .is_some_and(|bytes| bytes == Self::ZIP_DESCRIPTOR_SIGNATURE);
+        Ok((consumed, descriptor))
+    }
+
+    #[cfg(feature = "aes")]
+    pub(crate) fn preview_intrinsic(&self, input: &[u8]) -> Result<(usize, bool), ArchiveError> {
+        let mut next = self.clone();
+        let preview = &input[..input.len().min(Self::PREVIEW_BYTES)];
+        let mut consumed = 0;
+        let mut discard = Vec::new();
+        while consumed < preview.len() && !next.done() {
+            next.validator.push(preview[consumed], &mut discard)?;
+            discard.clear();
+            consumed += 1;
+        }
+        Ok((consumed, next.done()))
+    }
+
+    pub(crate) fn consume(&mut self, input: &[u8]) -> Result<usize, ArchiveError> {
+        let mut consumed = 0;
+        let mut discard = Vec::new();
+        while consumed < input.len() {
+            if self.validator.at_stream_boundary() {
+                let remaining = &input[consumed..];
+                if remaining[0] != 0 {
+                    let signature = Self::ZIP_DESCRIPTOR_SIGNATURE;
+                    let signature_prefix = signature.len().min(remaining.len());
+                    if signature.starts_with(&remaining[..signature_prefix]) {
+                        break;
+                    }
+                    let magic_prefix = XZ_MAGIC.len().min(remaining.len());
+                    if XZ_MAGIC.starts_with(&remaining[..magic_prefix]) {
+                        if remaining.len() < XZ_MAGIC.len() {
+                            break;
+                        }
+                    } else {
+                        return Err(ArchiveError::new(ErrorKind::Unsupported)
+                            .with_format("zip")
+                            .with_context(
+                                "forward-only ZIP XZ requires a signed data descriptor",
+                            ));
+                    }
+                }
+            }
+            self.validator.push(input[consumed], &mut discard)?;
+            discard.clear();
+            consumed += 1;
+        }
+        Ok(consumed)
     }
 }
 

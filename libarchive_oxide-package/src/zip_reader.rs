@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-use libarchive_oxide_core::{ArchivePath, Limits, PathEncoding};
+use libarchive_oxide::{ArchivePath, Limits, PathEncoding};
 
 use super::finding::{PackageFinding, PackageFindingCode};
 use libarchive_oxide::sanitize_archive_path;

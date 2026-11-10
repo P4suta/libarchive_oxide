@@ -25,7 +25,10 @@
 
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
-use libarchive_oxide::{Error, ReaderEvent, SeekArchiveReader, SeekArchiveWriter};
+use libarchive_oxide::{
+    ArchiveEngine, CreateOptions, Error, FormatWriteOptions, ReaderEvent, SeekArchiveReader,
+    SeekArchiveWriter, SevenZipCompression, SevenZipFilter, SevenZipWriteOptions,
+};
 use libarchive_oxide_core::{
     ArchiveError, ArchivePath, EntryKind, EntryMetadata, ErrorKind, FormatId, Limits,
 };
@@ -38,6 +41,38 @@ use sevenz_rust2::{
 
 mod common;
 use common::{EntryShape, read_with_arca};
+
+#[test]
+fn solid_writer_finishes_without_nonempty_streams() {
+    for with_empty_entries in [false, true] {
+        let mut writer = SeekArchiveWriter::with_format(
+            Cursor::new(Vec::new()),
+            FormatId::SevenZip,
+            Limits::default(),
+        )
+        .expect("solid 7z writer");
+        if with_empty_entries {
+            for (kind, name) in [(EntryKind::Dir, "empty"), (EntryKind::File, "empty/file")] {
+                let metadata = EntryMetadata::builder(kind, ArchivePath::from_utf8(name))
+                    .size(Some(0))
+                    .build();
+                writer.start_entry(&metadata).expect("start empty entry");
+                writer.end_entry().expect("end empty entry");
+            }
+        }
+        let bytes = writer
+            .finish()
+            .expect("finish metadata-only 7z")
+            .into_inner();
+        let reader = SevenReader::new(Cursor::new(bytes), Password::empty())
+            .expect("sevenz-rust2 opens metadata-only 7z");
+        assert_eq!(
+            reader.archive().files.len(),
+            usize::from(with_empty_entries) * 2
+        );
+        assert!(reader.archive().blocks.is_empty());
+    }
+}
 
 /// Writes an arca 7z with a directory, two content files, and an empty file.
 fn arca_archive() -> Vec<u8> {
@@ -100,6 +135,312 @@ fn sevenz_rust2_reads_arca_output() {
         b"the quick brown fox\n".repeat(50)
     );
     assert_eq!(reader.read_file("d/empty.txt").unwrap().len(), 0);
+}
+
+#[test]
+fn sevenz_rust2_reads_arca_non_solid_store_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new()
+                .with_compression(SevenZipCompression::Store)
+                .with_solid(false),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("non-solid Store writer");
+    for (name, payload) in [
+        ("a.bin", b"alpha".as_slice()),
+        ("b.bin", b"bravo payload".as_slice()),
+    ] {
+        let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8(name))
+            .size(Some(payload.len() as u64))
+            .build();
+        writer.start_entry(&metadata).unwrap();
+        writer.write_data(payload).unwrap();
+        writer.end_entry().unwrap();
+    }
+    let bytes = writer.finish().unwrap().into_inner();
+
+    let mut reference = SevenReader::new(Cursor::new(bytes), Password::empty()).unwrap();
+    assert!(!reference.archive().is_solid);
+    assert_eq!(reference.archive().blocks.len(), 2);
+    assert_eq!(reference.read_file("a.bin").unwrap(), b"alpha");
+    assert_eq!(reference.read_file("b.bin").unwrap(), b"bravo payload");
+}
+
+#[test]
+fn sevenz_rust2_reads_arca_store_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new().with_compression(SevenZipCompression::Store),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("arca Store writer");
+    let payload = b"independent Store consumer\n".repeat(32);
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("store/payload.bin"))
+            .size(Some(payload.len() as u64))
+            .try_build()
+            .expect("Store metadata");
+    writer.start_entry(&metadata).expect("start Store entry");
+    for chunk in payload.chunks(17) {
+        writer.write_data(chunk).expect("write Store chunk");
+    }
+    writer.end_entry().expect("end Store entry");
+    let bytes = writer.finish().expect("finish Store 7z").into_inner();
+
+    let mut reader =
+        SevenReader::new(Cursor::new(bytes), Password::empty()).expect("sevenz-rust2 opens Store");
+    assert_eq!(
+        reader
+            .read_file("store/payload.bin")
+            .expect("sevenz-rust2 reads Store payload"),
+        payload
+    );
+}
+
+#[test]
+fn sevenz_rust2_reads_arca_deflate_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new().with_compression(SevenZipCompression::Deflate),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("arca Deflate writer");
+    let payload = b"independent raw Deflate consumer\n".repeat(256);
+    let metadata = EntryMetadata::builder(
+        EntryKind::File,
+        ArchivePath::from_utf8("deflate/payload.bin"),
+    )
+    .size(Some(payload.len() as u64))
+    .try_build()
+    .expect("Deflate metadata");
+    writer.start_entry(&metadata).expect("start Deflate entry");
+    for chunk in payload.chunks(29) {
+        writer.write_data(chunk).expect("write Deflate chunk");
+    }
+    writer.end_entry().expect("end Deflate entry");
+    let bytes = writer.finish().expect("finish Deflate 7z").into_inner();
+
+    let mut reader = SevenReader::new(Cursor::new(bytes), Password::empty())
+        .expect("sevenz-rust2 opens Deflate");
+    assert_eq!(
+        reader
+            .read_file("deflate/payload.bin")
+            .expect("sevenz-rust2 reads Deflate payload"),
+        payload
+    );
+}
+
+#[test]
+fn sevenz_rust2_reads_arca_lzma_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new().with_compression(SevenZipCompression::Lzma),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("arca LZMA writer");
+    let payload = b"independent LZMA1 consumer\n".repeat(256);
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("lzma/payload.bin"))
+            .size(Some(payload.len() as u64))
+            .try_build()
+            .expect("LZMA metadata");
+    writer.start_entry(&metadata).expect("start LZMA entry");
+    for chunk in payload.chunks(31) {
+        writer.write_data(chunk).expect("write LZMA chunk");
+    }
+    writer.end_entry().expect("end LZMA entry");
+    let bytes = writer.finish().expect("finish LZMA 7z").into_inner();
+
+    let mut reader =
+        SevenReader::new(Cursor::new(bytes), Password::empty()).expect("sevenz-rust2 opens LZMA");
+    assert_eq!(
+        reader
+            .read_file("lzma/payload.bin")
+            .expect("sevenz-rust2 reads LZMA payload"),
+        payload
+    );
+}
+
+#[test]
+#[cfg(feature = "bzip2")]
+fn sevenz_rust2_reads_arca_bzip2_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new().with_compression(SevenZipCompression::Bzip2),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("arca BZip2 writer");
+    let payload = b"independent BZip2 consumer\n".repeat(256);
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("bzip2/payload.bin"))
+            .size(Some(payload.len() as u64))
+            .try_build()
+            .expect("BZip2 metadata");
+    writer.start_entry(&metadata).expect("start BZip2 entry");
+    for chunk in payload.chunks(37) {
+        writer.write_data(chunk).expect("write BZip2 chunk");
+    }
+    writer.end_entry().expect("end BZip2 entry");
+    let bytes = writer.finish().expect("finish BZip2 7z").into_inner();
+
+    let mut reader =
+        SevenReader::new(Cursor::new(bytes), Password::empty()).expect("sevenz-rust2 opens BZip2");
+    assert_eq!(
+        reader
+            .read_file("bzip2/payload.bin")
+            .expect("sevenz-rust2 reads BZip2 payload"),
+        payload
+    );
+}
+
+#[test]
+#[cfg(feature = "zstd")]
+fn sevenz_rust2_reads_arca_zstd_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new().with_compression(SevenZipCompression::Zstd),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("arca Zstandard writer");
+    let payload = b"independent Zstandard consumer\n".repeat(256);
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("zstd/payload.bin"))
+            .size(Some(payload.len() as u64))
+            .try_build()
+            .expect("Zstandard metadata");
+    writer
+        .start_entry(&metadata)
+        .expect("start Zstandard entry");
+    for chunk in payload.chunks(41) {
+        writer.write_data(chunk).expect("write Zstandard chunk");
+    }
+    writer.end_entry().expect("end Zstandard entry");
+    let bytes = writer.finish().expect("finish Zstandard 7z").into_inner();
+
+    let mut reader = SevenReader::new(Cursor::new(bytes), Password::empty())
+        .expect("sevenz-rust2 opens Zstandard");
+    assert_eq!(
+        reader
+            .read_file("zstd/payload.bin")
+            .expect("sevenz-rust2 reads Zstandard payload"),
+        payload
+    );
+}
+
+#[test]
+fn sevenz_rust2_reads_arca_ppmd7_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new().with_compression(SevenZipCompression::Ppmd7),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("arca PPMd7 writer");
+    let payload = b"independent PPMd7 consumer\n".repeat(256);
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("ppmd7/payload.bin"))
+            .size(Some(payload.len() as u64))
+            .try_build()
+            .expect("PPMd7 metadata");
+    writer.start_entry(&metadata).expect("start PPMd7 entry");
+    for chunk in payload.chunks(43) {
+        writer.write_data(chunk).expect("write PPMd7 chunk");
+    }
+    writer.end_entry().expect("end PPMd7 entry");
+    let bytes = writer.finish().expect("finish PPMd7 7z").into_inner();
+
+    let mut reader =
+        SevenReader::new(Cursor::new(bytes), Password::empty()).expect("sevenz-rust2 opens PPMd7");
+    assert_eq!(
+        reader
+            .read_file("ppmd7/payload.bin")
+            .expect("sevenz-rust2 reads PPMd7 payload"),
+        payload
+    );
+}
+
+#[test]
+fn sevenz_rust2_reads_arca_delta_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new().with_filter(Some(SevenZipFilter::Delta(8))),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("arca Delta writer");
+    let payload: Vec<u8> = (0_u8..=255).cycle().take(32 * 1024).collect();
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("delta/payload.bin"))
+            .size(Some(payload.len() as u64))
+            .try_build()
+            .expect("Delta metadata");
+    writer.start_entry(&metadata).expect("start Delta entry");
+    for chunk in payload.chunks(61) {
+        writer.write_data(chunk).expect("write Delta chunk");
+    }
+    writer.end_entry().expect("end Delta entry");
+    let bytes = writer.finish().expect("finish Delta 7z").into_inner();
+
+    let mut reader =
+        SevenReader::new(Cursor::new(bytes), Password::empty()).expect("sevenz-rust2 opens Delta");
+    assert_eq!(
+        reader
+            .read_file("delta/payload.bin")
+            .expect("sevenz-rust2 reads Delta payload"),
+        payload
+    );
+}
+
+#[test]
+fn sevenz_rust2_reads_arca_bcj_x86_output() {
+    let options = CreateOptions::new()
+        .with_format(FormatId::SevenZip)
+        .with_format_options(Some(FormatWriteOptions::SevenZip(
+            SevenZipWriteOptions::new().with_filter(Some(SevenZipFilter::BcjX86)),
+        )));
+    let mut writer = ArchiveEngine::new()
+        .create_seek(Cursor::new(Vec::new()), options)
+        .expect("arca BCJ x86 writer");
+    let mut payload = Vec::new();
+    for index in 0_u32..2048 {
+        payload.push(0xe8);
+        payload.extend_from_slice(&index.wrapping_mul(31).to_le_bytes());
+    }
+    let metadata =
+        EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("bcj/payload.bin"))
+            .size(Some(payload.len() as u64))
+            .try_build()
+            .expect("BCJ metadata");
+    writer.start_entry(&metadata).expect("start BCJ entry");
+    for chunk in payload.chunks(71) {
+        writer.write_data(chunk).expect("write BCJ chunk");
+    }
+    writer.end_entry().expect("end BCJ entry");
+    let bytes = writer.finish().expect("finish BCJ 7z").into_inner();
+
+    let mut reader = SevenReader::new(Cursor::new(bytes), Password::empty())
+        .expect("sevenz-rust2 opens BCJ x86");
+    assert_eq!(
+        reader
+            .read_file("bcj/payload.bin")
+            .expect("sevenz-rust2 reads BCJ payload"),
+        payload
+    );
 }
 
 #[test]
@@ -761,15 +1102,83 @@ mod aes {
 
     use super::*;
 
+    #[derive(Debug)]
+    struct FailOnSecondBackwardSeek {
+        inner: Cursor<Vec<u8>>,
+        backward_seeks: usize,
+        fail_next_read: bool,
+    }
+
+    impl FailOnSecondBackwardSeek {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                backward_seeks: 0,
+                fail_next_read: false,
+            }
+        }
+    }
+
+    impl Read for FailOnSecondBackwardSeek {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_next_read {
+                self.fail_next_read = false;
+                return Err(std::io::Error::other(
+                    "injected encoded-header source failure",
+                ));
+            }
+            self.inner.read(output)
+        }
+    }
+
+    impl Seek for FailOnSecondBackwardSeek {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            let previous = self.inner.position();
+            let current = self.inner.seek(position)?;
+            if current < previous {
+                self.backward_seeks += 1;
+                if self.backward_seeks == 2 {
+                    self.fail_next_read = true;
+                }
+            }
+            Ok(current)
+        }
+    }
+
     /// Builds a `.7z` whose single content folder is AES-256/SHA-256 encrypted under `password`.
     /// `encrypt_header` selects between `sevenz-rust2`'s default encrypted next-header (an AES-coded
     /// `kEncodedHeader`, so even listing needs the password) and a plain header (so the encryption is
     /// confined to the content folder — the shape that exercises the per-substream CRC check).
     fn build_aes(password: &str, name: &str, data: &[u8], encrypt_header: bool) -> Vec<u8> {
+        build_aes_with_material(password, name, data, encrypt_header, 0)
+    }
+
+    fn build_aes_with_material(
+        password: &str,
+        name: &str,
+        data: &[u8],
+        encrypt_header: bool,
+        material: u64,
+    ) -> Vec<u8> {
         let mut w = SevenWriter::new(Cursor::new(Vec::new())).unwrap();
         w.set_encrypt_header(encrypt_header);
         let pw: Password = password.into();
-        w.set_content_methods(vec![AesEncoderOptions::new(pw).into()]);
+        let material = material.to_le_bytes();
+        let mut salt = [0_u8; 16];
+        let mut iv = [0_u8; 16];
+        for index in 0..16 {
+            salt[index] = material[index % material.len()]
+                .wrapping_add(u8::try_from(index).unwrap().wrapping_mul(17));
+            iv[index] = material[(index + 3) % material.len()]
+                .wrapping_add(u8::try_from(index).unwrap().wrapping_mul(29));
+        }
+        let aes = AesEncoderOptions {
+            password: pw,
+            iv,
+            salt,
+            num_cycles_power: 8,
+        };
+        w.set_content_methods(vec![aes.into()]);
         w.push_archive_entry(ArchiveEntry::new_file(name), Some(data))
             .unwrap();
         w.finish().unwrap().into_inner()
@@ -791,6 +1200,49 @@ mod aes {
         }
     }
 
+    #[test]
+    fn sevenz_rust2_reads_arca_non_solid_aes256_output() {
+        let password = "arca-7z-secret-🔐";
+        let data = mixed_payload();
+        let second = b"second encrypted folder".repeat(211);
+        let options = CreateOptions::new()
+            .with_format(FormatId::SevenZip)
+            .with_format_options(Some(FormatWriteOptions::SevenZip(
+                SevenZipWriteOptions::new()
+                    .with_compression(SevenZipCompression::Lzma2)
+                    .with_filter(Some(SevenZipFilter::Delta(3)))
+                    .with_solid(false)
+                    .with_encryption(libarchive_oxide::SevenZipEncryption::Aes256),
+            )));
+        let mut writer = ArchiveEngine::new()
+            .create_seek_with_password(
+                Cursor::new(Vec::new()),
+                options,
+                SecretBytes::new(password.as_bytes().to_vec()),
+            )
+            .expect("arca AES writer");
+        for (name, payload) in [
+            ("secret.bin", data.as_slice()),
+            ("second.bin", second.as_slice()),
+        ] {
+            let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8(name))
+                .size(Some(payload.len() as u64))
+                .build();
+            writer.start_entry(&metadata).unwrap();
+            for chunk in payload.chunks(89) {
+                writer.write_data(chunk).unwrap();
+            }
+            writer.end_entry().unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let mut reference = SevenReader::new(Cursor::new(bytes), Password::from(password)).unwrap();
+        assert!(!reference.archive().is_solid);
+        assert_eq!(reference.archive().blocks.len(), 2);
+        assert_eq!(reference.read_file("secret.bin").unwrap(), data);
+        assert_eq!(reference.read_file("second.bin").unwrap(), second);
+    }
+
     /// The correct password (including a non-ASCII code point, to exercise the UTF-16LE encoding)
     /// decrypts to the original plaintext, matching what `sevenz-rust2` reads back from its own file.
     /// Uses the default *encrypted* next-header, so this also proves the AES-coded `kEncodedHeader`
@@ -807,6 +1259,65 @@ mod aes {
         assert_eq!(reference.read_file("secret.bin").unwrap(), data);
 
         assert_eq!(read_aes(&bytes, password).unwrap(), data);
+    }
+
+    #[test]
+    fn encrypted_header_tries_ordered_password_candidates() {
+        let data = mixed_payload();
+        let password = "encrypted-header-secret";
+        let bytes = build_aes(password, "secret.bin", &data, true);
+        let options = libarchive_oxide::OpenOptions::new().with_password_provider(
+            std::sync::Arc::new(libarchive_oxide::PasswordCandidates::new([
+                SecretBytes::new(b"wrong first".to_vec()),
+                SecretBytes::new(password.as_bytes().to_vec()),
+            ])),
+        );
+        let mut reader = SeekArchiveReader::with_options(Cursor::new(bytes), &options)
+            .expect("a later candidate decrypts the encoded header");
+        let mut decoded = Vec::new();
+        loop {
+            match reader.next_event().expect("read encrypted-header event") {
+                ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+                ReaderEvent::Done => break,
+                _ => {},
+            }
+        }
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn encrypted_header_rejects_all_wrong_candidates_as_integrity() {
+        let payload = mixed_payload();
+        let bytes =
+            build_aes_with_material("correct-header-secret", "secret.bin", &payload, true, 96);
+        let options = libarchive_oxide::OpenOptions::new().with_password_provider(
+            std::sync::Arc::new(libarchive_oxide::PasswordCandidates::new([
+                SecretBytes::new(b"wrong first".to_vec()),
+                SecretBytes::new(b"wrong second".to_vec()),
+            ])),
+        );
+        let error = SeekArchiveReader::with_options(Cursor::new(bytes), &options)
+            .expect_err("no candidate decrypts the encoded header");
+        assert_eq!(error.kind(), ErrorKind::Integrity);
+    }
+
+    #[test]
+    fn encrypted_header_preserves_source_io_failures() {
+        let bytes = build_aes(
+            "correct-header-secret",
+            "secret.bin",
+            &mixed_payload(),
+            true,
+        );
+        let options = libarchive_oxide::OpenOptions::new().with_password_provider(
+            std::sync::Arc::new(libarchive_oxide::PasswordCandidates::new([
+                SecretBytes::new(b"wrong first".to_vec()),
+                SecretBytes::new(b"correct-header-secret".to_vec()),
+            ])),
+        );
+        let error = SeekArchiveReader::with_options(FailOnSecondBackwardSeek::new(bytes), &options)
+            .expect_err("source I/O failure must not be retried as a wrong password");
+        assert_eq!(error.kind(), ErrorKind::Io);
     }
 
     /// A wrong password decrypts the content to garbage of the right length; the stored per-substream

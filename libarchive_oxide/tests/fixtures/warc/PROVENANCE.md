@@ -19,3 +19,7 @@ with SHA-256
 
 The fixture is specification-derived test data, contains no user data, and is
 covered by the repository's `REUSE.toml` test-fixture override.
+
+Writer tests construct WARC 1.0 and 1.1 records from first-party metadata and verify the exact version line, named-field CRLF framing, derived `Content-Length`, content block, and four-byte record trailer before reading them back.
+The writer wire contract follows the same IIPC-hosted ISO 28500:2017 specification.
+No external producer bytes are added for the writer.

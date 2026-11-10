@@ -15,20 +15,30 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+#[cfg(feature = "lha")]
+mod compcol_adapter;
+
 #[cfg(feature = "aes7z")]
 pub mod aes7z;
+pub mod base64;
 #[cfg(feature = "bcj")]
 pub mod bcj;
 #[cfg(feature = "delta")]
 pub mod delta;
 #[cfg(feature = "deflate")]
 pub mod gzip;
+#[cfg(feature = "lha")]
+pub mod lha;
 #[cfg(feature = "lz4")]
 pub mod lz4;
+#[cfg(feature = "lzo")]
+pub mod lzop;
 #[cfg(feature = "lzw")]
 pub mod lzw;
 #[cfg(feature = "lzx")]
 pub mod lzx;
+pub mod rpm;
+pub mod uuencode;
 #[cfg(feature = "zstd")]
 pub mod zstd;
 
@@ -39,6 +49,7 @@ pub mod zstd;
         feature = "bcj",
         feature = "deflate",
         feature = "delta",
+        feature = "lha",
         feature = "lzw"
     )
 ))]
@@ -46,7 +57,7 @@ pub mod zstd;
 mod test_support {
     use alloc::{vec, vec::Vec};
 
-    use libarchive_oxide_core::{ArchiveError, Codec, CodecStatus, EndOfInput, ErrorKind};
+    use libarchive_oxide_protocol::{ArchiveError, Codec, CodecStatus, EndOfInput, ErrorKind};
 
     /// Drives a codec directly with bounded input and output slices.
     ///

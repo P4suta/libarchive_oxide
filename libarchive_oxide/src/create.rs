@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path};
 
 use libarchive_oxide_core::filter::FilterId;
@@ -20,7 +20,7 @@ use libarchive_oxide_core::{
 #[cfg(feature = "aes")]
 use crate::SecretBytes;
 use crate::path::sanitize_archive_path;
-use crate::{ArchiveEngine, ArchiveWriter, CreateOptions, StreamError};
+use crate::{ArchiveEngine, ArchiveWriter, CreateOptions, SeekArchiveWriter, StreamError};
 
 const COPY_BUFFER: usize = 64 * 1024;
 
@@ -28,7 +28,7 @@ const COPY_BUFFER: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CreationMetadataProfile {
-    /// Preserve portable mode, numeric ownership, and modification time.
+    /// Preserve portable mode, numeric ownership, and modification time where the destination can represent them, projecting IDs and timestamp precision to its wire fields.
     #[default]
     Filesystem,
     /// Emit deterministic portable modes and omit host ownership/timestamps.
@@ -84,16 +84,75 @@ impl From<ArchiveError> for CreateStreamError {
     }
 }
 
+#[derive(Debug)]
+struct BuilderState {
+    copy_buffer: Vec<u8>,
+    limits: Limits,
+    metadata_profile: CreationMetadataProfile,
+    seen_names: BTreeSet<Vec<u8>>,
+}
+
+impl BuilderState {
+    fn new(limits: Limits) -> Self {
+        Self {
+            copy_buffer: vec![0; COPY_BUFFER],
+            limits,
+            metadata_profile: CreationMetadataProfile::Filesystem,
+            seen_names: BTreeSet::new(),
+        }
+    }
+}
+
+trait BuilderWriter {
+    fn format(&self) -> FormatId;
+    fn start_entry(&mut self, entry: &EntryMetadata) -> Result<(), StreamError>;
+    fn write_data(&mut self, bytes: &[u8]) -> Result<(), StreamError>;
+    fn end_entry(&mut self) -> Result<(), StreamError>;
+}
+
+impl<W: Write> BuilderWriter for ArchiveWriter<W> {
+    fn format(&self) -> FormatId {
+        self.format()
+    }
+
+    fn start_entry(&mut self, entry: &EntryMetadata) -> Result<(), StreamError> {
+        self.start_entry(entry)
+    }
+
+    fn write_data(&mut self, bytes: &[u8]) -> Result<(), StreamError> {
+        self.write_data(bytes)
+    }
+
+    fn end_entry(&mut self) -> Result<(), StreamError> {
+        self.end_entry()
+    }
+}
+
+impl<W: Write + Seek> BuilderWriter for SeekArchiveWriter<W> {
+    fn format(&self) -> FormatId {
+        self.format()
+    }
+
+    fn start_entry(&mut self, entry: &EntryMetadata) -> Result<(), StreamError> {
+        self.start_entry(entry)
+    }
+
+    fn write_data(&mut self, bytes: &[u8]) -> Result<(), StreamError> {
+        self.write_data(bytes)
+    }
+
+    fn end_entry(&mut self) -> Result<(), StreamError> {
+        self.end_entry()
+    }
+}
+
 /// Filesystem walker backed by the common bounded archive state machine.
 ///
 /// Regular-file payload is copied in 64 KiB chunks. The builder never retains
 /// a complete file or archive.
 pub struct StreamingArchiveBuilder<W: Write> {
     writer: ArchiveWriter<W>,
-    copy_buffer: Vec<u8>,
-    limits: Limits,
-    metadata_profile: CreationMetadataProfile,
-    seen_names: BTreeSet<Vec<u8>>,
+    state: BuilderState,
 }
 
 impl<W: Write> fmt::Debug for StreamingArchiveBuilder<W> {
@@ -133,10 +192,7 @@ impl<W: Write> StreamingArchiveBuilder<W> {
         let writer = engine.create(output, options)?;
         Ok(Self {
             writer,
-            copy_buffer: vec![0; COPY_BUFFER],
-            limits,
-            metadata_profile: CreationMetadataProfile::Filesystem,
-            seen_names: BTreeSet::new(),
+            state: BuilderState::new(limits),
         })
     }
 
@@ -156,17 +212,14 @@ impl<W: Write> StreamingArchiveBuilder<W> {
         let writer = engine.create_with_password(output, options, password)?;
         Ok(Self {
             writer,
-            copy_buffer: vec![0; COPY_BUFFER],
-            limits,
-            metadata_profile: CreationMetadataProfile::Filesystem,
-            seen_names: BTreeSet::new(),
+            state: BuilderState::new(limits),
         })
     }
 
     /// Selects how filesystem metadata is represented in generated entries.
     #[must_use]
     pub const fn with_metadata_profile(mut self, profile: CreationMetadataProfile) -> Self {
-        self.metadata_profile = profile;
+        self.state.metadata_profile = profile;
         self
     }
 
@@ -179,7 +232,12 @@ impl<W: Write> StreamingArchiveBuilder<W> {
         if archive_path.as_bytes() != b"." && sanitize_archive_path(archive_path).is_none() {
             return Err(unsafe_archive_name(archive_path.as_bytes()));
         }
-        self.append_path_bytes(filesystem_path.as_ref(), archive_path.as_bytes())
+        append_path_bytes(
+            &mut self.writer,
+            &mut self.state,
+            filesystem_path.as_ref(),
+            archive_path.as_bytes(),
+        )
     }
 
     /// Recursively appends a path, deriving a safe relative archive name.
@@ -189,109 +247,213 @@ impl<W: Write> StreamingArchiveBuilder<W> {
     ) -> Result<(), CreateStreamError> {
         let path = filesystem_path.as_ref();
         let name = normalize_name(path)?;
-        self.append_path_bytes(path, &name)
+        append_path_bytes(&mut self.writer, &mut self.state, path, &name)
     }
 
     /// Finalizes the archive and returns the destination.
     pub fn finish(self) -> Result<W, CreateStreamError> {
         self.writer.finish().map_err(CreateStreamError::Archive)
     }
+}
 
-    fn append_path_bytes(
-        &mut self,
-        filesystem_path: &Path,
-        archive_name: &[u8],
-    ) -> Result<(), CreateStreamError> {
-        validate_archive_name(archive_name, self.limits)?;
-        let metadata = fs::symlink_metadata(filesystem_path)?;
-        let duplicate_key = duplicate_key(archive_name);
-        if !self.seen_names.insert(duplicate_key) {
-            return Err(CreateStreamError::Contract(
-                ArchiveError::new(ErrorKind::Protocol)
-                    .with_entry(0, archive_name)
-                    .with_context("duplicate archive path during filesystem creation"),
-            ));
-        }
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            let target = fs::read_link(filesystem_path)?;
-            let target = os_bytes_checked(target.as_os_str())?;
-            let body = matches!(self.writer.format(), FormatId::Cpio | FormatId::Zip)
-                .then_some(target.as_slice())
-                .unwrap_or_default();
-            let entry = metadata_for(
-                EntryKind::Symlink,
-                archive_name,
-                body.len() as u64,
-                &metadata,
-                Some(&target),
-                self.metadata_profile,
-            )?;
-            self.writer.start_entry(&entry)?;
-            self.writer.write_data(body)?;
-            self.writer.end_entry()?;
-            return Ok(());
-        }
-        if file_type.is_dir() {
-            let mut directory_name = archive_name.to_vec();
-            if !directory_name.ends_with(b"/") {
-                directory_name.push(b'/');
-            }
-            let entry = metadata_for(
-                EntryKind::Dir,
-                &directory_name,
-                0,
-                &metadata,
-                None,
-                self.metadata_profile,
-            )?;
-            self.writer.start_entry(&entry)?;
-            self.writer.end_entry()?;
-            let mut children = fs::read_dir(filesystem_path)?
-                .map(|child| {
-                    let child = child?;
-                    let component = os_bytes_checked(&child.file_name())?;
-                    Ok((component, child))
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            children.sort_by(|left, right| left.0.cmp(&right.0));
-            for (component, child) in children {
-                let mut child_name = archive_name.to_vec();
-                if !child_name.ends_with(b"/") {
-                    child_name.push(b'/');
-                }
-                child_name.extend_from_slice(&component);
-                self.append_path_bytes(&child.path(), &child_name)?;
-            }
-            return Ok(());
-        }
-        if file_type.is_file() {
-            let entry = metadata_for(
-                EntryKind::File,
-                archive_name,
-                metadata.len(),
-                &metadata,
-                None,
-                self.metadata_profile,
-            )?;
-            self.writer.start_entry(&entry)?;
-            let mut input = fs::File::open(filesystem_path)?;
-            loop {
-                let read = input.read(&mut self.copy_buffer)?;
-                if read == 0 {
-                    break;
-                }
-                self.writer.write_data(&self.copy_buffer[..read])?;
-            }
-            self.writer.end_entry()?;
-            return Ok(());
-        }
-        Err(CreateStreamError::Contract(
-            ArchiveError::new(ErrorKind::Capability).with_context(
-                "input filesystem object is not a regular file, directory, or symlink",
-            ),
-        ))
+/// Filesystem walker for seek-native archive writers.
+///
+/// The filesystem contract, metadata profiles, duplicate checks, and 64 KiB copy loop are shared with [`StreamingArchiveBuilder`].
+/// Container-specific bounded spooling, such as XAR's heap spool, remains inside the selected [`SeekArchiveWriter`].
+pub struct SeekArchiveBuilder<W: Write + Seek> {
+    writer: SeekArchiveWriter<W>,
+    state: BuilderState,
+}
+
+impl<W: Write + Seek> fmt::Debug for SeekArchiveBuilder<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SeekArchiveBuilder")
+            .field("format", &self.writer.format())
+            .finish_non_exhaustive()
     }
+}
+
+impl<W: Write + Seek> SeekArchiveBuilder<W> {
+    /// Creates a builder for a seek-capable format without an outer filter.
+    pub fn new(output: W, format: FormatId, limits: Limits) -> Result<Self, CreateStreamError> {
+        Self::with_engine(
+            ArchiveEngine::new().with_limits(limits),
+            output,
+            CreateOptions::new().with_format(format),
+        )
+    }
+
+    /// Creates a bounded seek filesystem builder through an [`ArchiveEngine`].
+    pub fn with_engine(
+        engine: ArchiveEngine,
+        output: W,
+        options: CreateOptions,
+    ) -> Result<Self, CreateStreamError> {
+        let limits = options.limits().unwrap_or(engine.limits());
+        let writer = engine.create_seek(output, options)?;
+        Ok(Self {
+            writer,
+            state: BuilderState::new(limits),
+        })
+    }
+
+    /// Creates a bounded filesystem builder for a password-protected 7z archive.
+    ///
+    /// The password remains in the underlying writer's zeroizing storage.
+    /// [`ArchiveEngine::create_seek_with_password`] rejects non-7z formats,
+    /// unencrypted profiles, and outer filters before any archive bytes are written.
+    #[cfg(feature = "aes")]
+    pub fn with_engine_and_password(
+        engine: ArchiveEngine,
+        output: W,
+        options: CreateOptions,
+        password: SecretBytes,
+    ) -> Result<Self, CreateStreamError> {
+        let limits = options.limits().unwrap_or(engine.limits());
+        let writer = engine.create_seek_with_password(output, options, password)?;
+        Ok(Self {
+            writer,
+            state: BuilderState::new(limits),
+        })
+    }
+
+    /// Selects how filesystem metadata is represented in generated entries.
+    #[must_use]
+    pub const fn with_metadata_profile(mut self, profile: CreationMetadataProfile) -> Self {
+        self.state.metadata_profile = profile;
+        self
+    }
+
+    /// Recursively appends a filesystem path using the supplied archive name.
+    pub fn append_path_as(
+        &mut self,
+        filesystem_path: impl AsRef<Path>,
+        archive_path: &ArchivePath,
+    ) -> Result<(), CreateStreamError> {
+        if archive_path.as_bytes() != b"." && sanitize_archive_path(archive_path).is_none() {
+            return Err(unsafe_archive_name(archive_path.as_bytes()));
+        }
+        append_path_bytes(
+            &mut self.writer,
+            &mut self.state,
+            filesystem_path.as_ref(),
+            archive_path.as_bytes(),
+        )
+    }
+
+    /// Recursively appends a path, deriving a safe relative archive name.
+    pub fn append_path(
+        &mut self,
+        filesystem_path: impl AsRef<Path>,
+    ) -> Result<(), CreateStreamError> {
+        let path = filesystem_path.as_ref();
+        let name = normalize_name(path)?;
+        append_path_bytes(&mut self.writer, &mut self.state, path, &name)
+    }
+
+    /// Finalizes the archive and returns the seekable destination.
+    pub fn finish(self) -> Result<W, CreateStreamError> {
+        self.writer.finish().map_err(CreateStreamError::Archive)
+    }
+}
+
+fn append_path_bytes(
+    writer: &mut impl BuilderWriter,
+    state: &mut BuilderState,
+    filesystem_path: &Path,
+    archive_name: &[u8],
+) -> Result<(), CreateStreamError> {
+    validate_archive_name(archive_name, state.limits)?;
+    let metadata = fs::symlink_metadata(filesystem_path)?;
+    let duplicate_key = duplicate_key(archive_name);
+    if !state.seen_names.insert(duplicate_key) {
+        return Err(CreateStreamError::Contract(
+            ArchiveError::new(ErrorKind::Protocol)
+                .with_entry(0, archive_name)
+                .with_context("duplicate archive path during filesystem creation"),
+        ));
+    }
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let target = fs::read_link(filesystem_path)?;
+        let target = os_bytes_checked(target.as_os_str())?;
+        let body = matches!(writer.format(), FormatId::Cpio | FormatId::Zip)
+            .then_some(target.as_slice())
+            .unwrap_or_default();
+        let entry = metadata_for(
+            EntryKind::Symlink,
+            archive_name,
+            body.len() as u64,
+            &metadata,
+            Some(&target),
+            state.metadata_profile,
+            writer.format(),
+        )?;
+        writer.start_entry(&entry)?;
+        writer.write_data(body)?;
+        writer.end_entry()?;
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        let mut directory_name = archive_name.to_vec();
+        if !directory_name.ends_with(b"/") {
+            directory_name.push(b'/');
+        }
+        let entry = metadata_for(
+            EntryKind::Dir,
+            &directory_name,
+            0,
+            &metadata,
+            None,
+            state.metadata_profile,
+            writer.format(),
+        )?;
+        writer.start_entry(&entry)?;
+        writer.end_entry()?;
+        let mut children = fs::read_dir(filesystem_path)?
+            .map(|child| {
+                let child = child?;
+                let component = os_bytes_checked(&child.file_name())?;
+                Ok((component, child))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        for (component, child) in children {
+            let mut child_name = archive_name.to_vec();
+            if !child_name.ends_with(b"/") {
+                child_name.push(b'/');
+            }
+            child_name.extend_from_slice(&component);
+            append_path_bytes(writer, state, &child.path(), &child_name)?;
+        }
+        return Ok(());
+    }
+    if file_type.is_file() {
+        let entry = metadata_for(
+            EntryKind::File,
+            archive_name,
+            metadata.len(),
+            &metadata,
+            None,
+            state.metadata_profile,
+            writer.format(),
+        )?;
+        writer.start_entry(&entry)?;
+        let mut input = fs::File::open(filesystem_path)?;
+        loop {
+            let read = input.read(&mut state.copy_buffer)?;
+            if read == 0 {
+                break;
+            }
+            writer.write_data(&state.copy_buffer[..read])?;
+        }
+        writer.end_entry()?;
+        return Ok(());
+    }
+    Err(CreateStreamError::Contract(
+        ArchiveError::new(ErrorKind::Capability)
+            .with_context("input filesystem object is not a regular file, directory, or symlink"),
+    ))
 }
 
 fn metadata_for(
@@ -301,6 +463,7 @@ fn metadata_for(
     metadata: &fs::Metadata,
     link_target: Option<&[u8]>,
     profile: CreationMetadataProfile,
+    format: FormatId,
 ) -> Result<EntryMetadata, ArchiveError> {
     let (mode, owner, modified) = match profile {
         CreationMetadataProfile::Filesystem => platform_metadata(metadata),
@@ -314,7 +477,7 @@ fn metadata_for(
             None,
         ),
     };
-    EntryMetadata::builder(kind, ArchivePath::from_bytes(path.to_vec()))
+    let metadata = EntryMetadata::builder(kind, ArchivePath::from_bytes(path.to_vec()))
         .size(Some(size))
         .mode(Some(mode))
         .owner(owner)
@@ -323,7 +486,87 @@ fn metadata_for(
             ..EntryTimes::default()
         })
         .link_target(link_target.map(|target| ArchivePath::from_bytes(target.to_vec())))
-        .try_build()
+        .try_build()?;
+    Ok(project_creation_metadata(metadata, format))
+}
+
+fn project_creation_metadata(metadata: EntryMetadata, format: FormatId) -> EntryMetadata {
+    let mode = if format == FormatId::Warc {
+        Some(0o644)
+    } else {
+        metadata.mode()
+    };
+    let source_owner = metadata.owner();
+    let owner_exact = match format {
+        FormatId::Tar | FormatId::Xar | FormatId::Mtree => true,
+        FormatId::Cpio | FormatId::Iso9660 => source_owner
+            .uid
+            .into_iter()
+            .chain(source_owner.gid)
+            .all(|value| u32::try_from(value).is_ok()),
+        FormatId::Ar => source_owner
+            .uid
+            .into_iter()
+            .chain(source_owner.gid)
+            .all(|value| value < 1_000_000),
+        FormatId::Zip => match (source_owner.uid, source_owner.gid) {
+            (None, None) => true,
+            (Some(uid), Some(gid)) => u16::try_from(uid).is_ok() && u16::try_from(gid).is_ok(),
+            _ => false,
+        },
+        _ => source_owner == &Owner::default(),
+    };
+    let owner = if owner_exact {
+        source_owner.clone()
+    } else {
+        Owner::default()
+    };
+    let modified = metadata
+        .times()
+        .modified
+        .and_then(|timestamp| project_creation_timestamp(timestamp, format));
+    metadata
+        .into_builder()
+        .mode(mode)
+        .owner(owner)
+        .times(EntryTimes {
+            modified,
+            ..EntryTimes::default()
+        })
+        .build()
+}
+
+fn project_creation_timestamp(timestamp: Timestamp, format: FormatId) -> Option<Timestamp> {
+    const FILETIME_EPOCH_DIFF: i128 = 11_644_473_600;
+    match format {
+        FormatId::Tar | FormatId::Xar | FormatId::Mtree => Some(timestamp),
+        FormatId::Zip => i32::try_from(timestamp.seconds())
+            .ok()
+            .map(|seconds| Timestamp::from_seconds(i64::from(seconds))),
+        FormatId::Cpio => u32::try_from(timestamp.seconds())
+            .ok()
+            .map(|seconds| Timestamp::from_seconds(i64::from(seconds))),
+        FormatId::Ar => (0..=999_999_999_999)
+            .contains(&timestamp.seconds())
+            .then(|| Timestamp::from_seconds(timestamp.seconds())),
+        FormatId::Iso9660 => Timestamp::new(
+            timestamp.seconds(),
+            timestamp.nanoseconds() / 10_000_000 * 10_000_000,
+        )
+        .ok()
+        .filter(|timestamp| crate::iso_stream::iso_timestamp_supported(*timestamp)),
+        FormatId::SevenZip => {
+            let projected =
+                Timestamp::new(timestamp.seconds(), timestamp.nanoseconds() / 100 * 100).ok()?;
+            i128::from(projected.seconds())
+                .checked_add(FILETIME_EPOCH_DIFF)
+                .and_then(|seconds| seconds.checked_mul(10_000_000))
+                .and_then(|ticks| ticks.checked_add(i128::from(projected.nanoseconds() / 100)))
+                .and_then(|ticks| u64::try_from(ticks).ok())
+                .map(|_| projected)
+        },
+        _ => None,
+    }
 }
 
 fn duplicate_key(name: &[u8]) -> Vec<u8> {
@@ -465,7 +708,11 @@ fn unsafe_archive_name(name: &[u8]) -> CreateStreamError {
 mod tests {
     use std::path::Path;
 
-    use super::normalize_name;
+    use libarchive_oxide_core::{
+        ArchivePath, EntryKind, EntryMetadata, EntryTimes, FormatId, Owner, Timestamp,
+    };
+
+    use super::{normalize_name, project_creation_metadata};
 
     #[test]
     fn normalize_strips_roots_and_dot_without_lossy_text_conversion() {
@@ -483,5 +730,39 @@ mod tests {
     fn normalize_rejects_parent_components() {
         assert!(normalize_name(Path::new("../outside")).is_err());
         assert!(normalize_name(Path::new("inside/../../outside")).is_err());
+    }
+
+    #[test]
+    fn filesystem_metadata_is_projected_to_destination_precision_and_ranges() {
+        let metadata = EntryMetadata::builder(EntryKind::File, ArchivePath::from_utf8("entry"))
+            .size(Some(0))
+            .mode(Some(0o640))
+            .owner(Owner {
+                uid: Some(1_000),
+                gid: Some(1_001),
+                ..Owner::default()
+            })
+            .times(EntryTimes {
+                modified: Some(Timestamp::new(1_700_000_000, 123_456_789).unwrap()),
+                ..EntryTimes::default()
+            })
+            .build();
+
+        let zip = project_creation_metadata(metadata.clone(), FormatId::Zip);
+        assert_eq!(zip.owner(), metadata.owner());
+        assert_eq!(zip.times().modified.unwrap().nanoseconds(), 0);
+
+        let iso = project_creation_metadata(metadata.clone(), FormatId::Iso9660);
+        assert_eq!(iso.owner(), metadata.owner());
+        assert_eq!(iso.times().modified.unwrap().nanoseconds(), 120_000_000);
+
+        let sevenz = project_creation_metadata(metadata.clone(), FormatId::SevenZip);
+        assert_eq!(sevenz.owner(), &Owner::default());
+        assert_eq!(sevenz.times().modified.unwrap().nanoseconds(), 123_456_700);
+
+        let warc = project_creation_metadata(metadata, FormatId::Warc);
+        assert_eq!(warc.mode(), Some(0o644));
+        assert_eq!(warc.owner(), &Owner::default());
+        assert!(warc.times().modified.is_none());
     }
 }

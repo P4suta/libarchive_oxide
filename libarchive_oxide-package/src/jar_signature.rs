@@ -16,7 +16,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use cryptographic_message_syntax::{CmsError, SignedData};
-use libarchive_oxide_core::Limits;
+use libarchive_oxide::Limits;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use subtle::ConstantTimeEq;
 use x509_certificate::certificate::certificate_is_subset_of;
@@ -88,7 +88,7 @@ pub(crate) enum SignatureFailure {
 }
 
 impl SignatureFailure {
-    const fn code(&self) -> PackageFindingCode {
+    pub(crate) const fn code(&self) -> PackageFindingCode {
         match self {
             Self::InvalidMetadata(_) => PackageFindingCode::InvalidSignatureMetadata,
             Self::Mismatch(_) => PackageFindingCode::SignatureMismatch,
@@ -895,7 +895,7 @@ fn required_apk_signature_schemes(
     Ok(required)
 }
 
-fn verify_cms(
+pub(crate) fn verify_cms(
     signature_block: &[u8],
     signature_file: &[u8],
     limits: Limits,
@@ -1078,7 +1078,7 @@ fn verify_cms_inner(
         .is_some_and(|content| content != signature_file)
     {
         return Err(SignatureFailure::Mismatch(
-            "CMS encapsulated content does not match the paired JAR .SF bytes".to_string(),
+            "CMS encapsulated content does not match the expected signed bytes".to_string(),
         ));
     }
 
@@ -1281,7 +1281,7 @@ mod tests {
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
-    use libarchive_oxide_core::Limits;
+    use libarchive_oxide::Limits;
     use sha2::{Digest, Sha256};
     use x509_certificate::{DigestAlgorithm, SignatureAlgorithm};
 
@@ -1304,6 +1304,7 @@ mod tests {
         EntryDigest {
             name: name.to_vec(),
             size: 0,
+            sha1: Vec::new(),
             sha256: Vec::new(),
             sha384: Vec::new(),
             sha512: Vec::new(),

@@ -183,13 +183,15 @@ pub enum ChecksumAlgorithm {
     Sha256,
     /// BLAKE2b-256.
     Blake2b256,
+    /// BLAKE2sp-256, as used by RAR5.
+    Blake2sp,
 }
 
 impl ChecksumAlgorithm {
     const fn output_bytes(self) -> usize {
         match self {
             Self::CpioSum32 | Self::Crc32 => 4,
-            Self::Sha256 | Self::Blake2b256 => 32,
+            Self::Sha256 | Self::Blake2b256 | Self::Blake2sp => 32,
         }
     }
 }

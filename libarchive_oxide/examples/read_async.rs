@@ -5,7 +5,7 @@
 //! Runtime-neutral futures-io reading over the shared archive state machine.
 
 #[cfg(feature = "async")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), libarchive_oxide::Error> {
     use futures_lite::future::block_on;
     use futures_lite::io::Cursor;
     use libarchive_oxide::{ArchiveWriter, AsyncArchiveReader, ReaderEvent};

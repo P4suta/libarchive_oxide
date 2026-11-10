@@ -11,12 +11,17 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use flate2::{Compression, write::DeflateEncoder};
 use libarchive_oxide::advanced::{
-    CabVolumeProvider, CabVolumeReader, MemoryReadAt, RangeReadError, RangeReadErrorKind, Registry,
+    CabVolumeProvider, CabVolumeReader, MemoryReadAt, RangeReadError, RangeReadErrorKind,
     SourceIdentity, SourceLimits, VolumeId, VolumeResolver, VolumeSet,
 };
-use libarchive_oxide::{Error, Limits, ReaderEvent};
+use libarchive_oxide::{
+    ArchiveEngine, Error, ErrorKind, FilterId, FormatId, Limits, OpenOptions, PasswordCandidates,
+    Policy, ReaderEvent, SecretBytes, VolumeArchiveReader,
+};
 
 const METHOD_STORE: u16 = 0;
 const METHOD_MSZIP: u16 = 1;
@@ -473,7 +478,7 @@ fn typed_range(error: &Error) -> Option<RangeReadErrorKind> {
 }
 
 #[test]
-fn store_split_cfdata_round_trips_through_registry_provider() {
+fn store_split_cfdata_round_trips_through_typed_provider() {
     let payload = b"store bytes cross a physical cabinet boundary".to_vec();
     let record = Record {
         payload: payload.clone(),
@@ -490,20 +495,10 @@ fn store_split_cfdata_round_trips_through_registry_provider() {
     };
     let cabinets = build_set(&fixture, &[vec![first], vec![second]]);
     let (volumes, resolver) = volume_set(cabinets, SourceLimits::safe());
-    let mut builder = Registry::builder();
-    builder
-        .register_random_access_format(Box::new(CabVolumeProvider::new()))
-        .expect("register CAB set provider");
-    let registry = builder.build();
-    assert_eq!(
-        registry
-            .detect_random_access(&volumes, Limits::safe())
-            .expect("probe CAB set"),
-        Some(libarchive_oxide::FormatId::Cab),
-    );
-    let mut reader = registry
-        .open_random_access(libarchive_oxide::FormatId::Cab, volumes, Limits::safe())
+    let options = OpenOptions::new().with_volumes(volumes);
+    let mut reader = VolumeArchiveReader::with_provider(&options, &CabVolumeProvider::new())
         .expect("open CAB set");
+    assert_eq!(reader.format(), libarchive_oxide::FormatId::Cab);
     let mut decoded = Vec::new();
     loop {
         match reader.next_event().expect("read CAB set") {
@@ -514,6 +509,218 @@ fn store_split_cfdata_round_trips_through_registry_provider() {
     }
     assert_eq!(decoded, payload);
     assert_eq!(resolver.requests.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn common_volume_reader_detects_cab_from_open_options() {
+    let payload = b"common volume reader crosses cabinet boundaries".to_vec();
+    let record = Record {
+        payload: payload.clone(),
+        uncompressed: u16::try_from(payload.len()).unwrap(),
+    };
+    let (first, second) = split_record(&record, 13);
+    let fixture = Fixture {
+        method: METHOD_STORE,
+        file_size: u32::try_from(payload.len()).unwrap(),
+        file_name: b"nested/common.bin".to_vec(),
+        date: 0,
+        time: 0,
+        attributes: 0,
+    };
+    let (volumes, resolver) = volume_set(
+        build_set(&fixture, &[vec![first], vec![second]]),
+        SourceLimits::safe(),
+    );
+    let options = OpenOptions::new().with_volumes(volumes);
+    let mut reader = VolumeArchiveReader::with_options(&options).expect("open CAB volume set");
+    assert_eq!(reader.format(), FormatId::Cab);
+
+    let mut decoded = Vec::new();
+    loop {
+        match reader.next_event().expect("read CAB set") {
+            ReaderEvent::Data(bytes) => decoded.extend_from_slice(bytes),
+            ReaderEvent::Done => break,
+            _ => {},
+        }
+    }
+    assert_eq!(decoded, payload);
+    assert_eq!(resolver.requests.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn common_volume_reader_requires_a_volume_set() {
+    let error = VolumeArchiveReader::with_options(&OpenOptions::new())
+        .expect_err("volume reader must not invent a source");
+    assert_eq!(error.kind(), ErrorKind::Capability);
+}
+
+#[test]
+fn common_volume_reader_rejects_an_unregistered_explicit_format() {
+    let fixture = Fixture {
+        method: METHOD_STORE,
+        file_size: 0,
+        file_name: b"empty.bin".to_vec(),
+        date: 0,
+        time: 0,
+        attributes: 0,
+    };
+    let (volumes, _) = volume_set(
+        build_set(
+            &fixture,
+            &[vec![Record {
+                payload: Vec::new(),
+                uncompressed: 0,
+            }]],
+        ),
+        SourceLimits::safe(),
+    );
+    let options = OpenOptions::new()
+        .with_format(Some(FormatId::Tar))
+        .with_volumes(volumes);
+    let error =
+        VolumeArchiveReader::with_options(&options).expect_err("tar has no multi-volume provider");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
+
+#[test]
+fn common_volume_reader_rejects_handle_adjacent_discovery() {
+    let (volumes, _) = volume_set(vec![b"MSCF".to_vec()], SourceLimits::safe());
+    let options = OpenOptions::new()
+        .with_volumes(volumes)
+        .with_adjacent_volume_discovery(true);
+    let error = VolumeArchiveReader::with_options(&options)
+        .expect_err("handle-based opens must not discover adjacent paths");
+    assert_eq!(error.kind(), ErrorKind::Capability);
+}
+
+#[test]
+fn common_volume_reader_rejects_outer_filters_instead_of_ignoring_them() {
+    let (volumes, _) = volume_set(vec![b"MSCF".to_vec()], SourceLimits::safe());
+    let options = OpenOptions::new()
+        .with_volumes(volumes)
+        .with_filter(Some(FilterId::Base64));
+    let error = VolumeArchiveReader::with_options(&options)
+        .expect_err("multi-volume providers cannot ignore an outer filter");
+    assert_eq!(error.kind(), ErrorKind::Capability);
+}
+
+#[test]
+fn common_volume_reader_rejects_source_limits_changed_after_set_creation() {
+    let limits = SourceLimits::safe().with_volumes(Some(2));
+    let (volumes, _) = volume_set(vec![b"MSCF".to_vec()], limits);
+    let options = OpenOptions::new()
+        .with_volumes(volumes)
+        .with_source_limits(SourceLimits::unlimited());
+    let error = VolumeArchiveReader::with_options(&options)
+        .expect_err("already-created VolumeSet limits cannot be replaced silently");
+    assert_eq!(error.kind(), ErrorKind::Capability);
+}
+
+#[test]
+fn common_volume_reader_rejects_passwords_for_non_password_provider() {
+    let (volumes, _) = volume_set(vec![b"MSCF".to_vec()], SourceLimits::safe());
+    let options = OpenOptions::new()
+        .with_volumes(volumes)
+        .with_password_provider(Arc::new(PasswordCandidates::new([SecretBytes::new(
+            b"secret".to_vec(),
+        )])));
+    let error = VolumeArchiveReader::with_options(&options)
+        .expect_err("CAB provider must not silently ignore credentials");
+    assert_eq!(error.kind(), ErrorKind::Capability);
+}
+
+#[test]
+fn archive_engine_inspects_plans_applies_and_rewinds_volume_sets() {
+    let payload = b"engine session over a split cabinet".to_vec();
+    let record = Record {
+        payload: payload.clone(),
+        uncompressed: u16::try_from(payload.len()).unwrap(),
+    };
+    let (first, second) = split_record(&record, 9);
+    let fixture = Fixture {
+        method: METHOD_STORE,
+        file_size: u32::try_from(payload.len()).unwrap(),
+        file_name: b"engine/volume.bin".to_vec(),
+        date: 0,
+        time: 0,
+        attributes: 0,
+    };
+    let (volumes, resolver) = volume_set(
+        build_set(&fixture, &[vec![first], vec![second]]),
+        SourceLimits::safe(),
+    );
+    let options = OpenOptions::new().with_volumes(volumes);
+    let mut session = ArchiveEngine::new()
+        .open_volumes(&options)
+        .expect("open engine volume session");
+
+    let inspection = session.inspect().expect("inspect volume session");
+    assert_eq!(inspection.format(), FormatId::Cab);
+    assert_eq!(inspection.entries().len(), 1);
+    assert_eq!(
+        inspection.entries()[0].metadata().path().as_bytes(),
+        b"engine/volume.bin"
+    );
+
+    let plan = session.plan(Policy::safe()).expect("plan volume session");
+    let destination = tempfile::tempdir().expect("volume extraction root");
+    let root = Dir::open_ambient_dir(destination.path(), ambient_authority())
+        .expect("open extraction capability");
+    let report = session.apply(plan, root).expect("apply volume plan");
+    assert!(!report.extraction().has_rejections());
+    assert_eq!(
+        std::fs::read(destination.path().join("engine/volume.bin"))
+            .expect("read extracted payload"),
+        payload
+    );
+
+    session.rewind().expect("rewind volume session");
+    assert_eq!(
+        session.inspect().expect("reinspect").format(),
+        FormatId::Cab
+    );
+    assert_eq!(resolver.requests.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn archive_engine_volume_digest_covers_additional_volume_bytes() {
+    let fixture = Fixture {
+        method: METHOD_STORE,
+        file_size: 15,
+        file_name: b"digest.bin".to_vec(),
+        date: 0,
+        time: 0,
+        attributes: 0,
+    };
+    let cabinets = |payload: &[u8]| {
+        let record = Record {
+            payload: payload.to_vec(),
+            uncompressed: u16::try_from(payload.len()).unwrap(),
+        };
+        let (first, second) = split_record(&record, 14);
+        build_set(&fixture, &[vec![first], vec![second]])
+    };
+
+    let (first_volumes, _) = volume_set(cabinets(b"shared-prefix-A"), SourceLimits::safe());
+    let first_options = OpenOptions::new().with_volumes(first_volumes);
+    let first = ArchiveEngine::new()
+        .open_volumes(&first_options)
+        .expect("first volume session");
+
+    let (same_volumes, _) = volume_set(cabinets(b"shared-prefix-A"), SourceLimits::safe());
+    let same_options = OpenOptions::new().with_volumes(same_volumes);
+    let same = ArchiveEngine::new()
+        .open_volumes(&same_options)
+        .expect("equivalent volume session");
+
+    let (changed_volumes, _) = volume_set(cabinets(b"shared-prefix-B"), SourceLimits::safe());
+    let changed_options = OpenOptions::new().with_volumes(changed_volumes);
+    let changed = ArchiveEngine::new()
+        .open_volumes(&changed_options)
+        .expect("changed volume session");
+
+    assert_eq!(first.digest(), same.digest());
+    assert_ne!(first.digest(), changed.digest());
 }
 
 #[test]

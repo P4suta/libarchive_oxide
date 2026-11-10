@@ -11,8 +11,8 @@ use std::io::Cursor;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use libarchive_oxide::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use libarchive_oxide::{ArchiveWriter, ReaderEvent, SeekArchiveReader, ZipMethod};
-use libarchive_oxide_core::{ArchivePath, EntryKind, EntryMetadata, Limits};
 use libarchive_oxide_package::{
     AppPackageProfile, PackageFindingCode, PackageVerifier, TrustPolicy, VerificationDimension,
     ZipPackageProfile,
@@ -258,7 +258,14 @@ fn openjdk_jarsigner_fixture_verifies_for_jar_and_android_apk_v1() {
     assert_eq!(trusted.trust(), VerificationDimension::Verified);
 
     let apk = verifier.app(AppPackageProfile::AndroidApk, Cursor::new(SIGNED_JAR_APK));
-    assert!(apk.structure().profile_valid(), "{:?}", apk.findings());
+    assert!(!apk.structure().profile_valid(), "{:?}", apk.findings());
+    assert_eq!(
+        apk.android_apk_manifest()
+            .expect("manifest report")
+            .validity(),
+        VerificationDimension::Invalid
+    );
+    assert!(apk.has_code(PackageFindingCode::InvalidAndroidManifest));
     assert_eq!(apk.integrity(), VerificationDimension::Verified);
     assert_eq!(apk.signature_validity(), VerificationDimension::Verified);
     assert_eq!(apk.trust(), VerificationDimension::Verified);

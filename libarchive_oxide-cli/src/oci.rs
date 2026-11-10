@@ -22,10 +22,9 @@ use std::path::Path;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use libarchive_oxide::{
-    CapStdFilesystemAdapter, IdentityOwnership, LayerDigests, OciApplyReport, OciLayerApplier,
-    OciLayerEngine, OciLayerError, Policy,
+    CapStdFilesystemAdapter, EntryKind, IdentityOwnership, LayerDigests, OciApplyReport,
+    OciLayerApplier, OciLayerEngine, OciLayerError, Policy,
 };
-use libarchive_oxide_core::EntryKind;
 use serde_json::{Value, json};
 
 use crate::oxarchive::{JSON_SCHEMA_VERSION, hex, print_json, write_json_record};

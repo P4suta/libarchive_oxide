@@ -8,7 +8,7 @@
 #![cfg(all(feature = "lz4", feature = "zstd"))]
 
 use libarchive_oxide_codecs::{lz4, zstd};
-use libarchive_oxide_core::{Codec, CodecStatus, EndOfInput, ErrorKind, Limits};
+use libarchive_oxide_protocol::{Codec, CodecStatus, EndOfInput, ErrorKind, Limits};
 
 #[test]
 fn zstd_rejects_declared_workspace_before_output() {

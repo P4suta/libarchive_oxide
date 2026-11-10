@@ -176,7 +176,12 @@ independence for LZMA is real but narrower than for Store/Deflate.
   `state ^= state << 5`, retaining the low eight bits after the third
   operation. Repeat that 50,000-byte sequence three times. This is the same
   authoritative algorithm asserted by
-  `tests/interop_zip_deflate64.rs::official_7zip_fixture_exercises_the_64k_window`.
+  `tests/interop_zip_deflate64.rs::official_7zip_fixture_exercises_the_64k_window`
+  and its forward-only counterpart
+  `forward_only_reader_accepts_the_official_7zip_fixture`. The descriptor
+  boundary regression test also extracts this same compressed member at test
+  time and re-frames it in a first-party single-member ZIP with a signed data
+  descriptor; no generated binary fixture is committed.
   The repeated sequence requires a match distance beyond the 32 KiB Deflate
   window; 7-Zip reports method `Deflate64` and packed size 51,126 bytes for
   that member.

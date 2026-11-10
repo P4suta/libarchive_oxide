@@ -366,8 +366,10 @@ fn async_reader_concatenates_every_filter_and_rejects_trailing_data() {
                         Ok(_) => {},
                         Err(error) => {
                             assert_eq!(
-                                error.io_error().map(std::io::Error::kind),
-                                Some(std::io::ErrorKind::InvalidData),
+                                error
+                                    .archive_error()
+                                    .map(libarchive_oxide_core::ArchiveError::kind),
+                                Some(libarchive_oxide_core::ErrorKind::Malformed),
                                 "{filter:?}: {error}"
                             );
                             break;
@@ -441,8 +443,10 @@ fn async_xz_dictionary_limit_prevents_oversized_allocation() {
             }
         };
         assert_eq!(
-            error.io_error().map(std::io::Error::kind),
-            Some(std::io::ErrorKind::OutOfMemory)
+            error
+                .archive_error()
+                .map(libarchive_oxide_core::ArchiveError::kind),
+            Some(libarchive_oxide_core::ErrorKind::Limit)
         );
     });
 }
