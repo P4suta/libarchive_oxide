@@ -32,10 +32,6 @@ allow = [
     # ring and its untrusted parser dependency use the short permissive ISC
     # license for their bounded CMS signature-verification implementation.
     "ISC",
-    # cryptographic-message-syntax and x509-certificate use MPL-2.0. They are
-    # unmodified, library-only CMS/X.509 adapters behind libarchive_oxide-package's
-    # bounded offline verification boundary; the optional HTTP feature is disabled.
-    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
@@ -54,8 +50,8 @@ skip = [
     # cap-std 4 pulls io-lifetimes v2 through fs-set-times while its current
     # io-extras path uses v3. Both are internal compatibility layers.
     { crate = "io-lifetimes@2.0.4", reason = "transitive cap-std compatibility split; no workspace crate uses this API" },
-    # x509-certificate 0.25 still uses the stable DER 0.7 / const-oid 0.9
-    # family, while digest 0.11 has moved to const-oid 0.10.
+    # cms and x509-cert use DER 0.7 and const-oid 0.9.
+    # digest 0.11 uses const-oid 0.10.
     { crate = "const-oid@0.9.6", reason = "bounded CMS/X.509 parser is on DER 0.7 while the workspace digest family independently uses const-oid 0.10" },
     # ring 0.17 intentionally retains getrandom 0.2 for its audited platform
     # entropy boundary; build tooling and current archive dependencies use 0.4.

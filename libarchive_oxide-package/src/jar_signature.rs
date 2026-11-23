@@ -4,23 +4,27 @@
 
 //! Bounded offline verification for JAR and Android APK v1 signatures.
 //!
-//! Signature blocks are retained inside [`Limits::metadata_bytes`], preflighted
-//! as definite-length DER with finite node/depth caps, and only then handed to
-//! the CMS/X.509 parser behind a panic boundary. The dependency's optional HTTP
-//! feature is disabled, and trust is decided separately by the caller's pinned
-//! certificate fingerprints.
+//! Signature blocks are retained inside [`Limits::metadata_bytes`], preflighted as definite-length DER with finite node/depth caps, and only then handed to the CMS/X.509 parser behind a panic boundary.
+//! The caller pins certificate fingerprints to decide trust separately.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use crate::certificate::CertificateKey;
+use crate::package_cms::{
+    CONTENT_TYPE, DigestAlgorithm, MESSAGE_DIGEST, PackageAttribute, PackageSignatureAlgorithm,
+    PackageSignedData, PackageSignerInfo, matches_certificate,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use cryptographic_message_syntax::{CmsError, SignedData};
+use cms::cert::CertificateChoices;
+use cms::signed_data::SignerIdentifier;
+use der::Decode;
+use der::asn1::{ObjectIdentifier, OctetString};
 use libarchive_oxide_core::Limits;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use subtle::ConstantTimeEq;
-use x509_certificate::certificate::certificate_is_subset_of;
-use x509_certificate::{DigestAlgorithm, SignatureAlgorithm};
+use x509_cert::time::Time;
 
 use crate::integrity::{
     EntryDigest, ManifestSection, RawManifestSection, manifest_sections, manifest_sections_with_raw,
@@ -1047,136 +1051,178 @@ fn verify_cms_inner(
     signature_block: &[u8],
     signature_file: &[u8],
 ) -> Result<Vec<[u8; 32]>, SignatureFailure> {
-    let signed_data =
-        SignedData::parse_ber(signature_block).map_err(|error| cms_failure(&error))?;
-    let certificate_count = signed_data
-        .certificates()
-        .take(MAX_CMS_CERTIFICATES.saturating_add(1))
-        .count();
-    if certificate_count > MAX_CMS_CERTIFICATES {
-        return Err(SignatureFailure::ResourceLimit(format!(
-            "CMS certificate count {certificate_count} exceeds the fixed limit \
-             {MAX_CMS_CERTIFICATES}"
-        )));
-    }
-    let signer_count = signed_data
-        .signers()
-        .take(MAX_CMS_SIGNERS.saturating_add(1))
-        .count();
-    if signer_count == 0 {
+    let signed_data = PackageSignedData::decode_der(signature_block).map_err(|error| {
+        SignatureFailure::InvalidMetadata(format!("invalid CMS signature metadata: {error}"))
+    })?;
+    if signed_data.has_revocations {
         return Err(SignatureFailure::InvalidMetadata(
-            "CMS SignedData contains no signer".to_string(),
+            "CMS revocation information is unsupported".into(),
         ));
     }
-    if signer_count > MAX_CMS_SIGNERS {
+    let certificates = signed_data.certificates.as_deref().unwrap_or_default();
+    if certificates.len() > MAX_CMS_CERTIFICATES {
         return Err(SignatureFailure::ResourceLimit(format!(
-            "CMS signer count {signer_count} exceeds the fixed limit {MAX_CMS_SIGNERS}"
+            "CMS certificate count {} exceeds the fixed limit {MAX_CMS_CERTIFICATES}",
+            certificates.len()
         )));
     }
-    if signed_data
-        .signed_content()
-        .is_some_and(|content| content != signature_file)
-    {
-        return Err(SignatureFailure::Mismatch(
-            "CMS encapsulated content does not match the paired JAR .SF bytes".to_string(),
+    if signed_data.signer_infos.is_empty() {
+        return Err(SignatureFailure::InvalidMetadata(
+            "CMS SignedData contains no signer".into(),
         ));
     }
-
-    let mut fingerprints = Vec::with_capacity(signer_count);
-    for signer in signed_data.signers() {
-        verify_signer_algorithms(signer.digest_algorithm(), signer.signature_algorithm())?;
-        if signer.signed_attributes().is_some() || signed_data.signed_content().is_some() {
-            signer
-                .verify_signature_with_signed_data(&signed_data)
-                .map_err(|error| cms_failure(&error))?;
-        } else {
-            signer
-                .verify_signature_with_signed_data_and_content(&signed_data, signature_file)
-                .map_err(|error| cms_failure(&error))?;
-        }
-        if signer.signed_attributes().is_some() {
-            signer
-                .verify_message_digest_with_content(signature_file)
-                .map_err(|error| cms_failure(&error))?;
-        }
-
-        let (issuer, serial) = signer.certificate_issuer_and_serial().ok_or_else(|| {
-            SignatureFailure::Unsupported(
-                "CMS signer uses an unsupported certificate identifier".to_string(),
-            )
+    if signed_data.signer_infos.len() > MAX_CMS_SIGNERS {
+        return Err(SignatureFailure::ResourceLimit(format!(
+            "CMS signer count {} exceeds the fixed limit {MAX_CMS_SIGNERS}",
+            signed_data.signer_infos.len()
+        )));
+    }
+    if let Some(content) = signed_data.content_info.econtent {
+        let content = content.decode_as::<OctetString>().map_err(|error| {
+            SignatureFailure::InvalidMetadata(format!("invalid CMS encapsulated content: {error}"))
         })?;
-        let matching_certificates = signed_data
-            .certificates()
-            .filter(|certificate| {
-                certificate_is_subset_of(
-                    serial,
-                    issuer,
-                    certificate.serial_number_asn1(),
-                    certificate.issuer_name(),
-                )
-            })
-            .map(|certificate| certificate.constructed_data().to_vec())
-            .collect::<BTreeSet<_>>();
-        if matching_certificates.is_empty() {
-            return Err(SignatureFailure::InvalidMetadata(
-                "CMS signer certificate is absent from the signature block".to_string(),
+        if content.as_bytes() != signature_file {
+            return Err(SignatureFailure::Mismatch(
+                "CMS encapsulated content does not match the paired JAR .SF bytes".into(),
             ));
         }
-        if matching_certificates.len() != 1 {
-            return Err(SignatureFailure::InvalidMetadata(
-                "CMS signer identifier ambiguously matches multiple distinct certificates"
-                    .to_string(),
+    }
+
+    let mut fingerprints = Vec::with_capacity(signed_data.signer_infos.len());
+    for signer in &signed_data.signer_infos {
+        let digest = DigestAlgorithm::from_oid(signer.digest_algorithm.oid).ok_or_else(|| {
+            SignatureFailure::Unsupported(format!(
+                "unsupported CMS digest algorithm: {}",
+                signer.digest_algorithm.oid
+            ))
+        })?;
+        let algorithm = PackageSignatureAlgorithm::from_oid(signer.signature_algorithm.oid, digest)
+            .ok_or_else(|| {
+                SignatureFailure::Unsupported(format!(
+                    "unsupported CMS signature algorithm: {}",
+                    signer.signature_algorithm.oid
+                ))
+            })?;
+        verify_signer_algorithms(digest, algorithm)?;
+        if !matches!(signer.sid, SignerIdentifier::IssuerAndSerialNumber(_)) {
+            return Err(SignatureFailure::Unsupported(
+                "CMS signer uses an unsupported certificate identifier".into(),
             ));
         }
-        let certificate = matching_certificates.into_iter().next().ok_or_else(|| {
+        let mut matching = certificates.iter().filter_map(|entry| {
+            let CertificateChoices::Certificate(certificate) = &entry.choice else {
+                return None;
+            };
+            matches_certificate(&signer.sid, certificate).then_some((certificate, &entry.encoded))
+        });
+        let (certificate, encoded) = matching.next().ok_or_else(|| {
             SignatureFailure::InvalidMetadata(
-                "CMS signer certificate resolution unexpectedly produced no certificate"
-                    .to_string(),
+                "CMS signer certificate is absent from the signature block".into(),
             )
         })?;
-        fingerprints.push(Sha256::digest(&certificate).into());
+        if matching.any(|(_, other)| other != encoded) {
+            return Err(SignatureFailure::InvalidMetadata(
+                "CMS signer identifier ambiguously matches multiple distinct certificates".into(),
+            ));
+        }
+        let verifier = algorithm.verifier(certificate).ok_or_else(|| {
+            SignatureFailure::Unsupported(
+                "CMS signature algorithm and certificate key combination is unsupported".into(),
+            )
+        })?;
+        verify_signed_attributes(signer, digest, signature_file)?;
+        certificate
+            .verify_signed_data_with_algorithm(
+                signer.signed_bytes.as_deref().unwrap_or(signature_file),
+                signer.signature.to_bytes().as_ref(),
+                verifier,
+            )
+            .map_err(|_| SignatureFailure::Mismatch("CMS signature verification failed".into()))?;
+        fingerprints.push(Sha256::digest(encoded).into());
     }
     Ok(fingerprints)
 }
 
 fn verify_signer_algorithms(
     digest: DigestAlgorithm,
-    signature: SignatureAlgorithm,
+    signature: PackageSignatureAlgorithm,
 ) -> Result<(), SignatureFailure> {
+    use DigestAlgorithm::{Sha256, Sha384, Sha512};
     if digest == DigestAlgorithm::Sha1 {
         return Err(SignatureFailure::Unsupported(
-            "SHA-1 CMS content digests are outside the verifier policy".to_string(),
+            "SHA-1 CMS content digests are outside the verifier policy".into(),
         ));
     }
     match signature {
-        SignatureAlgorithm::RsaSha256
-        | SignatureAlgorithm::RsaSha384
-        | SignatureAlgorithm::RsaSha512
-        | SignatureAlgorithm::EcdsaSha256
-        | SignatureAlgorithm::EcdsaSha384
-        | SignatureAlgorithm::Ed25519 => Ok(()),
-        SignatureAlgorithm::RsaSha1 | SignatureAlgorithm::NoSignature(_) => {
-            Err(SignatureFailure::Unsupported(format!(
-                "CMS signature algorithm {signature:?} is outside the verifier policy"
-            )))
-        },
+        PackageSignatureAlgorithm::Rsa(Sha256 | Sha384 | Sha512)
+        | PackageSignatureAlgorithm::Ecdsa(Sha256 | Sha384)
+        | PackageSignatureAlgorithm::Ed25519 => Ok(()),
+        _ => Err(SignatureFailure::Unsupported(format!(
+            "CMS signature algorithm {signature:?} is outside the verifier policy"
+        ))),
     }
 }
 
-fn cms_failure(error: &CmsError) -> SignatureFailure {
-    match error {
-        CmsError::UnknownKeyAlgorithm(_)
-        | CmsError::UnknownDigestAlgorithm(_)
-        | CmsError::UnknownSignatureAlgorithm(_)
-        | CmsError::SubjectKeyIdentifierUnsupported
-        | CmsError::X509Certificate(_) => {
-            SignatureFailure::Unsupported(format!("unsupported CMS algorithm or key: {error}"))
-        },
-        CmsError::SignatureVerificationError | CmsError::DigestNotEqual => {
-            SignatureFailure::Mismatch(format!("CMS signature verification failed: {error}"))
-        },
-        _ => SignatureFailure::InvalidMetadata(format!("invalid CMS signature metadata: {error}")),
+fn attribute_value<'a>(
+    attributes: &'a [PackageAttribute],
+    oid: &str,
+) -> Result<Option<&'a [u8]>, SignatureFailure> {
+    let mut matching = attributes
+        .iter()
+        .filter(|attribute| attribute.typ.to_string() == oid);
+    let Some(attribute) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() || attribute.values.len() != 1 {
+        return Err(SignatureFailure::InvalidMetadata(format!(
+            "CMS attribute {oid} must occur once with one value"
+        )));
     }
+    Ok(attribute.values.first().map(bcder::Captured::as_slice))
+}
+
+fn verify_signed_attributes(
+    signer: &PackageSignerInfo,
+    digest: DigestAlgorithm,
+    content: &[u8],
+) -> Result<(), SignatureFailure> {
+    let invalid =
+        |error| SignatureFailure::InvalidMetadata(format!("invalid CMS attribute: {error}"));
+    if let Some(attributes) = &signer.signed_attributes {
+        let required = |oid| {
+            attribute_value(attributes, oid)?.ok_or_else(|| {
+                SignatureFailure::InvalidMetadata(format!(
+                    "required CMS signed attribute {oid} is absent"
+                ))
+            })
+        };
+        ObjectIdentifier::from_der(required(CONTENT_TYPE)?).map_err(invalid)?;
+        let expected = OctetString::from_der(required(MESSAGE_DIGEST)?).map_err(invalid)?;
+        let mut hasher = digest.digester();
+        hasher.update(content);
+        if !bool::from(expected.as_bytes().ct_eq(hasher.finish().as_ref())) {
+            return Err(SignatureFailure::Mismatch(
+                "CMS message digest does not match JAR content".into(),
+            ));
+        }
+        if let Some(time) = attribute_value(attributes, "1.2.840.113549.1.9.5")? {
+            Time::from_der(time).map_err(invalid)?;
+        }
+    }
+    if let Some(token) = attribute_value(
+        signer.unsigned_attributes.as_deref().unwrap_or_default(),
+        "1.2.840.113549.1.9.16.2.14",
+    )? {
+        let timestamp = PackageSignedData::decode_der(token).map_err(|error| {
+            SignatureFailure::InvalidMetadata(format!("invalid CMS timestamp token: {error}"))
+        })?;
+        if timestamp.has_revocations {
+            return Err(SignatureFailure::InvalidMetadata(
+                "CMS timestamp revocation information is unsupported".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn signature_member(name: &[u8]) -> Option<(Vec<u8>, SignatureMemberKind)> {
@@ -1279,11 +1325,11 @@ mod tests {
         group_signature_members, preflight_der, valid_signer_base, verify_signature_file,
         verify_signer_algorithms,
     };
+    use crate::package_cms::{DigestAlgorithm, PackageSignatureAlgorithm};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use libarchive_oxide_core::Limits;
     use sha2::{Digest, Sha256};
-    use x509_certificate::{DigestAlgorithm, SignatureAlgorithm};
 
     use crate::integrity::EntryDigest;
 
@@ -1334,12 +1380,18 @@ mod tests {
     #[test]
     fn cms_algorithm_policy_rejects_sha1() {
         assert!(matches!(
-            verify_signer_algorithms(DigestAlgorithm::Sha1, SignatureAlgorithm::RsaSha1),
+            verify_signer_algorithms(
+                DigestAlgorithm::Sha1,
+                PackageSignatureAlgorithm::Rsa(DigestAlgorithm::Sha1)
+            ),
             Err(SignatureFailure::Unsupported(_))
         ));
         assert!(
-            verify_signer_algorithms(DigestAlgorithm::Sha256, SignatureAlgorithm::RsaSha256)
-                .is_ok()
+            verify_signer_algorithms(
+                DigestAlgorithm::Sha256,
+                PackageSignatureAlgorithm::Rsa(DigestAlgorithm::Sha256)
+            )
+            .is_ok()
         );
     }
 

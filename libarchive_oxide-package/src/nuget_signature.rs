@@ -4,37 +4,32 @@
 
 //! Offline `NuGet` package structure, integrity, and CMS signature verification.
 //!
-//! `NuGet` signs a canonical byte stream obtained by removing the final stored
-//! `.signature.p7s` ZIP member and patching the classic EOCD counts, central
-//! directory size, and central directory offset. ZIP64 packages are not
-//! signable under `NuGet` signature format v1 and are rejected explicitly.
+//! `NuGet` signs a canonical byte stream obtained by removing the final stored `.signature.p7s` ZIP member and patching the classic EOCD counts, central directory size, and central directory offset.
+//! ZIP64 packages are not signable under `NuGet` signature format v1 and are rejected explicitly.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
-use std::ops::Deref as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use bcder::decode::{Constructed, DecodeError, Source};
-use bcder::{Ia5String, Mode, OctetString, Oid, Tag, Utf8String};
-use cryptographic_message_syntax::asn1::rfc5652::{
-    CertificateChoices, CertificateSet, CmsVersion, DigestAlgorithmIdentifiers,
-    EncapsulatedContentInfo, IssuerAndSerialNumber, OID_CONTENT_TYPE, OID_COUNTER_SIGNATURE,
-    OID_ID_DATA, OID_ID_SIGNED_DATA, OID_MESSAGE_DIGEST, SignedAttributes, UnsignedAttributes,
-};
+use bcder::{Ia5String, OctetString, Oid, Utf8String};
+use cms::cert::CertificateChoices;
+use der::Decode;
 use libarchive_oxide_core::Limits;
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use ring::signature;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use subtle::ConstantTimeEq;
-use x509_certificate::certificate::certificate_is_subset_of;
-use x509_certificate::rfc5280::AlgorithmIdentifier;
-use x509_certificate::rfc5652::Attribute;
-use x509_certificate::{DigestAlgorithm, KeyAlgorithm, SignatureAlgorithm, X509Certificate};
+use x509_cert::Certificate;
 
+use crate::certificate::{CertificateKey, KeyAlgorithm};
 use crate::integrity::{ZipVerification, collect_entries};
+use crate::package_cms::{
+    CONTENT_TYPE, COUNTER_SIGNATURE, DigestAlgorithm, ID_DATA, MESSAGE_DIGEST, PackageAttribute,
+    PackageCertificate, PackageSignatureAlgorithm, PackageSignedData, PackageSignerInfo,
+    matches_certificate,
+};
 use crate::verification::VerificationDimension;
 use crate::{PackageFinding, PackageFindingCode};
 
@@ -57,7 +52,6 @@ const OID_PROOF_OF_RECEIPT: &str = "1.2.840.113549.1.9.16.6.2";
 const OID_SIGNING_CERTIFICATE_V2: &str = "1.2.840.113549.1.9.16.2.47";
 const OID_SERVICE_INDEX: &str = "1.3.6.1.4.1.311.84.2.1.1.1";
 const OID_PACKAGE_OWNERS: &str = "1.3.6.1.4.1.311.84.2.1.1.2";
-const OID_SUBJECT_KEY_IDENTIFIER: &str = "2.5.29.14";
 
 #[derive(Debug)]
 struct Failure {
@@ -111,155 +105,6 @@ struct SignatureEnvelope {
     hash_algorithm: DigestAlgorithm,
     expected_package_hash: Vec<u8>,
     signer_fingerprints: Vec<[u8; 32]>,
-}
-
-#[derive(Clone, Debug)]
-enum NuGetSignerIdentifier {
-    IssuerAndSerialNumber(IssuerAndSerialNumber),
-    SubjectKeyIdentifier(Vec<u8>),
-}
-
-#[derive(Clone, Debug)]
-struct NuGetSignerInfo {
-    sid: NuGetSignerIdentifier,
-    digest_algorithm: AlgorithmIdentifier,
-    signed_attributes: Option<SignedAttributes>,
-    signature_algorithm: AlgorithmIdentifier,
-    signature: OctetString,
-    unsigned_attributes: Option<UnsignedAttributes>,
-    signed_attributes_data: Option<Vec<u8>>,
-}
-
-impl NuGetSignerInfo {
-    fn take_opt_from<S: Source>(
-        cons: &mut Constructed<S>,
-    ) -> Result<Option<Self>, DecodeError<S::Error>> {
-        cons.take_opt_sequence(Self::from_sequence)
-    }
-
-    fn from_sequence<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
-        let version = CmsVersion::take_from(cons)?;
-        #[allow(
-            clippy::redundant_closure_for_method_calls,
-            reason = "the generic method reference is not lifetime-general enough"
-        )]
-        let sid = match cons.take_opt_primitive_if(Tag::CTX_0, |primitive| primitive.take_all())? {
-            Some(identifier) => {
-                NuGetSignerIdentifier::SubjectKeyIdentifier(identifier.as_ref().to_vec())
-            },
-            None => NuGetSignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber::take_from(
-                cons,
-            )?),
-        };
-        match (&sid, version) {
-            (NuGetSignerIdentifier::SubjectKeyIdentifier(_), CmsVersion::V3)
-            | (NuGetSignerIdentifier::IssuerAndSerialNumber(_), CmsVersion::V1) => {},
-            _ => return Err(cons.content_err("CMS signer identifier/version mismatch")),
-        }
-        let digest_algorithm = AlgorithmIdentifier::take_from(cons)?;
-        let signed_attributes = cons.take_opt_constructed_if(Tag::CTX_0, |cons| {
-            let captured = cons.capture_all()?;
-            let encoded = captured.as_slice().to_vec();
-            let attributes = Constructed::decode(captured.as_slice(), Mode::Der, |cons| {
-                SignedAttributes::take_from_set(cons)
-            })
-            .map_err(DecodeError::convert)?;
-            Ok((attributes, encoded))
-        })?;
-        let (signed_attributes, signed_attributes_data) = signed_attributes
-            .map_or((None, None), |(attributes, encoded)| {
-                (Some(attributes), Some(encoded))
-            });
-        let signature_algorithm = AlgorithmIdentifier::take_from(cons)?;
-        let signature = OctetString::take_from(cons)?;
-        let unsigned_attributes =
-            cons.take_opt_constructed_if(Tag::CTX_1, UnsignedAttributes::take_from_set)?;
-        Ok(Self {
-            sid,
-            digest_algorithm,
-            signed_attributes,
-            signature_algorithm,
-            signature,
-            unsigned_attributes,
-            signed_attributes_data,
-        })
-    }
-
-    fn signed_attributes_digested_content(&self) -> Option<Vec<u8>> {
-        let content = self.signed_attributes_data.as_ref()?;
-        let mut encoded = Vec::with_capacity(content.len().saturating_add(8));
-        encoded.push(0x31);
-        encode_der_length(content.len(), &mut encoded);
-        encoded.extend_from_slice(content);
-        Some(encoded)
-    }
-}
-
-#[derive(Debug)]
-struct NuGetSignedData {
-    content_info: EncapsulatedContentInfo,
-    certificates: Option<CertificateSet>,
-    signer_infos: Vec<NuGetSignerInfo>,
-}
-
-impl NuGetSignedData {
-    fn decode_der(data: &[u8]) -> Result<Self, DecodeError<std::convert::Infallible>> {
-        Constructed::decode(data, Mode::Der, |cons| {
-            cons.take_sequence(|cons| {
-                let content_type = Oid::take_from(cons)?;
-                if content_type != OID_ID_SIGNED_DATA {
-                    return Err(cons.content_err("expected signed-data content type"));
-                }
-                cons.take_constructed_if(Tag::CTX_0, |cons| {
-                    cons.take_sequence(|cons| {
-                        let _version = CmsVersion::take_from(cons)?;
-                        let _digest_algorithms = DigestAlgorithmIdentifiers::take_from(cons)?;
-                        let content_info = EncapsulatedContentInfo::take_from(cons)?;
-                        let certificates =
-                            cons.take_opt_constructed_if(Tag::CTX_0, CertificateSet::take_from)?;
-                        #[allow(
-                            clippy::redundant_closure_for_method_calls,
-                            reason = "the generic method reference is not lifetime-general enough"
-                        )]
-                        let revocations =
-                            cons.take_opt_constructed_if(Tag::CTX_1, |cons| cons.capture_all())?;
-                        if revocations.is_some() {
-                            return Err(cons.content_err(
-                                "NuGet SignedData must not contain revocation-info choices",
-                            ));
-                        }
-                        let signer_infos = cons.take_set(|cons| {
-                            let mut signers = Vec::new();
-                            while let Some(signer) = NuGetSignerInfo::take_opt_from(cons)? {
-                                signers.push(signer);
-                            }
-                            Ok(signers)
-                        })?;
-                        Ok(Self {
-                            content_info,
-                            certificates,
-                            signer_infos,
-                        })
-                    })
-                })
-            })
-        })
-    }
-}
-
-fn encode_der_length(length: usize, target: &mut Vec<u8>) {
-    if length < 0x80 {
-        target.push(u8::try_from(length).unwrap_or(0));
-        return;
-    }
-    let bytes = length.to_be_bytes();
-    let first = bytes
-        .iter()
-        .position(|byte| *byte != 0)
-        .unwrap_or(bytes.len().saturating_sub(1));
-    let significant = &bytes[first..];
-    target.push(0x80 | u8::try_from(significant.len()).unwrap_or(u8::MAX));
-    target.extend_from_slice(significant);
 }
 
 #[derive(Debug)]
@@ -1084,7 +929,7 @@ fn verify_signature_envelope(
         )
     })?;
     let raw = catch_unwind(AssertUnwindSafe(|| {
-        NuGetSignedData::decode_der(signature_body)
+        PackageSignedData::decode_der(signature_body)
     }))
     .map_err(|_| {
         Failure::invalid(
@@ -1098,6 +943,12 @@ fn verify_signature_envelope(
             format!("cannot parse NuGet CMS SignedData: {error}"),
         )
     })?;
+    if raw.has_revocations {
+        return Err(Failure::invalid(
+            PackageFindingCode::InvalidSignatureMetadata,
+            "NuGet SignedData must not contain revocation-info choices",
+        ));
+    }
     if raw.signer_infos.len() != 1 {
         return Err(Failure::invalid(
             PackageFindingCode::InvalidSignatureMetadata,
@@ -1121,7 +972,7 @@ fn verify_signature_envelope(
     }
     let content = raw
         .content_info
-        .content
+        .econtent
         .as_ref()
         .ok_or_else(|| {
             Failure::invalid(
@@ -1129,10 +980,15 @@ fn verify_signature_envelope(
                 "NuGet primary signature has no encapsulated SignatureContent",
             )
         })?
-        .clone()
-        .to_bytes()
-        .to_vec();
-    if raw.content_info.content_type != OID_ID_DATA {
+        .decode_as::<der::asn1::OctetString>()
+        .map_err(|error| {
+            Failure::invalid(
+                PackageFindingCode::InvalidSignatureMetadata,
+                format!("invalid NuGet SignatureContent: {error}"),
+            )
+        })?
+        .into_bytes();
+    if raw.content_info.econtent_type.to_string() != ID_DATA {
         return Err(Failure::unsupported(
             PackageFindingCode::UnsupportedIntegrityScope,
             "NuGet CMS encapsulates a content type other than id-data",
@@ -1187,20 +1043,19 @@ fn verify_signature_envelope(
     })
 }
 
-fn countersignatures(primary: &NuGetSignerInfo) -> Result<Vec<NuGetSignerInfo>, Failure> {
+fn countersignatures(primary: &PackageSignerInfo) -> Result<Vec<PackageSignerInfo>, Failure> {
     let mut counters = Vec::new();
     let Some(attributes) = primary.unsigned_attributes.as_ref() else {
         return Ok(counters);
     };
-    for attribute in attributes.iter() {
-        if attribute.typ != OID_COUNTER_SIGNATURE {
+    for attribute in attributes {
+        if attribute.typ.to_string() != COUNTER_SIGNATURE {
             continue;
         }
         for value in &attribute.values {
             let signer = value
-                .deref()
                 .clone()
-                .decode(|cons| cons.take_sequence(NuGetSignerInfo::from_sequence))
+                .decode(|cons| cons.take_sequence(PackageSignerInfo::from_sequence))
                 .map_err(|error| {
                     Failure::invalid(
                         PackageFindingCode::InvalidSignatureMetadata,
@@ -1214,14 +1069,17 @@ fn countersignatures(primary: &NuGetSignerInfo) -> Result<Vec<NuGetSignerInfo>, 
 }
 
 fn verify_signer(
-    signer: &NuGetSignerInfo,
+    signer: &PackageSignerInfo,
     content: &[u8],
-    certificates: &CertificateSet,
+    certificates: &[PackageCertificate],
 ) -> Result<[u8; 32], Failure> {
-    let digest = DigestAlgorithm::try_from(&signer.digest_algorithm).map_err(|error| {
+    let digest = DigestAlgorithm::from_oid(signer.digest_algorithm.oid).ok_or_else(|| {
         Failure::unsupported(
             PackageFindingCode::UnsupportedSignatureAlgorithm,
-            format!("NuGet CMS digest algorithm is unsupported: {error}"),
+            format!(
+                "NuGet CMS digest algorithm is unsupported: {}",
+                signer.digest_algorithm.oid
+            ),
         )
     })?;
     if digest == DigestAlgorithm::Sha1 {
@@ -1230,27 +1088,14 @@ fn verify_signer(
             "NuGet signature format v1 accepts only SHA-256, SHA-384, or SHA-512",
         ));
     }
-    let signature_algorithm = SignatureAlgorithm::from_oid_and_digest_algorithm(
-        &signer.signature_algorithm.algorithm,
-        digest,
-    )
-    .map_err(|error| {
-        Failure::unsupported(
-            PackageFindingCode::UnsupportedSignatureAlgorithm,
-            format!("NuGet CMS signature algorithm is unsupported: {error}"),
-        )
-    })?;
-    if !matches!(
-        signature_algorithm,
-        SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512
-    ) {
+    let signature_algorithm =
+        PackageSignatureAlgorithm::from_oid(signer.signature_algorithm.oid, digest);
+    let Some(PackageSignatureAlgorithm::Rsa(signature_digest)) = signature_algorithm else {
         return Err(Failure::unsupported(
             PackageFindingCode::UnsupportedSignatureAlgorithm,
             "NuGet signature format v1 accepts only RSA with SHA-2",
         ));
-    }
+    };
     let (certificate, certificate_der) = find_signer_certificate(signer, certificates)?;
     if certificate.key_algorithm() != Some(KeyAlgorithm::Rsa) {
         return Err(Failure::unsupported(
@@ -1258,23 +1103,17 @@ fn verify_signer(
             "NuGet signer certificate does not contain an RSA public key",
         ));
     }
-    let rsa = certificate.rsa_public_key_data().map_err(|error| {
+    let modulus_length = certificate.rsa_modulus_length().map_err(|error| {
         Failure::invalid(
             PackageFindingCode::InvalidSignatureMetadata,
             format!("cannot parse NuGet signer RSA key: {error}"),
         )
     })?;
-    let modulus = rsa
-        .modulus
-        .as_slice()
-        .strip_prefix(&[0])
-        .unwrap_or_else(|| rsa.modulus.as_slice());
-    if !(256..=1024).contains(&modulus.len()) {
+    if !(256..=1024).contains(&modulus_length) {
         return Err(Failure::unsupported(
             PackageFindingCode::UnsupportedSignatureAlgorithm,
             format!(
-                "NuGet signer RSA key is outside the supported 2048..=8192-bit range ({} bytes)",
-                modulus.len()
+                "NuGet signer RSA key is outside the supported 2048..=8192-bit range ({modulus_length} bytes)"
             ),
         ));
     }
@@ -1288,22 +1127,26 @@ fn verify_signer(
     validate_message_digest(signed_attributes, digest, content)?;
     validate_signing_certificate_v2(signed_attributes, &certificate_der)?;
 
-    let signed_bytes = signer.signed_attributes_digested_content().ok_or_else(|| {
+    let signed_bytes = signer.signed_bytes.as_deref().ok_or_else(|| {
         Failure::invalid(
             PackageFindingCode::InvalidSignatureMetadata,
             "NuGet CMS signer has no signed-attribute bytes",
         )
     })?;
-    let verification_algorithm = signature_algorithm
-        .resolve_verification_algorithm(KeyAlgorithm::Rsa)
-        .map_err(|error| {
+    let verification_algorithm = PackageSignatureAlgorithm::Rsa(signature_digest)
+        .verifier(&certificate)
+        .ok_or_else(|| {
             Failure::unsupported(
                 PackageFindingCode::UnsupportedSignatureAlgorithm,
-                format!("cannot resolve NuGet RSA verification algorithm: {error}"),
+                "unsupported NuGet RSA signature algorithm",
             )
         })?;
-    signature::UnparsedPublicKey::new(verification_algorithm, certificate.public_key_data())
-        .verify(&signed_bytes, signer.signature.clone().to_bytes().as_ref())
+    certificate
+        .verify_signed_data_with_algorithm(
+            signed_bytes,
+            signer.signature.to_bytes().as_ref(),
+            verification_algorithm,
+        )
         .map_err(|_| {
             Failure::mismatch(
                 PackageFindingCode::SignatureMismatch,
@@ -1314,44 +1157,19 @@ fn verify_signer(
 }
 
 fn find_signer_certificate(
-    signer: &NuGetSignerInfo,
-    certificates: &CertificateSet,
-) -> Result<(X509Certificate, Vec<u8>), Failure> {
+    signer: &PackageSignerInfo,
+    certificates: &[PackageCertificate],
+) -> Result<(Certificate, Vec<u8>), Failure> {
     let mut matching_certificates = BTreeSet::<Vec<u8>>::new();
-    for choice in certificates.iter() {
-        let CertificateChoices::Certificate(certificate) = choice else {
+    for entry in certificates {
+        let CertificateChoices::Certificate(certificate) = &entry.choice else {
             return Err(Failure::unsupported(
                 PackageFindingCode::UnsupportedSignatureAlgorithm,
                 "NuGet CMS contains a non-X.509 certificate choice",
             ));
         };
-        let certificate = X509Certificate::from((**certificate).clone());
-        let identifier_matches = match &signer.sid {
-            NuGetSignerIdentifier::IssuerAndSerialNumber(identifier) => certificate_is_subset_of(
-                &identifier.serial_number,
-                &identifier.issuer,
-                certificate.serial_number_asn1(),
-                certificate.issuer_name(),
-            ),
-            NuGetSignerIdentifier::SubjectKeyIdentifier(identifier) => {
-                certificate.iter_extensions().any(|extension| {
-                    if extension.id.to_string() != OID_SUBJECT_KEY_IDENTIFIER {
-                        return false;
-                    }
-                    let encoded = extension.value.clone().into_bytes();
-                    Constructed::decode(encoded.as_ref(), Mode::Der, OctetString::take_from)
-                        .is_ok_and(|actual| actual.to_bytes().as_ref() == identifier)
-                })
-            },
-        };
-        if identifier_matches {
-            let der = certificate.encode_der().map_err(|error| {
-                Failure::invalid(
-                    PackageFindingCode::InvalidSignatureMetadata,
-                    format!("cannot DER-encode NuGet signer certificate: {error}"),
-                )
-            })?;
-            matching_certificates.insert(der);
+        if matches_certificate(&signer.sid, certificate) {
+            matching_certificates.insert(entry.encoded.clone());
         }
     }
     if matching_certificates.len() != 1 {
@@ -1369,7 +1187,7 @@ fn find_signer_certificate(
             "NuGet CMS signer certificate is absent",
         )
     })?;
-    let certificate = X509Certificate::from_der(&der).map_err(|error| {
+    let certificate = Certificate::from_der(&der).map_err(|error| {
         Failure::invalid(
             PackageFindingCode::InvalidSignatureMetadata,
             format!("cannot parse matched NuGet signer certificate: {error}"),
@@ -1378,8 +1196,8 @@ fn find_signer_certificate(
     Ok((certificate, der))
 }
 
-fn validate_content_type(attributes: &SignedAttributes) -> Result<(), Failure> {
-    let attribute = single_attribute(attributes, OID_CONTENT_TYPE.to_string().as_str())?;
+fn validate_content_type(attributes: &[PackageAttribute]) -> Result<(), Failure> {
+    let attribute = single_attribute(attributes, CONTENT_TYPE)?;
     if attribute.values.len() != 1 {
         return Err(Failure::invalid(
             PackageFindingCode::InvalidSignatureMetadata,
@@ -1387,7 +1205,6 @@ fn validate_content_type(attributes: &SignedAttributes) -> Result<(), Failure> {
         ));
     }
     let oid = attribute.values[0]
-        .deref()
         .clone()
         .decode(Oid::take_from)
         .map_err(|error| {
@@ -1396,7 +1213,7 @@ fn validate_content_type(attributes: &SignedAttributes) -> Result<(), Failure> {
                 format!("NuGet CMS content-type attribute is malformed: {error}"),
             )
         })?;
-    if oid != OID_ID_DATA {
+    if oid.to_string() != ID_DATA {
         return Err(Failure::unsupported(
             PackageFindingCode::UnsupportedIntegrityScope,
             "NuGet CMS signer authenticates a content type other than id-data",
@@ -1406,11 +1223,11 @@ fn validate_content_type(attributes: &SignedAttributes) -> Result<(), Failure> {
 }
 
 fn validate_message_digest(
-    attributes: &SignedAttributes,
+    attributes: &[PackageAttribute],
     digest: DigestAlgorithm,
     content: &[u8],
 ) -> Result<(), Failure> {
-    let attribute = single_attribute(attributes, OID_MESSAGE_DIGEST.to_string().as_str())?;
+    let attribute = single_attribute(attributes, MESSAGE_DIGEST)?;
     if attribute.values.len() != 1 {
         return Err(Failure::invalid(
             PackageFindingCode::InvalidSignatureMetadata,
@@ -1418,7 +1235,6 @@ fn validate_message_digest(
         ));
     }
     let wanted = attribute.values[0]
-        .deref()
         .clone()
         .decode(OctetString::take_from)
         .map_err(|error| {
@@ -1442,7 +1258,7 @@ fn validate_message_digest(
 }
 
 fn validate_signing_certificate_v2(
-    attributes: &SignedAttributes,
+    attributes: &[PackageAttribute],
     certificate_der: &[u8],
 ) -> Result<(), Failure> {
     let attribute = single_attribute(attributes, OID_SIGNING_CERTIFICATE_V2)?;
@@ -1453,13 +1269,16 @@ fn validate_signing_certificate_v2(
         ));
     }
     let (algorithm, wanted) = attribute.values[0]
-        .deref()
         .clone()
         .decode(|cons| {
             cons.take_sequence(|cons| {
                 cons.take_sequence(|cons| {
                     cons.take_sequence(|cons| {
-                        let algorithm = AlgorithmIdentifier::take_opt_from(cons)?;
+                        let algorithm = cons.take_opt_sequence(|cons| {
+                            let oid = Oid::take_from(cons)?;
+                            let _parameters = cons.skip_one()?;
+                            Ok(oid)
+                        })?;
                         let hash = OctetString::take_from(cons)?;
                         let _issuer_serial = cons.capture_all()?;
                         Ok((algorithm, hash.to_bytes().to_vec()))
@@ -1475,12 +1294,17 @@ fn validate_signing_certificate_v2(
         })?;
     let digest = match algorithm {
         None => DigestAlgorithm::Sha256,
-        Some(algorithm) => DigestAlgorithm::try_from(&algorithm).map_err(|error| {
-            Failure::unsupported(
-                PackageFindingCode::UnsupportedSignatureAlgorithm,
-                format!("NuGet signing-certificate-v2 digest is unsupported: {error}"),
-            )
-        })?,
+        Some(algorithm) => algorithm
+            .to_string()
+            .parse()
+            .ok()
+            .and_then(DigestAlgorithm::from_oid)
+            .ok_or_else(|| {
+                Failure::unsupported(
+                    PackageFindingCode::UnsupportedSignatureAlgorithm,
+                    format!("NuGet signing-certificate-v2 digest is unsupported: {algorithm}"),
+                )
+            })?,
     };
     if digest == DigestAlgorithm::Sha1 {
         return Err(Failure::unsupported(
@@ -1501,7 +1325,7 @@ fn validate_signing_certificate_v2(
     }
 }
 
-fn signature_type(signer: &NuGetSignerInfo) -> Result<NuGetSignatureType, Failure> {
+fn signature_type(signer: &PackageSignerInfo) -> Result<NuGetSignatureType, Failure> {
     let attributes = signer.signed_attributes.as_ref().ok_or_else(|| {
         Failure::invalid(
             PackageFindingCode::InvalidSignatureMetadata,
@@ -1516,7 +1340,6 @@ fn signature_type(signer: &NuGetSignerInfo) -> Result<NuGetSignatureType, Failur
         ));
     }
     let oid = attribute.values[0]
-        .deref()
         .clone()
         .decode(|cons| cons.take_sequence(Oid::take_from))
         .map_err(|error| {
@@ -1537,7 +1360,7 @@ fn signature_type(signer: &NuGetSignerInfo) -> Result<NuGetSignatureType, Failur
 }
 
 fn validate_repository_attributes(
-    signer: &NuGetSignerInfo,
+    signer: &PackageSignerInfo,
     signature_type: NuGetSignatureType,
 ) -> Result<(), Failure> {
     let attributes = signer.signed_attributes.as_ref().ok_or_else(|| {
@@ -1570,7 +1393,6 @@ fn validate_repository_attributes(
         ));
     }
     let service_url = service[0].values[0]
-        .deref()
         .clone()
         .decode(Ia5String::take_from)
         .map_err(|error| {
@@ -1603,7 +1425,6 @@ fn validate_repository_attributes(
             ));
         }
         let owner_names = owners.values[0]
-            .deref()
             .clone()
             .decode(|cons| {
                 cons.take_sequence(|cons| {
@@ -1631,9 +1452,9 @@ fn validate_repository_attributes(
 }
 
 fn single_attribute<'a>(
-    attributes: &'a SignedAttributes,
+    attributes: &'a [PackageAttribute],
     oid: &str,
-) -> Result<&'a Attribute, Failure> {
+) -> Result<&'a PackageAttribute, Failure> {
     let matches = attributes
         .iter()
         .filter(|attribute| attribute.typ.to_string() == oid)
