@@ -17,11 +17,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use der::Decode;
 use libarchive_oxide_core::Limits;
 use ring::signature;
 use sha2::{Digest, Sha256, Sha512};
-use spki::EncodePublicKey;
-use x509_certificate::{CapturedX509Certificate, EcdsaCurve, KeyAlgorithm};
+use x509_cert::Certificate;
+
+use crate::certificate::{CertificateKey, EcdsaCurve, KeyAlgorithm};
 
 use crate::jar_signature::preflight_der;
 use crate::verification::VerificationDimension;
@@ -285,7 +287,7 @@ impl SignatureAlgorithm {
                 "APK signer certificate uses an unsupported public-key algorithm".to_string(),
             )),
             (_, Some(actual)) => Err(Failure::Invalid(format!(
-                "APK signature algorithm does not match signer public-key type {actual}"
+                "APK signature algorithm does not match signer public-key type {actual:?}"
             ))),
         }
     }
@@ -977,9 +979,9 @@ fn verify_signer(
         .collect::<BTreeSet<_>>();
     let (certificate, certificate_der) = parse_first_certificate(certificate_values, limits)?;
     let canonical_public_key = certificate
-        .to_public_key_der()
+        .public_key_der()
         .map_err(|error| Failure::Invalid(format!("cannot encode APK signer SPKI: {error}")))?;
-    if canonical_public_key.as_bytes() != public_key {
+    if canonical_public_key != public_key {
         return Err(Failure::Invalid(
             "APK signer public key differs from the first certificate's SPKI".to_string(),
         ));
@@ -1217,7 +1219,7 @@ fn parse_digest_records(bytes: &[u8]) -> Result<Vec<DigestRecord<'_>>, Failure> 
 fn parse_first_certificate(
     bytes: &[u8],
     limits: Limits,
-) -> Result<(CapturedX509Certificate, Vec<u8>), Failure> {
+) -> Result<(Certificate, Vec<u8>), Failure> {
     let mut cursor = ByteCursor::new(bytes);
     let mut count = 0_usize;
     let mut first = None;
@@ -1237,44 +1239,33 @@ fn parse_first_certificate(
     first.ok_or_else(|| Failure::Invalid("APK signer has no certificate".to_string()))
 }
 
-pub(crate) fn parse_certificate(
-    encoded: &[u8],
-    limits: Limits,
-) -> Result<CapturedX509Certificate, Failure> {
+pub(crate) fn parse_certificate(encoded: &[u8], limits: Limits) -> Result<Certificate, Failure> {
     preflight_der(encoded, limits).map_err(|error| {
         Failure::Invalid(format!("malformed APK certificate: {}", error.detail()))
     })?;
-    catch_unwind(AssertUnwindSafe(|| {
-        CapturedX509Certificate::from_der(encoded.to_vec())
-    }))
-    .map_err(|_| {
-        Failure::Invalid(
-            "APK certificate parser rejected malformed input without propagating its panic"
-                .to_string(),
-        )
-    })?
-    .map_err(|error| Failure::Invalid(format!("malformed APK certificate: {error}")))
+    catch_unwind(AssertUnwindSafe(|| Certificate::from_der(encoded)))
+        .map_err(|_| {
+            Failure::Invalid(
+                "APK certificate parser rejected malformed input without propagating its panic"
+                    .to_string(),
+            )
+        })?
+        .map_err(|error| Failure::Invalid(format!("malformed APK certificate: {error}")))
 }
 
 pub(crate) fn validate_key_support(
     algorithm: SignatureAlgorithm,
-    certificate: &CapturedX509Certificate,
+    certificate: &Certificate,
 ) -> Result<(), Failure> {
     if !algorithm.uses_rsa() || certificate.key_algorithm() != Some(KeyAlgorithm::Rsa) {
         return Ok(());
     }
-    let public_key = certificate.rsa_public_key_data().map_err(|error| {
+    let modulus = certificate.rsa_modulus_length().map_err(|error| {
         Failure::Invalid(format!("cannot parse APK signer RSA public key: {error}"))
     })?;
-    let modulus = public_key
-        .modulus
-        .as_slice()
-        .strip_prefix(&[0])
-        .unwrap_or_else(|| public_key.modulus.as_slice());
-    if !(256..=1024).contains(&modulus.len()) {
+    if !(256..=1024).contains(&modulus) {
         return Err(Failure::Unsupported(format!(
-            "APK RSA keys outside 2048..=8192 bits are not supported by this build ({} bytes)",
-            modulus.len()
+            "APK RSA keys outside 2048..=8192 bits are not supported by this build ({modulus} bytes)"
         )));
     }
     Ok(())
@@ -1443,7 +1434,7 @@ fn verify_proof_of_rotation(
 
     let mut levels = Vec::new();
     let mut certificates = BTreeSet::new();
-    let mut previous: Option<(CapturedX509Certificate, u32)> = None;
+    let mut previous: Option<(Certificate, u32)> = None;
     while cursor.remaining() != 0 {
         if levels.len() >= MAX_LINEAGE_LEVELS {
             return Err(Failure::Resource(format!(

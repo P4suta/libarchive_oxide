@@ -15,9 +15,9 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use crate::certificate::CertificateKey;
 use libarchive_oxide_core::Limits;
 use sha2::{Digest, Sha256};
-use spki::EncodePublicKey;
 use subtle::ConstantTimeEq;
 
 use crate::android_signature::{
@@ -549,14 +549,14 @@ fn verify_signing_info(
 ) -> Result<[u8; 32], Failure> {
     let certificate =
         parse_certificate(signing_info.certificate, limits).map_err(map_certificate_failure)?;
-    let canonical_public_key = catch_unwind(AssertUnwindSafe(|| certificate.to_public_key_der()))
+    let canonical_public_key = catch_unwind(AssertUnwindSafe(|| certificate.public_key_der()))
         .map_err(|_| {
             Failure::Invalid(
                 "APK v4 certificate public-key encoder rejected malformed input".to_string(),
             )
         })?
         .map_err(|error| Failure::Invalid(format!("cannot encode APK v4 signer SPKI: {error}")))?;
-    if canonical_public_key.as_bytes() != signing_info.public_key {
+    if canonical_public_key != signing_info.public_key {
         return Err(Failure::Invalid(
             "APK v4 public key differs from the signer certificate's SPKI".to_string(),
         ));
