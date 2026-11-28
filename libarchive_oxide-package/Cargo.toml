@@ -48,7 +48,7 @@ lz4 = ["gzip", "libarchive_oxide/lz4"]
 base64 = "0.22"
 bcder = "0.7.7"
 cms = { version = "0.2.3", default-features = false }
-der = { version = "0.7.10", features = ["alloc", "derive", "oid"] }
+der = { version = "0.8.0", features = ["alloc", "derive", "oid"] }
 # Its default `http` feature performs timestamp-protocol requests; verification
 # in this crate is deliberately offline.
 libarchive_oxide = { path = "../libarchive_oxide", version = "0.2.0", default-features = false }
@@ -61,7 +61,7 @@ sha3 = "0.12"
 spki = { version = "0.7", default-features = false, features = ["alloc"] }
 subtle = "2.6"
 unicode-normalization = "0.1.24"
-x509-cert = { version = "0.2.5", default-features = false }
+x509-cert = { version = "0.3.0", default-features = false }
 
 [dev-dependencies]
 crc32fast = "1"
